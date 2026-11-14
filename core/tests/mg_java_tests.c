@@ -3738,6 +3738,9 @@ static int run_data(void)
                                          /* And a reference that comes to @null is no value in a styled attribute array: a tint that is a
                                             colour @null by day leaves the image without one (WhatsApp's settings on a PC). */
                                          "null-reference",
+                                         /* And BidiFormatter wraps a text in an embedding with marks where its direction is not the
+                                            context's, and gives it as it is where it is (Deezer's search). */
+                                         "bidi-wrap",
                                          /* And PrecomputedText is the text it was made of -- characters, spans, paragraphs and the parameters
                                             it was made with -- so a SpannableString of one keeps the spans, and a TextView shows it (Ozon's
                                             chat). */

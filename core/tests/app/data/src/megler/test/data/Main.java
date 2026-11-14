@@ -7199,6 +7199,33 @@ public class Main extends Activity {
             Log.i("DataTest", "null-reference " + detail);
             return xml && plain && style && value && view && byNight;
         });
+        // BidiFormatter wraps a text as Android's does: as it is where its direction is the context's, in an embedding with
+        // marks around it where it is not. Each unicodeWrap gave null (a generated class), and Deezer's search stopped at its
+        // first result: an R8 null check of what unicodeWrap gave for "title • artist".
+        step("bidi-wrap", () -> {
+            final String heb = "שלום", lrm = "‎", rlm = "‏";
+            android.text.BidiFormatter ltr = android.text.BidiFormatter.getInstance(java.util.Locale.US);
+            String same = ltr.unicodeWrap("Album • Artist");
+            boolean plain = "Album • Artist".equals(same) && ltr.unicodeWrap((String) null) == null && !ltr.isRtlContext()
+                && ltr.getStereoReset();
+            boolean other = (lrm + "‫" + heb + "‬" + lrm).equals(ltr.unicodeWrap(heb)) && ltr.isRtl(heb) && !ltr.isRtl("abc")
+                && (heb).equals(ltr.unicodeWrap(heb, android.text.TextDirectionHeuristics.FIRSTSTRONG_LTR, false).replace("‫", "").replace("‬", ""));
+            android.text.BidiFormatter rtl = android.text.BidiFormatter.getInstance(true);
+            boolean inRtl = rtl.isRtlContext() && (rlm + "‪" + "abc" + "‬" + rlm).equals(rtl.unicodeWrap("abc")) && heb.equals(rtl.unicodeWrap(heb))
+                && android.text.BidiFormatter.getInstance(new java.util.Locale("ar")).isRtlContext()
+                && "x".equals(new android.text.BidiFormatter.Builder(false).stereoReset(false).build().unicodeWrap("x", false));
+            // A mark after a left-to-right text that ends right to left, in a left-to-right context.
+            boolean mark = ("a " + heb + lrm).equals(ltr.unicodeWrap("a " + heb)) && ("a " + heb).equals(ltr.unicodeWrap("a " + heb, false));
+            android.text.SpannableString spanned = new android.text.SpannableString("bold");
+            Object bold = new android.text.style.StyleSpan(android.graphics.Typeface.BOLD);
+            spanned.setSpan(bold, 0, 4, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            CharSequence wrapped = ltr.unicodeWrap(spanned);
+            boolean spans = wrapped instanceof android.text.Spanned && "bold".equals(wrapped.toString())
+                && ((android.text.Spanned) wrapped).getSpanStart(bold) == 0 && ((android.text.Spanned) wrapped).getSpanEnd(bold) == 4;
+            detail = "plain=" + plain + " other=" + other + " rtl=" + inRtl + " mark=" + mark + " spans=" + spans;
+            Log.i("DataTest", "bidi-wrap " + detail);
+            return plain && other && inRtl && mark && spans;
+        });
         // PrecomputedText is the text it was made of: its characters and its spans, its paragraphs (each ends after its line
         // feed) and the parameters a Builder was told. It was signatures alone -- no characters, getSpans null -- so a
         // SpannableString made of one, which androidx's PrecomputedTextCompat hands on as it is from Android 10, ended in a
