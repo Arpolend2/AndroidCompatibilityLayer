@@ -12,9 +12,12 @@
 static int g_system_handle;
 #define SYSTEM_HANDLE ((void *)&g_system_handle)
 
-/* 32-bit bionic's RTLD_DEFAULT and RTLD_NEXT (on 64-bit they are 0 and -1). */
+/* 32-bit bionic's RTLD_DEFAULT and RTLD_NEXT, and 64-bit bionic's RTLD_NEXT (its RTLD_DEFAULT is 0). dlsym took a
+   64-bit RTLD_NEXT for a library and read it at 0x127: a library of the Play Store's sign-in page on an x64 PC
+   (0.1.0.699). On a 32-bit core the last is 32-bit bionic's RTLD_DEFAULT. */
 #define G_RTLD_DEFAULT ((void *)(mg_addr)0xFFFFFFFFu)
 #define G_RTLD_NEXT ((void *)(mg_addr)0xFFFFFFFEu)
+#define G_RTLD_NEXT64 ((void *)~(mg_addr)0)
 
 static MG_THREAD_LOCAL char g_dlerror[200];
 static MG_THREAD_LOCAL bool g_dlerror_set;
@@ -243,7 +246,7 @@ static void *g_dlsym(void *handle, const char *name)
 {
     void *p;
     if (!name) return NULL;
-    if (!handle || handle == G_RTLD_DEFAULT || handle == G_RTLD_NEXT) p = mg_ld_sym(NULL, name);
+    if (!handle || handle == G_RTLD_DEFAULT || handle == G_RTLD_NEXT || handle == G_RTLD_NEXT64) p = mg_ld_sym(NULL, name);
     else if (handle == SYSTEM_HANDLE) p = mg_bionic_find(name) ? mg_bionic_find(name) : mg_egl_resolve(name);
     else {
         p = mg_ld_sym_deep((mg_lib *)handle, name, NULL);
