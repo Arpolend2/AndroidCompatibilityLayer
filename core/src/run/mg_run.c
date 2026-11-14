@@ -570,6 +570,32 @@ static void sign_google_accounts_out(const char *storage_dir)
     free(mark);
 }
 
+/*
+ * The keys Google Play services make in Android's key store (megler.KeyStoreProvider) are kept with the services' data, in
+ * their folder of the services' shared one: one store for the services in every app's process, as their data is one. They
+ * were kept in the store of whichever app's process had made them: the services in another app found the encrypted data
+ * and not its key ("Keystore cannot load the key with ID: mobstore_encrypt", in users' logs of 681 to 699). Data begun that
+ * way still has its keys in the apps' own stores, and megler.KeyStoreProvider looks there too for as long as that data
+ * lives. This mark says the data here was begun with the shared store: it is written when the services' folder is not
+ * there -- at the first start of anything, and when Clear Data has just removed it (mg_run_clear_data_if_asked, which
+ * mg_run_files calls first) -- and, beside that folder and not in it, it stays. With it the shared store is the only one
+ * the services have, and a key left in an app's store by data that was cleared since is never taken for the new data's.
+ */
+#define KEYSTORE_SHARED ".megler-keystore-shared"
+void mg_run_services_key_store(const char *storage_dir)
+{
+    char *services = mg_sprintf("%s/services/%s", storage_dir, services_folder());
+    char *gms = mg_sprintf("%s/com.google.android.gms", services), *mark = mg_sprintf("%s/" KEYSTORE_SHARED, services);
+    mg_stat st;
+    if (!mg_path_stat(gms, &st, NULL) && !mg_path_stat(mark, &st, NULL)) {
+        if (mg_path_mkdirs(services) && mg_file_write_all(mark, "1", 1)) mg_info("run: Google Play services' data begins here: their keys are the shared key store's and no app's (%s)", mark);
+        else mg_warn("run: %s could not be written: Google Play services' key store goes on looking in the apps' own", mark);
+    }
+    free(services);
+    free(gms);
+    free(mark);
+}
+
 bool mg_run_clear_data_if_asked(const char *data_dir, const char *storage_dir, const char *package)
 {
     char *ask = mg_sprintf("%s/clear-data/%s", storage_dir, package), *internal, *own, *external;
@@ -644,6 +670,7 @@ void mg_run_files(const char *data_dir, const char *storage_dir, const char *pac
     left_behind left;
     mg_run_clear_data_if_asked(data_dir, storage_dir, package);
     mg_run_clear_cache_if_asked(data_dir, storage_dir, package);
+    mg_run_services_key_store(storage_dir);
     internal = internal_dir(data_dir, storage_dir, package);
     mg_fs_configure(package, internal, own);
     mg_path_mkdirs(services);

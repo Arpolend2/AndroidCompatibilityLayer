@@ -886,6 +886,32 @@ static void test_clear_services_data(const char *data)
     CHECK(mg_run_clear_data_if_asked(data, data, "com.google.android.gms"));
     CHECK(!mg_path_stat(mark, &st, NULL));
     free(mark);
+    /*
+     * And the services' key store (megler.KeyStoreProvider keeps their keys with their data, one store for every app's process).
+     * With no folder of theirs their data begins here: the mark that the shared store is the only one they have is left
+     * beside it, and stays when the folder is there. Where the folder was there before any mark -- data of a Megler that
+     * kept their keys in the apps' own stores -- none is written, until that data is cleared.
+     */
+    say("Google Play services' key store: marked shared where their data begins, not over data that was there before");
+    mark = mg_sprintf("%s/services/data/.megler-keystore-shared", data);
+    dir = mg_sprintf("%s/services/data/com.google.android.gms", data);
+    CHECK(!mg_path_stat(mark, &st, NULL) && !mg_path_stat(dir, &st, NULL));
+    mg_run_services_key_store(data);
+    CHECK(mg_path_stat(mark, &st, NULL));
+    CHECK(mg_path_mkdirs(dir));
+    mg_run_services_key_store(data);
+    CHECK(mg_path_stat(mark, &st, NULL));
+    CHECK(mg_path_remove(mark, NULL));
+    mg_run_services_key_store(data);
+    CHECK(!mg_path_stat(mark, &st, NULL));
+    p = mg_sprintf("%s/clear-data/com.google.android.gms", data);
+    CHECK(mg_file_write_all(p, "x", 1));
+    free(p);
+    CHECK(mg_run_clear_data_if_asked(data, data, "com.google.android.gms"));
+    mg_run_services_key_store(data);
+    CHECK(mg_path_stat(mark, &st, NULL) && !mg_path_stat(dir, &st, NULL));
+    free(dir);
+    free(mark);
 }
 
 /*

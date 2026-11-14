@@ -2590,6 +2590,45 @@ generate key attestation"), as it does on such a device. The data app's
 `keystore-certificates` step checks both kinds of certificate, a chain set
 with a key, the refusal, and, on the second run, the first run's certificate.
 
+Google Play services' keys are one store, whichever process runs them: the file
+`.megler_keystore2` of their data folder, which every process that hosts them
+has (`/data/megler-services/com.google.android.gms`; the Google Play services
+app's own data folder is that same folder). They were the keys of the app
+whose process asked, in that app's own data, while the data they protect is
+shared: Tink's key set in the services' preferences is encrypted with the AES
+key `mobstore_encrypt` of this store, so the process that happened to make the
+key set could read it and every other one failed with "Keystore cannot load the
+key with ID: mobstore_encrypt" and "Failed to initialize encryption" (the Play
+Store, the services' own app and others, in eighteen users' logs of 681 to 699
+and on the Lumia 650 with 701). `KeyStoreProvider.view` tells whose call it is
+(`MicroG.calledByHosted`: the closest class loader of an app on the stack is
+GmsCore's; or the process is the Google Play services app's) and gives it the
+shared store. Other processes write that file too, so it is read again when its
+time or length is another, and changed -- read, changed, written to a file
+beside it that takes its place -- with `.megler_keystore2.lock` held, a file
+made with `createNewFile` (`CREATE_NEW` on the host) and deleted after; one a
+process left behind is taken away after ten seconds.
+
+The keys their earlier data left in the apps' own stores are wanted until that
+data is cleared, and nothing says which app's is the one that fits. So
+`mg_run_services_key_store` (`run/mg_run.c`, at every app's start) leaves the
+mark `.megler-keystore-shared` beside the services' data folder where there is
+no such folder yet: a first start, or Clear Data on Google Play services. With
+the mark the shared store is the only one. Without it a call of theirs that
+finds nothing in the shared store looks in the hosting app's own store and in
+the imports (`.megler_keystore2.hosts`, in the shared folder), where a key
+found in an app's own store and taken is copied for the other processes; of an
+alias in both, the newer key is the one. So a key set made in the Google Play
+services app's own process is readable everywhere at once, and one made in
+another app's process once that app has run again. Their code never changes
+an app's own store: what it makes goes to the shared one, and what it deletes
+of the app's is hidden from it while the process runs. The data app's
+`keystore-hosted` step makes its own thread's calls theirs
+(`KeyStoreProvider.hostedForTests`, a folder of the app in the place of
+`/data/megler-services`) and checks the import, the two stores kept apart, the
+delete, a file another process wrote read again, a lock left behind, and the
+mark; `mg_storage_tests.c` checks when the mark is written.
+
 `android.util.Base64OutputStream` and `Base64InputStream` encode and decode
 as they go, with `Base64`'s flags as `Base64.encode` and `decode` take them
 (`MeglerBase64Coder`, in the overlay): lines of 76 and a line end, the last

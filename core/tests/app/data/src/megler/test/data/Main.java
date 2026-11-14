@@ -352,6 +352,7 @@ public class Main extends Activity {
         keystore(run);
         keystoreCertificates(run);
         keystoreForeignKey();
+        keystoreHosted();
         pathOps();
         textPath();
         base64Streams();
@@ -4150,6 +4151,102 @@ public class Main extends Activity {
             Log.i("DataTest", "keystore-foreign-key " + detail);
             return !"taken".equals(said) && !"StackOverflowError".equals(said);
         });
+    }
+
+    /**
+     * Google Play services' key store in an app's process: one store in their shared data folder, not the app's own
+     * (megler.KeyStoreProvider; its hostedForTests makes this thread's calls theirs, a folder of this app standing for
+     * /data/megler-services). Their keys were the hosting app's, so what one process encrypted in the shared folder no other
+     * could read ("Keystore cannot load the key with ID: mobstore_encrypt" in the Play Store and others, 681-701). Checked:
+     * while their data is older than the shared store, a key of the app's own store is found by them and copied to the
+     * imports when they take it; a key they make is in the shared store and not in the app's; their delete of the app's
+     * alias hides it from them and leaves the app its key; what another process wrote is read again; a lock file a process
+     * left behind is taken away; and with the mark (.megler-keystore-shared) the shared store is the only one.
+     */
+    private void keystoreHosted() {
+        step("keystore-hosted", () -> {
+            final java.lang.reflect.Method hosted = Class.forName("megler.KeyStoreProvider").getMethod("hostedForTests", String.class);
+            final File root = new File(getFilesDir(), "keystore-hosted"), data = new File(root, "com.google.android.gms");
+            final File keys = new File(data, ".megler_keystore2"), imports = new File(data, ".megler_keystore2.hosts"),
+                    lock = new File(data, ".megler_keystore2.lock"), mark = new File(root, ".megler-keystore-shared");
+            deleteAll(root);
+            final String tag = Long.toString(System.nanoTime(), 36);
+            final String mine = "megler-hosted-app-" + tag, only = "megler-hosted-only-" + tag, theirs = "megler-hosted-gms-" + tag,
+                    other = "megler-hosted-other-" + tag, late = "megler-hosted-late-" + tag;
+            java.security.KeyStore store = java.security.KeyStore.getInstance("AndroidKeyStore");
+            store.load(null);
+            try {
+                keystoreAes(mine);
+                keystoreAes(only);
+                byte[] own = store.getKey(mine, null).getEncoded();
+                // Theirs from here: the app's key is seen, and is in the imports once they have taken it.
+                hosted.invoke(null, root.getPath());
+                boolean seen = store.containsAlias(mine) && !imports.exists();
+                java.security.Key taken = store.getKey(mine, null);
+                boolean imported = own != null && taken != null && Arrays.equals(own, taken.getEncoded()) && imports.isFile();
+                // A key they make: in the shared store, and no key of the app's.
+                keystoreAes(theirs);
+                boolean made = keys.isFile() && store.getKey(theirs, null) != null;
+                hosted.invoke(null, (Object) null);
+                boolean apart = !store.containsAlias(theirs) && store.containsAlias(mine);
+                // Their delete of the app's alias: gone for them, and from the imports; the app has its key.
+                hosted.invoke(null, root.getPath());
+                long importsWith = imports.length();
+                store.deleteEntry(mine);
+                long importsWithout = imports.length();
+                boolean hidden = !store.containsAlias(mine) && store.getKey(mine, null) == null && importsWithout < importsWith;
+                hosted.invoke(null, (Object) null);
+                boolean kept = store.containsAlias(mine) && Arrays.equals(own, store.getKey(mine, null).getEncoded());
+                // Another process's writing: the file as it was with a key they have deleted since, put back.
+                hosted.invoke(null, root.getPath());
+                keystoreAes(other);
+                byte[] with = new byte[(int) keys.length()];
+                try (java.io.RandomAccessFile in = new java.io.RandomAccessFile(keys, "r")) {
+                    in.readFully(with);
+                }
+                store.deleteEntry(other);
+                boolean deleted = !store.containsAlias(other);
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(keys)) {
+                    out.write(with);
+                }
+                boolean reread = store.containsAlias(other) && store.getKey(other, null) != null;
+                // A lock a process left behind a minute ago: taken away, not waited for and then gone without.
+                boolean left = lock.createNewFile() && lock.setLastModified(System.currentTimeMillis() - 60000);
+                long start = System.nanoTime();
+                keystoreAes(late);
+                long ms = (System.nanoTime() - start) / 1000000;
+                boolean unlocked = left && !lock.exists() && store.containsAlias(late);
+                // The mark: the app's store and the imports are not theirs any more, the shared store is.
+                boolean before = store.containsAlias(only) && store.getKey(only, null) != null && imports.length() > importsWithout;
+                boolean marked = mark.createNewFile();
+                boolean alone = marked && !store.containsAlias(only) && store.getKey(only, null) == null && store.getKey(theirs, null) != null
+                        && store.containsAlias(late) && !java.util.Collections.list(store.aliases()).contains(only);
+                detail = "seen=" + seen + " imported=" + imported + " made=" + made + " apart=" + apart + " hidden=" + hidden + " kept=" + kept
+                        + " deleted=" + deleted + " reread=" + reread + " unlocked=" + unlocked + " (" + ms + " ms) before=" + before + " alone=" + alone;
+                Log.i("DataTest", "keystore-hosted " + detail);
+                return seen && imported && made && apart && hidden && kept && deleted && reread && unlocked && before && alone;
+            } finally {
+                hosted.invoke(null, (Object) null);
+                store.deleteEntry(mine);
+                store.deleteEntry(only);
+                deleteAll(root);
+            }
+        });
+    }
+
+    private static void keystoreAes(String alias) throws Exception {
+        javax.crypto.KeyGenerator aes = javax.crypto.KeyGenerator.getInstance("AES", "AndroidKeyStore");
+        aes.init(new android.security.keystore.KeyGenParameterSpec.Builder(alias, android.security.keystore.KeyProperties.PURPOSE_ENCRYPT
+                | android.security.keystore.KeyProperties.PURPOSE_DECRYPT).setKeySize(256)
+                .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE).build());
+        aes.generateKey();
+    }
+
+    private static void deleteAll(File f) {
+        File[] in = f.listFiles();
+        if (in != null) for (File c : in) deleteAll(c);
+        f.delete();
     }
 
     /**
