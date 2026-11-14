@@ -26,6 +26,7 @@
 #include "shell/AppPackage.h"
 #include "shell/Checks.h"
 #include "shell/Files.h"
+#include "shell/LogMirror.h"
 #include "shell/PicturesDiag.h"
 #include "shell/Platform.h"
 #include "shell/Settings.h"
@@ -148,6 +149,8 @@ void onExit(void*, int status, const char* reason) {
     // than the log's 200 ms, and its last lines were lost -- ACBridge's log stopped at "EXPORT ICONS START", and its
     // icons, its toast, its "Runtime.exit(0)" and this line were never in the file, so that it looked hung.
     shellLog::flush();
+    // And into the log's copy in the shared folder, for Save All Logs: the process may end before the mirror's next pass.
+    logMirror::now();
     std::lock_guard<std::mutex> lock(gMutex);
     gSnapshot.state = State::exited;
     gSnapshot.exitStatus = status;
