@@ -766,6 +766,90 @@ the loopback probe inside `init`. Check for the socket exception well before
 the 60-second deadline, then for a device-key token without the encoded
 error, the response status and the stored key.
 
+**Draft module assessment (2026-11-15).** The supplied
+`PlayIntegrityFix_v19.1.zip` is 127130 bytes, SHA-256
+`bbc618e794d8bb11add4d8f54c8ed53dfee5c6df07b49813bcbd5154c0c89c7c`.
+Its module metadata names chiteroman and version 19.1. The installer and
+boot scripts were read, its DEX was decompiled, and the native libraries'
+imports, exports and strings were inspected. This identifies the local
+sample; it does not authenticate it as an upstream release. All analysis
+files are in ignored build folders.
+
+The archive contains ARM32/ARM64 Zygisk libraries, a Java DEX, root
+installation/boot scripts and a WebUI. Its bundled profile describes a
+Pixel 6 Android 16 beta with security patch 2025-04-05. The Action script
+downloads Android release/OTA metadata and writes a replacement profile.
+The boot scripts change build/debug/boot properties, adjust Magisk's
+DenyList and change access to SELinux files on a permissive Android
+system. These scripts depend on Android root/module infrastructure.
+
+Its Java payload has three relevant mechanisms. It changes configured
+`Build`/`Build.VERSION` fields, wraps the AndroidKeyStore provider, and
+optionally replaces the platform package's reported signing certificate.
+The wrapper delegates key operations except
+`engineGetCertificateChain`: a caller whose stack contains
+`droidguard` receives `UnsupportedOperationException`. That suppresses
+the chain a working keystore would otherwise return. It does not
+generate an attested key or obtain an AppCertManager device key.
+
+The current PlayIntegrityFork was inspected at
+`d7e6a4d635b7463bbee7c9701f91ebfc6f5eb4ff`; the latest release reported
+by GitHub on this date was v19. Its native code scopes configuration to
+the GMS unstable process and, for separate options, Play Store.
+It hooks `__system_property_read_callback` with ShadowHook and injects
+Java code for typed Build-field changes. The provider wrapper retains the
+DroidGuard certificate-chain exception. Defaults enable Build, property
+and provider changes; platform-signature and Play Store overrides are
+optional. The repository supplies a configuration template, so a working
+device profile is another input to an experiment.
+[PlayIntegrityFork native code](https://github.com/osm0sis/PlayIntegrityFork/blob/d7e6a4d635b7463bbee7c9701f91ebfc6f5eb4ff/app/src/main/cpp/main.cpp),
+[provider wrapper](https://github.com/osm0sis/PlayIntegrityFork/blob/d7e6a4d635b7463bbee7c9701f91ebfc6f5eb4ff/app/src/main/java/es/chiteroman/playintegrityfix/CustomKeyStoreSpi.java),
+[configuration template](https://github.com/osm0sis/PlayIntegrityFork/blob/d7e6a4d635b7463bbee7c9701f91ebfc6f5eb4ff/module/example.pif.prop).
+
+TrickyStore's current release documentation was inspected at
+`55d65f305e04110b87210d86cc12b64a1b7e151d`; its latest release was
+1.4.1. The project states that releases from 1.1.0 are closed-source.
+The last public tag, 1.0.3 at
+`6f82e4011b770e390d1157928c6cf45df99b7d7d`, was read as an architectural
+baseline. Its injector and Binder interceptors reach Android keystore2.
+They can replace a returned certificate chain or intercept challenged
+key generation and synthesize key metadata and a chain. The certificate
+builder uses the configured keybox's private key and certificates to
+sign the generated leaf and rewrites attestation data including
+RootOfTrust. Current documentation also describes fallback generation
+and configurable patch levels; the closed release's implementation was
+not audited.
+[Current TrickyStore documentation](https://github.com/5ec1cff/TrickyStore/blob/55d65f305e04110b87210d86cc12b64a1b7e151d/README.md),
+[open generation interceptor](https://github.com/5ec1cff/TrickyStore/blob/6f82e4011b770e390d1157928c6cf45df99b7d7d/service/src/main/java/io/github/a13e300/tricky_store/SecurityLevelInterceptor.kt),
+[open certificate builder](https://github.com/5ec1cff/TrickyStore/blob/6f82e4011b770e390d1157928c6cf45df99b7d7d/service/src/main/java/io/github/a13e300/tricky_store/keystore/CertHack.java).
+
+For Megler the relevant boundaries are:
+
+| Mechanism | Existing Megler behaviour | What a useful experiment would establish |
+| --- | --- | --- |
+| PIF's certificate-chain exception | A challenged `PairGen.generateKeyPair` fails with `KeyStoreException(-100)` before a new chain exists. Ordinary chain retrieval is implemented. | Whether the failing device-key program actually reaches chain retrieval and changes its request when that call throws. |
+| Build/property profile | Java Build fields and native properties already describe a synthetic Android device. They are shared within the app's process. | Whether one consistent profile, scoped to hosted GMS, changes Google's reply with the same GMS version and transport. |
+| Platform-signature replacement | `PlatformSigner` reads the framework-res APK's certificate. PIF's optional replacement is another platform identity. | Whether that reported identity is a relevant input to this particular rejection. |
+| TrickyStore key generation and chain rewriting | Megler implements its keystore directly in Java, without Android's keystore2/KeyMint services. Software-attestation experiments above still received HTTP 400. | Whether a specified, verifiable attestation chain changes the server result while keeping generated keys and certificates consistent. |
+
+The attestation keybox signs Android key-attestation certificates.
+AppCertManager's `device_key` is the response from Google's
+`/auth/devicekey` service and supplies material for Spatula signatures.
+One does not supply the other. Neither inspected project's code
+demonstrates a successful device-key exchange inside Megler.
+
+The current draft records the assessment. A runtime integration remains
+an experiment: Zygisk process isolation and keystore Binder hooks would
+need counterparts at Megler's hosted-service and provider boundaries.
+A global fingerprint change would also alter the client app, and an
+attestation chain with rewritten boot claims would require validation
+beyond parsing its X.509 structure. Before retaining a port, compare a
+fresh `devicekey` request with and without one mechanism, then verify
+an HTTP success, a stored key loaded at the next start and a Google
+network-location result. The earlier native Cronet control on Android
+also returned HTTP 400, so that response alone cannot identify a
+Megler-specific API defect.
+
 **Following it on a phone** (flags in `Pictures\Megler\diag\<package>\flags`):
 `trace-syscalls` (a library's calls by number with the path each names:
 "/sys/fs/selinux/enforce" = -2 from `libdB21738DAE92C.so+0x2e18`, its own
