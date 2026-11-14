@@ -4109,6 +4109,10 @@ static int run_data(void)
     expect_line("I/DataTest: decor-reparent ok", &at, 30);
     /* An alert with a message taller than the screen fits on it, its button wholly there to be pressed. */
     expect_line("I/DataTest: dialog-tall ok", &at, 30);
+    /* A dialog without a window title is told "at most" for its height and never "exactly" (megler.DecorView.makeContent, as
+       Android's screen_simple): a content that measures its parts with its own height spec, as Telegram's alert, has them
+       one under the other inside the window. And the activity's content still fills its window. */
+    expect_line("I/DataTest: dialog-wrap ok", &at, 30);
     /* A panel window's root view draws on the window's frame, hardware accelerated, and a SurfaceView straight in that root on
        one that does not say so (megler.ViewRoot.ScreenCanvas): where a WebView in a window of its own is drawn by its functor. */
     expect_line("I/DataTest: panel-root ok", &at, 30);

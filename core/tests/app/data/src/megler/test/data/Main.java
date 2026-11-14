@@ -2385,6 +2385,64 @@ public class Main extends Activity {
             boolean fits = ok.isShown() && ok.getHeight() > 0 && at[1] >= 0 && at[1] + ok.getHeight() <= screen && decor.getHeight() <= screen;
             Log.i("DataTest", "dialog-tall " + (fits ? "ok" : "FAILED") + " button=" + at[1] + "+" + ok.getHeight() + " screen=" + screen + " dialog=" + decor.getHeight());
             dialog.dismiss();
+            wrapDialog();
+        }, 500);
+    }
+
+    /**
+     * A dialog without a window title whose content measures its parts with the height it was itself told, as Telegram's own
+     * AlertDialog does (the title's frame and the row of buttons are each given the container's height spec): the window wraps
+     * its content, so the content is told "at most" and never "exactly", as under Android's screen_simple, and the title, the
+     * message and the button lie one under the other inside the window. Told "exactly" the height it had answered, the title
+     * and the button were each as tall as the whole dialog, and the message and the button lay below the window. And the
+     * activity's own content, in a window of a set size, still fills what the window has for it.
+     */
+    private void wrapDialog() {
+        final int[] modes = new int[16], count = { 0 };
+        final android.widget.TextView title = new android.widget.TextView(this), message = new android.widget.TextView(this), button = new android.widget.TextView(this);
+        title.setText("Log out");
+        message.setText("Are you sure you want to log out?");
+        button.setText("OK");
+        final android.view.ViewGroup box = new android.view.ViewGroup(this) {
+            @Override protected void onMeasure(int ws, int hs) {
+                if (count[0] < modes.length) modes[count[0]++] = MeasureSpec.getMode(hs);
+                int width = MeasureSpec.getSize(ws), exact = MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY);
+                title.measure(exact, hs);
+                button.measure(exact, hs);
+                int left = Math.max(0, MeasureSpec.getSize(hs) - title.getMeasuredHeight() - button.getMeasuredHeight());
+                message.measure(exact, MeasureSpec.makeMeasureSpec(left, MeasureSpec.AT_MOST));
+                setMeasuredDimension(width, title.getMeasuredHeight() + message.getMeasuredHeight() + button.getMeasuredHeight());
+            }
+            @Override protected void onLayout(boolean changed, int l, int t, int r, int b) {
+                int y = 0;
+                for (android.view.View v : new android.view.View[] { title, message, button }) {
+                    v.layout(0, y, r - l, y + v.getMeasuredHeight());
+                    y += v.getMeasuredHeight();
+                }
+            }
+        };
+        box.addView(title);
+        box.addView(message);
+        box.addView(button);
+        final android.app.Dialog dialog = new android.app.Dialog(this);
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+        dialog.setContentView(box, new android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+        dialog.show();
+        new android.os.Handler().postDelayed(() -> {
+            android.view.View decor = dialog.getWindow().getDecorView();
+            boolean atMost = count[0] > 0;
+            for (int i = 0; i < count[0]; i++) atMost &= modes[i] == android.view.View.MeasureSpec.AT_MOST;
+            int[] top = new int[2], at = new int[2];
+            decor.getLocationOnScreen(top);
+            button.getLocationOnScreen(at);
+            int line = message.getHeight();
+            boolean inside = line > 0 && title.getHeight() > 0 && title.getHeight() <= 2 * line && button.getHeight() > 0 && button.getHeight() <= 2 * line
+                && button.isShown() && at[1] >= top[1] && at[1] + button.getHeight() <= top[1] + decor.getHeight();
+            android.view.View content = findViewById(android.R.id.content), stack = (android.view.View) content.getParent();
+            boolean fills = content.getHeight() > 0 && content.getBottom() == stack.getHeight();
+            Log.i("DataTest", "dialog-wrap " + (atMost && inside && fills ? "ok" : "FAILED") + " measures=" + count[0] + " atMost=" + atMost + " title=" + title.getHeight()
+                + " message=" + line + " button=" + (at[1] - top[1]) + "+" + button.getHeight() + " dialog=" + decor.getHeight() + " activity=" + content.getBottom() + "/" + stack.getHeight());
+            dialog.dismiss();
             panelRoot();
         }, 500);
     }
