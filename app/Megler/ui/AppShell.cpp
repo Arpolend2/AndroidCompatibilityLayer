@@ -485,6 +485,7 @@ void AppShell::poll() {
         uiShots::poll(*this);
         phoneAppsList::publish();
         tellAskedInstalls();
+        refreshDialogLive();
         // Google Play or not, asked at the first start; once wanted, Megler's own installed (ui/GooglePlay.h).
         googlePlay::tick(*this);
         // A newer Megler on GitHub, for this Windows and processor: offered, downloaded and installed (ui/Ota.h).
@@ -687,6 +688,24 @@ void AppShell::dialog(DialogSpec spec, std::function<void(int, std::string)> don
         }
         add(column, list);
     }
+    // What moves while the dialog is up (a download): Material's linear progress indicator and a line under it.
+    dialogLive_ = nullptr;
+    dialogLiveBar_ = nullptr;
+    dialogLiveText_ = nullptr;
+    dialogLiveShown_.clear();
+    if (spec.live) {
+        dialogLiveBar_ = ProgressBar();
+        dialogLiveBar_.Minimum(0);
+        dialogLiveBar_.Maximum(1);
+        dialogLiveBar_.IsIndeterminate(true);
+        dialogLiveBar_.Foreground(brush(p.primary));
+        dialogLiveBar_.Background(brush(p.secondaryContainer));
+        dialogLiveBar_.Margin(ThicknessHelper::FromLengths(0, 20, 0, 8));
+        add(column, dialogLiveBar_);
+        dialogLiveText_ = text("", font::bodyMedium, weightNormal(), p.onSurface);
+        add(column, dialogLiveText_);
+        dialogLive_ = std::move(spec.live);
+    }
     dialogField_ = nullptr;
     dialogSecret_ = nullptr;
     if (spec.field && spec.secret) {
@@ -756,6 +775,23 @@ void AppShell::dialog(DialogSpec spec, std::function<void(int, std::string)> don
         dialogField_.Focus(FocusState::Programmatic);
     }
     if (dialogSecret_) dialogSecret_.Focus(FocusState::Programmatic);
+    refreshDialogLive();
+}
+
+void AppShell::refreshDialogLive() {
+    if (!dialogOpen_ || !dialogLive_) return;
+    DialogSpec::Live now;
+    if (!dialogLive_(now)) {
+        closeDialog(-2);
+        return;
+    }
+    const bool known = now.fraction >= 0;
+    if (dialogLiveBar_.IsIndeterminate() == known) dialogLiveBar_.IsIndeterminate(!known);
+    if (known) dialogLiveBar_.Value(now.fraction > 1 ? 1 : now.fraction);
+    if (now.text != dialogLiveShown_) {
+        dialogLiveShown_ = now.text;
+        dialogLiveText_.Text(hs(now.text));
+    }
 }
 
 void AppShell::dialogWhenFree(DialogSpec spec, std::function<void(int, std::string)> done) {
@@ -780,6 +816,10 @@ void AppShell::closeDialog(int button) {
     dialogLayer_ = nullptr;
     dialogField_ = nullptr;
     dialogSecret_ = nullptr;
+    dialogLive_ = nullptr;
+    dialogLiveBar_ = nullptr;
+    dialogLiveText_ = nullptr;
+    dialogLiveShown_.clear();
     dialogOpen_ = false;
     auto done = std::move(dialogDone_);
     dialogDone_ = nullptr;

@@ -7,6 +7,7 @@
 #include "library/Library.h"
 #include "shell/AppPackage.h"
 #include "shell/BundledApks.h"
+#include "shell/OwnUpdate.h"
 #include "shell/Strings.h"
 #include "ui/AppShell.h"
 #include "ui/Components.h"
@@ -104,7 +105,8 @@ public:
         setVisible(updateCard_, false);
         add(column_, updateCard_);
 
-        // A newer Megler downloaded from GitHub (ui/Ota.h), while it comes.
+        // A newer Megler downloaded from GitHub (ui/Ota.h), while it comes: how far, how fast, how long yet. Tapped, its
+        // dialog again (which Hide closed), with its Stop.
         otaTitle_ = text("", font::titleMedium, weightMedium(), p.onSurface);
         otaBar_ = ProgressBar();
         otaBar_.Minimum(0);
@@ -118,9 +120,10 @@ public:
         add(otaColumn, otaBar_);
         add(otaColumn, otaDetail_);
         otaCard_ = card(otaColumn, 12, 16);
-        otaCard_.Margin(ThicknessHelper::FromLengths(0, 8, 0, 8));
-        setVisible(otaCard_, false);
-        add(column_, otaCard_);
+        otaButton_ = button(otaCard_, [this] { ota::showProgress(shell_); }, ButtonKind::rounded, "Megler's download");
+        otaButton_.Margin(ThicknessHelper::FromLengths(0, 8, 0, 8));
+        setVisible(otaButton_, false);
+        add(column_, otaButton_);
 
         // The copy of a picked APK, while it runs.
         importTitle_ = text("", font::titleMedium, weightMedium(), p.onSurface);
@@ -232,14 +235,18 @@ public:
                                                    "rule within a minute: leave the phone on, then open Megler again."));
             updateText_.Foreground(brush(updating.empty() ? palette().error : palette().onSurface));
         }
-        std::string otaVersion;
-        uint64_t otaGot = 0, otaTotal = 0;
-        const bool otaComing = ota::downloading(otaVersion, otaGot, otaTotal);
-        setVisible(otaCard_, otaComing);
+        // (Installed, it is the card above: appPackage::selfUpdateVersion.)
+        const ota::Progress coming = ota::progress();
+        const bool otaComing = coming.kind == ota::Progress::Kind::downloading;
+        setVisible(otaButton_, otaComing);
         if (otaComing) {
-            otaTitle_.Text(hs("Downloading Megler " + otaVersion));
-            otaBar_.Value(otaTotal ? double(otaGot) / double(otaTotal) : 0);
-            otaDetail_.Text(hs(formattedByteCount(otaGot) + " of " + formattedByteCount(otaTotal) + " from GitHub; then it is checked and installed"));
+            otaTitle_.Text(hs("Downloading Megler " + coming.version));
+            otaBar_.Value(coming.total ? double(coming.got) / double(coming.total) : 0);
+            const std::string detail = ownUpdate::progressLine(coming.got, coming.total, coming.bytesPerSecond) + ". Tap for more, or to stop it.";
+            if (detail != otaDetailShown_) {
+                otaDetailShown_ = detail;
+                otaDetail_.Text(hs(detail));
+            }
         }
         const std::string working = separateApps::working();
         setVisible(workCard_, !working.empty());
@@ -390,9 +397,11 @@ private:
     UIElement view_{nullptr};
     StackPanel column_{nullptr};
     Border otaCard_{nullptr};
+    Button otaButton_{nullptr};
     TextBlock otaTitle_{nullptr};
     ProgressBar otaBar_{nullptr};
     TextBlock otaDetail_{nullptr};
+    std::string otaDetailShown_;
     Border importCard_{nullptr};
     TextBlock importTitle_{nullptr};
     ProgressBar importBar_{nullptr};

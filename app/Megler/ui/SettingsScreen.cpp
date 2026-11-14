@@ -84,6 +84,9 @@ public:
         if (!host_ || !showsPhone()) return;
         // The phone's folders are looked for while Megler starts: shown once they are known.
         if (!linksShown_ && StorageHost::shared().searched()) rebuild();
+        // Updates: Check Now's line is where a newer Megler stands, built again when that changed (GitHub answered, the
+        // download began, failed or was stopped). It stayed "Asking GitHub..." until the page was left and opened again.
+        if (otaShown_ && ota::summary() != *otaShown_) rebuild();
         // Apps' Storage: built again when what it shows changed (a list came, an app was moved), and what is being moved now.
         if (showsAppsStorage()) {
             if (storageSignature(separateApps::storage()) != storageShown_) {
@@ -226,7 +229,14 @@ private:
         rows.push_back(choice("At Start", "Megler asks GitHub for a newer Megler when it starts, at most every six hours, and offers it", atStart,
                               [] { ota::setAtStart(true); }));
         rows.push_back(choice("Only When Asked", "Only Check Now asks", !atStart, [] { ota::setAtStart(false); }));
-        rows.push_back(button(listItem("Check Now", ota::summary(), glyphs::refresh), [this] {
+        const std::string summary = ota::summary();
+        otaShown_ = summary;
+        rows.push_back(button(listItem("Check Now", ota::busy() ? summary + ": tap for how far it is" : summary, glyphs::refresh), [this] {
+            // One being downloaded or installed: its dialog again (which Hide closed), as the Library's card brings it back.
+            if (ota::busy()) {
+                ota::showProgress(shell_);
+                return;
+            }
             ota::checkNow();
             rebuild();
         }, ButtonKind::plain, "Check Now"));
@@ -805,6 +815,7 @@ private:
     void rebuild() {
         if (!host_) return;
         const auto& p = palette();
+        otaShown_.reset();
         // The app's App Permissions open in place (an app's own package), a line back to these settings over them.
         if (sub_) {
             host_.Content(subPage_);
@@ -875,6 +886,7 @@ private:
     Grid memory_{nullptr};
     int ticks_ = 0;
     bool linksShown_ = false; // the Android Storage section was built after the search for the links was over
+    std::optional<std::string> otaShown_; // what Check Now's line said when Updates was built (none: not on this page)
     std::string storageShown_;          // what Apps' Storage showed when it was built (storageSignature)
     TextBlock storageNow_{nullptr};     // ... and its line of what is being moved now
     bool adding_ = false;     // the folder picker or a dialog is up

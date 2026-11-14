@@ -15,7 +15,13 @@
 // new; taken, it is downloaded into LocalState\update, its size and its SHA-256 checked against what GitHub says of the
 // asset, and installed as Megler's own update from Pictures\Megler is (shell/AppPackage.h, installOwnUpdate): Windows's
 // deployment engine (on an Xbox, the console's Device Portal) closes this Megler, and Megler is opened again once Windows
-// has installed it. Not in an app's own package. Off the UI thread, all of it but the dialog.
+// has installed it. Not in an app's own package. Off the UI thread, all of it but the dialogs.
+//
+// While it is downloaded a dialog says how far it is, how fast it comes and how long it has left (shell/OwnUpdate.h), with
+// Stop and Hide; hidden, the Library's card says the same and brings the dialog back, as Settings' Check Now does. What
+// went wrong -- no room, a download that broke off, a package Windows refused -- is said in a dialog too, a download's
+// with Try Again. (Until 0.1.0.699 "Update" closed the offer and nothing followed it but a card on the Library's tab,
+// without a speed; a failure went into Settings' line and the log.)
 #pragma once
 
 #include <cstdint>
@@ -41,8 +47,17 @@ bool atStart();
 void setAtStart(bool on);
 /// Where it stands, in a line, for Settings.
 std::string summary();
-/// While a newer Megler is downloaded: true, with its version, what has come and its size (the Library's card).
-bool downloading(std::string& version, uint64_t& got, uint64_t& total);
+/// Where a newer Megler that was taken stands: being downloaded (what has come, of how much, how fast) or installed.
+struct Progress {
+    enum class Kind { none, downloading, installing } kind = Kind::none;
+    std::string version, file;
+    uint64_t got = 0, total = 0;
+    double bytesPerSecond = -1; // as ownUpdate::Speed::at says it: 0 nothing coming, less than 0 not known yet
+};
+Progress progress();
+/// The dialog of a newer Megler being downloaded (how far, how fast, how long yet; Stop, Hide) or installed, where one is
+/// and no other dialog is up: shown when Update is pressed, and again from the Library's card and Settings' Check Now.
+void showProgress(AppShell& shell);
 /// While a newer Megler is downloaded or installed: the screen is kept on (ui/AppShell), for a phone that locks suspends
 /// Megler, and its download with it.
 bool busy();

@@ -27,6 +27,9 @@
 //     asked every time --, the groups a manifest asks for, and Google Play services' own location in Megler's settings;
 //   - the versions of the apps' own packages (shell/PackageVersions.h): which Megler made one, the next one a build makes
 //     of an app (Aurora Store's update of an app made its package again with the same version, 0x80073CFB), Windows' order;
+//   - Megler's own update as its screens tell of it (shell/OwnUpdate.h): how fast its download comes -- not known at
+//     first, the mean of its last five seconds, nothing coming, anew after a pause --, how long it has left, and the line
+//     that says how far it is;
 //   - the phone's picker and camera for an app (player/PickerHost.cpp): Windows' picker's filter, start and view for the
 //     MIME types an app asks for, the flags that answer a request in place of the user (pick-cancel, pick-file-<name>), and
 //     files handed over copied into the request's folder -- a name already there made unique, one missing a failure -- with
@@ -46,6 +49,7 @@
 #include "shell/AppPackage.h"
 #include "shell/BundledApks.h"
 #include "shell/Files.h"
+#include "shell/OwnUpdate.h"
 #include "shell/PackageVersions.h"
 #include "shell/Placement.h"
 #include "shell/Platform.h"
@@ -1028,6 +1032,71 @@ void testPackageVersions() {
           "Windows' order: the same is not older; Megler 0.1.0.682's own version is older than its apps' packages");
 }
 
+/// Megler's own update as its screens tell of it (shell/OwnUpdate.h): the download's speed, the time it has left, its line.
+void testOwnUpdate() {
+    printf("Megler's own update\n");
+    namespace ou = ownUpdate;
+    const auto about = [](double value, double wanted) { return value > wanted * 0.97 && value < wanted * 1.03; };
+    {
+        ou::Speed speed;
+        check(speed.at(0) < 0, "a download nothing was measured of: its speed is not known");
+        speed.add(1000, 0);
+        check(speed.at(1000) < 0 && speed.at(5999) < 0, "one moment measured: not known yet");
+        check(speed.at(6000) == 0, "... and nothing coming once five seconds passed with no more");
+        speed.add(1500, 500000);
+        check(speed.at(1500) < 0, "half a second measured: not known yet");
+        speed.add(2000, 1000000);
+        check(about(speed.at(2000), 1000000), "a second measured, 1,000,000 bytes in it: 1,000,000 bytes a second");
+        check(about(speed.at(6999), 1000000) && speed.at(7000) == 0, "it stands for five seconds after the last bytes, then nothing is coming");
+        // A pause is not how fast it comes now: measured anew after it.
+        speed.add(8000, 1100000);
+        check(speed.at(8000) < 0, "the first bytes after a pause of six seconds: not known yet, not the pause's mean");
+        speed.add(9000, 2100000);
+        check(about(speed.at(9000), 1000000), "... and a second later the speed since the pause");
+        speed.reset();
+        check(speed.at(9000) < 0, "reset: not known");
+    }
+    {
+        // Five seconds at 1,000,000 bytes a second, then five at 100,000: the mean is of the last five.
+        ou::Speed speed;
+        uint64_t bytes = 0;
+        for (uint64_t ms = 0; ms <= 5000; ms += 100, bytes += 100000) speed.add(ms, bytes);
+        bytes -= 100000;
+        check(about(speed.at(5000), 1000000), "five seconds at 1,000,000 bytes a second");
+        for (uint64_t ms = 5100; ms <= 10000; ms += 100) speed.add(ms, bytes += 10000);
+        check(about(speed.at(10000), 100000), "then five at 100,000: the last five seconds' mean, 100,000");
+        check(about(speed.at(10400), 100000), "... said so between the chunks too");
+    }
+    {
+        // A fast download's chunks, hundreds to the second: the same speed, whatever is kept of them.
+        ou::Speed speed;
+        uint64_t bytes = 0;
+        for (uint64_t ms = 0; ms <= 20000; ms += 3, bytes += 6000) speed.add(ms, bytes);
+        check(about(speed.at(20001), 2000000), "a chunk every 3 ms for twenty seconds, 2,000,000 bytes a second");
+        // A clock that went back (it does not: GetTickCount64) is the last moment again.
+        speed.add(100, bytes + 1);
+        check(speed.at(20001) > 0, "a moment before the last one is taken for the last one");
+    }
+    check(ou::timeLeft(0) == "less than a minute" && ou::timeLeft(59.9) == "less than a minute", "0 and 59.9 seconds: less than a minute");
+    check(ou::timeLeft(60) == "about a minute" && ou::timeLeft(89) == "about a minute", "60 and 89 seconds: about a minute");
+    check(ou::timeLeft(90) == "about 2 minutes" && ou::timeLeft(3540) == "about 59 minutes", "90 seconds: about 2 minutes; 59 minutes");
+    check(ou::timeLeft(3599) == "about an hour" && ou::timeLeft(3660) == "about an hour 1 minute", "3599 seconds: about an hour; 61 minutes");
+    check(ou::timeLeft(7500) == "about 2 hours 5 minutes", "125 minutes: about 2 hours 5 minutes");
+    check(ou::timeLeft(86399) == "about 24 hours" && ou::timeLeft(86400) == "more than a day", "a day: more than a day");
+    const uint64_t got = 12897485, total = uint64_t(371) << 20; // 12.3 MB of 371 MB
+    const double fast = 1.25 * 1048576;
+    check(ou::progressLine(got, total, fast) == "12.3 MB of 371 MB (3%), 1.25 MB/s, about 5 minutes left",
+          "the line: " + ou::progressLine(got, total, fast));
+    check(ou::progressLine(got, total, -1) == "12.3 MB of 371 MB (3%)", "... with the speed not known yet: " + ou::progressLine(got, total, -1));
+    check(ou::progressLine(got, total, 0) == "12.3 MB of 371 MB (3%), nothing coming now" &&
+              ou::progressLine(got, total, 0.4) == "12.3 MB of 371 MB (3%), nothing coming now",
+          "... with nothing coming: " + ou::progressLine(got, total, 0));
+    check(ou::progressLine(total, total, fast) == "371 MB of 371 MB (100%), 1.25 MB/s", "... all of it here: " + ou::progressLine(total, total, fast));
+    check(ou::progressLine(uint64_t(2) << 20, 0, 524288) == "2.00 MB, 512 KB/s",
+          "... of a size not known: " + ou::progressLine(uint64_t(2) << 20, 0, 524288));
+    check(ou::progressLine(0, 0, -1) == "0 bytes", "... of nothing yet: " + ou::progressLine(0, 0, -1));
+}
+
 /// What a folder's files take, its folders' too (files::treeSize: an app's data and cache in its own package's Settings).
 void testTreeSize(const std::wstring& root) {
     printf("a folder's size with its folders' (files::treeSize)\n");
@@ -1296,6 +1365,7 @@ int wmain(int argc, wchar_t** argv) {
     testBundled();
     testSharedApks(root);
     testPackageVersions();
+    testOwnUpdate();
     testTreeSize(root);
     testPermissions();
     testPicker(root);
