@@ -981,6 +981,32 @@ N(VMStack_getClosestUserClassLoader)
     c->ret.l = NULL;
 }
 
+/*
+ * The process, as Android has it, of the code that asks: the class scope of a service this process hosts or of another of the
+ * app's processes (megler.Processes), 0 for the app's own. It is that of the innermost frame of an app's code or a service's
+ * (the code of a loader a service made is the service's: mg_dvm_dex_process_scope); with none on the stack, the thread's
+ * owner. The table of file locks asks (core/libcore-overlay/sun/nio/ch/FileLockTable.java): a file's lock is held against
+ * the other processes, which here are in this one.
+ */
+N(SharedFileLockTable_scope)
+{
+    mg_dvm_thread *self = mg_dvm_self();
+    mg_dvm_frame *f;
+    for (f = self->top; f; f = f->prev) {
+        mg_dvm_class *k = f->m ? f->m->cls : NULL;
+        if (!k) continue;
+        if (k->scope > 0) {
+            c->ret.i = mg_dvm_scope_root(k->scope);
+            return;
+        }
+        if (mg_dvm_class_is_app(k)) {
+            c->ret.i = mg_dvm_dex_process_scope(k->dex);
+            return;
+        }
+    }
+    c->ret.i = self->owner_scope;
+}
+
 N(VMStack_getThreadStackTrace)
 {
     mg_jobj *peer = c->args[0].l;
@@ -1909,6 +1935,7 @@ static const mg_jhle k_art[] = {
     { "java/lang/Package", "getSystemPackage0", NULL, Class_null },
     { "java/lang/Package", "getSystemPackages0", NULL, Package_getSystemPackages0 },
     { "dalvik/system/VMStack", "getClosestUserClassLoader", NULL, VMStack_getClosestUserClassLoader },
+    { "sun/nio/ch/SharedFileLockTable", "scope", NULL, SharedFileLockTable_scope },
     { "dalvik/system/VMStack", "fillStackTraceElements", NULL, nothing },
     { "dalvik/system/VMStack", "getAnnotatedThreadStackTrace", NULL, Class_null },
 

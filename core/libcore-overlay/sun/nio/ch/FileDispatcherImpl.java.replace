@@ -1,0 +1,9 @@
+<<<
+        return lock0(fd, blocking, pos, size, shared);
+===
+        // Megler: what Android runs as several processes is one here, and the locks between them are the lock table's to
+        // grant, which FileChannelImpl asks through this call (FileLockTable.java). The native call grants every lock.
+        int refused = SharedFileLockTable.contend(blocking);
+        if (refused != FileDispatcher.LOCKED) return refused;
+        return lock0(fd, blocking, pos, size, shared);
+>>>

@@ -427,6 +427,7 @@ public class Main extends Activity {
                     d3.recycle();
                     r3.recycle();
                     Log.i("DataTest", "process-bundle note=" + inBundle);
+                    fileLocksAcrossScopes(b);
                 }
                 @Override public void onServiceDisconnected(android.content.ComponentName n) {}
             }, BIND_AUTO_CREATE);
@@ -4534,15 +4535,138 @@ public class Main extends Activity {
         };
     }
 
+    /** Asks the service Elsewhere for one of its file lock answers (codes 4 to 8). */
+    private static String askLock(android.os.IBinder b, int code, String path, boolean shared) throws android.os.RemoteException {
+        android.os.Parcel data = android.os.Parcel.obtain(), reply = android.os.Parcel.obtain();
+        try {
+            data.writeString(path);
+            data.writeInt(shared ? 1 : 0);
+            data.setDataPosition(0);
+            b.transact(code, data, reply, 0);
+            reply.setDataPosition(0);
+            return reply.readString();
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    /**
+     * A file's lock between this process and Elsewhere's, as between two processes of Android: while one holds it the
+     * other's tryLock() answers null and its lock() waits; a lock lasts while its channel is open, its FileLock forgotten
+     * or not; two shared locks may be held together, and an exclusive one beside a shared one may not. Within one process a
+     * second lock is the program's error, OverlappingFileLockException. Here the two are class scopes of one virtual
+     * machine, where the library's one table of locks gave the error to the other process too (the Play Store's value store,
+     * Google Play services' configuration). In a thread of its own, for the waits; said in one line of the log.
+     */
+    private void fileLocksAcrossScopes(final android.os.IBinder b) {
+        new Thread(() -> {
+            StringBuilder said = new StringBuilder();
+            try {
+                File f = new File(getFilesDir(), "scopes.lock");
+                String path = f.getPath();
+                java.io.RandomAccessFile mine = new java.io.RandomAccessFile(f, "rw"), again = new java.io.RandomAccessFile(f, "rw");
+                java.nio.channels.FileLock lock = mine.getChannel().lock();
+                String same;
+                try {
+                    same = again.getChannel().tryLock() == null ? "null" : "locked";
+                } catch (java.nio.channels.OverlappingFileLockException e) {
+                    same = "overlapping";
+                }
+                said.append("same=").append(same);
+                said.append(" other=").append(askLock(b, 4, path, false));
+                // The other process waits for it, and has it once this one lets it go.
+                askLock(b, 6, path, false);
+                Thread.sleep(700);
+                said.append(" waits=").append(askLock(b, 7, null, false));
+                lock.release();
+                String then = "";
+                for (int i = 0; i < 150 && !"granted".equals(then = askLock(b, 7, null, false)); i++) Thread.sleep(100);
+                said.append(" then=").append(then);
+                said.append(" back=").append(mine.getChannel().tryLock() == null ? "null" : "locked");
+                // It forgets its FileLock and keeps the channel: still its lock. It closes the channel: nobody's.
+                askLock(b, 8, null, false);
+                System.gc();
+                said.append(" forgotten=").append(mine.getChannel().tryLock() == null ? "null" : "locked");
+                askLock(b, 5, null, false);
+                java.nio.channels.FileLock back = mine.getChannel().tryLock();
+                said.append(" closed=").append(back == null ? "null" : "locked");
+                if (back != null) back.release();
+                java.nio.channels.FileLock shared = mine.getChannel().lock(0, Long.MAX_VALUE, true);
+                said.append(" shared=").append(askLock(b, 4, path, true));
+                said.append(" exclusive=").append(askLock(b, 4, path, false));
+                askLock(b, 5, null, false);
+                shared.release();
+                again.close();
+                mine.close();
+            } catch (Throwable e) {
+                said.append(" ").append(e);
+            }
+            Log.i("DataTest", "file-locks-across-scopes " + said);
+        }, "file-locks").start();
+    }
+
     /**
      * A service in another process (android:process=":elsewhere"), as Play Store's download service is: asked through its
      * binder, it says the name of the process it runs in (its ActivityManager's, for this pid), the app's static sMarker as
      * its process has it, and the kind of loader its class came from.
      */
     public static final class Elsewhere extends android.app.Service {
+        // What this process does with the file of fileLocksAcrossScopes, asked by codes 4 to 8: 4 opens it and tries its lock
+        // (shared or not), 5 closes it, 6 starts a thread that waits for the lock, 7 says how that went, 8 forgets the
+        // FileLock and keeps the channel.
+        private static java.io.RandomAccessFile sLockFile;
+        private static java.nio.channels.FileLock sLock;
+        private static volatile String sLockWait = "idle";
+        private static void closeLockFile() throws java.io.IOException {
+            if (sLockFile != null) sLockFile.close();
+            sLockFile = null;
+            sLock = null;
+        }
+        static String fileLock(int code, final String path, boolean shared) {
+            try {
+                if (code == 4) {
+                    closeLockFile();
+                    sLockFile = new java.io.RandomAccessFile(path, "rw");
+                    sLock = sLockFile.getChannel().tryLock(0, Long.MAX_VALUE, shared);
+                    return sLock == null ? "null" : "locked";
+                }
+                if (code == 5) {
+                    closeLockFile();
+                    return "closed";
+                }
+                if (code == 6) {
+                    closeLockFile();
+                    sLockWait = "waiting";
+                    new Thread(() -> {
+                        try {
+                            java.io.RandomAccessFile file = new java.io.RandomAccessFile(path, "rw");
+                            java.nio.channels.FileLock lock = file.getChannel().lock();
+                            sLockFile = file;
+                            sLock = lock;
+                            sLockWait = "granted";
+                        } catch (Throwable e) {
+                            sLockWait = String.valueOf(e);
+                        }
+                    }, "file-lock-wait").start();
+                    return "started";
+                }
+                if (code == 7) return sLockWait;
+                sLock = null;
+                System.gc();
+                return "forgotten";
+            } catch (Throwable e) {
+                return String.valueOf(e);
+            }
+        }
         @Override public android.os.IBinder onBind(android.content.Intent intent) {
             return new android.os.Binder() {
                 @Override protected boolean onTransact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) {
+                    if (code >= 4 && code <= 8) {
+                        String path = data.readString();
+                        reply.writeString(fileLock(code, path, data.readInt() != 0));
+                        return true;
+                    }
                     if (code == 3) {
                         // a bundle holding a bundle with a Note of this process's class, in the reply
                         android.os.Bundle details = new android.os.Bundle();

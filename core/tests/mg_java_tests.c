@@ -4010,6 +4010,14 @@ static int run_data(void)
     /* And a bundle in a reply of its binder, holding an object of its process's class: given this process's loader, the
        object is of this process's class (Bundle.setClassLoader, as WhatsApp reads Google Play services' TokenData). */
     CHECK(wait_line("I/DataTest: process-bundle note=in a bundle", 0, 30) >= 0);
+    /*
+     * And a file's lock between the two processes, which are class scopes of one virtual machine (the libcore overlay's
+     * FileLockTable): the other's tryLock() answers null and its lock() waits, where the library's one table of locks threw
+     * OverlappingFileLockException; within one process it still does. A lock lasts while its channel is open; shared locks
+     * are held together.
+     */
+    CHECK(wait_line("I/DataTest: file-locks-across-scopes same=overlapping other=null waits=waiting then=granted back=null forgotten=null "
+                    "closed=locked shared=locked exclusive=null", 0, 60) >= 0);
     /* The jobs of the step "job-scheduler", run: the one scheduled with its extra, the one given work with both pieces, in order. */
     CHECK(wait_line("I/DataTest: job 41 said=hello", 0, 30) >= 0);
     CHECK(wait_line("I/DataTest: job 42 work=one,two,", 0, 30) >= 0);

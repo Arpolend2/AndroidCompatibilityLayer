@@ -2619,6 +2619,38 @@ two default methods of Java 9 (`update(byte[])`, `update(ByteBuffer)`). The
 data app's "crc32c" step checks the standard check value, the defaults, a
 direct buffer and `Adler32` through the interface.
 
+**File locks between an app's processes** are the overlay's too
+(`sun/nio/ch/FileLockTable.java`, Megler's own in place of Android 9's). A
+`FileChannel`'s lock is the process's, held against other processes: while one
+holds it, another's `tryLock()` answers null and its `lock()` waits; within
+one process the library keeps one table of its locks, and an overlapping one
+is `OverlappingFileLockException`, an unchecked exception. What Android runs
+as several processes is one virtual machine here (an app's other processes
+and hosted Google Play services are class scopes, `megler.Processes`), so the
+second process got the exception where it expected null or a wait: the Play
+Store's value store, which its main and `:background` processes both write
+("VS: Failed to update class", 0.1.0.699), and Google Play services'
+`.config.lock`, taken by its own process and its `.unstable` one. The table
+now knows whose each lock is, the class scope of the code that takes it
+(`SharedFileLockTable.scope()`, a native of `dvm/mg_dvm_art.c`: the innermost
+frame of an app's or a service's code, else the thread's owner). Within a
+scope the rule is Android's for one process; between scopes it is the
+system's for two: null from `tryLock()`, a wait in `lock()` until the other
+lock is released or its channel closed, shared locks held together. Since
+`FileChannelImpl` adds a lock to the table before it asks the system, `add()`
+only notes it for the asking thread, and `FileDispatcherImpl.lock()` (a
+`.java.replace` of one line) asks `SharedFileLockTable.contend()` before its
+native call, which grants every lock here (`fcntl` in `bionic/mg_libc_io.c`).
+A lock lasts while its channel is open, even with its `FileLock` collected
+(AndroidX's `ProcessLock` keeps only the channel). An asynchronous channel
+asks the system from another thread: its locks are granted at once. Not
+modelled: locks between two apps' processes, which are Windows processes with
+a table each; deadlock detection; fairness. `FileDispatcherImpl`'s source
+uses `dalvik.system.BlockGuard`, which the SDK's `android.jar` lacks: a
+`.java.stubs` file names AOSP sources that are compiled for javac's class
+path only and are not put in the overlay. The data app says the checks in one
+line, "file-locks-across-scopes", after its "process-scope" step.
+
 **Java 9 and 10's collection factories** are added that way to Android 9's
 `List`, `Set` and `Map` (Android's `Map.java` says it took them out):
 `List.of` and `Set.of` of 0 to 10 elements and of an array, `Map.of` of 0 to 10
