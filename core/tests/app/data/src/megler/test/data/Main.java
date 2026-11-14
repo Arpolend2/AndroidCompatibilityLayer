@@ -1909,6 +1909,48 @@ public class Main extends Activity {
             sendBroadcast(new android.content.Intent("megler.test.ON_HANDLER"));
             return true;
         });
+        // A receiver unregistered hears nothing more -- a broadcast already on its way to it too, sent and waiting its turn on
+        // the receiver's thread -- as on Android. One that unregisters itself at the first broadcast it hears, to hear one only,
+        // heard the second of two sent together. An ordered broadcast goes on past a receiver unregistered since it was sent:
+        // to the result receiver here, the first receiver having unregistered the second.
+        step("broadcast-unregistered", () -> {
+            final android.os.HandlerThread thread = new android.os.HandlerThread("broadcast-unregistered");
+            thread.start();
+            final android.os.Handler on = new android.os.Handler(thread.getLooper());
+            final java.util.concurrent.atomic.AtomicInteger heard = new java.util.concurrent.atomic.AtomicInteger();
+            final StringBuffer order = new StringBuffer();
+            // (The receivers' thread waits until both broadcasts are sent: both are in its queue when the first is heard.)
+            final java.util.concurrent.CountDownLatch sent = new java.util.concurrent.CountDownLatch(1);
+            on.post(() -> { try { sent.await(); } catch (InterruptedException e) {} });
+            registerReceiver(new android.content.BroadcastReceiver() {
+                @Override public void onReceive(Context c, android.content.Intent i) { heard.incrementAndGet(); c.unregisterReceiver(this); }
+            }, new android.content.IntentFilter("megler.test.UNREGISTERED"), null, on);
+            sendBroadcast(new android.content.Intent("megler.test.UNREGISTERED"));
+            sendBroadcast(new android.content.Intent("megler.test.UNREGISTERED"));
+            sent.countDown();
+            final android.content.BroadcastReceiver second = new android.content.BroadcastReceiver() {
+                @Override public void onReceive(Context c, android.content.Intent i) { order.append("second "); }
+            };
+            android.content.IntentFilter before = new android.content.IntentFilter("megler.test.UNREGISTERED_ORDERED");
+            before.setPriority(10);
+            registerReceiver(new android.content.BroadcastReceiver() {
+                @Override public void onReceive(Context c, android.content.Intent i) {
+                    order.append("first ");
+                    c.unregisterReceiver(second);
+                    c.unregisterReceiver(this);
+                }
+            }, before, null, on);
+            registerReceiver(second, new android.content.IntentFilter("megler.test.UNREGISTERED_ORDERED"), null, on);
+            final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+            sendOrderedBroadcast(new android.content.Intent("megler.test.UNREGISTERED_ORDERED"), null, new android.content.BroadcastReceiver() {
+                @Override public void onReceive(Context c, android.content.Intent i) { order.append("result"); done.countDown(); }
+            }, on, 0, null, null);
+            // (The result comes on the same thread, after the two broadcasts above had their turn.)
+            boolean finished = done.await(20, java.util.concurrent.TimeUnit.SECONDS);
+            thread.quitSafely();
+            detail = "heard " + heard.get() + " of 2 sent, ordered: " + order + ", finished " + finished;
+            return finished && heard.get() == 1 && "first result".equals(order.toString());
+        });
         // Preferences whose keys have spaces (GmsCore keys some by an account, "Account {name=..., type=com.google}"): what
         // one run commits, the next reads from the file whole.
         step("prefs-spaced-key", () -> {
