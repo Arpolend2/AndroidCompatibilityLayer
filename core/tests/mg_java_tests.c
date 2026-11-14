@@ -3735,6 +3735,9 @@ static int run_data(void)
                                          /* And a LayerDrawable has a constant state, whose copy is a drawable of its kind with the layers'
                                             copies: a ripple, a layer list with ids and insets, a transition (YouTube's watch page). */
                                          "layer-copy",
+                                         /* And a reference that comes to @null is no value in a styled attribute array: a tint that is a
+                                            colour @null by day leaves the image without one (WhatsApp's settings on a PC). */
+                                         "null-reference",
                                          /* And PrecomputedText is the text it was made of -- characters, spans, paragraphs and the parameters
                                             it was made with -- so a SpannableString of one keeps the spans, and a TextView shows it (Ozon's
                                             chat). */

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Main's step "null-reference": an image whose tint is a colour that is @null by day. -->
+<ImageView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="10px"
+    android:layout_height="10px"
+    android:tint="@color/null_by_day" />

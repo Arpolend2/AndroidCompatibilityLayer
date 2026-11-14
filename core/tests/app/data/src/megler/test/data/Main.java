@@ -7160,6 +7160,45 @@ public class Main extends Activity {
             Log.i("DataTest", "layer-copy " + detail);
             return rippled && shown && laid && crossed && shared;
         });
+        // A reference that comes to @null is no value in a styled attribute array: WhatsApp tints an image of its settings
+        // with a colour that is @null by day and a colour by night (app:tint="@color/..."), and AppCompat asks hasValue and
+        // getResourceId before it reads a colour list. Android's ApplyStyle turns a reference resolved to @null back into
+        // TYPE_NULL; here the entry stayed a reference with the colour's id, so AppCompat went on to getXml of the colour --
+        // "Resource ID #0x7f060748 type #0x1 is not valid" as the settings opened. From a layout's attribute, from a style and
+        // without a theme; the value itself stays the reference to nothing it is on Android; by night it is the colour.
+        step("null-reference", () -> {
+            final int[] attrs = { android.R.attr.tint };
+            android.content.res.XmlResourceParser parser = getResources().getLayout(R.layout.null_tint);
+            int token;
+            while ((token = parser.next()) != org.xmlpull.v1.XmlPullParser.START_TAG && token != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) { }
+            android.util.AttributeSet set = android.util.Xml.asAttributeSet(parser);
+            android.content.res.TypedArray a = obtainStyledAttributes(set, attrs);
+            boolean xml = !a.hasValue(0) && a.getResourceId(0, -1) == -1 && a.getColorStateList(0) == null && a.getIndexCount() == 0;
+            a.recycle();
+            a = getResources().obtainAttributes(set, attrs);
+            boolean plain = !a.hasValue(0) && a.getResourceId(0, -1) == -1;
+            a.recycle();
+            parser.close();
+            a = obtainStyledAttributes(R.style.NullTint, attrs);
+            boolean style = !a.hasValue(0) && a.getResourceId(0, -1) == -1 && a.getColorStateList(0) == null;
+            a.recycle();
+            android.util.TypedValue v = new android.util.TypedValue();
+            getResources().getValue(R.color.null_by_day, v, true);
+            boolean value = v.type == android.util.TypedValue.TYPE_REFERENCE && v.data == 0 && v.string == null;
+            android.widget.ImageView image = (android.widget.ImageView) android.view.LayoutInflater.from(this).inflate(R.layout.null_tint, null);
+            boolean view = image.getImageTintList() == null;
+            android.content.res.Configuration night = new android.content.res.Configuration(getResources().getConfiguration());
+            night.uiMode = (night.uiMode & ~android.content.res.Configuration.UI_MODE_NIGHT_MASK) | android.content.res.Configuration.UI_MODE_NIGHT_YES;
+            android.content.Context dark = createConfigurationContext(night);
+            a = dark.obtainStyledAttributes(R.style.NullTint, attrs);
+            int tint = a.getColor(0, 0);
+            boolean byNight = a.hasValue(0) && tint == 0xFFC8C8C9;
+            a.recycle();
+            detail = "xml=" + xml + " plain=" + plain + " style=" + style + " value=" + value + " (type " + v.type + ", data " + v.data + ") view=" + view
+                + " night=" + byNight + " (" + Integer.toHexString(tint) + ")";
+            Log.i("DataTest", "null-reference " + detail);
+            return xml && plain && style && value && view && byNight;
+        });
         // PrecomputedText is the text it was made of: its characters and its spans, its paragraphs (each ends after its line
         // feed) and the parameters a Builder was told. It was signatures alone -- no characters, getSpans null -- so a
         // SpannableString made of one, which androidx's PrecomputedTextCompat hands on as it is from Android 10, ended in a
