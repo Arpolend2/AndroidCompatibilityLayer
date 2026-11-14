@@ -10,6 +10,7 @@
 #include "shell/DevicePortal.h"
 #endif
 #include "shell/Files.h"
+#include "shell/OwnUpdate.h"
 #include "shell/PackageVersions.h"
 #include "shell/PickedFile.h"
 #include "shell/Placement.h"
@@ -30,6 +31,10 @@
 #include <map>
 #include <mutex>
 #include <thread>
+
+// Left out of the app partition by the SDK's headers, in every Windows's kernelbase all the same (the core declares it so
+// too: core/src/host/mg_host_win32.c).
+extern "C" __declspec(dllimport) HMODULE WINAPI GetModuleHandleW(LPCWSTR moduleName);
 
 namespace megler::app::appPackage {
 
@@ -2058,6 +2063,47 @@ InstallResult moveToKeptVolume(const InstalledApp& app, const std::function<void
 
 std::string meglerVersion() { return versionString(); }
 
+namespace {
+/// Whether this (32-bit ARM) Megler runs on a 64-bit ARM Windows rather than a 32-bit ARM one. IsWow64Process2 says
+/// which; it came with Windows 10 1709, the first Windows on 64-bit ARM, so a Windows without it -- build 15035 of
+/// Windows RT's tablets -- is a 32-bit ARM one. Looked up by name, as a static import of it would keep Megler from
+/// starting there at all.
+bool windowsOnArm64() {
+    using Wow64Process2 = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
+    const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    const auto fn = kernel ? reinterpret_cast<Wow64Process2>(reinterpret_cast<void*>(GetProcAddress(kernel, "IsWow64Process2"))) : nullptr;
+    USHORT process = 0, native = 0;
+    return fn && fn(GetCurrentProcess(), &process, &native) && native == IMAGE_FILE_MACHINE_ARM64;
+}
+}
+
+std::string ownPackageSuffix() {
+    static const std::string suffix = [] {
+        using winrt::Windows::System::ProcessorArchitecture;
+        const std::string family = platform::deviceFamily();
+        ProcessorArchitecture arch = ProcessorArchitecture::Unknown;
+        try {
+            arch = winrt::Windows::ApplicationModel::Package::Current().Id().Architecture();
+        } catch (...) {
+        }
+        // An Xbox's own (tools/build-appx.sh x64 --xbox: its manifest the console's, its installs its Device Portal's), the
+        // console being x64; taken by the desktop's x64 Megler too, should one have been put on a console.
+        if (family == "Windows.Xbox") return std::string(arch == ProcessorArchitecture::X64 ? "Xbox_x64" : "");
+        switch (arch) {
+        case ProcessorArchitecture::Arm:
+            // The phone's own; a 32-bit ARM Megler on desktop Windows takes that Windows's: an ARM64 computer's, which runs
+            // it, or Windows RT's tablets', build 15035 on 32-bit ARM (tools/build-appx.sh --rt).
+            if (family == "Windows.Mobile") return std::string("ARM");
+            return std::string(family != "Windows.Desktop" ? "" : windowsOnArm64() ? "ARM64" : "RT_ARM");
+        case ProcessorArchitecture::Arm64: return std::string("ARM64");
+        case ProcessorArchitecture::X64: return std::string("x64");
+        case ProcessorArchitecture::X86: return std::string("x86");
+        default: return std::string();
+        }
+    }();
+    return suffix;
+}
+
 std::string madeByVersion(const std::string& packageVersion) { return packageVersions::madeBy(packageVersion); }
 
 std::string appPackageVersion(const std::string& installedVersion) { return packageVersions::next(ownPackageVersion(), installedVersion); }
@@ -2333,7 +2379,7 @@ std::string selfUpdateFailure() {
 
 namespace {
 /*
- * Whether Windows refused a package for its data, as a copy damaged on its way to the phone is: invalid data, a block map
+ * Whether Windows refused a package for its data, as a copy or a download damaged on its way is: invalid data, a block map
  * or a block's hash that does not match, a CRC, a digest the signature does not match. A Lumia 650's copy of 650 made over
  * USB had the right size and other bytes; Windows's installer said 0x8007000d, and Megler, which had tried it, said nothing.
  */
@@ -2350,8 +2396,8 @@ void rememberFailure(const std::string& file, const std::string& version, const 
     const std::string text = denied ? ownUpdateRefusedText(version, file, true)
                              : damagedCopy(said)
                                  ? "Megler " + version + " was not installed: Windows found the data of Pictures\\Megler\\" + file +
-                                       " invalid, as in a copy damaged on its way to the phone. Delete it there, copy it to the phone "
-                                       "again, and open Megler."
+                                       " invalid, as in a copy or a download damaged on its way. Delete it there, put it there again, "
+                                       "and open Megler."
                                  : "Megler " + version + " in Pictures\\Megler was not installed: " + said;
     std::lock_guard<std::mutex> lock(gSelfUpdateMutex);
     gSelfUpdateFailure = text;
@@ -2374,7 +2420,7 @@ bool keepRefusedUpdate(const std::wstring& appx, const std::wstring& certificate
         auto folder = KnownFolders::PicturesLibrary().CreateFolderAsync(L"Megler", CreationCollisionOption::OpenIfExists).get();
         StorageFile::GetFileFromPathAsync(appx).get().MoveAsync(folder, widen(file), NameCollisionOption::ReplaceExisting).get();
         moved = true;
-        // (installCopiedUpdate tries a package only with the certificate beside it.)
+        // (Its certificate with it, for whoever installs it by hand; installCopiedUpdate needs it on an Xbox alone.)
         if (files::exists(certificate))
             StorageFile::GetFileFromPathAsync(certificate).get().MoveAsync(folder, L"Megler.cer", NameCollisionOption::ReplaceExisting).get();
         shellLog::write("update: " + file + " moved to Pictures\\Megler, where the file manager opens it and Megler tries it again at its next start");
@@ -2444,33 +2490,110 @@ InstallResult installOwnUpdate(const std::wstring& appx, const std::wstring& cer
     return result;
 }
 
-void installCopiedUpdate() {
-    if (isSingleApp()) return;
+namespace {
+
+/// The folders named Megler in the Pictures library, where Megler's own updates are put: the one the library itself gives,
+/// and that of each folder the library is made of -- a phone's own Pictures and its memory card's --, each once.
+std::vector<StorageFolder> updateFolders() {
+    std::vector<StorageFolder> folders;
+    if (auto item = KnownFolders::PicturesLibrary().TryGetItemAsync(L"Megler").get())
+        if (auto folder = item.try_as<StorageFolder>()) folders.push_back(folder);
+    try {
+        for (auto const& part : StorageLibrary::GetLibraryAsync(KnownLibraryId::Pictures).get().Folders()) {
+            auto item = part.TryGetItemAsync(L"Megler").get();
+            auto folder = item ? item.try_as<StorageFolder>() : nullptr;
+            if (!folder) continue;
+            const std::wstring path(folder.Path());
+            bool taken = false;
+            for (auto const& other : folders) taken = taken || _wcsicmp(std::wstring(other.Path()).c_str(), path.c_str()) == 0;
+            if (!taken) folders.push_back(folder);
+        }
+    } catch (hresult_error const&) {
+        // (The library's own folder is looked in all the same.)
+    }
+    return folders;
+}
+
+/// Whether `file` ends as a whole package does (ownUpdate::endsAsZip, of its last 4 KB). `read`: whether its end could be
+/// read at all, which that of a file another program holds open -- one being written, it may be -- cannot.
+bool endsWhole(StorageFile const& file, bool& read) {
+    read = false;
+    try {
+        using namespace winrt::Windows::Storage::Streams;
+        const IRandomAccessStream stream = file.OpenAsync(FileAccessMode::Read).get();
+        const uint64_t size = stream.Size();
+        const uint32_t n = uint32_t(std::min<uint64_t>(size, 4096));
+        if (!n) {
+            read = true;
+            return false;
+        }
+        const IBuffer tail = stream.GetInputStreamAt(size - n).ReadAsync(Buffer(n), n, InputStreamOptions::None).get();
+        read = true;
+        return ownUpdate::endsAsZip(tail.data(), tail.Length());
+    } catch (hresult_error const&) {
+        return false;
+    }
+}
+
+/// A package of Megler's own in Pictures\Megler.
+struct Copied {
+    StorageFile file{nullptr};
+    StorageFolder folder{nullptr};
+    std::string version;
+    uint64_t size = 0, changed = 0; // changed: when it was written last, 0 not known
+    bool whole = false, read = false; // endsWhole
+};
+
+/// Megler's own package for this Windows and processor in Pictures\Megler ("Megler_0.1.0.476_ARM.appx" on a phone): of
+/// `version`, or (empty) the newest there that is newer than this Megler. Of one version's files -- a browser's second
+/// download beside the first, "Megler_0.1.0.700_ARM (1).appx" -- a whole one before one that is not, then the one changed
+/// last. Throws where the folder cannot be read.
+std::optional<Copied> copiedPackage(const std::string& version) {
+    const std::string suffix = ownPackageSuffix();
+    std::optional<Copied> best;
+    for (auto const& folder : updateFolders()) {
+        for (auto const& file : folder.GetFilesAsync().get()) {
+            Copied at;
+            at.version = ownUpdate::versionInName(narrow(file.Name()), suffix);
+            if (at.version.empty() || (version.empty() ? !olderVersion(versionString(), at.version) : at.version != version)) continue;
+            if (best && olderVersion(at.version, best->version)) continue;
+            at.file = file;
+            at.folder = folder;
+            try {
+                const auto properties = file.GetBasicPropertiesAsync().get();
+                at.size = properties.Size();
+                at.changed = uint64_t(properties.DateModified().time_since_epoch().count());
+            } catch (hresult_error const&) {
+            }
+            at.whole = endsWhole(file, at.read);
+            if (!best || olderVersion(best->version, at.version) || (at.whole && !best->whole) || (at.whole == best->whole && at.changed > best->changed))
+                best = at;
+        }
+    }
+    return best;
+}
+
+std::atomic<bool> gCopiedLooking{false};
+
+}
+
+bool installCopiedUpdate() {
+    if (isSingleApp()) return false;
+    // One look at a time (ui/Ota.cpp asks for one when the file it waits for has come), and none while an update is installed.
+    if (gSelfUpdating || gCopiedLooking.exchange(true)) return false;
     std::thread([] {
+        struct Looking {
+            ~Looking() { gCopiedLooking = false; }
+        } looking;
         {
             std::lock_guard<std::mutex> lock(gSelfUpdateMutex);
             gSelfUpdateFailure.clear();
         }
         try {
-            auto item = KnownFolders::PicturesLibrary().TryGetItemAsync(L"Megler").get();
-            auto folder = item ? item.try_as<StorageFolder>() : nullptr;
-            if (!folder) return;
-            // "Megler_0.1.0.476_ARM.appx": the newest there.
-            std::string best;
-            StorageFile bestFile{nullptr};
-            for (auto const& file : folder.GetFilesAsync().get()) {
-                const std::string name = narrow(file.Name());
-                const std::string head = "Megler_", tail = "_ARM.appx";
-                if (name.size() <= head.size() + tail.size() || name.compare(0, head.size(), head) || name.compare(name.size() - tail.size(), tail.size(), tail)) continue;
-                const std::string version = name.substr(head.size(), name.size() - head.size() - tail.size());
-                unsigned v[4];
-                if (sscanf_s(version.c_str(), "%u.%u.%u.%u", &v[0], &v[1], &v[2], &v[3]) != 4) continue;
-                if (best.empty() || olderVersion(best, version)) {
-                    best = version;
-                    bestFile = file;
-                }
-            }
-            if (best.empty() || !olderVersion(versionString(), best)) return;
+            const std::optional<Copied> found = copiedPackage({});
+            if (!found) return;
+            const std::string best = found->version;
+            const StorageFile bestFile = found->file;
             const std::string name = narrow(std::wstring(bestFile.Name()));
             // The file's size and times: what tells a file copied there again from the one tried.
             std::string file;
@@ -2480,6 +2603,17 @@ void installCopiedUpdate() {
                               static_cast<unsigned long long>(bestFile.DateCreated().time_since_epoch().count()),
                               static_cast<unsigned long long>(properties.DateModified().time_since_epoch().count()));
             } catch (hresult_error const&) {
+            }
+            // A file that does not end as a package does is still being copied there, or was cut short on its way: not tried
+            // (Windows would refuse it, and that be written down as its try), and said in the Library. One whose end cannot
+            // be read is tried, as every file was.
+            if (!found->whole && found->read) {
+                shellLog::write("update: " + name + " in Pictures\\Megler does not end as a package does (" + file +
+                                "): still being copied, or cut short; not tried");
+                std::lock_guard<std::mutex> lock(gSelfUpdateMutex);
+                gSelfUpdateFailure = "Megler " + best + " was not installed: Pictures\\Megler\\" + name +
+                                     " is not whole -- still being copied, or cut short on its way. Once it is all there, open Megler again.";
+                return;
             }
             /*
              * A try is written down before it is made, and its result after: a package the installer refused is not tried again.
@@ -2536,19 +2670,83 @@ void installCopiedUpdate() {
                 shellLog::write(format("update: the try %d of Megler %s did not end (this Megler was closed or suspended while it sent it): tried again",
                                        tries, best.c_str()));
             }
-            auto certificate = folder.TryGetItemAsync(L"Megler.cer").get();
-            if (!certificate) {
+            // Megler.cer beside it is what an Xbox's Device Portal is sent with the package. Windows's deployment engine is
+            // handed none (installOwnUpdate): a package fetched with the browser needs none beside it.
+            std::wstring certificate;
+            if (auto item = found->folder.TryGetItemAsync(L"Megler.cer").get()) certificate = std::wstring(item.Path());
+#if defined(MEGLER_XBOX)
+            if (certificate.empty()) {
                 shellLog::write("update: Megler " + best + " is in Pictures\\Megler without Megler.cer beside it: not installed");
                 return;
             }
+#endif
             if (!file.empty()) files::append(tried, "file: " + file + "\r\n");
-            const InstallResult result =
-                installOwnUpdate(std::wstring(bestFile.Path()), std::wstring(certificate.Path()), best, "found in Pictures\\Megler");
+            const InstallResult result = installOwnUpdate(std::wstring(bestFile.Path()), certificate, best, "found in Pictures\\Megler");
             if (!result.ok) rememberFailure(name, best, result.said, result.accessDenied);
         } catch (hresult_error const& e) {
             shellLog::write(format("update: Pictures\\Megler could not be read: 0x%08x ", unsigned(e.code())) + narrow(e.message()));
         }
     }).detach();
+    return true;
+}
+
+std::optional<CopiedUpdate> copiedUpdate(const std::string& version) {
+    if (version.empty()) return std::nullopt;
+    try {
+        const std::optional<Copied> found = copiedPackage(version);
+        if (!found) return std::nullopt;
+        CopiedUpdate at;
+        at.name = narrow(std::wstring(found->file.Name()));
+        at.folder = std::wstring(found->folder.Path());
+        at.size = found->size;
+        at.changed = found->changed;
+        at.whole = found->whole;
+        return at;
+    } catch (hresult_error const& e) {
+        // (Asked every ten seconds while a file is waited for: said once.)
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            shellLog::write(format("update: Pictures\\Megler could not be looked in: 0x%08x ", unsigned(e.code())) + narrow(e.message()));
+        return std::nullopt;
+    }
+}
+
+std::wstring copiedUpdateFolder() {
+    try {
+        for (auto const& folder : updateFolders()) {
+            const std::wstring path(folder.Path());
+            if (!path.empty()) return path;
+        }
+        return std::wstring(KnownFolders::PicturesLibrary().CreateFolderAsync(L"Megler", CreationCollisionOption::OpenIfExists).get().Path());
+    } catch (hresult_error const& e) {
+        shellLog::write(format("update: Pictures\\Megler could not be made: 0x%08x ", unsigned(e.code())) + narrow(e.message()));
+        return {};
+    }
+}
+
+int removeCopiedUpdates(const std::string& version) {
+    int removed = 0;
+    if (version.empty()) return removed;
+    try {
+        const std::string suffix = ownPackageSuffix();
+        for (auto const& folder : updateFolders()) {
+            for (auto const& file : folder.GetFilesAsync().get()) {
+                const std::string name = narrow(file.Name());
+                if (ownUpdate::versionInName(name, suffix) != version) continue;
+                try {
+                    file.DeleteAsync(StorageDeleteOption::PermanentDelete).get();
+                    removed++;
+                    shellLog::write("update: " + name + " removed from Pictures\\Megler: its Megler is installed");
+                } catch (hresult_error const& e) {
+                    shellLog::write(format("update: %s could not be removed from Pictures\\Megler: 0x%08x ", name.c_str(), unsigned(e.code())) +
+                                    narrow(e.message()));
+                }
+            }
+        }
+    } catch (hresult_error const& e) {
+        shellLog::write(format("update: Pictures\\Megler could not be read: 0x%08x ", unsigned(e.code())) + narrow(e.message()));
+    }
+    return removed;
 }
 
 }  // namespace megler::app::appPackage

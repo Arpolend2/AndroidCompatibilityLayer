@@ -11,16 +11,13 @@
 #include "shell/Strings.h"
 #include "ui/AppShell.h"
 
+#include <winrt/Windows.ApplicationModel.DataTransfer.h>
 #include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.Security.Cryptography.Core.h>
 #include <winrt/Windows.Security.Cryptography.h>
 
 #include <ctime>
 #include <optional>
-
-// Left out of the app partition by the SDK's headers, in every Windows's kernelbase all the same (the core declares it so
-// too: core/src/host/mg_host_win32.c).
-extern "C" __declspec(dllimport) HMODULE WINAPI GetModuleHandleW(LPCWSTR moduleName);
 
 namespace megler::app::ui::ota {
 
@@ -37,6 +34,11 @@ constexpr const wchar_t* releasesUrl = L"https://api.github.com/repos/Computersh
 constexpr int64_t askEverySeconds = 6 * 3600;
 /// Room for Windows to install the package once it is here, besides the package itself.
 constexpr uint64_t installRoom = uint64_t(1200) << 20;
+/// A newer Megler fetched with the browser: Pictures\Megler is looked in for its file this long from Download or Copy
+/// Link, and this often.
+constexpr uint64_t awaitMs = uint64_t(2) * 3600 * 1000, lookEveryMs = 10 * 1000;
+/// What a release's assets' direct links begin with.
+constexpr const char* downloadsUrl = "https://github.com/Computershik73/megler-w10m/releases/download/";
 
 /// The newest Megler for this one on GitHub, newer than it.
 struct Found {
@@ -56,6 +58,7 @@ bool gForced = false;           // ... the ask under way is one of those
 bool gTidied = false;
 std::atomic<uint64_t> gGot{0}, gTotal{0};
 std::atomic<bool> gStop{false}; // the dialog's Stop: the download under way ends at its worker's next look
+bool gGaveWay = false;          // ... ended so for the browser's download of it (awaitFile), not by Stop
 std::mutex gSpeedMutex;
 ownUpdate::Speed gSpeed;        // how fast the package comes (gSpeedMutex)
 
@@ -68,8 +71,23 @@ struct Failure {
 };
 std::optional<Failure> gFailure;
 
+/// A newer Megler fetched with the browser (In Browser): how is shown, and from Download or Copy Link on its file is
+/// looked for in Pictures\Megler (gMutex).
+struct Awaited {
+    Found f;
+    std::wstring folder;          // Pictures\Megler, as the dialog names it
+    bool asked = false;           // Download or Copy Link was pressed: the file is looked for,
+    uint64_t until = 0, next = 0; // ... until then, and next then (GetTickCount64)
+    bool looking = false;         // a look is under way on a worker thread
+    bool show = false;            // its dialog is to be shown at the next poll that has none up
+    std::string handed;           // the file Windows was asked to install, by its name, size and time: asked once for each
+    std::string state;            // where the file stands, as the dialog and the Library's card say it
+};
+std::optional<Awaited> gAwaited;
+
 std::wstring updateFolder() { return platform::localStateDirectory() + L"\\update"; }
 std::wstring askedFile() { return platform::localStateDirectory() + L"\\ota-asked.txt"; }
+std::wstring noteFile() { return platform::localStateDirectory() + L"\\update-browser.txt"; }
 
 std::string userAgent() { return "Megler/" + appPackage::meglerVersion() + " (" + platform::deviceFamily() + ")"; }
 
@@ -117,6 +135,51 @@ std::string versionOf(const std::string& tag) {
     unsigned n[4] = {};
     char extra = 0;
     return sscanf_s(v.c_str(), "%u.%u.%u.%u%c", &n[0], &n[1], &n[2], &n[3], &extra, 1) == 4 ? v : std::string();
+}
+
+/// Whether a newer Megler can be fetched with the browser: not on an Xbox, where no file gets to Pictures\Megler by hand
+/// and the console's Device Portal wants Megler.cer with the package.
+bool browserRoute() { return !platform::isXbox(); }
+
+/// Settings' line while a file fetched with the browser is waited for.
+std::string waitingLine(const std::string& version) { return "Megler " + version + ": waiting for its file in Pictures\\Megler"; }
+
+/// LocalState\update-browser.txt: the Megler fetched with the browser -- its version, its package's name, size and direct
+/// link, a line each --, and when Download or Copy Link was pressed (seconds since 1970; 0 not yet). It outlives this
+/// start: the next takes the look up, and removes the file from Pictures\Megler once that Megler is installed.
+struct Note {
+    Found f;
+    int64_t asked = 0;
+};
+
+std::optional<Note> readNote() {
+    std::string text;
+    if (!files::read(noteFile(), text)) return std::nullopt;
+    std::vector<std::string> lines;
+    for (size_t at = 0; at < text.size();) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(at, end - at);
+        while (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
+        at = end + 1;
+    }
+    // (Only what Megler itself would have written: a version, this Megler's package of it, a link to a release's asset.)
+    if (lines.size() < 5 || lines[0].empty() || versionOf(lines[0]) != lines[0] ||
+        ownUpdate::versionInName(lines[1], packageSuffix()) != lines[0] || lines[3].rfind(downloadsUrl, 0) != 0)
+        return std::nullopt;
+    Note note;
+    note.f.version = lines[0];
+    note.f.tag = "v" + lines[0];
+    note.f.file = lines[1];
+    note.f.size = uint64_t(_atoi64(lines[2].c_str()));
+    note.f.url = lines[3];
+    note.asked = _atoi64(lines[4].c_str());
+    return note;
+}
+
+void writeNote(const Found& f, int64_t asked) {
+    files::write(noteFile(), f.version + "\r\n" + f.file + "\r\n" + std::to_string(f.size) + "\r\n" + f.url + "\r\n" + std::to_string(asked) + "\r\n");
 }
 
 /// The newest release (not a draft, not a pre-release) with a package for this Megler, from GitHub's list of them: its
@@ -216,6 +279,11 @@ void ask() {
         error = format("GitHub could not be reached (0x%08x %s)", unsigned(e.code()), narrow(e.message()).c_str());
     }
     files::write(askedFile(), std::to_string(int64_t(std::time(nullptr))));
+    // flags\ota-again (a test's): the newest is offered though it is not newer than this Megler, so that what follows an
+    // offer -- its download, its dialogs, the browser's way -- is tried without a release made for it.
+    const bool newer = found && appPackage::olderVersion(current, found->version);
+    const bool again = found && !newer && files::exists(platform::localStateDirectory() + L"\\flags\\ota-again");
+    if (again) shellLog::write("ota: flags\\ota-again: Megler " + found->version + " is offered though this is " + current);
     std::lock_guard<std::mutex> lock(gMutex);
     if (!error.empty()) {
         shellLog::write("ota: " + error);
@@ -223,7 +291,7 @@ void ask() {
         gStep = Step::idle;
         return;
     }
-    if (!found || !appPackage::olderVersion(current, found->version)) {
+    if (!newer && !again) {
         shellLog::write("ota: the newest Megler on GitHub for " + suffix + " is " + (found ? found->version : std::string("none")) + "; this is " + current);
         gSummary = "Megler " + current + " is the newest for " + suffix + ", asked GitHub at " + clock();
         gStep = Step::idle;
@@ -354,11 +422,15 @@ void downloadAndInstall(Found f) {
     {
         std::lock_guard<std::mutex> lock(gMutex);
         if (gStop) {
-            // Stop: nothing of it is kept, and it is not offered again by itself this start (Check Now offers it).
+            // Stop, or the browser asked for it instead: nothing of it is kept, and it is not offered again by itself this
+            // start (Check Now offers it).
+            const bool awaited = gGaveWay;
+            gGaveWay = false;
             files::remove(appx);
-            shellLog::write(format("ota: Megler %s: its download stopped by the user, at %s of %s", f.version.c_str(),
-                                   formattedByteCount(gGot).c_str(), formattedByteCount(f.size).c_str()));
-            gSummary = "Megler " + f.version + ": its download was stopped";
+            shellLog::write(format("ota: Megler %s: its download stopped %s, at %s of %s", f.version.c_str(),
+                                   awaited ? "for the browser's" : "by the user", formattedByteCount(gGot).c_str(),
+                                   formattedByteCount(f.size).c_str()));
+            gSummary = awaited ? waitingLine(f.version) : "Megler " + f.version + ": its download was stopped";
             gDeclined = f.version;
             gStep = Step::idle;
             return;
@@ -429,18 +501,6 @@ void tidy() {
     }
 }
 
-/// Whether this (32-bit ARM) Megler runs on a 64-bit ARM Windows rather than a 32-bit ARM one. IsWow64Process2 says
-/// which; it came with Windows 10 1709, the first Windows on 64-bit ARM, so a Windows without it -- build 15035 of
-/// Windows RT's tablets -- is a 32-bit ARM one. Looked up by name, as a static import of it would keep Megler from
-/// starting there at all.
-bool windowsOnArm64() {
-    using Wow64Process2 = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
-    const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
-    const auto fn = kernel ? reinterpret_cast<Wow64Process2>(reinterpret_cast<void*>(GetProcAddress(kernel, "IsWow64Process2"))) : nullptr;
-    USHORT process = 0, native = 0;
-    return fn && fn(GetCurrentProcess(), &process, &native) && native == IMAGE_FILE_MACHINE_ARM64;
-}
-
 /// Whether the phone's connection is one that is paid for by the byte.
 bool metered() {
     try {
@@ -452,6 +512,242 @@ bool metered() {
     } catch (...) {
         return false;
     }
+}
+
+/// Download or Copy Link was pressed: the file is looked for in Pictures\Megler from now on, for two hours, and Megler's
+/// own download of it gives way -- two of them at once would share a phone's connection, and its memory.
+void awaitFile(AppShell& shell, const Found& f) {
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        if (!gAwaited || gAwaited->f.version != f.version) return;
+        const uint64_t now = GetTickCount64();
+        gAwaited->asked = true;
+        gAwaited->until = now + awaitMs;
+        gAwaited->next = now + 3000;
+        gDeclined = f.version;
+        if (gStep == Step::downloading && gFound && gFound->version == f.version) {
+            if (!gStop) {
+                gGaveWay = true;
+                gStop = true;
+                shellLog::write("ota: Megler " + f.version + ": its download here gives way to the browser's");
+            }
+        } else if (gStep == Step::idle) {
+            gSummary = waitingLine(f.version);
+        }
+    }
+    shell.runInBackground([f] { writeNote(f, int64_t(std::time(nullptr))); });
+}
+
+/// How to get the newer Megler with the browser, in a dialog: its package's direct link, where the file is to be put, and
+/// under them where things stand. `did`: what the press before this did.
+void showBrowser(AppShell& shell, std::string did = {}) {
+    Found f;
+    std::wstring folder;
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        if (!gAwaited) return;
+        f = gAwaited->f;
+        folder = gAwaited->folder;
+    }
+    if (shell.dialogShown()) return;
+    const bool phone = platform::isMobile();
+    AppShell::DialogSpec spec;
+    spec.title = "Megler " + f.version + " with the Browser";
+    spec.message = ownUpdate::browserText(f.file, f.url, f.size, ownUpdate::folderPlace(narrow(folder), phone), phone);
+    spec.buttons = {"Close", "Copy Link", "Download"};
+    spec.live = [version = f.version, did](AppShell::DialogSpec::Live& live) {
+        live.bar = false;
+        bool asked = false, downloading = false;
+        std::string state;
+        {
+            std::lock_guard<std::mutex> lock(gMutex);
+            // (Installed by Megler's own download meanwhile, or not waited for any more: closed, -2.)
+            if (!gAwaited || gAwaited->f.version != version || gStep == Step::installing) return false;
+            asked = gAwaited->asked;
+            state = gAwaited->state;
+            downloading = gStep == Step::downloading && gFound && gFound->version == version && !gStop;
+        }
+        if (downloading) {
+            const Progress now = progress();
+            live.text = "Megler's own download goes on meanwhile (" + ownUpdate::progressLine(now.got, now.total, now.bytesPerSecond) +
+                        "): Download and Copy Link stop it.";
+        } else if (appPackage::selfUpdating()) {
+            live.text = "Windows is installing it. Megler is closed when Windows takes it: open it again after that.";
+        } else {
+            live.text = did;
+            if (asked && !state.empty()) live.text += (live.text.empty() ? "" : " ") + state + ".";
+        }
+        return true;
+    };
+    std::weak_ptr<AppShell> weak = shell.weak_from_this();
+    shell.dialog(std::move(spec), [weak, f](int button, std::string) {
+        auto self = weak.lock();
+        if (!self) return;
+        if (button == -2) {
+            showProgress(*self);
+            return;
+        }
+        if (button != 1 && button != 2) {
+            // Close, Back, a tap beside it. A file looked for is looked for on, and the Library's card shows this again; one
+            // never asked for is not waited for.
+            std::lock_guard<std::mutex> lock(gMutex);
+            if (gAwaited && gAwaited->f.version == f.version && !gAwaited->asked) gAwaited.reset();
+            return;
+        }
+        std::string did;
+        if (button == 2) {
+            // Download: the link opened as the browser's own, which saves what it gives as a file.
+            try {
+                winrt::Windows::System::Launcher::LaunchUriAsync(Uri(widen(f.url)));
+                did = "The browser was asked for the file.";
+            } catch (hresult_error const& e) {
+                did = format("The browser could not be asked (0x%08x %s): copy the link.", unsigned(e.code()), said(e).c_str());
+            }
+        } else {
+            try {
+                using namespace winrt::Windows::ApplicationModel::DataTransfer;
+                DataPackage data;
+                data.SetText(hs(f.url));
+                Clipboard::SetContent(data);
+                did = "The link is copied.";
+            } catch (hresult_error const& e) {
+                did = format("The link could not be copied (0x%08x %s).", unsigned(e.code()), said(e).c_str());
+            }
+        }
+        shellLog::write("ota: Megler " + f.version + " with the browser: " + did);
+        awaitFile(*self, f);
+        showBrowser(*self, did);
+    });
+}
+
+/// In Browser: how to get the newer Megler with the browser is shown. Its download here, where one is under way, goes on
+/// until the browser is asked for it.
+void inBrowser(AppShell& shell, const Found& f) {
+    bool installing = false;
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        installing = gStep == Step::installing;
+        // (The offer is answered: not made again this start, unless Check Now asks.)
+        if (gStep == Step::offering) {
+            gStep = Step::idle;
+            gDeclined = f.version;
+        }
+    }
+    if (installing) {
+        showProgress(shell);
+        return;
+    }
+    shellLog::write("ota: Megler " + f.version + ": how to get it with the browser shown (" + f.url + ")");
+    auto folder = std::make_shared<std::wstring>();
+    std::weak_ptr<AppShell> weak = shell.weak_from_this();
+    shell.runInBackground(
+        [f, folder] {
+            *folder = appPackage::copiedUpdateFolder();
+            // (Written now, with no press yet: a file fetched from what this shows is removed once its Megler is installed.)
+            const std::optional<Note> note = readNote();
+            writeNote(f, note && note->f.version == f.version ? note->asked : 0);
+        },
+        [weak, f, folder] {
+            auto self = weak.lock();
+            if (!self) return;
+            {
+                std::lock_guard<std::mutex> lock(gMutex);
+                if (!gAwaited || gAwaited->f.version != f.version) gAwaited = Awaited{f};
+                gAwaited->folder = *folder;
+                // (Another dialog came up meanwhile: this one at the next poll that has none.)
+                gAwaited->show = self->dialogShown();
+                if (gAwaited->show) return;
+            }
+            showBrowser(*self);
+        });
+}
+
+/// Pictures\Megler looked in for the file awaited, on a worker thread: once it is there, whole and of GitHub's size,
+/// Windows is asked to install it (once for each file: `handedBefore` is the one it was asked for).
+void look(AppShell& shell, const Found& f, const std::string& handedBefore) {
+    auto state = std::make_shared<std::string>();
+    auto handed = std::make_shared<std::string>(handedBefore);
+    shell.runInBackground(
+        [f, state, handed] {
+            const std::optional<appPackage::CopiedUpdate> at = appPackage::copiedUpdate(f.version);
+            if (!at) {
+                *state = f.file + " is not in Pictures\\Megler yet";
+                return;
+            }
+            const std::string identity = format("%s, %llu bytes, changed %llu", at->name.c_str(), static_cast<unsigned long long>(at->size),
+                                                static_cast<unsigned long long>(at->changed));
+            if (identity == *handed) {
+                const std::string failed = appPackage::selfUpdateFailure();
+                *state = appPackage::selfUpdating() ? std::string("Windows is installing it")
+                         : !failed.empty()          ? failed
+                                                    : at->name + " is there, and Windows was asked to install it";
+            } else if (f.size && at->size < f.size) {
+                *state = at->name + " is there, " + formattedByteCount(at->size) + " of " + formattedByteCount(f.size) + " so far";
+            } else if (f.size && at->size > f.size) {
+                // (Not a download of that asset, whatever it is: not handed to Windows by this look.)
+                *state = at->name + " there is not GitHub's file (its size is another): not taken";
+            } else if (!at->whole) {
+                *state = at->name + " is there, still being written";
+            } else if (appPackage::installCopiedUpdate()) {
+                *state = at->name + " is there: Windows is asked to install it";
+                *handed = identity;
+                shellLog::write("ota: " + at->name + " has come to Pictures\\Megler (" + formattedByteCount(at->size) +
+                                "): Windows is asked to install it");
+            } else {
+                // (A look there, or an install, is under way: asked at the next look.)
+                *state = at->name + " is there";
+            }
+        },
+        [f, state, handed] {
+            std::lock_guard<std::mutex> lock(gMutex);
+            if (!gAwaited || gAwaited->f.version != f.version) return;
+            gAwaited->looking = false;
+            while (!state->empty() && state->back() == '.') state->pop_back();
+            gAwaited->state = *state;
+            gAwaited->handed = *handed;
+            if (GetTickCount64() < gAwaited->until) return;
+            // Two hours on: not looked for any more by this start (the next finds it there all the same).
+            const bool was = !gAwaited->handed.empty();
+            gAwaited.reset();
+            shellLog::write("ota: Megler " + f.version + ": its file is not looked for in Pictures\\Megler any more, two hours on");
+            if (gStep == Step::idle && !was)
+                gSummary = "Megler " + f.version + " did not come to Pictures\\Megler in two hours: Megler looks there again when it starts";
+        });
+}
+
+/// At start (a worker thread), by LocalState\update-browser.txt: once the Megler fetched with the browser is installed, its
+/// file is removed from Pictures\Megler; while it is not, the look for it is taken up for what is left of its two hours.
+void restoreAwaited() {
+    const std::optional<Note> note = readNote();
+    if (!note) {
+        files::remove(noteFile());
+        return;
+    }
+    const std::string version = note->f.version, current = appPackage::meglerVersion();
+    if (!appPackage::olderVersion(current, version)) {
+        const int removed = appPackage::removeCopiedUpdates(version);
+        files::remove(noteFile());
+        shellLog::write(format("ota: Megler %s was fetched with the browser, and this is %s: %d of its files removed from Pictures\\Megler",
+                               version.c_str(), current.c_str(), removed));
+        return;
+    }
+    const int64_t since = int64_t(std::time(nullptr)) - note->asked;
+    if (!note->asked || since < 0 || since >= int64_t(awaitMs / 1000)) return;
+    const std::wstring folder = appPackage::copiedUpdateFolder();
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (gAwaited) return;
+    const uint64_t now = GetTickCount64();
+    Awaited awaited{note->f};
+    awaited.folder = folder;
+    awaited.asked = true;
+    awaited.until = now + (awaitMs - uint64_t(since) * 1000);
+    awaited.next = now + lookEveryMs;
+    gAwaited = awaited;
+    // (Not offered by itself meanwhile.)
+    gDeclined = version;
+    if (gStep == Step::idle && gSummary.empty()) gSummary = waitingLine(version);
+    shellLog::write(format("ota: Megler %s is fetched with the browser, asked for %lld minutes ago: its file is looked for in Pictures\\Megler",
+                           version.c_str(), static_cast<long long>(since / 60)));
 }
 
 /// The dialog's Stop: the download under way is ended (its worker looks five times a second). False where none is under
@@ -471,8 +767,10 @@ void startDownload(AppShell& shell, const Found& f) {
         gStep = Step::downloading;
         gFound = f;
         gFailure.reset();
+        if (gAwaited && gAwaited->f.version != f.version) gAwaited.reset(); // (an older one's file is not waited for)
         gSummary = "Megler " + f.version + " is being downloaded";
         gStop = false;
+        gGaveWay = false;
         gGot = 0;
         gTotal = f.size;
     }
@@ -486,22 +784,31 @@ void startDownload(AppShell& shell, const Found& f) {
 }
 
 void offer(AppShell& shell, const Found& f) {
-    const bool phone = platform::deviceFamily() == "Windows.Mobile";
+    const bool phone = platform::deviceFamily() == "Windows.Mobile", route = browserRoute();
     AppShell::DialogSpec spec;
     spec.title = "Megler " + f.version;
     const std::string news = whatsNew(f.notes);
     spec.message = format("A newer Megler is on GitHub: %s (this one is %s). Its package for this %s (%s) is %s%s: Megler downloads it, checks it and "
-                          "installs it. Megler closes while Windows installs it, a few minutes%s; then open Megler again.",
+                          "installs it. Megler closes while Windows installs it, a few minutes%s; then open Megler again.%s",
                           f.version.c_str(), appPackage::meglerVersion().c_str(), device(), packageSuffix().c_str(),
                           formattedByteCount(f.size).c_str(), metered() ? ", over a connection paid for by the byte" : "",
-                          phone ? " (leave the phone on)" : "") +
+                          phone ? " (leave the phone on)" : "",
+                          route ? " If its download here is too slow, In Browser tells how to get the file with the browser instead." : "") +
                    (news.empty() ? std::string() : "\n\nWhat's new:\n" + news);
-    spec.buttons = {"Later", "Update"};
+    // (The confirming one last; In Browser between them where there is that way.)
+    if (route)
+        spec.buttons = {"Later", "In Browser", "Update"};
+    else
+        spec.buttons = {"Later", "Update"};
     std::weak_ptr<AppShell> weak = shell.weak_from_this();
-    shell.dialog(std::move(spec), [weak, f](int button, std::string) {
+    shell.dialog(std::move(spec), [weak, f, route](int button, std::string) {
         auto self = weak.lock();
-        if (button == 1 && self) {
+        if (self && button == (route ? 2 : 1)) {
             startDownload(*self, f);
+            return;
+        }
+        if (self && route && button == 1) {
+            inBrowser(*self, f);
             return;
         }
         // Later (or dismissed): not offered again this start, unless Check Now asks.
@@ -512,7 +819,7 @@ void offer(AppShell& shell, const Found& f) {
     });
 }
 
-/// What went wrong, in a dialog: a download's with Try Again.
+/// What went wrong, in a dialog: a download's with Try Again, and with In Browser where there is that way.
 void say(AppShell& shell, const Failure& failure) {
     AppShell::DialogSpec spec;
     spec.title = failure.title;
@@ -522,43 +829,26 @@ void say(AppShell& shell, const Failure& failure) {
         shell.dialog(std::move(spec), nullptr);
         return;
     }
-    spec.buttons = {"Close", "Try Again"};
+    const bool route = browserRoute();
+    if (route)
+        spec.buttons = {"Close", "In Browser", "Try Again"};
+    else
+        spec.buttons = {"Close", "Try Again"};
     std::weak_ptr<AppShell> weak = shell.weak_from_this();
     const Found f = failure.f;
-    shell.dialog(std::move(spec), [weak, f](int button, std::string) {
+    shell.dialog(std::move(spec), [weak, f, route](int button, std::string) {
         auto self = weak.lock();
-        if (button == 1 && self) startDownload(*self, f);
+        if (!self) return;
+        if (button == (route ? 2 : 1))
+            startDownload(*self, f);
+        else if (route && button == 1)
+            inBrowser(*self, f);
     });
 }
 
 } // namespace
 
-std::string packageSuffix() {
-    static const std::string suffix = [] {
-        using winrt::Windows::System::ProcessorArchitecture;
-        const std::string family = platform::deviceFamily();
-        ProcessorArchitecture arch = ProcessorArchitecture::Unknown;
-        try {
-            arch = winrt::Windows::ApplicationModel::Package::Current().Id().Architecture();
-        } catch (...) {
-        }
-        // An Xbox's own (tools/build-appx.sh x64 --xbox: its manifest the console's, its installs its Device Portal's), the
-        // console being x64; taken by the desktop's x64 Megler too, should one have been put on a console.
-        if (family == "Windows.Xbox") return std::string(arch == ProcessorArchitecture::X64 ? "Xbox_x64" : "");
-        switch (arch) {
-        case ProcessorArchitecture::Arm:
-            // The phone's own; a 32-bit ARM Megler on desktop Windows takes that Windows's: an ARM64 computer's, which runs
-            // it, or Windows RT's tablets', build 15035 on 32-bit ARM (tools/build-appx.sh --rt).
-            if (family == "Windows.Mobile") return std::string("ARM");
-            return std::string(family != "Windows.Desktop" ? "" : windowsOnArm64() ? "ARM64" : "RT_ARM");
-        case ProcessorArchitecture::Arm64: return std::string("ARM64");
-        case ProcessorArchitecture::X64: return std::string("x64");
-        case ProcessorArchitecture::X86: return std::string("x86");
-        default: return std::string();
-        }
-    }();
-    return suffix;
-}
+std::string packageSuffix() { return appPackage::ownPackageSuffix(); }
 
 bool atStart() { return settings::megler(settings::otaAtStart).value_or("") != "off"; }
 
@@ -584,7 +874,16 @@ Progress progress() {
     Progress now;
     {
         std::lock_guard<std::mutex> lock(gMutex);
-        if ((gStep != Step::downloading && gStep != Step::installing) || !gFound) return now;
+        if ((gStep != Step::downloading && gStep != Step::installing) || !gFound) {
+            // (Its file fetched with the browser and waited for; taken by Windows, it is the Library's other card.)
+            if (gAwaited && gAwaited->asked && !appPackage::selfUpdating()) {
+                now.kind = Progress::Kind::waiting;
+                now.version = gAwaited->f.version;
+                now.file = gAwaited->f.file;
+                now.state = gAwaited->state;
+            }
+            return now;
+        }
         now.kind = gStep == Step::downloading ? Progress::Kind::downloading : Progress::Kind::installing;
         now.version = gFound->version;
         now.file = gFound->file;
@@ -598,8 +897,14 @@ Progress progress() {
 
 void showProgress(AppShell& shell) {
     const Progress at = progress();
+    // (A file fetched with the browser and waited for: that way's dialog.)
+    if (at.kind == Progress::Kind::waiting) {
+        showBrowser(shell);
+        return;
+    }
     if (at.kind == Progress::Kind::none || shell.dialogShown()) return;
     const bool installing = at.kind == Progress::Kind::installing, phone = platform::deviceFamily() == "Windows.Mobile";
+    const bool route = browserRoute();
     AppShell::DialogSpec spec;
     spec.title = "Megler " + at.version;
     if (installing) {
@@ -611,9 +916,13 @@ void showProgress(AppShell& shell) {
     } else {
         spec.message = format("%s is coming from GitHub. Megler then checks it and installs it, and is closed while Windows installs it: open "
                               "Megler again after that. Keep Megler on the screen%s meanwhile: Windows may hold up an app that is not shown, "
-                              "and its download with it.",
-                              at.file.c_str(), phone ? " and the phone on" : "");
-        spec.buttons = {"Stop", "Hide"};
+                              "and its download with it.%s",
+                              at.file.c_str(), phone ? " and the phone on" : "",
+                              route ? " If it comes too slowly, In Browser tells how to get the file with the browser instead." : "");
+        if (route)
+            spec.buttons = {"Stop", "In Browser", "Hide"};
+        else
+            spec.buttons = {"Stop", "Hide"};
     }
     // The dialog is of one step: over, it closes by itself (-2), and the next step's is shown in its place.
     spec.live = [kind = at.kind, version = at.version](AppShell::DialogSpec::Live& live) {
@@ -628,13 +937,24 @@ void showProgress(AppShell& shell) {
         return true;
     };
     std::weak_ptr<AppShell> weak = shell.weak_from_this();
-    shell.dialog(std::move(spec), [weak, installing](int button, std::string) {
+    shell.dialog(std::move(spec), [weak, installing, route](int button, std::string) {
         auto self = weak.lock();
         if (!self) return;
-        // Closed by itself: installing is shown in its turn; what went wrong is said at the next poll (tick).
-        if (button == -2) showProgress(*self);
-        // Stop; too late for it where the package is being installed by now, which is shown then.
-        else if (button == 0 && !installing && !stop()) showProgress(*self);
+        if (button == -2) {
+            // Closed by itself: installing is shown in its turn; what went wrong is said at the next poll (tick).
+            showProgress(*self);
+        } else if (button == 0 && !installing) {
+            // Stop; too late for it where the package is being installed by now, which is shown then.
+            if (!stop()) showProgress(*self);
+        } else if (button == 1 && !installing && route) {
+            // In Browser: this download goes on until the browser is asked for the file.
+            std::optional<Found> f;
+            {
+                std::lock_guard<std::mutex> lock(gMutex);
+                f = gFound;
+            }
+            if (f) inBrowser(*self, *f);
+        }
         // (Hide, Back, a tap beside it: the download goes on, and the Library's card and Settings' Check Now show this again.)
     });
 }
@@ -648,7 +968,10 @@ void tick(AppShell& shell) {
     if (appPackage::isSingleApp() || packageSuffix().empty()) return;
     if (!gTidied) {
         gTidied = true;
-        shell.runInBackground([] { tidy(); });
+        shell.runInBackground([] {
+            tidy();
+            restoreAwaited();
+        });
     }
     std::unique_lock<std::mutex> lock(gMutex);
     if (gFailure && !shell.dialogShown()) {
@@ -656,6 +979,24 @@ void tick(AppShell& shell) {
         gFailure.reset();
         lock.unlock();
         say(shell, failure);
+        return;
+    }
+    if (gAwaited && gAwaited->show && !shell.dialogShown()) {
+        gAwaited->show = false;
+        lock.unlock();
+        showBrowser(shell);
+        return;
+    }
+    // A file fetched with the browser: Pictures\Megler looked in every ten seconds -- not while Megler's own download of it
+    // goes on, nor while Windows installs one.
+    if (gAwaited && gAwaited->asked && !gAwaited->looking && gStep != Step::downloading && gStep != Step::installing &&
+        !appPackage::selfUpdating() && GetTickCount64() >= gAwaited->next) {
+        gAwaited->looking = true;
+        gAwaited->next = GetTickCount64() + lookEveryMs;
+        const Found f = gAwaited->f;
+        const std::string handed = gAwaited->handed;
+        lock.unlock();
+        look(shell, f, handed);
         return;
     }
     switch (gStep) {

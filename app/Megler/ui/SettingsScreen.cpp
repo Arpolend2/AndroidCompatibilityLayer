@@ -246,7 +246,12 @@ private:
                            "and processor" +
                                (suffix.empty() ? std::string(": none is for this one.") : ": this Megler takes Megler_<version>_" + suffix + ".appx.") +
                                " What is downloaded is checked against the SHA-256 GitHub gives, and installed as an update copied to "
-                               "Pictures\\Megler is.");
+                               "Pictures\\Megler is." +
+                               (platform::isXbox() ? std::string()
+                                                   : std::string(" Where that is too slow, In Browser -- in the offer and in the download's "
+                                                                 "dialog -- gives the package's direct link for the browser and says where to "
+                                                                 "put the file: Pictures\\Megler, where Megler finds it and Windows checks it "
+                                                                 "as it installs it.")));
     }
 
     /// Apps' Storage is Megler's own alone: not an app's settings, nor in an app's own package, nor on an Xbox, where the

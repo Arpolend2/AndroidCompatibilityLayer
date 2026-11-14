@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -244,6 +245,11 @@ std::string portalHelp();
 std::string meglerVersion();
 /// Whether version `a` ("0.1.0.354") is older than `b` ("0.1.0.358").
 bool olderVersion(const std::string& a, const std::string& b);
+/// The part of a package's name that says which Windows and processor it is for, as this Megler needs: "ARM" on a phone,
+/// "ARM64", "x64" or "x86" on desktop Windows, "Xbox_x64" on an Xbox, "RT_ARM" on desktop Windows on 32-bit ARM; empty
+/// where there is none for it. Its releases' packages on GitHub are named by it (ui/Ota.h), and so are those taken from
+/// Pictures\Megler (installCopiedUpdate).
+std::string ownPackageSuffix();
 
 /// A newer package of Megler's own at `appx`, its certificate at `certificate`, installed by Windows's deployment engine,
 /// which reads it where it lies and closes this Megler (on an Xbox, through the console's Device Portal, which closes it
@@ -252,18 +258,40 @@ bool olderVersion(const std::string& a, const std::string& b);
 /// and GitHub's (ui/Ota.h).
 InstallResult installOwnUpdate(const std::wstring& appx, const std::wstring& certificate, const std::string& version, const std::string& from);
 
-/// Megler's own update, copied to the phone over USB (MTP) into Pictures\Megler: the newest Megler_<version>_ARM.appx there,
-/// when it is newer than this Megler, installed with the Megler.cer beside it by Windows's deployment engine (installOwnUpdate),
-/// which closes this Megler to replace it. Tried once for each file (LocalState\update-tried-<version>): a file copied there
-/// again is tried anew. Megler's own package only, not an app's. Off the UI thread: started on a thread of its own.
-void installCopiedUpdate();
+/// Megler's own update put into Pictures\Megler -- copied to the phone over USB (MTP), or downloaded with the browser and
+/// moved there (ui/Ota.h) --: the newest Megler_<version>_<ownPackageSuffix>.appx there (in the folder Megler of any of the
+/// Pictures library's folders: a phone's own and its memory card's), when it is newer than this Megler, installed by
+/// Windows's deployment engine (installOwnUpdate), which closes this Megler to replace it. Megler.cer beside it is needed on
+/// an Xbox alone, whose Device Portal is sent it. A file that does not end as a whole package does -- still being copied, or
+/// cut short -- is not tried, and the Library says so (selfUpdateFailure). Tried once for each file
+/// (LocalState\update-tried-<version>): a file put there again is tried anew. Megler's own package only, not an app's. Off
+/// the UI thread: started on a thread of its own; one look at a time, and none while an update is being installed -- false
+/// then, and in an app's own package: no look was begun.
+bool installCopiedUpdate();
+/// Megler's own package of `version` in Pictures\Megler, as installCopiedUpdate would find it: its name, the folder it is
+/// in, its size, when it was changed last (0 not known), and whether it ends as a whole package does. Of several files of
+/// that version (a browser's second download, "Megler_0.1.0.700_ARM (1).appx") a whole one, then the one changed last.
+/// Nothing where none is there. Off the UI thread.
+struct CopiedUpdate {
+    std::string name;
+    std::wstring folder;
+    uint64_t size = 0, changed = 0;
+    bool whole = false;
+};
+std::optional<CopiedUpdate> copiedUpdate(const std::string& version);
+/// Where Megler's own updates are put: the folder Megler in Pictures, made where there is none yet (in the folder the
+/// Pictures library saves to: a phone's own, or its memory card's). Empty where it could not be made. Off the UI thread.
+std::wstring copiedUpdateFolder();
+/// Megler's own packages of `version` removed from Pictures\Megler, once that Megler is installed (some 370 MB a phone has
+/// better use for): how many. Megler.cer stays. Off the UI thread.
+int removeCopiedUpdates(const std::string& version);
 /// Whether installCopiedUpdate is installing the newer Megler now (the screen is kept on meanwhile: ui/AppShell).
 bool selfUpdating();
 /// The version installCopiedUpdate is installing ("0.1.0.610"), empty when it is not: the Library says so.
 std::string selfUpdateVersion();
-/// Why the newer Megler in Pictures\Megler was not installed, as the Library says it: that the copy is damaged and is to be
-/// copied again, that Windows does not let Megler install it (ownUpdateRefusedText), or Windows's reason. Empty when
-/// nothing failed.
+/// Why the newer Megler in Pictures\Megler was not installed, as the Library says it: that the file is not whole, that it
+/// is damaged and is to be put there again, that Windows does not let Megler install it (ownUpdateRefusedText), or
+/// Windows's reason. Empty when nothing failed.
 std::string selfUpdateFailure();
 /// What is said of Megler's own update `file` (Megler_<version>_ARM.appx) that Windows refused for access: accessDeniedText,
 /// with the file to open meanwhile from Pictures\Megler in the file manager, which hands it to Windows's own installer

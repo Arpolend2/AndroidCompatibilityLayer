@@ -115,10 +115,12 @@ public:
         int chosen = -1;                     // the choice marked as things stand; -1: none
         /// What moves while the dialog is up, under its text: a bar of how far it is (`fraction`, 0 to 1; less than 0, a bar
         /// that says only that something goes on) and a line. Asked when the dialog is shown and at every poll; false
-        /// closes the dialog, and `done` gets -2 (a download's, ui/Ota.cpp).
+        /// closes the dialog, and `done` gets -2 (a download's, ui/Ota.cpp). Without `bar`, the line alone: where a thing
+        /// stands that has no measure (a file looked for).
         struct Live {
             std::string text;
             double fraction = -1;
+            bool bar = true;
         };
         std::function<bool(Live&)> live;
     };

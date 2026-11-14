@@ -106,7 +106,8 @@ public:
         add(column_, updateCard_);
 
         // A newer Megler downloaded from GitHub (ui/Ota.h), while it comes: how far, how fast, how long yet. Tapped, its
-        // dialog again (which Hide closed), with its Stop.
+        // dialog again (which Hide closed), with its Stop. And one fetched with the browser, while its file is waited for in
+        // Pictures\Megler: where the file stands, and tapped, how to get it.
         otaTitle_ = text("", font::titleMedium, weightMedium(), p.onSurface);
         otaBar_ = ProgressBar();
         otaBar_.Minimum(0);
@@ -237,12 +238,21 @@ public:
         }
         // (Installed, it is the card above: appPackage::selfUpdateVersion.)
         const ota::Progress coming = ota::progress();
-        const bool otaComing = coming.kind == ota::Progress::Kind::downloading;
-        setVisible(otaButton_, otaComing);
-        if (otaComing) {
-            otaTitle_.Text(hs("Downloading Megler " + coming.version));
-            otaBar_.Value(coming.total ? double(coming.got) / double(coming.total) : 0);
-            const std::string detail = ownUpdate::progressLine(coming.got, coming.total, coming.bytesPerSecond) + ". Tap for more, or to stop it.";
+        const bool otaComing = coming.kind == ota::Progress::Kind::downloading, otaAwaited = coming.kind == ota::Progress::Kind::waiting;
+        setVisible(otaButton_, otaComing || otaAwaited);
+        if (otaComing || otaAwaited) {
+            const std::string title = otaComing ? "Downloading Megler " + coming.version : "Megler " + coming.version + " with the browser";
+            if (title != otaTitleShown_) {
+                otaTitleShown_ = title;
+                otaTitle_.Text(hs(title));
+                setVisible(otaBar_, otaComing);
+            }
+            if (otaComing) otaBar_.Value(coming.total ? double(coming.got) / double(coming.total) : 0);
+            // (Why a file that came was not installed is the card above's to say.)
+            const std::string detail =
+                otaComing ? ownUpdate::progressLine(coming.got, coming.total, coming.bytesPerSecond) + ". Tap for more, or to stop it."
+                          : (coming.state.empty() || !failed.empty() ? "Megler looks for " + coming.file + " in Pictures\\Megler" : coming.state) +
+                                ". Tap for how to get it.";
             if (detail != otaDetailShown_) {
                 otaDetailShown_ = detail;
                 otaDetail_.Text(hs(detail));
@@ -401,7 +411,7 @@ private:
     TextBlock otaTitle_{nullptr};
     ProgressBar otaBar_{nullptr};
     TextBlock otaDetail_{nullptr};
-    std::string otaDetailShown_;
+    std::string otaTitleShown_, otaDetailShown_;
     Border importCard_{nullptr};
     TextBlock importTitle_{nullptr};
     ProgressBar importBar_{nullptr};

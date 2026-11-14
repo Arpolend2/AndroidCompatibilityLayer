@@ -29,7 +29,8 @@
 //     of an app (Aurora Store's update of an app made its package again with the same version, 0x80073CFB), Windows' order;
 //   - Megler's own update as its screens tell of it (shell/OwnUpdate.h): how fast its download comes -- not known at
 //     first, the mean of its last five seconds, nothing coming, anew after a pause --, how long it has left, and the line
-//     that says how far it is;
+//     that says how far it is; and of the file fetched with the browser instead, the names in Pictures\Megler that are
+//     Megler's packages for one Windows and processor, a whole package's end, the folder as its owner finds it, the text;
 //   - the phone's picker and camera for an app (player/PickerHost.cpp): Windows' picker's filter, start and view for the
 //     MIME types an app asks for, the flags that answer a request in place of the user (pick-cancel, pick-file-<name>), and
 //     files handed over copied into the request's folder -- a name already there made unique, one missing a failure -- with
@@ -1032,7 +1033,8 @@ void testPackageVersions() {
           "Windows' order: the same is not older; Megler 0.1.0.682's own version is older than its apps' packages");
 }
 
-/// Megler's own update as its screens tell of it (shell/OwnUpdate.h): the download's speed, the time it has left, its line.
+/// Megler's own update as its screens tell of it (shell/OwnUpdate.h): the download's speed, the time it has left, its line;
+/// and the file fetched with the browser: its name, its end, its folder, the text.
 void testOwnUpdate() {
     printf("Megler's own update\n");
     namespace ou = ownUpdate;
@@ -1095,6 +1097,64 @@ void testOwnUpdate() {
     check(ou::progressLine(uint64_t(2) << 20, 0, 524288) == "2.00 MB, 512 KB/s",
           "... of a size not known: " + ou::progressLine(uint64_t(2) << 20, 0, 524288));
     check(ou::progressLine(0, 0, -1) == "0 bytes", "... of nothing yet: " + ou::progressLine(0, 0, -1));
+
+    // The names in Pictures\Megler that are Megler's packages for one Windows and processor.
+    check(ou::versionInName("Megler_0.1.0.700_ARM.appx", "ARM") == "0.1.0.700" && ou::versionInName("Megler_0.1.0.700_ARM.msix", "ARM") == "0.1.0.700",
+          "Megler_0.1.0.700_ARM.appx (and .msix) is the phone's 0.1.0.700");
+    check(ou::versionInName("Megler_0.1.0.700_ARM (1).appx", "ARM") == "0.1.0.700" && ou::versionInName("Megler_0.1.0.700_ARM(12).appx", "ARM") == "0.1.0.700",
+          "... and so is a browser's second download of it, \"Megler_0.1.0.700_ARM (1).appx\"");
+    check(ou::versionInName("Megler_0.1.0.700_RT_ARM.appx", "ARM").empty() && ou::versionInName("Megler_0.1.0.700_ARM64.appx", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.700_Xbox_x64.appx", "x64").empty(),
+          "RT_ARM's and ARM64's are not the phone's, nor an Xbox's a computer's");
+    check(ou::versionInName("Megler_0.1.0.700_RT_ARM.appx", "RT_ARM") == "0.1.0.700" && ou::versionInName("Megler_0.1.0.700_Xbox_x64.appx", "Xbox_x64") == "0.1.0.700" &&
+              ou::versionInName("Megler_12.3.45.6789_x64.appx", "x64") == "12.3.45.6789",
+          "each Windows and processor takes its own");
+    check(ou::versionInName("Megler_0.1.0.700_ARM.appx.part", "ARM").empty() && ou::versionInName("Megler_0.1.0.700_ARM.appx.crdownload", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.700_ARM.zip", "ARM").empty() && ou::versionInName("Megler_0.1.0.700_ARM", "ARM").empty(),
+          "a download that is not over, a .zip, a name without its ending: not packages");
+    check(ou::versionInName("Megler_0.1.700_ARM.appx", "ARM").empty() && ou::versionInName("Megler_0.1.0.x_ARM.appx", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.700.1_ARM.appx", "ARM").empty() && ou::versionInName("Megler_0.1.0._ARM.appx", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.7000000000_ARM.appx", "ARM").empty(),
+          "a version that is not four numbers: not a package");
+    check(ou::versionInName("megler_0.1.0.700_ARM.appx", "ARM").empty() && ou::versionInName("Megler_0.1.0.700_ARM.appx", "").empty() &&
+              ou::versionInName("", "ARM").empty() && ou::versionInName("Megler_0.1.0.700", "ARM").empty() && ou::versionInName("Megler.cer", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.700_ARM (1.appx", "ARM").empty() && ou::versionInName("Megler_0.1.0.700_ARM ().appx", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.700_ARM (1) (2).appx", "ARM").empty(),
+          "another name, no suffix, a mark that is not a browser's: not packages");
+    {
+        // A whole package ends with the archive's end record; a copy whose size was set first ends with zeros meanwhile.
+        std::vector<unsigned char> tail(100, 0);
+        check(!ou::endsAsZip(tail.data(), tail.size()) && !ou::endsAsZip(tail.data(), 0) && !ou::endsAsZip(nullptr, 100) && !ou::endsAsZip(tail.data(), 21),
+              "zeros, nothing, less than the record: not a package's end");
+        const unsigned char record[22] = {'P', 'K', 5, 6};
+        memcpy(tail.data() + 78, record, 22);
+        check(ou::endsAsZip(tail.data(), tail.size()) && ou::endsAsZip(tail.data() + 78, 22), "the archive's end record at the file's end: a whole package's");
+        check(!ou::endsAsZip(tail.data(), tail.size() - 1), "... cut short by a byte: not one");
+        memset(tail.data(), 0, tail.size());
+        memcpy(tail.data() + 73, record, 22);
+        tail[73 + 20] = 5;
+        check(ou::endsAsZip(tail.data(), tail.size()), "... with the archive's comment of 5 bytes after it: a whole package's");
+        tail[73 + 20] = 4;
+        check(!ou::endsAsZip(tail.data(), tail.size()), "... with a comment that does not reach the end: not one");
+    }
+    check(ou::folderPlace("C:\\Data\\Users\\Public\\Pictures\\Megler", true) == "This device › Pictures › Megler" && ou::folderPlace("", true) == "This device › Pictures › Megler",
+          "the phone's own Pictures\\Megler: " + ou::folderPlace("C:\\Data\\Users\\Public\\Pictures\\Megler", true));
+    check(ou::folderPlace("D:\\Pictures\\Megler", true) == "SD card › Pictures › Megler", "the memory card's: " + ou::folderPlace("D:\\Pictures\\Megler", true));
+    check(ou::folderPlace("C:\\Users\\me\\Pictures\\Megler", false) == "C:\\Users\\me\\Pictures\\Megler" && ou::folderPlace("", false) == "the folder Megler in Pictures",
+          "a computer's: its path");
+    {
+        const std::string url = "https://github.com/Computershik73/megler-w10m/releases/download/v0.1.0.700/Megler_0.1.0.700_ARM.appx";
+        const std::string phone = ou::browserText("Megler_0.1.0.700_ARM.appx", url, uint64_t(371) << 20, "SD card › Pictures › Megler", true);
+        const std::string computer = ou::browserText("Megler_0.1.0.700_x64.appx", url, 0, "C:\\Users\\me\\Pictures\\Megler", false);
+        check(phone.rfind("Megler_0.1.0.700_ARM.appx (371 MB) by its direct link:\n" + url + "\n\n1. ", 0) == 0, "the browser's way: the file, its size, its link on a line of its own");
+        check(phone.find("move the file from Downloads to SD card › Pictures › Megler: hold it, then Move to.\n3. ") != std::string::npos &&
+                  phone.find("over USB") != std::string::npos,
+              "... on a phone: File Explorer's Move to, and the way from a computer");
+        check(computer.rfind("Megler_0.1.0.700_x64.appx by its direct link:\n", 0) == 0 &&
+                  computer.find("2. Move the file from Downloads to C:\\Users\\me\\Pictures\\Megler, or save it there at once.\n3. ") != std::string::npos &&
+                  computer.find("over USB") == std::string::npos && computer.find("phone") == std::string::npos,
+              "... on a computer: the folder's path, and nothing of a phone");
+    }
 }
 
 /// What a folder's files take, its folders' too (files::treeSize: an app's data and cache in its own package's Settings).

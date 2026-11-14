@@ -736,12 +736,16 @@ void AppShell::dialog(DialogSpec spec, std::function<void(int, std::string)> don
             add(column, chips);
         }
     }
-    auto actions = hstack(8);
+    // Three buttons side by side are wider than a phone's window lets the sheet be, and the row would cut its last one off,
+    // the confirming one: there they stand one under the other, as Material stacks them, in the same order.
+    const bool stacked = spec.buttons.size() >= 3 && root_.ActualWidth() < 420;
+    auto actions = stacked ? vstack(0) : hstack(8);
     actions.HorizontalAlignment(HorizontalAlignment::Right);
     actions.Margin(ThicknessHelper::FromLengths(24, 24, 12, -8));
     for (size_t i = 0; i < spec.buttons.size(); ++i) {
         const bool confirming = i + 1 == spec.buttons.size();
         auto b = textButton(spec.buttons[i], [this, i] { closeDialog(int(i)); }, confirming && spec.destructive ? p.error : p.primary);
+        if (stacked) b.HorizontalAlignment(HorizontalAlignment::Right);
         add(actions, b);
     }
     // The content scrolls where it is higher than the window lets the sheet be, and the buttons stay below it: a phone's
@@ -785,13 +789,21 @@ void AppShell::refreshDialogLive() {
         closeDialog(-2);
         return;
     }
-    const bool known = now.fraction >= 0;
+    if ((dialogLiveBar_.Visibility() == Visibility::Visible) != now.bar) {
+        // (A bar that is not shown does not run either; the line keeps the bar's distance from the text above it.)
+        setVisible(dialogLiveBar_, now.bar);
+        dialogLiveText_.Margin(ThicknessHelper::FromLengths(0, now.bar ? 0 : 16, 0, 0));
+    }
+    const bool known = now.fraction >= 0 || !now.bar;
     if (dialogLiveBar_.IsIndeterminate() == known) dialogLiveBar_.IsIndeterminate(!known);
-    if (known) dialogLiveBar_.Value(now.fraction > 1 ? 1 : now.fraction);
+    if (known && now.bar) dialogLiveBar_.Value(now.fraction > 1 ? 1 : now.fraction);
     if (now.text != dialogLiveShown_) {
         dialogLiveShown_ = now.text;
         dialogLiveText_.Text(hs(now.text));
     }
+    // (No bar and nothing to say: no empty line kept under the text.)
+    const bool lined = now.bar || !now.text.empty();
+    if ((dialogLiveText_.Visibility() == Visibility::Visible) != lined) setVisible(dialogLiveText_, lined);
 }
 
 void AppShell::dialogWhenFree(DialogSpec spec, std::function<void(int, std::string)> done) {
