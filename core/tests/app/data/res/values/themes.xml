@@ -9,4 +9,8 @@
     <style name="SharedElement">
         <item name="android:transitionName">by-style</item>
     </style>
+    <!-- Main's step "theme-switch": the style a context is switched to after its theme was made. -->
+    <style name="SwitchedTheme">
+        <item name="android:colorForeground">#FF333333</item>
+    </style>
 </resources>

@@ -7226,6 +7226,25 @@ public class Main extends Activity {
             Log.i("DataTest", "bidi-wrap " + detail);
             return plain && other && inRtl && mark && spans;
         });
+        // A context's setTheme puts the new style onto the theme it has already made, the same object, as Android's ContextImpl
+        // does: YouTube switches to its dark theme after its start, and what had the theme before resolved its text colour
+        // in the light one (dark titles on a dark page). Here with a context of this app's resources: the theme taken
+        // before the switch says the new style's colour, the context gives the same theme, and a style set again changes
+        // nothing.
+        step("theme-switch", () -> {
+            android.content.Context ctx = createConfigurationContext(getResources().getConfiguration());
+            android.content.res.Resources.Theme before = ctx.getTheme();
+            ctx.setTheme(R.style.ProbeTheme);
+            int first = foreground(before);
+            ctx.setTheme(R.style.SwitchedTheme);
+            int second = foreground(before);
+            boolean same = ctx.getTheme() == before;
+            ctx.setTheme(R.style.SwitchedTheme);
+            boolean again = ctx.getTheme() == before && foreground(before) == 0xFF333333;
+            detail = "first=" + Integer.toHexString(first) + " second=" + Integer.toHexString(second) + " same=" + same + " again=" + again;
+            Log.i("DataTest", "theme-switch " + detail);
+            return (first == 0xFF111111 || first == 0xFF222222) && second == 0xFF333333 && same && again;
+        });
         // PrecomputedText is the text it was made of: its characters and its spans, its paragraphs (each ends after its line
         // feed) and the parameters a Builder was told. It was signatures alone -- no characters, getSpans null -- so a
         // SpannableString made of one, which androidx's PrecomputedTextCompat hands on as it is from Android 10, ended in a

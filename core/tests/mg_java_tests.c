@@ -3741,6 +3741,9 @@ static int run_data(void)
                                          /* And BidiFormatter wraps a text in an embedding with marks where its direction is not the
                                             context's, and gives it as it is where it is (Deezer's search). */
                                          "bidi-wrap",
+                                         /* And a context's setTheme puts the new style onto the theme it has made, the same object, so
+                                            what took the theme before sees the switch (YouTube's dark theme). */
+                                         "theme-switch",
                                          /* And PrecomputedText is the text it was made of -- characters, spans, paragraphs and the parameters
                                             it was made with -- so a SpannableString of one keeps the spans, and a TextView shows it (Ozon's
                                             chat). */
