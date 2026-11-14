@@ -447,6 +447,55 @@ public final class ViewRoot implements ViewParent {
     /** Whether the frame being drawn draws only part of the screen (View.drawFromParent then skips what lies outside it). */
     public static boolean meglerDrawingPart() { return sDrawingPart; }
     public void requestLayout() { mLayoutRequested = true; scheduleFrame(); }
+    /*
+     * Views that asked for layout while this window was being laid out, as Android's ViewRootImpl keeps them
+     * (requestLayoutDuringLayout, mLayoutRequesters): after the pass, those still asking, attached and not under a GONE view
+     * have their requests and their parents' taken back and made again, and the window is measured and laid out a second
+     * time; what asks during that second pass asks again at the next frame. Without it the request stopped at a parent
+     * being laid out and was lost with that parent's own, and the view kept asking for good (View.requestLayout).
+     */
+    private final ArrayList<View> mLayoutRequesters = new ArrayList<>();
+    private boolean mHandlingLayoutInLayoutRequest;
+    private static int sSecondPassesSaid;
+    /** View.requestLayout, while this window is laid out: the view noted; false where it is to wait for the next frame. */
+    public boolean requestLayoutDuringLayout(View v) {
+        if (v.getParent() == null) return true;
+        if (!mLayoutRequesters.contains(v)) mLayoutRequesters.add(v);
+        return !mHandlingLayoutInLayoutRequest;
+    }
+    private ArrayList<View> validLayoutRequesters(boolean second) {
+        ArrayList<View> valid = new ArrayList<>();
+        for (View v : mLayoutRequesters) {
+            if (v == null || !v.isAttachedToWindow() || v.getParent() == null || (!second && !v.meglerLayoutForced())) continue;
+            boolean gone = false;
+            for (View p = v; p != null; p = p.getParent() instanceof View ? (View) p.getParent() : null)
+                if (p.getVisibility() == View.GONE) { gone = true; break; }
+            if (!gone) valid.add(v);
+        }
+        if (!second) for (View v : mLayoutRequesters) if (v != null) v.meglerUnforceLayoutUp();
+        mLayoutRequesters.clear();
+        return valid;
+    }
+    private void layoutRequestedDuringLayout(int ws, int hs, int w, int h) {
+        if (mLayoutRequesters.isEmpty()) return;
+        ArrayList<View> valid = validLayoutRequesters(false);
+        if (valid.isEmpty()) return;
+        mHandlingLayoutInLayoutRequest = true;
+        mInLayout = false;
+        for (View v : valid) {
+            if (sSecondPassesSaid < 10) { sSecondPassesSaid++; android.util.Log.i("MeglerViews", "requestLayout() called by " + v + " during layout: running second layout pass"); }
+            v.requestLayout();
+        }
+        mView.measure(ws, hs);
+        mInLayout = true;
+        mView.layout(0, 0, w, h);
+        mHandlingLayoutInLayoutRequest = false;
+        final ArrayList<View> again = validLayoutRequesters(true);
+        if (!again.isEmpty()) {
+            // (Asked again during the second pass: asked once more at the next frame, as Android posts them to its run queue.)
+            Choreographer.getMainThreadInstance().postCallback(Choreographer.CALLBACK_ANIMATION, () -> { for (View v : again) v.requestLayout(); }, null);
+        }
+    }
     public void requestApplyInsets() { mInsetsDirty = true; mLayoutRequested = true; scheduleFrame(); }
     public WindowInsets insets() { return mWindowInsets; }
     public int systemUi() { return mSystemUi; }
@@ -877,7 +926,8 @@ public final class ViewRoot implements ViewParent {
             }
             mX = out.left; mLaidY = out.top; mY = mLaidY - mPan; mW = w; mH = h;
             mView.layout(0, 0, w, h);
-        } finally { mInLayout = false; }
+            layoutRequestedDuringLayout(ws, hs, w, h);
+        } finally { mInLayout = false; mHandlingLayoutInLayoutRequest = false; }
         mObserver.dispatchOnGlobalLayout();
         updatePan();
         /* (On the phone, the flag trace-views: a file of that name in the data folder's flags.) */

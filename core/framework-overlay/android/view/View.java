@@ -1110,11 +1110,36 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
     }
     protected void onLayout(boolean changed, int l, int t, int r, int b) {}
     protected void onSizeChanged(int w, int h, int ow, int oh) {}
+    /*
+     * The view whose requestLayout is going up its parents now (Android's AttachInfo.mViewRequestingLayout): only that view is
+     * told to its window when it asks while the window is being laid out (megler.ViewRoot.requestLayoutDuringLayout). Its
+     * parents, being laid out, have their own request set, so the request stopped at them and was gone when their layout
+     * ended -- the view left asking for good, every later request of it and of its children stopping at it: YouTube's
+     * watch page kept its panel's views at 0x0 under the player (0.1.0.708).
+     */
+    private static View sRequestingLayout;
     public void requestLayout() {
-        mPrivateFlags |= PFLAG_FORCE_LAYOUT;
-        mOldWidthSpec = Integer.MIN_VALUE;
-        if (mParent != null && !mParent.isLayoutRequested()) mParent.requestLayout();
-        else if (mParent == null && mRoot != null) mRoot.requestLayout();
+        boolean first = sRequestingLayout == null;
+        if (first) {
+            megler.ViewRoot r = mRoot;
+            if (r != null && r.isInLayout() && !r.requestLayoutDuringLayout(this)) return;
+            sRequestingLayout = this;
+        }
+        try {
+            mPrivateFlags |= PFLAG_FORCE_LAYOUT;
+            mOldWidthSpec = Integer.MIN_VALUE;
+            if (mParent != null && !mParent.isLayoutRequested()) mParent.requestLayout();
+            else if (mParent == null && mRoot != null) mRoot.requestLayout();
+        } finally {
+            if (first) sRequestingLayout = null;
+        }
+    }
+    /** For megler.ViewRoot's second layout pass: whether this view still asks for layout. */
+    public final boolean meglerLayoutForced() { return (mPrivateFlags & PFLAG_FORCE_LAYOUT) != 0; }
+    /** ... its request and its parents' taken back (those that still ask), so that asking again goes up to the window. */
+    public final void meglerUnforceLayoutUp() {
+        for (View v = this; v != null && (v.mPrivateFlags & PFLAG_FORCE_LAYOUT) != 0; v = v.mParent instanceof View ? (View) v.mParent : null)
+            v.mPrivateFlags &= ~PFLAG_FORCE_LAYOUT;
     }
     public void forceLayout() { mPrivateFlags |= PFLAG_FORCE_LAYOUT; mOldWidthSpec = Integer.MIN_VALUE; }
     public void addOnLayoutChangeListener(OnLayoutChangeListener l) { if (mOnLayoutChange == null) mOnLayoutChange = new ArrayList<>(); mOnLayoutChange.add(l); }
