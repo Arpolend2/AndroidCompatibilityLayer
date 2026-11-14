@@ -712,6 +712,56 @@ public class Main extends Activity {
             detail = "calls=" + afterLeaf + " child=" + child + " target=" + target;
             return afterLeaf == 1 && child && target;
         });
+        // A view's own invalidate() is not what the framework calls where Android calls its hidden invalidate(boolean): as a
+        // child is added to a group or removed, as a view is enabled, selected, padded, clipped, given a background or laid
+        // out. Telegram's UndoView invalidates two of its fields in its invalidate(), and its constructor sets them after its
+        // first addView: the Profile screen ended there. An app's own call, and a posted one, still reach it.
+        step("invalidate-override", () -> {
+            final int[] calls = new int[1];
+            android.widget.FrameLayout group = new android.widget.FrameLayout(this) {
+                @Override public void invalidate() { calls[0]++; super.invalidate(); }
+            };
+            android.view.View child = new android.view.View(this) {
+                @Override public void invalidate() { calls[0]++; super.invalidate(); }
+            };
+            group.addView(child, new android.widget.FrameLayout.LayoutParams(10, 10));
+            int added = calls[0];
+            group.setPadding(1, 2, 3, 4);
+            group.setEnabled(false);
+            group.setSelected(true);
+            group.setActivated(true);
+            group.setClipChildren(false);
+            group.setClipToPadding(false);
+            group.setBackground(new android.graphics.drawable.ColorDrawable(0xff102030));
+            group.setBackgroundColor(0xff405060);
+            group.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null);
+            group.setClipToOutline(true);
+            group.invalidateOutline();
+            group.setClipBounds(new android.graphics.Rect(0, 0, 5, 5));
+            child.setEnabled(false);
+            child.setPadding(1, 1, 1, 1);
+            int set = calls[0] - added;
+            group.measure(android.view.View.MeasureSpec.makeMeasureSpec(40, android.view.View.MeasureSpec.EXACTLY),
+                android.view.View.MeasureSpec.makeMeasureSpec(40, android.view.View.MeasureSpec.EXACTLY));
+            group.layout(0, 0, 40, 40);
+            int laid = calls[0] - added - set;
+            group.removeView(child);
+            group.addView(child);
+            group.removeViewAt(0);
+            group.addView(child, 0);
+            group.removeViews(0, 1);
+            group.addView(child);
+            group.removeAllViews();
+            int removed = calls[0] - added - set - laid;
+            // The hidden one itself, as the framework calls it (the SDK an app is built with does not have it: by reflection).
+            android.view.View.class.getMethod("invalidate", boolean.class).invoke(group, true);
+            int hidden =calls[0] - added - set - laid - removed;
+            group.invalidate();
+            child.invalidate();
+            int own = calls[0] - added - set - laid - removed - hidden;
+            detail = "added " + added + " set " + set + " laid " + laid + " removed " + removed + " hidden " + hidden + " own " + own;
+            return added == 0 && set == 0 && laid == 0 && removed == 0 && hidden == 0 && own == 2;
+        });
         // An image matrix set before the view is laid out, then the scale type made MATRIX, as Material's FloatingActionButton
         // does as it is made: once laid out, the view draws by that matrix.
         step("image-matrix-before-layout", () -> {

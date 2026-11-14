@@ -563,7 +563,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
         return false;
     }
     public boolean isEnabled() { return mEnabled; }
-    public void setEnabled(boolean e) { if (mEnabled != e) { mEnabled = e; refreshDrawableState(); invalidate(); if (!e) cancelPendingInputEvents(); } }
+    public void setEnabled(boolean e) { if (mEnabled != e) { mEnabled = e; refreshDrawableState(); invalidate(true); if (!e) cancelPendingInputEvents(); } }
     public boolean isClickable() { return mClickable; }
     public void setClickable(boolean c) { mClickable = c; }
     public boolean isLongClickable() { return mLongClickable; }
@@ -581,14 +581,14 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
     public void setSelected(boolean s) {
         if (s == isSelected()) return;
         if (s) mPrivateFlags |= PFLAG_SELECTED; else mPrivateFlags &= ~PFLAG_SELECTED;
-        invalidate(); refreshDrawableState(); dispatchSetSelected(s);
+        invalidate(true); refreshDrawableState(); dispatchSetSelected(s);
     }
     protected void dispatchSetSelected(boolean s) {}
     public boolean isActivated() { return (mPrivateFlags & PFLAG_ACTIVATED) != 0; }
     public void setActivated(boolean a) {
         if (a == isActivated()) return;
         if (a) mPrivateFlags |= PFLAG_ACTIVATED; else mPrivateFlags &= ~PFLAG_ACTIVATED;
-        invalidate(); refreshDrawableState(); dispatchSetActivated(a);
+        invalidate(true); refreshDrawableState(); dispatchSetActivated(a);
     }
     protected void dispatchSetActivated(boolean a) {}
     public boolean isHovered() { return (mPrivateFlags & PFLAG_HOVERED) != 0; }
@@ -655,8 +655,8 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
     public boolean dispatchNestedPreFling(float vx, float vy) { return false; }
     public int getLayerType() { return mLayerType; }
     // (The layer, its paint, the clip bounds and the outline's clip are put on by drawFromParent: in the parent's list.)
-    public void setLayerType(int t, Paint p) { mLayerType = t; mLayerPaint = p; invalidate(); invalidateParent(); }
-    public void setLayerPaint(Paint p) { mLayerPaint = p; invalidate(); invalidateParent(); }
+    public void setLayerType(int t, Paint p) { mLayerType = t; mLayerPaint = p; invalidate(true); invalidateParent(); }
+    public void setLayerPaint(Paint p) { mLayerPaint = p; invalidate(true); invalidateParent(); }
     public void buildLayer() {}
     public void setDrawingCacheEnabled(boolean e) {}
     public boolean isDrawingCacheEnabled() { return false; }
@@ -812,10 +812,10 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
             mBackground.setCallback(this);
         }
         requestLayout();
-        invalidate();
+        invalidate(true);
     }
     public void setBackgroundColor(int c) {
-        if (mBackground instanceof android.graphics.drawable.ColorDrawable) { ((android.graphics.drawable.ColorDrawable) mBackground.mutate()).setColor(c); invalidate(); }
+        if (mBackground instanceof android.graphics.drawable.ColorDrawable) { ((android.graphics.drawable.ColorDrawable) mBackground.mutate()).setColor(c); invalidate(true); }
         else setBackground(new android.graphics.drawable.ColorDrawable(c));
     }
     public void setBackgroundResource(int id) { setBackground(id == 0 ? null : mContext.getDrawable(id)); }
@@ -830,7 +830,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
             if (mBackgroundTint != null) mBackground.setTintList(mBackgroundTint);
             if (mBackgroundTintMode != null) mBackground.setTintMode(mBackgroundTintMode);
             if (mBackground.isStateful()) mBackground.setState(getDrawableState());
-            invalidate();
+            invalidate(true);
         }
     }
     public Drawable getForeground() { return mForeground; }
@@ -841,7 +841,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
         invalidate();
     }
     public int getForegroundGravity() { return mForegroundGravity; }
-    public void setForegroundGravity(int g) { mForegroundGravity = g; invalidate(); }
+    public void setForegroundGravity(int g) { mForegroundGravity = g; invalidate(true); }
     public void setForegroundTintList(ColorStateList t) { if (mForeground != null) mForeground.setTintList(t); }
 
     // ---- padding
@@ -854,7 +854,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
     private void meglerSetPadding(int l, int t, int r, int b) {
         if (mPaddingLeft != l || mPaddingTop != t || mPaddingRight != r || mPaddingBottom != b) {
             mPaddingLeft = l; mPaddingTop = t; mPaddingRight = r; mPaddingBottom = b;
-            requestLayout(); invalidate();
+            requestLayout(); invalidate(true);
         }
     }
     public int getPaddingLeft() { return mPaddingLeft; }
@@ -878,7 +878,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
     public final void setRight(int r) { if (r != mRight) { int ow = getWidth(); invalidateParent(); mRight = r; sizeChange(getWidth(), getHeight(), ow, getHeight()); } }
     public final void setBottom(int b) { if (b != mBottom) { int oh = getHeight(); invalidateParent(); mBottom = b; sizeChange(getWidth(), getHeight(), getWidth(), oh); } }
     public void setLeftTopRightBottom(int l, int t, int r, int b) { setFrame(l, t, r, b); }
-    private void sizeChange(int w, int h, int ow, int oh) { mMatrixDirty = true; onSizeChanged(w, h, ow, oh); if (mBackground != null) mBackground.setBounds(0, 0, w, h); invalidate(); }
+    private void sizeChange(int w, int h, int ow, int oh) { mMatrixDirty = true; onSizeChanged(w, h, ow, oh); if (mBackground != null) mBackground.setBounds(0, 0, w, h); invalidate(true); }
     public float getX() { return mLeft + mTranslationX; }
     public float getY() { return mTop + mTranslationY; }
     public float getZ() { return mElevation + mTranslationZ; }
@@ -964,14 +964,14 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
     public void getLocationInSurface(int[] out) { getLocationInWindow(out); }
     public void getWindowVisibleDisplayFrame(Rect r) { if (mRoot != null) mRoot.visibleDisplayFrame(r); else r.set(0, 0, megler.Native.screenWidth(), megler.Native.screenHeight()); }
     public void getWindowDisplayFrame(Rect r) { getWindowVisibleDisplayFrame(r); }
-    public void setClipBounds(Rect r) { mClipBounds = r == null ? null : new Rect(r); invalidate(); invalidateParent(); }
+    public void setClipBounds(Rect r) { mClipBounds = r == null ? null : new Rect(r); invalidate(true); invalidateParent(); }
     public Rect getClipBounds() { return mClipBounds == null ? null : new Rect(mClipBounds); }
     public boolean getClipBounds(Rect out) { if (mClipBounds == null) return false; out.set(mClipBounds); return true; }
-    public void setClipToOutline(boolean c) { if (c) mPrivateFlags |= PFLAG_CLIP_TO_OUTLINE; else mPrivateFlags &= ~PFLAG_CLIP_TO_OUTLINE; invalidate(); invalidateParent(); }
+    public void setClipToOutline(boolean c) { if (c) mPrivateFlags |= PFLAG_CLIP_TO_OUTLINE; else mPrivateFlags &= ~PFLAG_CLIP_TO_OUTLINE; invalidate(true); invalidateParent(); }
     public final boolean getClipToOutline() { return (mPrivateFlags & PFLAG_CLIP_TO_OUTLINE) != 0; }
     public void setOutlineProvider(ViewOutlineProvider p) { mOutlineProvider = p; invalidateOutline(); }
     public ViewOutlineProvider getOutlineProvider() { return mOutlineProvider; }
-    public void invalidateOutline() { invalidate(); invalidateParent(); }
+    public void invalidateOutline() { invalidate(true); invalidateParent(); }
     public void setOutlineAmbientShadowColor(int c) {}
     public void setOutlineSpotShadowColor(int c) {}
     public float getElevation() { return mElevation; }
@@ -1196,6 +1196,14 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
         if (!meglerDefer()) meglerDirty(0, 0, getWidth(), getHeight(), true);
     }
     public void invalidate() { invalidateMegler(); }
+    /*
+     * Android's hidden invalidate(boolean), which is what the framework itself calls where a view's state changes under it --
+     * a group as a child is added or removed, a view enabled, selected, padded, clipped, given a background or a size -- and
+     * so what this framework calls there too: not the public invalidate(), which an app's view may have a method of its own
+     * for. Telegram's UndoView has one that invalidates two of its fields, which its constructor sets after its first
+     * addView: here addView called it, and the Profile screen ended there (NullPointerException in UndoView.invalidate).
+     */
+    public void invalidate(boolean invalidateCache) { invalidateMegler(); }
     public void invalidate(Rect dirty) {
         if (dirty == null) invalidateMegler();
         else meglerInvalidate(dirty.left, dirty.top, dirty.right, dirty.bottom);
@@ -1249,7 +1257,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
     final void meglerInvalidateQuietly() {
         boolean was = sQuiet;
         sQuiet = true;
-        try { invalidate(); } finally { sQuiet = was; }
+        try { invalidateMegler(); } finally { sQuiet = was; }
     }
     private static final java.util.concurrent.ConcurrentHashMap<Class<?>, Boolean> sOwnsDescendantInvalidated = new java.util.concurrent.ConcurrentHashMap<>();
     static boolean ownsDescendantInvalidated(Class<?> c) {
@@ -2245,7 +2253,6 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
     protected void initializeScrollbars(android.content.res.TypedArray p0) {}
     protected void initializeScrollbarsInternal(android.content.res.TypedArray p0) {}
     protected void internalSetPadding(int p0, int p1, int p2, int p3) {}
-    public void invalidate(boolean p0) {}
     protected void invalidateParentCaches() {}
     protected void invalidateParentIfNeeded() {}
     protected void invalidateParentIfNeededAndWasQuickRejected() {}
@@ -2394,14 +2401,14 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
         if (effect == mRenderEffect) return;
         mRenderEffect = effect;
         invalidateParent();
-        invalidate();
+        invalidate(true);
     }
     public void setRequestedFrameRate(float p0) { meglerFill = megler.Fill.put(meglerFill, "RequestedFrameRate", Float.valueOf(p0)); }
     /** A circle the view is drawn clipped to (drawFromParent), as Android's RevealAnimator sets one (ViewAnimationUtils, overlaid). */
     public void setRevealClip(boolean clip, float x, float y, float radius) {
         if (!clip && mRevealClip == null) return;
         mRevealClip = clip ? new float[] { x, y, Math.max(0, radius) } : null;
-        invalidate();
+        invalidate(true);
         invalidateParent();
     }
     public void setScrollBarDefaultDelayBeforeFade(int p0) { meglerFill = megler.Fill.put(meglerFill, "ScrollBarDefaultDelayBeforeFade", Integer.valueOf(p0)); }

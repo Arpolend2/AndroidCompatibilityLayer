@@ -184,7 +184,7 @@ public abstract class ViewGroup extends View implements ViewParent, ViewManager 
     public void addView(View v, LayoutParams p) { addView(v, -1, p); }
     public void addView(View v, int index, LayoutParams p) {
         requestLayout();
-        invalidate();
+        invalidate(true); // (not the overridable invalidate(): see View.invalidate(boolean))
         addViewInner(v, index, p, false);
     }
     protected boolean addViewInLayout(View v, int index, LayoutParams p) { return addViewInLayout(v, index, p, false); }
@@ -236,12 +236,12 @@ public abstract class ViewGroup extends View implements ViewParent, ViewManager 
         mChildren[--mChildrenCount] = null;
         meglerListInvalid();
     }
-    public void removeView(View v) { int i = indexOfChild(v); if (i >= 0) { removeViewInternal(i); requestLayout(); invalidate(); } }
+    public void removeView(View v) { int i = indexOfChild(v); if (i >= 0) { removeViewInternal(i); requestLayout(); invalidate(true); } }
     public void removeViewInLayout(View v) { int i = indexOfChild(v); if (i >= 0) removeViewInternal(i); }
     public void removeViewsInLayout(int start, int count) { for (int i = start + count - 1; i >= start; i--) removeViewInternal(i); }
-    public void removeViewAt(int index) { removeViewInternal(index); requestLayout(); invalidate(); }
-    public void removeViews(int start, int count) { for (int i = start + count - 1; i >= start; i--) removeViewInternal(i); requestLayout(); invalidate(); }
-    public void removeAllViews() { removeAllViewsInLayout(); requestLayout(); invalidate(); }
+    public void removeViewAt(int index) { removeViewInternal(index); requestLayout(); invalidate(true); }
+    public void removeViews(int start, int count) { for (int i = start + count - 1; i >= start; i--) removeViewInternal(i); requestLayout(); invalidate(true); }
+    public void removeAllViews() { removeAllViewsInLayout(); requestLayout(); invalidate(true); }
     public void removeAllViewsInLayout() { for (int i = mChildrenCount - 1; i >= 0; i--) removeViewInternal(i); }
     private void removeViewInternal(int index) {
         View v = mChildren[index];
@@ -448,8 +448,8 @@ public abstract class ViewGroup extends View implements ViewParent, ViewManager 
     @Override protected abstract void onLayout(boolean changed, int l, int t, int r, int b);
     @Override public void requestLayout() { super.requestLayout(); }
     public void requestTransparentRegion(View child) {}
-    public void invalidateChild(View child, Rect r) { invalidate(); }
-    public ViewParent invalidateChildInParent(int[] loc, Rect r) { invalidate(); return null; }
+    public void invalidateChild(View child, Rect r) { invalidate(true); }
+    public ViewParent invalidateChildInParent(int[] loc, Rect r) { invalidate(true); return null; }
     public void recomputeViewAttributes(View child) {}
     public boolean getChildVisibleRect(View child, Rect r, Point offset) { return true; }
     public void focusableViewAvailable(View v) {}
@@ -477,7 +477,7 @@ public abstract class ViewGroup extends View implements ViewParent, ViewManager 
     public void createContextMenu(ContextMenu m) {}
     public boolean onRequestSendAccessibilityEvent(View child, android.view.accessibility.AccessibilityEvent e) { return true; }
     public CharSequence getAccessibilityClassName() { return ViewGroup.class.getName(); }
-    public void setClipChildren(boolean c) { mClipChildren = c; invalidate(); }
+    public void setClipChildren(boolean c) { mClipChildren = c; invalidate(true); }
     /*
      * A descendant's drawing changed though it invalidated nothing: Compose's graphics layers change their properties -- an
      * alpha, a translation, a scale -- and tell the view's parent so (RenderNodeLayer.triggerRepaint). A layer drawn as a
@@ -495,7 +495,7 @@ public abstract class ViewGroup extends View implements ViewParent, ViewManager 
         View.meglerTellParents(this, v);
     }
     public boolean getClipChildren() { return mClipChildren; }
-    public void setClipToPadding(boolean c) { mClipToPadding = c; invalidate(); }
+    public void setClipToPadding(boolean c) { mClipToPadding = c; invalidate(true); }
     public boolean getClipToPadding() { return mClipToPadding; }
     public int getDescendantFocusability() { return mDescendantFocusability; }
     public void setDescendantFocusability(int f) { mDescendantFocusability = f; }
