@@ -1383,6 +1383,38 @@ public class Main extends Activity {
             detail = "focused=" + focused + " hidden=" + hidden + " shown=" + shown + " closed=" + closed + " gone=" + gone;
             return focused && hidden && shown && gone;
         });
+        // The zoom buttons' controller, which Chromium's WebView makes for a WebView with the built-in zoom and reaches into at
+        // once and at every scroll of its page (AwZoomControls: getZoomControls().getLayoutParams(), .setVisibility(GONE)): its
+        // container and its controls are there, the controls in the container with a FrameLayout's parameters, and hidden when
+        // told; the buttons themselves never come up, and the listener hears nothing (android.widget.ZoomButtonsController,
+        // overlaid). Both answered null, and Royal Revolt 2 ended in the WebView's fatal error when its news page was laid out.
+        step("zoom-buttons", () -> {
+            android.widget.ZoomButtonsController zoom = new android.widget.ZoomButtonsController(new android.view.View(this));
+            final boolean[] told = { false };
+            zoom.setOnZoomListener(new android.widget.ZoomButtonsController.OnZoomListener() {
+                @Override public void onVisibilityChanged(boolean visible) { told[0] = true; }
+                @Override public void onZoom(boolean zoomIn) { told[0] = true; }
+            });
+            android.view.View controls = zoom.getZoomControls();
+            android.view.ViewGroup container = zoom.getContainer();
+            boolean made = controls != null && container != null && controls.getParent() == container && controls == zoom.getZoomControls();
+            boolean params = made && controls.getLayoutParams() instanceof android.widget.FrameLayout.LayoutParams;
+            if (params) ((android.widget.FrameLayout.LayoutParams) controls.getLayoutParams()).gravity = android.view.Gravity.RIGHT;
+            if (made) controls.setVisibility(android.view.View.GONE);
+            zoom.setZoomInEnabled(false);
+            zoom.setZoomOutEnabled(true);
+            zoom.setZoomSpeed(100);
+            zoom.setFocusable(true);
+            zoom.setAutoDismissed(false);
+            zoom.setVisible(true);
+            boolean hidden = made && controls.getVisibility() == android.view.View.GONE && !zoom.isVisible() && !told[0] && !zoom.isAutoDismissed();
+            // And one made of no view at all has nothing to make them of: null, and the setters are no errors.
+            android.widget.ZoomButtonsController none = new android.widget.ZoomButtonsController(null);
+            none.setZoomInEnabled(true);
+            boolean empty = none.getZoomControls() == null && none.getContainer() == null && !none.isVisible();
+            detail = "made=" + made + " params=" + params + " hidden=" + hidden + " empty=" + empty;
+            return made && params && hidden && empty;
+        });
         // Android 14's ZipPathValidator, which OsmAnd clears as it starts: there, and a ZIP entry named with ".." still reads.
         step("zip-path-validator", () -> {
             Class<?> v = Class.forName("dalvik.system.ZipPathValidator");
