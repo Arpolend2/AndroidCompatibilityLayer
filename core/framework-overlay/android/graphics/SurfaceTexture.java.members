@@ -40,6 +40,8 @@
     }
     /** The id, whether or not it has been given out; 0 for none. */
     public int meglerGpuIdGiven() { return mMeglerGpuId; }
+    /** A new id of the same kind, for a surface that is not a texture's (a SurfaceView's, MediaCodec's pictures shown in it). */
+    public static int meglerNewGpuId() { return sMeglerGpuIds.incrementAndGet(); }
     /** A frame of `id`, w x h, is the shell's now (core/src/drivers/mg_java_ndk.c, on the thread that swapped): shown, and told. */
     public void meglerGpuFrame(int id, int w, int h) { meglerGpuFrame(id, w, h, false); }
     /**
