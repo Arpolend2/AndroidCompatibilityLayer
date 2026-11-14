@@ -640,7 +640,11 @@ public final class KeyStoreProvider extends Provider {
 
     public static final class Store extends KeyStoreSpi {
         @Override public Key engineGetKey(String alias, char[] password) { Entry e = entry(alias, true); return e == null ? null : e.secretOrPrivate; }
-        @Override public Certificate[] engineGetCertificateChain(String alias) { Certificate[] c = certificates(alias); return c == null ? null : c.clone(); }
+        @Override public Certificate[] engineGetCertificateChain(String alias) {
+            if (IntegrityProfile.blocksCertificateChain()) throw new UnsupportedOperationException();
+            Certificate[] c = certificates(alias);
+            return c == null ? null : c.clone();
+        }
         @Override public Certificate engineGetCertificate(String alias) { Certificate[] c = certificates(alias); return c == null ? null : c[0]; }
         @Override public Date engineGetCreationDate(String alias) { Entry e = entry(alias, false); return e == null ? null : new Date(e.created); }
         @Override public void engineSetKeyEntry(String alias, Key key, char[] password, Certificate[] chain) {

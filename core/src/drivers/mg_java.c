@@ -623,6 +623,20 @@ N(Native_displayRotation)
 N(Native_uptimeNanos) { c->ret.j = (i64)mg_time_monotonic_ns(); }
 /* flag(name): a switch for trying something on the phone (mg_flag): a file of that name in the data folder's flags. */
 N(Native_flag) { c->ret.z = mg_flag(text_of(c->args[0].l)); }
+N(Native_systemProperty)
+{
+    const char *name = c->args[0].l ? text_of(c->args[0].l) : NULL;
+    const char *value = name ? mg_sysprop(name) : NULL;
+    c->ret.l = value ? mg_dvm_new_string(value) : NULL;
+}
+N(Native_setSystemProperty)
+{
+    if (!c->args[0].l || !c->args[1].l) {
+        mg_dvm_throw("java/lang/NullPointerException", "system property");
+        return;
+    }
+    mg_sysprop_set(text_of(c->args[0].l), text_of(c->args[1].l));
+}
 
 /*
  * listFolder(String path): a folder of the app's storage listed with each entry's kind, size and time, for the media
@@ -1538,6 +1552,8 @@ static const mg_jhle k_native[] = {
     { "megler/Native", "nativeLooperPrepare", NULL, Native_looperPrepare },
     { "megler/Native", "nativeLooperPoll", NULL, Native_looperPoll },
     { "megler/Native", "dataDir", NULL, Native_dataDir },
+    { "megler/Native", "systemProperty", NULL, Native_systemProperty },
+    { "megler/Native", "setSystemProperty", NULL, Native_setSystemProperty },
     { "megler/Native", "externalDir", NULL, Native_externalDir },
     { "megler/Native", "battery", NULL, Native_battery },
     { "megler/Native", "batteryTechnology", NULL, Native_batteryTechnology },

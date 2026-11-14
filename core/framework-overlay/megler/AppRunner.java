@@ -150,6 +150,7 @@ public final class AppRunner {
         Native.mainStarted();
         android.webkit.MimeTypeMap.meglerInstallDefault();
         KeyStoreProvider.install();
+        IntegrityProfile.install();
         Looper.prepareMainLooper();
         sHandler = new Handler(Looper.getMainLooper());
         /* as RuntimeInit: every exception nothing caught is logged before any handler has it (its LoggingHandler, the pre-handler

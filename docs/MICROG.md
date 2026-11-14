@@ -838,17 +838,75 @@ AppCertManager's `device_key` is the response from Google's
 One does not supply the other. Neither inspected project's code
 demonstrates a successful device-key exchange inside Megler.
 
-The current draft records the assessment. A runtime integration remains
-an experiment: Zygisk process isolation and keystore Binder hooks would
-need counterparts at Megler's hosted-service and provider boundaries.
-A global fingerprint change would also alter the client app, and an
-attestation chain with rewritten boot claims would require validation
-beyond parsing its X.509 structure. Before retaining a port, compare a
-fresh `devicekey` request with and without one mechanism, then verify
-an HTTP success, a stored key loaded at the next start and a Google
-network-location result. The earlier native Cronet control on Android
-also returned HTTP 400, so that response alone cannot identify a
-Megler-specific API defect.
+The draft now implements PlayIntegrityFork's three default mechanisms as
+an opt-in `megler.IntegrityProfile`, applied before `Application.onCreate`.
+It reads the first existing file in the Android app's internal data directory
+(`Native.dataDir()`, the directory returned by `Context.getDataDir()`):
+`custom.pif.prop`, `custom.pif.json`, `pif.prop`, then `pif.json`.
+For Transit in its Windows package, this is
+`LocalState\apps\com.thetransitapp.droid\data\custom.pif.prop`.
+A profile belongs to the client app hosting GMS; a profile in a separate
+GMS app's data directory does not configure Transit. Restart the client
+process after installing, changing or removing it.
+
+The UTF-8 property format accepts `name=value` lines, blank lines and `#`
+comments. JSON accepts an object with string or scalar values. Files are
+limited to 64 KiB. The three switches default to `1` when a file exists:
+
+```properties
+spoofBuild=1
+spoofProps=1
+spoofProvider=1
+# Add the chosen profile's Build fields and explicit system properties here.
+# DEVICE_INITIAL_SDK_INT=25
+# ro.board.first_api_level=25
+```
+
+`spoofBuild` applies named scalar fields of `Build` or `Build.VERSION`
+using their declared types. `spoofProps` applies explicit property names
+containing a dot to both Java `SystemProperties` and Megler's native
+property table, which serves bionic's property get/read/callback APIs.
+When both switches are enabled, common Build identity fields are also
+mirrored to their corresponding properties; explicit property entries
+win over those inferred values. Property values must fit 91 UTF-8 bytes.
+Unknown Build fields, invalid field types and unsupported options reject
+the profile before it is applied. Empty values are ignored.
+
+`spoofProvider` makes `AndroidKeyStore.getCertificateChain` throw
+`UnsupportedOperationException` when a class name in the calling stack
+contains `droidguard`, case-insensitively, as in the upstream wrapper.
+Other callers keep their ordinary certificate chains. It does not change
+challenged key generation, generate an attestation chain, or obtain a
+Google device key. With no profile, all three mechanisms are inactive.
+The startup log reports field/property counts and whether the chain block
+is enabled, without logging profile values.
+
+There is one significant scope difference from Zygisk: Build fields and
+system properties affect the entire opted-in app process, including its
+client code, because Megler hosts GMS in that same process. The provider
+exception is restricted by the caller's stack. This draft does not
+implement wildcard properties, `spoofSignature`, `spoofVendingSdk` or
+`spoofVendingFinger`; enabling those optional upstream modes rejects the
+profile. It supplies no fingerprint and downloads no replacement profile.
+It does not install or execute the module's root scripts or native hooks.
+
+The data test app covers missing configuration, property and JSON parsing,
+typed fields, Java/native property agreement, the scoped chain exception,
+invalid input preserving the previous values, and disabled modes. These
+checks establish local behaviour. To establish usefulness for devicekey,
+compare a fresh request with and without a chosen profile, then verify an
+HTTP success, a stored key loaded at the next start and a Google
+network-location result. The earlier native Cronet control on Android also
+returned HTTP 400, so that response alone cannot identify a Megler-specific
+API defect. No successful server exchange with this profile has yet been
+observed.
+
+Validation (2026-11-15): `tools/build-tests.sh arm` and
+`tools/build-tests.sh win`, with the shared heavy-build lock and
+`MEGLER_JOBS=4`, each completed with 33 result groups and zero failed
+checks. ARM's main passes reported 9187 and 9346 checks; Windows's 8614
+and 8736. Both data-app runs passed `integrity-profile`; the Windows run
+included the cached ANGLE build.
 
 **Following it on a phone** (flags in `Pictures\Megler\diag\<package>\flags`):
 `trace-syscalls` (a library's calls by number with the path each names:
