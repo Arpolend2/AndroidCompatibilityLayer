@@ -280,11 +280,14 @@ bool gpuWanted() {
 }
 
 /// Whether a decoder's own calls (Media Foundation's, which use the device's immediate context for its DXVA work) are made
-/// under GfxHost's lock, as everything of this file's own that uses the context is: unless the flag file codec-gpu-unlocked
-/// is in LocalState\flags, which leaves them to the device's multithread protection alone, so that Direct2D's drawing
-/// does not wait for a decode -- to compare.
+/// under GfxHost's lock, as everything of this file's own that uses the context is (the video processor, read-backs): only
+/// with the flag file codec-gpu-locked in LocalState\flags, to compare. Otherwise they are left to the device's
+/// multithread protection alone -- the video context's calls change none of the pipeline's state that Direct2D keeps --,
+/// so that Direct2D's drawing does not wait for a decode. Under the lock a 1080p H.264 decode held it 3 to 4 s of every
+/// 5 s on an HP Elite x3, and every app's drawing waited: YouTube showed some 4 pictures a second, its render thread
+/// 123 ms drawing a frame's lists where it took 15 to 50 without (the flag codec-gpu-unlocked then, 0.1.0.704).
 bool lockDecoderCalls() {
-    static const bool locked = !files::exists(platform::localStateDirectory() + L"\\flags\\codec-gpu-unlocked");
+    static const bool locked = files::exists(platform::localStateDirectory() + L"\\flags\\codec-gpu-locked");
     return locked;
 }
 
@@ -1149,8 +1152,8 @@ struct CodecHost::Codec {
         return false;
     }
 
-    /// Every 5 s of decoding, a line of what the time went to: the decoder's calls (under GfxHost's lock, or not: the flag
-    /// codec-gpu-unlocked), and the video processor's turning its pictures into colour; where a picture decoder's time goes
+    /// Every 5 s of decoding, a line of what the time went to: the decoder's calls (not under GfxHost's lock, or under it: the
+    /// flag codec-gpu-locked), and the video processor's turning its pictures into colour; where a picture decoder's time goes
     /// is where an app's drawing waits.
     void sayTimes() {
         const uint64_t now = nowNs();
