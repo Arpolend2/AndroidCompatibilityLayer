@@ -12,10 +12,12 @@
 #       as they are, as desktop Windows' core does (docs/DESKTOP.md) -- the
 #       guest linker's ELF64 and RELA, the x86 patcher, System V's native calls
 #       -- with gdb at hand. Run as the arm build is: the tests, again on
-#       Android's libcore (build/android9/root-x86_64, with x86_64's natives),
-#       the bundles; not the Java test apps, whose native libraries are
-#       armeabi-v7a's. Objects go to ~/megler-build-x64 (MEGLER_WSL_BUILD's
-#       folder with -x64 after its name).
+#       Android's libcore (build/android9/root-x86_64, with x86_64's natives).
+#       Not the bundles, whose tests choose 32-bit ARM's splits and this build
+#       keeps its own processor's (as arm64 below), nor the Java test apps,
+#       whose native libraries are armeabi-v7a's. Objects go to
+#       ~/megler-build-x64 (MEGLER_WSL_BUILD's folder with -x64 after its
+#       name).
 #   tools/build-tests.sh arm64 [--no-run] [--no-libcore] [-- extra arguments for mg_tests]
 #       ARM64's, with no ARM64 machine: the same core and tests compiled by
 #       clang for Android's own aarch64 ABI against the NDK's bionic
@@ -107,7 +109,7 @@
 #       and which folders of the apps' APKs in the shared folder an installed
 #       package reads and which go (SharedApks.cpp).
 #
-# Both builds unpack bundles of split APKs as the shell does (mg_tests
+# The arm and win builds unpack bundles of split APKs as the shell does (mg_tests
 # --bundles, core/tests/mg_bundle_tests.c): the test app `splits` as an .apks
 # and an .xapk (build/guest/java, made by tools/build-test-app.sh), and the
 # real bundles that are in build/bundles, which are not in the repository
@@ -408,8 +410,6 @@ EOF
       # The folder is copied into WSL's own disk: the Windows drive is slow from there, and ICU maps 24 MB of it.
       MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" wsl.exe -- bash -c "mkdir -p $WB/android-root && cp -ru '$WROOT/build/android9/root-x86_64/.' $WB/android-root/ && rm -rf $WB/scratch && $WB/mg_tests '$WROOT/build/guest/x86_64' $WB/scratch $DVM --dvm-android $WB/android-root ${EXTRA[*]:-} 2>&1" || STATUS=1
     fi
-    # Bundles of split APKs, unpacked as the shell unpacks them.
-    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" wsl.exe -- bash -c "rm -rf $WB/scratch-bundles && $WB/mg_tests --bundles '$WROOT/build/guest/java' $WB/scratch-bundles '$WROOT/build/bundles' 2>&1; STATUS=\$?; rm -rf $WB/scratch-bundles; exit \$STATUS" || STATUS=1
   fi
 elif [ "$MODE" = arm64 ]; then
   NDK="${MEGLER_NDK:-/c/Users/User/Documents/android-ndk-r21e}"
