@@ -3744,6 +3744,9 @@ static int run_data(void)
                                          /* And a context's setTheme puts the new style onto the theme it has made, the same object, so
                                             what took the theme before sees the switch (YouTube's dark theme). */
                                          "theme-switch",
+                                         /* And Choreographer's vsync callbacks are called at the next frame with its data, and one removed
+                                            is not (YouTube's watch page waited for one for ever). */
+                                         "vsync-callback",
                                          /* And PrecomputedText is the text it was made of -- characters, spans, paragraphs and the parameters
                                             it was made with -- so a SpannableString of one keeps the spans, and a TextView shows it (Ozon's
                                             chat). */

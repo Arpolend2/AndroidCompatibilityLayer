@@ -7245,6 +7245,40 @@ public class Main extends Activity {
             Log.i("DataTest", "theme-switch " + detail);
             return (first == 0xFF111111 || first == 0xFF222222) && second == 0xFF333333 && same && again;
         });
+        // Choreographer's vsync callbacks (Android 13) are called at the next frame, on the choreographer's looper, with the
+        // frame's data; one removed before its frame is not. They were signatures alone, and YouTube's watch page, which waits
+        // for one, left the panel under its player empty and its controls hidden.
+        step("vsync-callback", () -> {
+            final android.os.HandlerThread ht = new android.os.HandlerThread("vsync");
+            ht.start();
+            final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+            final Object[] got = new Object[6];
+            new android.os.Handler(ht.getLooper()).post(() -> {
+                final android.view.Choreographer c = android.view.Choreographer.getInstance();
+                got[0] = c.getLooper() == ht.getLooper();
+                android.view.Choreographer.VsyncCallback removed = data -> got[1] = "called";
+                c.postVsyncCallback(removed);
+                c.removeVsyncCallback(removed);
+                c.postVsyncCallback(data -> {
+                    android.view.Choreographer.FrameTimeline t = data.getPreferredFrameTimeline();
+                    android.view.Choreographer.FrameTimeline[] all = data.getFrameTimelines();
+                    got[2] = data.getFrameTimeNanos() > 0 && data.getFrameTimeNanos() == c.getFrameTimeNanos();
+                    got[3] = t != null && all != null && all.length >= 1 && all[0] == t && t.getVsyncId() > 0
+                        && t.getExpectedPresentationTimeNanos() > data.getFrameTimeNanos() && t.getDeadlineNanos() > data.getFrameTimeNanos();
+                    got[4] = android.os.Looper.myLooper() == ht.getLooper();
+                    got[5] = c.getLastFrameTimeNanos() == data.getFrameTimeNanos();
+                    done.countDown();
+                });
+            });
+            boolean called = done.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            Thread.sleep(50);
+            ht.quitSafely();
+            detail = "called=" + called + " looper=" + got[0] + " removed=" + (got[1] == null ? "not called" : got[1]) + " data=" + got[2]
+                + " timeline=" + got[3] + " onLooper=" + got[4] + " last=" + got[5];
+            Log.i("DataTest", "vsync-callback " + detail);
+            return called && Boolean.TRUE.equals(got[0]) && got[1] == null && Boolean.TRUE.equals(got[2]) && Boolean.TRUE.equals(got[3])
+                && Boolean.TRUE.equals(got[4]) && Boolean.TRUE.equals(got[5]);
+        });
         // PrecomputedText is the text it was made of: its characters and its spans, its paragraphs (each ends after its line
         // feed) and the parameters a Builder was told. It was signatures alone -- no characters, getSpans null -- so a
         // SpannableString made of one, which androidx's PrecomputedTextCompat hands on as it is from Android 10, ended in a
