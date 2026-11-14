@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Main's step "grid-cells": a grid whose cells leave layout_width or layout_height out, as Android lets a GridLayout's
+     children do: what is left out is wrap_content (YouTube's res/lzI.xml). The third cell says both. -->
+<GridLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:columnCount="2">
+    <TextView
+        android:text="name" />
+    <TextView
+        android:layout_width="40px"
+        android:text="value" />
+    <TextView
+        android:layout_width="30px"
+        android:layout_height="12px"
+        android:text="x" />
+    <TextView
+        android:layout_height="14px"
+        android:layout_columnWeight="1"
+        android:text="y" />
+</GridLayout>

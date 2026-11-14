@@ -3729,6 +3729,9 @@ static int run_data(void)
                                          /* And a table whose rows and cells leave layout_width or layout_height out inflates, with Android's
                                             sizes for what is left out (Device Info HW). */
                                          "table-cells",
+                                         /* And a grid whose cells leave them out inflates: what is left out is wrap_content (YouTube's
+                                            res/lzI.xml). */
+                                         "grid-cells",
                                          /* And PrecomputedText is the text it was made of -- characters, spans, paragraphs and the parameters
                                             it was made with -- so a SpannableString of one keeps the spans, and a TextView shows it (Ozon's
                                             chat). */

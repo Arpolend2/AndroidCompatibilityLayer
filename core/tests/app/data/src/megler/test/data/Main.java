@@ -7072,6 +7072,27 @@ public class Main extends Activity {
                 + " value " + value.getWidth() + "x" + value.getHeight() + " x " + x.getWidth() + "x" + x.getHeight();
             return rows && cells && laid;
         });
+        // A grid whose cells leave layout_width or layout_height out inflates, and what is left out is WRAP_CONTENT
+        // (GridLayout.LayoutParams, setBaseAttributes). It ended in "You must supply a layout_height attribute" (YouTube's
+        // res/lzI.xml, a ViewStub's layout). And it is measured and laid out: each cell has a width and a height.
+        step("grid-cells", () -> {
+            final int wrap = android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
+            android.widget.GridLayout grid = (android.widget.GridLayout) android.view.LayoutInflater.from(this).inflate(R.layout.grid_cells, null);
+            android.view.View name = grid.getChildAt(0), value = grid.getChildAt(1), x = grid.getChildAt(2), y = grid.getChildAt(3);
+            android.view.ViewGroup.LayoutParams p1 = name.getLayoutParams(), p2 = value.getLayoutParams(), p3 = x.getLayoutParams(), p4 = y.getLayoutParams();
+            boolean cells = p1 instanceof android.widget.GridLayout.LayoutParams && p1.width == wrap && p1.height == wrap && p2.width == 40 && p2.height == wrap
+                && p3.width == 30 && p3.height == 12 && p4.width == wrap && p4.height == 14;
+            grid.measure(android.view.View.MeasureSpec.makeMeasureSpec(300, android.view.View.MeasureSpec.EXACTLY), android.view.View.MeasureSpec.makeMeasureSpec(0, android.view.View.MeasureSpec.UNSPECIFIED));
+            grid.layout(0, 0, grid.getMeasuredWidth(), grid.getMeasuredHeight());
+            boolean laid = grid.getWidth() == 300 && grid.getHeight() > 0 && name.getWidth() > 0 && name.getHeight() > 0 && value.getWidth() == 40
+                && value.getHeight() > 0 && x.getWidth() == 30 && x.getHeight() == 12 && y.getWidth() > 0 && y.getHeight() == 14
+                && value.getLeft() >= name.getRight() && x.getTop() >= name.getBottom() && y.getLeft() >= x.getRight() && y.getTop() >= name.getBottom();
+            detail = "cells " + p1.width + "x" + p1.height + " " + p2.width + "x" + p2.height + " " + p3.width + "x" + p3.height + " " + p4.width + "x" + p4.height
+                + ", laid out " + grid.getWidth() + "x" + grid.getHeight() + " name " + name.getWidth() + "x" + name.getHeight() + " value " + value.getWidth() + "x"
+                + value.getHeight() + " at " + value.getLeft() + " x " + x.getWidth() + "x" + x.getHeight() + " at " + x.getLeft() + "," + x.getTop()
+                + " y " + y.getWidth() + "x" + y.getHeight() + " at " + y.getLeft() + "," + y.getTop();
+            return cells && laid;
+        });
         // PrecomputedText is the text it was made of: its characters and its spans, its paragraphs (each ends after its line
         // feed) and the parameters a Builder was told. It was signatures alone -- no characters, getSpans null -- so a
         // SpannableString made of one, which androidx's PrecomputedTextCompat hands on as it is from Android 10, ended in a
