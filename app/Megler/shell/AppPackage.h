@@ -38,8 +38,8 @@ struct SingleApp {
 const SingleApp& single();
 inline bool isSingleApp() { return !single().package.empty(); }
 /// An app's own package: why its app cannot start from what Megler put in the shared folder for it -- Windows gave the package
-/// no shared folder, or its APK or Android's files are not there (or cannot be read), as when the package and Megler are on
-/// different storage, a memory card and the phone's memory, should Windows keep their shared folders apart there -- in words
+/// no shared folder, or its APK or Android's files are not there (or cannot be read); not for where the package and Megler
+/// are, the shared folder being one for a memory card and the phone's memory (shell/Placement.h) -- in words
 /// for its screen, with what to do (placement::missingText, ui/StartScreen.cpp); the app is not opened then. Empty when
 /// nothing is missing, and in Megler. Looked at at the first call, which says it in the log with each folder and its drive.
 const std::string& singleAppProblem();

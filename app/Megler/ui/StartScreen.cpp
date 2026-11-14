@@ -2,8 +2,8 @@
 // as Windows showed it a moment before, in place of Megler's library, which such a package has no use for. AppShell
 // opens the app over it once the library has read the APK (ui/AppShell.cpp, poll).
 //
-// Where what Megler put in the shared folder for the app is not there -- no shared folder, no APK, no Android files, as when
-// the app's package and Megler are on different storage (a memory card and the phone's memory) -- the app is not opened, and
+// Where what Megler put in the shared folder for the app is not there -- no shared folder, no APK, no Android files, whatever
+// took them (not the app's package and Megler being on different storage: shell/Placement.h) -- the app is not opened, and
 // this says why and what to do instead of showing the picture for ever (appPackage::singleAppProblem).
 #include "pch.h"
 

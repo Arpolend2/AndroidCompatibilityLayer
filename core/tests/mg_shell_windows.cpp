@@ -363,18 +363,26 @@ void testMissing(const std::wstring& root) {
     const std::wstring card = root + L"\\missing\\card-shared";
     files::makeDirectories(card);
     check(placement::missingFor(card, card + L"\\apks\\MeglerApp.x\\0123\\app.apk", card + L"\\android\\0.1.0.0") == Missing::apk,
-          "another storage's shared folder, with nothing of Megler's in it");
+          "a shared folder with nothing of Megler's in it");
     for (const Missing missing : {Missing::sharedFolder, Missing::apk, Missing::androidFiles}) {
         const std::string text = placement::missingText(missing, "Telegram", shared, true);
-        check(text.rfind("Telegram can't start: ", 0) == 0 && text.find("Settings › System › Storage") != std::string::npos &&
-                  text.find("install the app again from Megler's Library") != std::string::npos,
-              "its screen says why and what to do: " + text);
+        check(text.rfind("Telegram can't start: ", 0) == 0 && text.find("nstall the app again") != std::string::npos &&
+                  text.find("Moving the app changes nothing of this") != std::string::npos &&
+                  text.find("whether an app is there or on the memory card") != std::string::npos &&
+                  text.find("Apps' Storage") == std::string::npos && text.find("Settings › System › Storage") == std::string::npos &&
+                  text.find("different storage") == std::string::npos,
+              "its screen says what it lacks and what to do, and not to move the app: " + text);
     }
     check(placement::missingText(Missing::nothing, "Telegram", shared, true).empty(), "nothing missing, nothing said");
-    check(placement::missingText(Missing::apk, "Telegram", shared, true).find("Megler's Settings, Apps' Storage") != std::string::npos,
-          "and that Megler's Settings move its apps to where Megler is");
-    check(placement::missingText(Missing::apk, "Telegram", shared, false).find("Settings › Apps") != std::string::npos,
-          "on desktop Windows, the system drive and Settings › Apps");
+    check(placement::missingText(Missing::androidFiles, "Telegram", shared, true).find("install the app again from its Library") != std::string::npos &&
+              placement::missingText(Missing::sharedFolder, "Telegram", shared, true).find("install the app again from its Library") != std::string::npos &&
+              placement::missingText(Missing::apk, "Telegram", shared, true).find("its APK opened with Megler again") != std::string::npos &&
+              placement::missingText(Missing::apk, "Telegram", shared, true).find("from its Library") == std::string::npos,
+          "Android's files come back with an install from the Library; an APK that is gone has to be brought again");
+    const std::string onPc = placement::missingText(Missing::apk, "Telegram", shared, false);
+    check(onPc.find("whichever drive an app is on") != std::string::npos && onPc.find("memory card") == std::string::npos &&
+              onPc.find("phone") == std::string::npos,
+          "on desktop Windows, drives, and no phone or memory card: " + onPc);
     // What Megler says of itself at its start: nothing with a shared folder, wherever it is -- its apps find the one shared
     // folder from either storage -- and that no app can be installed where Windows gave it none.
     check(placement::meglerOnCardText(false, false, true).empty() && placement::meglerOnCardText(true, false, false).empty() &&

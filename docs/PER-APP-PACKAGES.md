@@ -852,7 +852,9 @@ package on another volume than the system's. Such a package has its app data on
 that volume too (`<drive>:\WpSystem\...\AppData\...`), the files an app writes
 there encrypted for it; its publisher cache folder is that volume's, a folder
 other than the phone's memory's, or Windows gives it none
-(`GetPublisherCacheFolder` throws, `appPackage::sharedFolder` is empty). A card
+(`GetPublisherCacheFolder` throws, `appPackage::sharedFolder` is empty) -- so it
+was thought that day, and it is not so: the folder is one for the user wherever
+a package is, as Windows's own code says ("One place for the apps", below). A card
 is FAT32 or exFAT as a rule: no hard links, junctions, symbolic links, sparse
 files or ACLs, a time of writing kept to two seconds, no file of 4 GB on FAT32.
 
@@ -864,7 +866,8 @@ What that did to Megler:
   the phone's memory, had put neither Android's files nor the app's APK: its
   library found no APK and the app showed its splash picture for ever, which is
   a crash to whoever waits for it. An APK such an app handed Megler to install
-  (`<shared>\incoming`) was in a folder Megler does not see.
+  (`<shared>\incoming`) was in a folder Megler does not see. (A guess, as the
+  card's own shared folder it rests on was: no log ever showed either.)
 - **No shared folder is no folder.** Many places made their paths as
   `sharedFolder() + L"\\..."`: with none, `\apks\...`, `\services\...`,
   `\incoming\...` -- the current drive's root. An app's own package listed
@@ -903,24 +906,30 @@ since 0.1.0.699: "One place for the apps", below):
   callers know no shared folder from one: an app's own package has no APK folder
   and no Android root then (`single()`), its library reads nothing, Megler's
   library takes an installed app's APK for none, a link `megler:install` whose
-  APK is not in Megler's shared folder says why (the app that asked is on other
-  storage), and making a package says that Megler is on the card.
+  APK is not in Megler's shared folder says so (until 0.1.0.699 it said the app
+  that asked was on other storage), and making a package says that Megler is on
+  the card.
 - **An app's own package says what it lacks.** At its start
   (`appPackage::singleAppProblem`, `placement::missingFor`) it reads the first
   bytes of its APK and Android's `complete` in its shared folder; where Windows
   gave it no shared folder, or either is not there or cannot be read, its app is
-  not opened, and its screen (`ui/StartScreen.cpp`) says so: that may be because
-  the app and Megler are on different storage; keep the app where Megler is, by
-  Megler's Settings (Apps' Storage, which moves the apps), by the phone's
-  Settings › System › Storage (the app moved), or the app installed again
-  from Megler's Library (**Open Megler**). The log says which was missing, where
-  it was looked for, and each folder with its drive.
+  not opened, and its screen (`ui/StartScreen.cpp`) says so: what it lacks, that
+  Megler puts it there anew when the app is installed again (from Megler's
+  Library, **Open Megler**; an APK that is gone has to be opened with Megler
+  again, or the app taken from its store), and that moving the app changes
+  nothing of it. 0.1.0.699's screen said the app and Megler might be on
+  different storage and told the user to keep the app where Megler is, which
+  Windows's own code does not bear out (below). The log says which was missing,
+  where it was looked for, and each folder with its drive.
 - **Megler with no shared folder says so** once at each start, a dialog, and
   above the Library (`appPackage::meglerOnCard`): no app can be installed as an
   app of its own, and where Megler should be then (a phone's memory, where it is
   on the card). Until 0.1.0.699 Megler on the card said at every start that the
   phone's memory is where it should be, whether or not it had a shared folder;
   nothing bore that out (below), and with a shared folder it says nothing now.
+  That a card is why Windows would give Megler no shared folder is a guess too,
+  which no log and no code bears out; the text still names the phone's memory,
+  a move being the one thing at hand to try.
 - **The log says where everything is.** At each start, `storage: the install
   folder on C: (\\?\Volume{...}), LocalState on C:, the shared folder on C:
   (...); Windows on C:`; Save All Logs' summary says it as `Folders:`, and the
@@ -1010,12 +1019,47 @@ its apps go. Since 0.1.0.699:
 - An Xbox has none of this (the console puts apps where it will), nor has an
   app's own package.
 
-That the shared folder is one for the user, wherever a package is, is taken
-from this: that user's Google Play Store, on another volume than its Megler,
-found in its shared folder what Megler had put there (its logs, which are
-written there, name the files it opened); and `GetPublisherCacheFolder`'s path
-is made of the user's profile folder and the publisher's id, with no volume in
-it. It is not tried on a phone with a card by us.
+That the shared folder is one for the user, wherever a package is -- so that an
+app on the memory card and Megler in the phone's memory, or the other way
+round, have the same one -- is taken from Windows's own code and from one
+phone:
+
+- **The path.** `GetPublisherCacheFolder` (KernelBase.dll) makes it in
+  `StateSpace::GetPublisherRootPath`: the user's Local AppData folder (the
+  profile's shell folder "Local AppData", asked of the user and of nothing
+  else), `\Publishers\`, the publisher's id; then `\` and the folder's name.
+  Nothing of the package's volume enters -- unlike the package's own state
+  folders (`GetStateRootPathInternal`), which is where a card's
+  `<drive>:\WpSystem\...\AppData\Local\Packages` comes from. Read so in the
+  disassembly of a PC's KernelBase (10.0.26300, with its symbols) and of a
+  Lumia 650's own (10.0.15063.297, ARM, taken out of the phone's flash image;
+  no symbols: found by the export and the string `\Publishers\`, the profile
+  helper called with 6, which is its case for "Local AppData"). Windows 10
+  Mobile 15254 is of that line of code. So on a phone the folder is
+  `C:\Data\Users\DefApps\AppData\Local\Publishers\<publisher id>\shared`
+  for Megler in the phone's memory and for an app on the card alike.
+- **Who may open it** is not the path's matter: the folder carries entries for
+  the publisher's packages, which Windows's deployment puts there when a
+  package that declares the folder is registered (on a PC: capability SIDs
+  with full control, inherited by what is in it). A package's volume has no
+  part in what its token holds; the phone's deployment code was not read.
+- **One phone.** That user's Google Play Store, on another volume than its
+  Megler, found in its shared folder what Megler had put there (its logs,
+  which are written there, name the files it opened).
+- **Megler's own code** takes nothing for granted of where an app's package
+  is: what passes between Megler and an app goes through the shared folder
+  by copies (an APK handed over in `incoming\`, an app's files handed over in
+  `handover\`, the logs' mirror), and every rename of the shell's is within
+  one folder. An app's renames between its private files (the card) and the
+  shared storage (the phone's memory) are told EXDEV, as Android tells them
+  between `/data` and `/sdcard`.
+
+It is still not run on a phone with a card by us. What to look at there: the
+app's log line `storage: the install folder on D: (...), LocalState on D:, the
+shared folder on C: (...)`, and that the app opens instead of saying what it
+lacks. What an app on the card has that one in the phone's memory has not is
+its private files on the card's file system (above: "A memory card's file
+system"), wherever Megler is.
 
 *Tried* on a PC (0.1.0.697, a build for this, x64): the flag `test-second-volume`
 (Megler's LocalState\flags) adds a pretend second package volume, `T:\WindowsApps`

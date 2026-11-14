@@ -4,9 +4,12 @@
 //
 // Windows 10 keeps a package installed on another volume than the system's with its app data on that volume. Its publisher
 // cache folder, Megler's shared folder where Android's files and the apps' APKs are, was feared to be that volume's own, or
-// none; what is known since says it is the user's, one wherever a package is (a Lumia 950's Google Play Store in the phone's
-// memory read there what its Megler had put, 0.1.0.696, and Windows makes the folder's path of the user's profile folder and
-// the publisher's id alone). An app's own package still says what it lacks where it finds neither (missingFor).
+// none. It is the user's, one wherever a package is: Windows makes its path of the user's Local AppData folder, "\Publishers\"
+// and the publisher's id, and nothing of the package's volume enters (KernelBase.dll's StateSpace::GetPublisherRootPath, read
+// in a Lumia 650's own 10.0.15063.297 and a PC's 10.0.26300; docs/PER-APP-PACKAGES.md, "One place for the apps"), and a Lumia
+// 950's Google Play Store in the phone's memory read there what its Megler on the card had put (0.1.0.696). So an app on the
+// memory card and Megler in the phone's memory, or the other way round, have the one folder -- not run on a phone with a
+// card by us. An app's own package still says what it lacks where it finds neither (missingFor), whatever the cause.
 #pragma once
 
 #include <string>
@@ -73,12 +76,13 @@ enum class Missing {
 };
 /// What is missing for an app's own package whose shared folder is `shared`, its APK `apk` (MeglerApp.ini's apk=shared:..., in
 /// it; before 0.1.0.645 in the package's own install folder) and its Android files `androidRoot` (empty where MeglerApp.ini
-/// names none: not looked for). The APK is read, not only looked for: one of another storage's that Windows encrypted for
-/// another package is there and cannot be read.
+/// names none: not looked for). The APK is read, not only looked for: one that is there and cannot be read (a file Windows
+/// encrypted for another package, as an app's on a memory card are) is as good as none.
 Missing missingFor(const std::wstring& shared, const std::wstring& apk, const std::wstring& androidRoot);
-/// What an app's own package says on its screen for `missing` (not nothing): what it lacks and why, and what to do -- keep the
-/// app where Megler is, by Megler's Settings (Apps' Storage, which moves the apps) or Windows's (the app moved), or the app
-/// installed again from Megler.
+/// What an app's own package says on its screen for `missing` (not nothing): what it lacks and what to do -- the app installed
+/// again by Megler, which puts there anew what is missing -- and that moving the app changes nothing of it, the shared folder
+/// being one wherever a package is (until 0.1.0.699 it said the app and Megler might be on different storage and told the user
+/// to keep the app where Megler is, which Windows's own code does not bear out).
 std::string missingText(Missing missing, const std::string& label, const std::wstring& shared, bool mobile);
 
 /// What Megler says once at its start, and above its Library, where Windows gave it no shared folder (`noSharedFolder`): no
