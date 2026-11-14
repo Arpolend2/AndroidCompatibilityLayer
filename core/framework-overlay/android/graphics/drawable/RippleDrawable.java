@@ -1,6 +1,7 @@
 // Overlay of core/framework/src/android/graphics/drawable/RippleDrawable.java (tools/build-framework.sh).
-// It differs by one method, meglerSetMask, through which the inflater says that the ripple has a mask (megler/ResInflate.java,
-// also in the overlay). Everything else is the original's, unchanged.
+// It differs by two methods: meglerSetMask, through which the inflater says that the ripple has a mask (megler/ResInflate.java,
+// also in the overlay), and meglerNewEmpty, with which a copy of a ripple through its constant state (LayerDrawable's, also
+// in the overlay) is a ripple of this one's colour and mask. Everything else is the original's, unchanged.
 //
 // Why. Android's commonest ripple is one with nothing in it but a mask -- item_background_material, which is
 // ?attr/selectableItemBackground and the selector of every ListView: <ripple><item android:id="@android:id/mask">...</item>
@@ -27,6 +28,11 @@ public class RippleDrawable extends LayerDrawable {
     }
     /** Megler: the mask layer of a ripple inflated from XML, which bounds it. See the top of the file. */
     public void meglerSetMask(Drawable mask) { mMask = mask; }
+    /** Megler: the ripple a copy of this one begins as (LayerDrawable.meglerCopy): its colour, and its mask's own copy. */
+    @Override LayerDrawable meglerNewEmpty(android.content.res.Resources res) {
+        ConstantState s = mMask != null ? mMask.getConstantState() : null;
+        return new RippleDrawable(mColor, null, s != null ? s.newDrawable(res) : mMask);
+    }
     public void setColor(ColorStateList c) { mColor = c; invalidateSelf(); }
     public void setRadius(int r) {}
     public int getRadius() { return RADIUS_AUTO; }

@@ -7093,6 +7093,73 @@ public class Main extends Activity {
                 + " y " + y.getWidth() + "x" + y.getHeight() + " at " + y.getLeft() + "," + y.getTop();
             return cells && laid;
         });
+        // A LayerDrawable has a constant state, and its copy is a drawable of its own kind with the layers' copies at their
+        // ids and insets (LayerDrawable.meglerCopy): a ripple made in code is copied so for each view it is the background of
+        // (getConstantState().newDrawable().mutate(): YouTube's watch page, which stopped on the null state). Checked: a
+        // ripple's copy is a ripple with its content's copy, and draws it; a layer list's copy has the layers' ids and
+        // insets and its own layers, and the original keeps its own; a transition's copy is a transition that cross-fades
+        // as it does; and a layer without a constant state is the copy's layer too.
+        step("layer-copy", () -> {
+            android.graphics.drawable.ColorDrawable content = new android.graphics.drawable.ColorDrawable(0xff112233);
+            android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(0x40ffffff), content, new android.graphics.drawable.ColorDrawable(0xffffffff));
+            android.graphics.drawable.Drawable.ConstantState rs = ripple.getConstantState();
+            android.graphics.drawable.Drawable rc = rs != null ? rs.newDrawable().mutate() : null;
+            android.graphics.drawable.Drawable rl = rc instanceof android.graphics.drawable.RippleDrawable
+                && ((android.graphics.drawable.RippleDrawable) rc).getNumberOfLayers() == 1 ? ((android.graphics.drawable.RippleDrawable) rc).getDrawable(0) : null;
+            boolean rippled = rc != ripple && rl instanceof android.graphics.drawable.ColorDrawable && rl != content
+                && ((android.graphics.drawable.ColorDrawable) rl).getColor() == 0xff112233 && ripple.getDrawable(0) == content
+                && rl.getCallback() == rc && content.getCallback() == ripple;
+            int pixel = 0;
+            boolean shown = false;
+            if (rc != null) {
+                android.view.View v = new android.view.View(this);
+                v.setBackground(rc);
+                android.graphics.Bitmap bm = android.graphics.Bitmap.createBitmap(8, 8, android.graphics.Bitmap.Config.ARGB_8888);
+                rc.setBounds(0, 0, 8, 8);
+                rc.draw(new android.graphics.Canvas(bm));
+                pixel = bm.getPixel(4, 4);
+                shown = v.getBackground() == rc && pixel == 0xff112233;
+            }
+            android.graphics.drawable.LayerDrawable layers = new android.graphics.drawable.LayerDrawable(new android.graphics.drawable.Drawable[] {
+                new android.graphics.drawable.ColorDrawable(0xff000000), new android.graphics.drawable.ColorDrawable(0xff00ff00) });
+            layers.setId(1, android.R.id.progress);
+            layers.setLayerInset(1, 10, 2, 30, 4);
+            android.graphics.drawable.Drawable.ConstantState ls = layers.getConstantState();
+            android.graphics.drawable.Drawable lc = ls != null ? ls.newDrawable(getResources()) : null;
+            boolean laid = false;
+            String at = "none";
+            if (lc != null && lc.getClass() == android.graphics.drawable.LayerDrawable.class) {
+                android.graphics.drawable.LayerDrawable l2 = (android.graphics.drawable.LayerDrawable) lc;
+                l2.setBounds(0, 0, 100, 50);
+                android.graphics.drawable.Drawable top = l2.findDrawableByLayerId(android.R.id.progress);
+                at = top != null ? top.getBounds().toShortString() : "no layer of the id";
+                laid = l2 != layers && l2.getNumberOfLayers() == 2 && top != null && top != layers.getDrawable(1)
+                    && top.getBounds().equals(new android.graphics.Rect(10, 2, 70, 46))
+                    && l2.getDrawable(0).getBounds().equals(new android.graphics.Rect(0, 0, 100, 50)) && top.getCallback() == l2
+                    && layers.getDrawable(1).getCallback() == layers && ls == layers.getConstantState();
+            }
+            android.graphics.drawable.TransitionDrawable tr = new android.graphics.drawable.TransitionDrawable(new android.graphics.drawable.Drawable[] {
+                new android.graphics.drawable.ColorDrawable(0xffff0000), new android.graphics.drawable.ColorDrawable(0xff0000ff) });
+            tr.setCrossFadeEnabled(true);
+            android.graphics.drawable.Drawable tc = tr.getConstantState() != null ? tr.getConstantState().newDrawable() : null;
+            boolean crossed = tc instanceof android.graphics.drawable.TransitionDrawable && tc != tr
+                && ((android.graphics.drawable.TransitionDrawable) tc).getNumberOfLayers() == 2 && ((android.graphics.drawable.TransitionDrawable) tc).isCrossFadeEnabled();
+            android.graphics.drawable.Drawable plain = new android.graphics.drawable.Drawable() {
+                @Override public void draw(android.graphics.Canvas c) {}
+                @Override public void setAlpha(int a) {}
+                @Override public void setColorFilter(android.graphics.ColorFilter f) {}
+                @Override public int getOpacity() { return android.graphics.PixelFormat.TRANSLUCENT; }
+            };
+            android.graphics.drawable.LayerDrawable over = new android.graphics.drawable.LayerDrawable(new android.graphics.drawable.Drawable[] { plain });
+            android.graphics.drawable.Drawable oc = over.getConstantState() != null ? over.getConstantState().newDrawable() : null;
+            boolean shared = plain.getConstantState() == null && oc instanceof android.graphics.drawable.LayerDrawable && oc != over
+                && ((android.graphics.drawable.LayerDrawable) oc).getDrawable(0) == plain;
+            detail = "rippled=" + rippled + " shown=" + shown + " (pixel " + Integer.toHexString(pixel) + ") laid=" + laid + " (the layer at " + at
+                + ") crossed=" + crossed + " shared=" + shared;
+            Log.i("DataTest", "layer-copy " + detail);
+            return rippled && shown && laid && crossed && shared;
+        });
         // PrecomputedText is the text it was made of: its characters and its spans, its paragraphs (each ends after its line
         // feed) and the parameters a Builder was told. It was signatures alone -- no characters, getSpans null -- so a
         // SpannableString made of one, which androidx's PrecomputedTextCompat hands on as it is from Android 10, ended in a
