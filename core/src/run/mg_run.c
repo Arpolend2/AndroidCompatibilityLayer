@@ -547,6 +547,29 @@ static bool asked_at_start(const char *storage_dir, const char *folder, const ch
 bool mg_run_clear_data_asked(const char *storage_dir, const char *package) { return asked_at_start(storage_dir, "clear-data", package); }
 bool mg_run_clear_cache_asked(const char *storage_dir, const char *package) { return asked_at_start(storage_dir, "clear-cache", package); }
 
+/*
+ * Google's own Play services keep each Google account's sign-in (its long-lived token) in their private files, while the
+ * account itself is in the services' shared accounts (megler.Accounts: <storage_dir>/services/data/accounts), which are not
+ * the package's data. With the files cleared the account stayed, and every request for a token of it was answered "sign in
+ * again" -- on Android a notification that leads to the sign-in, here nothing: the Play Store said "Authentication is
+ * required" for good, with nowhere to sign in (a Lumia 950, 0.1.0.699). So the Google accounts go with the data: a file
+ * beside the accounts' says so, and megler.Accounts takes them out when it first reads the accounts. microG keeps the
+ * sign-in in the account itself (its password): its accounts stay good, and stay.
+ */
+#define GOOGLE_SIGNED_OUT "google-signed-out"
+static void sign_google_accounts_out(const char *storage_dir)
+{
+    char *accounts = mg_sprintf("%s/services/data/accounts/accounts.json", storage_dir);
+    char *mark = mg_sprintf("%s/services/data/accounts/" GOOGLE_SIGNED_OUT, storage_dir);
+    mg_stat st;
+    if (mg_path_stat(accounts, &st, NULL)) {
+        if (mg_file_write_all(mark, "1", 1)) mg_info("run: Google Play services' data was cleared: the Google accounts are signed out with it (%s)", mark);
+        else mg_warn("run: Google Play services' data was cleared, and %s could not be written: the Google accounts stay, signed in no more", mark);
+    }
+    free(accounts);
+    free(mark);
+}
+
 bool mg_run_clear_data_if_asked(const char *data_dir, const char *storage_dir, const char *package)
 {
     char *ask = mg_sprintf("%s/clear-data/%s", storage_dir, package), *internal, *own, *external;
@@ -565,6 +588,7 @@ bool mg_run_clear_data_if_asked(const char *data_dir, const char *storage_dir, c
     mg_path_remove(ask, NULL);
     if (t.failed) mg_warn("run: the app's data was cleared, as asked, but for %d file(s) or folder(s) that could not be removed (%d files removed)", t.failed, t.files);
     else mg_info("run: the app's data was cleared, as asked: %d files removed from %s and %s", t.files, internal, external);
+    if (!strcmp(package, "com.google.android.gms") && !g_services_microg) sign_google_accounts_out(storage_dir);
     free(ask);
     free(internal);
     free(own);

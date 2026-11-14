@@ -32,7 +32,9 @@ u32 mg_run_frames(void);
 void mg_run_files(const char *data_dir, const char *storage_dir, const char *package, const megler_storage_host *storage);
 /*
  * What mg_run_files does first: when megler_ask_clear_data asked for it (<storage_dir>/clear-data/<package>), the app's
- * private folder and its own Android/data folder go, and the ask; true then.
+ * private folder and its own Android/data folder go, and the ask; true then. Google's own Play services' data cleared
+ * (com.google.android.gms, not microG's), the Google accounts are marked to go too: <storage_dir>/services/data/accounts/
+ * google-signed-out, which megler.Accounts acts on.
  */
 bool mg_run_clear_data_if_asked(const char *data_dir, const char *storage_dir, const char *package);
 /* Whether such an ask waits for the app's next start (megler_clear_data_asked). */

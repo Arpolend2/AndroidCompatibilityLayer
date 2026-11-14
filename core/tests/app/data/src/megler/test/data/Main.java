@@ -1981,6 +1981,30 @@ public class Main extends Activity {
                      + " listening=" + (listening != null);
             return typed && syncable == (run == 1 ? -1 : 1) && master && off && on && listening != null;
         });
+        // Google's own Play services' data cleared -- the core's mark beside the accounts' file -- the Google accounts go at the
+        // next reading of the accounts, the others stay, and the mark goes: their sign-in was in the cleared files, and an
+        // account left behind could only be told "sign in again" (the Play Store's "Authentication is required" for good, with
+        // nowhere to sign in). Without the mark nothing goes.
+        step("google-signed-out", () -> {
+            final android.accounts.AccountManager am = android.accounts.AccountManager.get(this);
+            final android.accounts.Account google = new android.accounts.Account("signed out by run " + run, "com.google");
+            final android.accounts.Account other = new android.accounts.Account("kept by run " + run, "megler.test.kept");
+            int googleWere = am.getAccountsByType(google.type).length, otherWere = am.getAccountsByType(other.type).length;
+            boolean added = am.addAccountExplicitly(google, null, null) && am.addAccountExplicitly(other, null, null);
+            File accounts = (File) Class.forName("megler.Accounts").getMethod("file").invoke(null);
+            File mark = new File(accounts.getParentFile(), "google-signed-out");
+            // (The accounts are read again when their file changed: its time moved, as another process's writing moves it.)
+            boolean unmarked = accounts.setLastModified(accounts.lastModified() + 4000) && am.getAccountsByType(google.type).length == googleWere + 1;
+            new java.io.FileOutputStream(mark).close();
+            boolean moved = accounts.setLastModified(accounts.lastModified() + 4000);
+            int googleNow = am.getAccountsByType(google.type).length, otherNow = am.getAccountsByType(other.type).length;
+            boolean markGone = !mark.exists();
+            am.removeAccountExplicitly(google);
+            am.removeAccountExplicitly(other);
+            detail = "added " + added + " unmarked " + unmarked + " moved " + moved + " google " + googleWere + " -> " + googleNow
+                     + " other " + otherWere + " -> " + otherNow + " mark gone " + markGone + " in " + accounts.getParent();
+            return added && unmarked && moved && googleNow == 0 && otherNow == otherWere + 1 && markGone;
+        });
         step("package-installer", () -> {
             android.content.pm.PackageInstaller installer = getPackageManager().getPackageInstaller();
             return installer != null && installer == getPackageManager().getPackageInstaller()

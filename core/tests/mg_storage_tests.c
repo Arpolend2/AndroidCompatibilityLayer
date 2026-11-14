@@ -843,6 +843,52 @@ static int type_of(const dir_seen *s, const char *name)
 #define SD "/storage/emulated/0"
 
 /*
+ * Google's own Play services' data cleared: their private folder in the services' shared one goes, the accounts' file
+ * beside it stays, and a mark is left there that the Google accounts are signed out (megler.Accounts takes them out: their
+ * sign-in was in the cleared files). Another services' package (com.google.android.gsf) leaves no mark, nor Play services
+ * with no accounts' file.
+ */
+static void test_clear_services_data(const char *data)
+{
+    static const char *const made[] = { "services/data/com.google.android.gms/files/datastore/GoogleAccountDataStore.pb",
+                                        "services/data/com.google.android.gsf/databases/gservices.db", "services/data/accounts/accounts.json",
+                                        "clear-data/com.google.android.gsf", "clear-data/com.google.android.gms" };
+    mg_stat st;
+    char *p, *dir, *mark = mg_sprintf("%s/services/data/accounts/google-signed-out", data);
+    size_t i;
+    say("clearing Google Play services' data: the Google accounts are marked signed out, their file stays");
+    for (i = 0; i < MG_COUNT(made); i++) {
+        p = mg_sprintf("%s/%s", data, made[i]);
+        dir = mg_sprintf("%s", p);
+        *strrchr(dir, '/') = 0;
+        CHECK(mg_path_mkdirs(dir) && mg_file_write_all(p, "x", 1));
+        free(dir);
+        free(p);
+    }
+    CHECK(mg_run_clear_data_if_asked(data, data, "com.google.android.gsf"));
+    CHECK(!mg_path_stat(mark, &st, NULL));
+    p = mg_sprintf("%s/services/data/com.google.android.gsf", data);
+    CHECK(!mg_path_stat(p, &st, NULL));
+    free(p);
+    CHECK(mg_run_clear_data_if_asked(data, data, "com.google.android.gms"));
+    CHECK(mg_path_stat(mark, &st, NULL));
+    p = mg_sprintf("%s/services/data/com.google.android.gms", data);
+    CHECK(!mg_path_stat(p, &st, NULL));
+    free(p);
+    p = mg_sprintf("%s/services/data/accounts/accounts.json", data);
+    CHECK(mg_path_stat(p, &st, NULL));
+    /* With no accounts there is nothing to sign out, and no mark. */
+    CHECK(mg_path_remove(mark, NULL) && mg_path_remove(p, NULL));
+    free(p);
+    p = mg_sprintf("%s/clear-data/com.google.android.gms", data);
+    CHECK(mg_file_write_all(p, "x", 1));
+    free(p);
+    CHECK(mg_run_clear_data_if_asked(data, data, "com.google.android.gms"));
+    CHECK(!mg_path_stat(mark, &st, NULL));
+    free(mark);
+}
+
+/*
  * Clearing an app's data, as asked (megler_ask_clear_data writes <storage>/clear-data/<package>): before its folders are set
  * up, its private folder goes with everything in it, and its own Android/data folder; its Android/obb stays, as on Android,
  * and so does another app's data. Asked for no more, nothing goes.
@@ -886,6 +932,7 @@ static void test_clear_data(const char *base)
     p = mg_sprintf("%s/apps/org.megler.test.kept/data/shared_prefs/settings.xml", data);
     CHECK(mg_path_stat(p, &st, NULL));
     free(p);
+    test_clear_services_data(data);
     free(data);
 }
 
