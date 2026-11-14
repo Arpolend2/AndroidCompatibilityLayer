@@ -908,6 +908,44 @@ checks. ARM's main passes reported 9187 and 9346 checks; Windows's 8614
 and 8736. Both data-app runs passed `integrity-profile`; the Windows run
 included the cached ANGLE build.
 
+### HP control, 2026-11-15: profile comparison still pending
+
+The Elite x3 had Megler 711 and GmsCore 26.41.31 (`264131009`), unlike
+the Lumia's 26.43.30. An isolated test branch based on the source of 711
+(`6a6d1caf`) applies the profile draft while retaining its newer shared
+keystore implementation. The phone's test runtime is 713.
+
+A small, separate diagnostic app, `megler.test.hpdevicekey`, binds the
+hosted DroidGuard service and calls this GMS version's
+`appr.a(Context).b()` off the main thread. It installs no interception
+hooks. Its own class names contain no `droidguard`, so they cannot
+accidentally satisfy the profile's certificate-chain stack check.
+With the profile disabled, the service bound and the device-key call
+returned `false` after 37.5 seconds. AppCertManager logged a parsing
+exception. No DGFRR error occurred in the captured log. This establishes
+neither a valid VM token nor this request's HTTP status: those were not
+captured. The raw log stays in ignored private build output.
+
+The phone ran out of battery before the profile-enabled run. Therefore
+there is no paired HP result and no evidence yet that the profile changes
+Google's acceptance. A signed normal package, 714, without an auto run is
+ready but was not installed before power-off.
+
+An inherited `ui-update-all` flag was also present in
+`Pictures/Megler/diag/megler/flags`; deleting its LocalState copy alone did
+not disable it at the next start. Both sources are now disabled and the
+Megler process was stopped. Some client packages received the 713 test
+runtime before this was found. After charging, those packages must be
+updated to the normal runtime, preserving their data; select only that
+test version rather than asking for Update All again.
+
+On this newer source base, the full ARM suite passed 33 result groups
+(main passes 9215 and 9374 checks). The full Windows retry passed 33
+result groups (8639 and 8761 checks). Every final group reported zero
+failures. The first Windows run failed its intermittent shell check
+"asked again, Megler's other settings kept" once; no runtime code changed
+before the successful full retry. Both data-app profile runs passed.
+
 **Following it on a phone** (flags in `Pictures\Megler\diag\<package>\flags`):
 `trace-syscalls` (a library's calls by number with the path each names:
 "/sys/fs/selinux/enforce" = -2 from `libdB21738DAE92C.so+0x2e18`, its own
