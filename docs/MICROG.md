@@ -958,6 +958,111 @@ failures. The first Windows run failed its intermittent shell check
 "asked again, Megler's other settings kept" once; no runtime code changed
 before the successful full retry. Both data-app profile runs passed.
 
+### Supplied 4PDA module set, 2026-11-15
+
+The two supplied screenshots describe Reddit login on rooted Android,
+using Play Integrity Break's intervention, synthetic error and synthetic
+response settings. The second post adds SUSFS kernel-version presentation
+for a kernel whose name contains `WILD`. The live forum pages could not
+be fetched; their text was read from the supplied screenshots. These are
+claims about a Reddit login flow, not a demonstrated `/auth/devicekey`
+exchange, a Play Integrity verdict or a Google Wi-Fi fix in Megler.
+[First post](https://4pda.to/forum/index.php?showtopic=738196&view=findpost&p=145071657),
+[follow-up](https://4pda.to/forum/index.php?showtopic=738196&view=findpost&p=145989144).
+
+Each supplied archive was copied to its own ignored analysis directory,
+hashed, checked for traversal/symlinks and unpacked without executing its
+installers or Android binaries on the host. Static DEX analysis used jadx.
+The PIF DEX decompiled without reported errors; PIB, TrickyStore service
+and LSPosed framework reported 20, 10 and 2 decompiler errors respectively.
+This is a partial static audit, not a proof of all native behaviour.
+The module README and script instructions were treated as sample contents.
+
+| Supplied file | SHA-256 |
+| --- | --- |
+| `Zygisk+Next-v1.5.0.zip` | `474d58abc208c0779e7f8f1d8449db755a874d475c13b9cf8decf74bc171933b` |
+| `Tricky-Store-v1.4.1-248-3b07ee3-release.zip` | `0bc227c59b9b4baa77d8c46ff310c276a88114e4dcf7ed10d886023924183454` |
+| `Play_Integrity47.zip` | `06a93bbbcbe4d94fb5dc2d6e1e651684a74c1568973984e8c118a70c26ac7ec3` |
+| `ksu_module_susfs_1.5.2+.zip` | `abcd6bf456ea8189298d9e496faa440201d90e4f0bd93b83c0527589001c9376` |
+| `pib-64-64.apk` | `f9c69912a37123398a2c2602fb6d1a5e1420cff4f2ff93b49da2d6dd30dc70d4` |
+| `LSPosed-v2.2.0-7854-release.apk` | `74d89370b4b17a94c130089b2868c3d6f289ab8c5c5715ba43a909d4bd6e216b` |
+| `LSPosed-v2.2.0-7854-release.zip` | `725915707f88a4f5ebecddab908cb217aa0a6d98955db5885bc9fadda81e75b8` |
+
+- **Play Integrity Break 64**, package `it.eldavo.pib`, versionCode
+  `7304742`: `assets/xposed_init` names `XposedEntry`. Its hook is installed
+  in the main Play Store process. `deliverSyntheticBlockedResponse`
+  invokes the callback with a Bundle containing `error` and
+  `is.error.remediable`, and the original request is short-circuited.
+  The supplied configuration defaults to `-8` and `true`. This is
+  `TOO_MANY_REQUESTS`, not a token or successful integrity verdict.
+  It can also suppress delivery or delay it, log events and optionally
+  send telemetry. Those extra modes are not part of this Megler change.
+- **Play_Integrity47**: metadata names `Play Integrity Fix [KEYBOX]` v47,
+  rather than the previously examined chiteroman 19.1 sample. Its Java
+  provider has the same DroidGuard-stack chain exception. Its template
+  adds wildcard properties; boot scripts change root/boot properties.
+  Its installer backs up/removes an existing TrickyStore keybox, chooses
+  a bundled `*.@fateh7` file and copies that to TrickyStore. Its profile
+  updater obtains Android build metadata using wget with certificate
+  verification disabled. None of those scripts was run.
+- **TrickyStore 1.4.1**: the bundle supplies `service.apk`, native libraries,
+  target list and a default software keybox (two private keys and four
+  certificates). No key contents are recorded here. Its installer calls
+  it a software keybox; presence in the ZIP proves neither hardware
+  provenance nor acceptance by Google. The current service/native
+  implementation is not fully audited. This port does not import it or
+  fabricate an attestation chain.
+- **Zygisk Next 1.5.0**: a root/Zygisk injection runtime for Android's
+  init/zygote processes. Megler has neither Android init/zygote nor ART.
+  It is not an integrity-result provider. No binaries are redistributed.
+- **LSPosed 2.2.0 (7854)**: ART hooks supplied by LSPlant plus a daemon and
+  manager. The separate supplied manager APK exactly matches the ZIP's
+  `manager.apk`. Megler already has its own Xposed method-hook primitives
+  for Aliuhook; that does not establish compatibility with the entire
+  LSPosed daemon, its ART implementation or its manager.
+- **SUSFS 1.5.2-R28**: root hiding controls for a SUSFS-patched Linux kernel
+  through `ksu_susfs`. The shown kernel setting calls `set_uname` with the
+  chosen release/build. Megler already supplies a synthetic Linux `uname`
+  and `/proc/version` (`4.4.0-megler`), with no `WILD` suffix. This does not
+  prove other environment checks pass; installing KernelSU scripts cannot
+  change the Windows kernel.
+
+The upstream PIB README explicitly limits its mechanism to applications
+that tolerate integrity errors; it does not obtain BASIC/DEVICE/STRONG
+verdicts or supply a working keybox.
+[PIB project explanation](https://github.com/ElDavoo/PlayIntegrityBreak/blob/pib/README.md),
+[Google's error codes](https://developer.android.com/google/play/integrity/reference/com/google/android/play/core/integrity/model/IntegrityErrorCode).
+
+#### Opt-in PIB error response in Megler
+
+The runtime now provides the supplied PIB's default synthetic blocked
+response without requiring its injection stack. Place a file named
+`play-integrity-break` in the selected app package's `LocalState/flags`
+(or `Pictures/Megler/diag/<Android package>/flags`), then restart that app.
+A same-named marker in its Android internal data directory is also accepted
+for test harnesses. This is independent of `pif.json` and applies only in
+the selected client process.
+
+Classic integrity-token requests, standard warm-up and standard-token
+requests return a single callback with `error=-8` and
+`is.error.remediable=true`. No token is returned and no request reaches
+Google through these local Play Integrity endpoints. With the switch off,
+Megler retains its previous `API_NOT_AVAILABLE` (-1) response. Age Signals,
+GMS DroidGuard requests and `/auth/devicekey` are unchanged. An application
+or its server decides what to do with either error.
+
+The data-app regression exercises all three transactions in default,
+PIB-enabled and restored modes, checks the callback descriptor/code,
+remediability and absence of a token, and removes its test marker.
+Full validation on this draft: ARM and Windows each reported 33 result
+groups and zero failed checks (main passes 9215/9374 and 8639/8761).
+`integrity-callbacks` passed both data-app runs. Heavy work was serialized
+under `heavy.lock` with `MEGLER_JOBS=4`.
+
+This implementation is a protocol-behaviour counterpart, not a port of
+all seven supplied packages. Reddit login, device-key issuance and Wi-Fi
+positioning with this change have not yet been demonstrated on a phone.
+
 **Following it on a phone** (flags in `Pictures\Megler\diag\<package>\flags`):
 `trace-syscalls` (a library's calls by number with the path each names:
 "/sys/fs/selinux/enforce" = -2 from `libdB21738DAE92C.so+0x2e18`, its own

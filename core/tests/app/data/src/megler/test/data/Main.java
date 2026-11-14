@@ -352,6 +352,7 @@ public class Main extends Activity {
         keystore(run);
         keystoreCertificates(run);
         integrityProfile();
+        integrityCallbacks();
         keystoreForeignKey();
         keystoreHosted();
         pathOps();
@@ -4151,6 +4152,68 @@ public class Main extends Activity {
             detail = said;
             Log.i("DataTest", "keystore-foreign-key " + detail);
             return !"taken".equals(said) && !"StackOverflowError".equals(said);
+        });
+    }
+
+    private void integrityCallbacks() {
+        step("integrity-callbacks", () -> {
+            Class<?> nativeClass = Class.forName("megler.Native");
+            File marker = new File((String) nativeClass.getMethod("dataDir").invoke(null), "play-integrity-break");
+            if (marker.exists()) throw new IllegalStateException("Test requires its own marker");
+            Class<?> play = Class.forName("megler.PlayStore");
+            java.lang.reflect.Method bind = play.getDeclaredMethod("bind", android.content.Intent.class);
+            bind.setAccessible(true);
+            int calls = 0;
+            try {
+                // Toggle after binding too: a client can keep its service connection across requests.
+                for (int mode = 0; mode < 3; mode++) {
+                    boolean blocked = mode == 1;
+                    if (blocked) { if (!marker.createNewFile()) throw new java.io.IOException("Create PIB marker"); }
+                    else if (marker.exists() && !marker.delete()) throw new java.io.IOException("Remove PIB marker");
+                    for (int operation = 0; operation < 3; operation++) {
+                        boolean standard = operation != 0;
+                        final String service = "com.google.android.play.core.integrity.protocol."
+                                + (standard ? "IExpressIntegrityService" : "IIntegrityService");
+                        final String callbackDescriptor = service + "Callback";
+                        final int code = operation == 2 ? 3 : 2;
+                        final int[] responses = { 0 };
+                        final android.os.Bundle[] answer = { null };
+                        android.os.IBinder callback = new android.os.Binder() {
+                            @Override protected boolean onTransact(int transaction, android.os.Parcel data,
+                                    android.os.Parcel reply, int flags) throws android.os.RemoteException {
+                                if (transaction != code) throw new IllegalStateException("Wrong callback transaction");
+                                data.enforceInterface(callbackDescriptor);
+                                if (data.readInt() != 1) throw new IllegalStateException("Missing callback bundle");
+                                answer[0] = android.os.Bundle.CREATOR.createFromParcel(data);
+                                responses[0]++;
+                                return true;
+                            }
+                        };
+                        String action = standard ? "com.google.android.play.core.expressintegrityservice.BIND_EXPRESS_INTEGRITY_SERVICE"
+                                : "com.google.android.play.core.integrityservice.BIND_INTEGRITY_SERVICE";
+                        android.os.IBinder binder = (android.os.IBinder) bind.invoke(null,
+                                new android.content.Intent(action).setPackage("com.android.vending"));
+                        if (binder == null) return false;
+                        android.os.Parcel request = android.os.Parcel.obtain();
+                        try {
+                            request.writeInterfaceToken(service);
+                            request.writeInt(1);
+                            android.os.Bundle options = new android.os.Bundle();
+                            options.putString("package.name", getPackageName());
+                            options.writeToParcel(request, 0);
+                            request.writeStrongBinder(callback);
+                            if (!binder.transact(code, request, null, android.os.IBinder.FLAG_ONEWAY)) return false;
+                        } finally { request.recycle(); }
+                        android.os.Bundle b = answer[0];
+                        if (responses[0] != 1 || b == null || b.getInt("error", 0) != (blocked ? -8 : -1)
+                                || b.containsKey("token") || b.getBoolean("is.error.remediable", false) != blocked
+                                || b.containsKey("is.error.remediable") != (standard || blocked)) return false;
+                        calls++;
+                    }
+                }
+                detail = "classic, standard warm-up and token: " + calls + " callbacks; default, PIB and restored";
+                return calls == 9;
+            } finally { marker.delete(); }
         });
     }
 
