@@ -1061,7 +1061,30 @@ under `heavy.lock` with `MEGLER_JOBS=4`.
 
 This implementation is a protocol-behaviour counterpart, not a port of
 all seven supplied packages. Reddit login, device-key issuance and Wi-Fi
-positioning with this change have not yet been demonstrated on a phone.
+positioning with this change have not been demonstrated on a phone.
+
+#### Claude login comparison on HP
+
+The owner installed `com.anthropic.claude` on HP and repeated the same
+email sign-in action. On its original runtime 714 the log records one
+classic token request answered `API_NOT_AVAILABLE`; the UI asks for a
+Google Play update or a Google account. Normal runtime 716 carries this
+Java change, has no auto run, and was installed as a compact package with
+optional bundled Google APK installers omitted. The already installed
+Google apps and their data were retained. Only Claude's client package
+was updated; no Update All command was used.
+
+With `play-integrity-break` enabled only for Claude, its log records two
+classic token requests answered `PIB synthetic error -8, remediable`, and
+zero old API_NOT_AVAILABLE replies. The UI changes to an app-verification
+failure and says the sign-in email could not be sent. There is no fatal
+exception in the captured run. Thus the PIB mode executes on HP, but its
+default response does not unblock this Claude login flow. It does not
+establish what all other PIB settings or applications would do, and it
+provides no device-key result. The experimental flag was removed after
+the comparison; Claude's data was not cleared. Raw logs and screenshots
+containing the owner's address stay out of commits.
+
 
 **Following it on a phone** (flags in `Pictures\Megler\diag\<package>\flags`):
 `trace-syscalls` (a library's calls by number with the path each names:
