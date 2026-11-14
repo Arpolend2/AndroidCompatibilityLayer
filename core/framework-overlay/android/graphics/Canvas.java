@@ -1,7 +1,8 @@
 // Overlay of core/framework/src/android/graphics/Canvas.java (tools/build-framework.sh).
 // It differs in saying, with the flag trace-readbacks, who made a canvas on a large bitmap or drew one
-// (Bitmap.meglerTraceRead): the core reads back what other canvases drew there first (bm_settle). Everything else
-// is the original's.
+// (Bitmap.meglerTraceRead): the core reads back what other canvases drew there first (bm_settle); and with the flag
+// trace-colors, who fills with a translucent colour or with opaque black (meglerTraceColor). Everything else is the
+// original's.
 package android.graphics;
 
 /** Drawing into a Bitmap through megler.Gfx. The view system draws the window through one of these each frame. */
@@ -124,23 +125,43 @@ public class Canvas {
         return r <= mClip[0] || l >= mClip[2] || b <= mClip[1] || t >= mClip[3];
     }
 
+    /*
+     * trace-colors (LocalState\flags): who fills with a translucent colour, or with opaque black -- each caller and colour
+     * once, sixty at most, with its stack, in the log (MeglerColors); a paint with a shader is left out. YouTube's buttons
+     * under a video are black in its light theme, where their colour is 5% black (#0d000000).
+     */
+    private static volatile Boolean sTraceColors;
+    private static final java.util.HashSet<String> sColorsTraced = new java.util.HashSet<>();
+    private static void meglerTraceColor(int color, Paint p, String what) {
+        Boolean on = sTraceColors;
+        if (on == null) { on = megler.Native.flag("trace-colors"); sTraceColors = on; }
+        if (!on || (p != null && p.getShader() != null)) return;
+        int a = color >>> 24;
+        if (a == 0 || (a == 255 && (color & 0xFFFFFF) != 0)) return;
+        Throwable t = new Throwable(what + " #" + Integer.toHexString(color) + (p != null && p.getColorFilter() != null ? " filtered" : ""));
+        StackTraceElement[] st = t.getStackTrace();
+        String key = Integer.toHexString(color) + (st.length > 2 ? st[2].toString() : "");
+        synchronized (sColorsTraced) { if (sColorsTraced.size() >= 60 || !sColorsTraced.add(key)) return; }
+        android.util.Log.i("MeglerColors", t.getMessage(), t);
+    }
     // ---- drawing
-    public void drawColor(int c) { if (mNative != 0) { megler.Gfx.cvDrawColor(mNative, c, 3); touched(); } }
+    public void drawColor(int c) { meglerTraceColor(c, null, "drawColor"); if (mNative != 0) { megler.Gfx.cvDrawColor(mNative, c, 3); touched(); } }
     public void drawColor(long c) { drawColor(Color.toArgb(c)); }
     public void drawColor(int c, PorterDuff.Mode m) { if (mNative != 0) { megler.Gfx.cvDrawColor(mNative, c, m.nativeInt); touched(); } }
     public void drawColor(int c, BlendMode m) { if (mNative != 0) { megler.Gfx.cvDrawColor(mNative, c, m.n); touched(); } }
     public void drawRGB(int r, int g, int b) { drawColor(Color.rgb(r, g, b)); }
     public void drawARGB(int a, int r, int g, int b) { drawColor(Color.argb(a, r, g, b)); }
     public void drawPaint(Paint p) {
+        meglerTraceColor(p.getColor(), p, "drawPaint");
         if (mNative == 0) return;
         megler.Gfx.cvClipBounds(mNative, mClip);
         megler.Gfx.cvDrawRect(mNative, mClip[0], mClip[1], mClip[2], mClip[3], p.mP, p.meglerShader());
         touched();
     }
-    public void drawRect(float l, float t, float r, float b, Paint p) { if (mNative != 0) { megler.Gfx.cvDrawRect(mNative, l, t, r, b, p.mP, p.meglerShader()); touched(); } }
+    public void drawRect(float l, float t, float r, float b, Paint p) { meglerTraceColor(p.getColor(), p, "drawRect"); if (mNative != 0) { megler.Gfx.cvDrawRect(mNative, l, t, r, b, p.mP, p.meglerShader()); touched(); } }
     public void drawRect(RectF r, Paint p) { drawRect(r.left, r.top, r.right, r.bottom, p); }
     public void drawRect(Rect r, Paint p) { drawRect(r.left, r.top, r.right, r.bottom, p); }
-    public void drawRoundRect(float l, float t, float r, float b, float rx, float ry, Paint p) { if (mNative != 0) { megler.Gfx.cvDrawRRect(mNative, l, t, r, b, rx, ry, p.mP, p.meglerShader()); touched(); } }
+    public void drawRoundRect(float l, float t, float r, float b, float rx, float ry, Paint p) { meglerTraceColor(p.getColor(), p, "drawRoundRect"); if (mNative != 0) { megler.Gfx.cvDrawRRect(mNative, l, t, r, b, rx, ry, p.mP, p.meglerShader()); touched(); } }
     public void drawRoundRect(RectF r, float rx, float ry, Paint p) { drawRoundRect(r.left, r.top, r.right, r.bottom, rx, ry, p); }
     public void drawDoubleRoundRect(RectF outer, float orx, float ory, RectF inner, float irx, float iry, Paint p) {
         Path path = new Path();
@@ -149,14 +170,14 @@ public class Canvas {
         path.setFillType(Path.FillType.EVEN_ODD);
         drawPath(path, p);
     }
-    public void drawOval(float l, float t, float r, float b, Paint p) { if (mNative != 0) { megler.Gfx.cvDrawOval(mNative, l, t, r, b, p.mP, p.meglerShader()); touched(); } }
+    public void drawOval(float l, float t, float r, float b, Paint p) { meglerTraceColor(p.getColor(), p, "drawOval"); if (mNative != 0) { megler.Gfx.cvDrawOval(mNative, l, t, r, b, p.mP, p.meglerShader()); touched(); } }
     public void drawOval(RectF r, Paint p) { drawOval(r.left, r.top, r.right, r.bottom, p); }
     public void drawCircle(float cx, float cy, float radius, Paint p) { drawOval(cx - radius, cy - radius, cx + radius, cy + radius, p); }
     public void drawArc(float l, float t, float r, float b, float start, float sweep, boolean useCenter, Paint p) {
         if (mNative != 0) { megler.Gfx.cvDrawArc(mNative, l, t, r, b, start, sweep, useCenter, p.mP, p.meglerShader()); touched(); }
     }
     public void drawArc(RectF o, float start, float sweep, boolean useCenter, Paint p) { drawArc(o.left, o.top, o.right, o.bottom, start, sweep, useCenter, p); }
-    public void drawPath(Path path, Paint p) { if (mNative != 0 && path.n > 0) { megler.Gfx.cvDrawPath(mNative, path.ops, path.n, path.meglerFill(), p.mP, p.meglerShader()); touched(); } }
+    public void drawPath(Path path, Paint p) { meglerTraceColor(p.getColor(), p, "drawPath"); if (mNative != 0 && path.n > 0) { megler.Gfx.cvDrawPath(mNative, path.ops, path.n, path.meglerFill(), p.mP, p.meglerShader()); touched(); } }
     public void drawLine(float x0, float y0, float x1, float y1, Paint p) { drawLines(new float[] { x0, y0, x1, y1 }, 0, 4, p); }
     public void drawLines(float[] pts, int offset, int count, Paint p) { if (mNative != 0) { megler.Gfx.cvDrawLines(mNative, pts, offset, count, p.mP, p.meglerShader(), false); touched(); } }
     public void drawLines(float[] pts, Paint p) { drawLines(pts, 0, pts.length, p); }
