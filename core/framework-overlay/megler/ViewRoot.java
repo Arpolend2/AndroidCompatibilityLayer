@@ -587,7 +587,54 @@ public final class ViewRoot implements ViewParent {
         sFrameRequests++;
         if (sScheduled) return;
         sScheduled = true;
+        sScheduledAt = System.nanoTime();
+        watchFrames();
         Choreographer.getMainThreadInstance().postCallback(Choreographer.CALLBACK_TRAVERSAL, ViewRoot::doFrame, null);
+    }
+    /*
+     * The frame watch: a frame asked for and not drawn 3 s later (the window not hidden) is said in the log, with what the main
+     * thread's choreographer waits for and the windows' states, once a stall -- from the main thread itself when its looper
+     * still runs (a probe posted to it), from the watch's thread when it does not answer in 2 s. YouTube's window froze for
+     * good after a playback error on the HP Elite x3 (0.1.0.707-708), its main thread idle, taps and Back reaching it, and
+     * no frame drawn; the log did not say where the frame went.
+     */
+    private static volatile long sScheduledAt;
+    private static volatile boolean sStallSaid;
+    private static int sStallsSaid;
+    private static Thread sWatch;
+    private static void watchFrames() {
+        if (sWatch != null) return;
+        sWatch = new Thread(() -> {
+            for (;;) {
+                try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
+                long at = sScheduledAt;
+                if (at == 0 || sStallSaid || sHostHidden || System.nanoTime() - at < 3_000_000_000L || sStallsSaid >= 20) continue;
+                sStallSaid = true;
+                sStallsSaid++;
+                final long asked = at;
+                final java.util.concurrent.CountDownLatch answered = new java.util.concurrent.CountDownLatch(1);
+                Handler h = sMain != null ? sMain : new Handler(Looper.getMainLooper());
+                h.postAtFrontOfQueue(() -> { sayStall(asked, "the main thread answers"); answered.countDown(); });
+                boolean ok = false;
+                try { ok = answered.await(2, java.util.concurrent.TimeUnit.SECONDS); } catch (InterruptedException e) { return; }
+                if (!ok) sayStall(asked, "the main thread does not answer in 2 s");
+            }
+        }, "megler-frame-watch");
+        sWatch.setDaemon(true);
+        sWatch.start();
+    }
+    private static void sayStall(long asked, String how) {
+        StringBuilder b = new StringBuilder();
+        b.append("a frame asked for ").append((System.nanoTime() - asked) / 1_000_000L).append(" ms ago is not drawn (").append(how)
+         .append("); scheduled ").append(sScheduled).append(", the window hidden ").append(sHostHidden).append("; choreographer: ")
+         .append(Choreographer.getMainThreadInstance().meglerState());
+        try {
+            // (From the watch's thread the list may change meanwhile: what could be read is said.)
+            for (ViewRoot r : new ArrayList<>(sRoots)) b.append("; ").append(r.mRemoved ? "(removed) " : "").append(r.windowState());
+        } catch (RuntimeException e) {
+            b.append("; the windows not read: ").append(e);
+        }
+        android.util.Log.w("MeglerFrames", b.toString());
     }
     /* The host's window is hidden whole (AppRunner.hostPause: minimized, the screen off): nothing is laid out or drawn until
        it comes back, as Android neither lays out nor draws a stopped app's windows; the whole screen is drawn again then. */
@@ -601,6 +648,8 @@ public final class ViewRoot implements ViewParent {
     }
     private static void doFrame() {
         sScheduled = false;
+        sScheduledAt = 0;
+        sStallSaid = false;
         if (sHostHidden) return;      /* (what asked for the frame waits: hostHidden asks for one as the window comes back) */
         Native.frameMark(1, 0);
         ArrayList<ViewRoot> roots = new ArrayList<>(sRoots);
@@ -717,6 +766,8 @@ public final class ViewRoot implements ViewParent {
         if (v.getPaddingLeft() != 0 || v.getPaddingTop() != 0 || v.getPaddingRight() != 0 || v.getPaddingBottom() != 0)
             b.append(" pad=").append(v.getPaddingLeft()).append(',').append(v.getPaddingTop()).append(',').append(v.getPaddingRight()).append(',').append(v.getPaddingBottom());
         if (v.getTranslationY() != 0f) b.append(" ty=").append(v.getTranslationY());
+        if (v.getBackground() != null) b.append(" bg=").append(View.meglerDescribeDrawable(v.getBackground()));
+        if (v.getForeground() != null) b.append(" fg=").append(View.meglerDescribeDrawable(v.getForeground()));
         if (v instanceof android.widget.TextView) {
             CharSequence tx = ((android.widget.TextView) v).getText();
             StringBuilder e = new StringBuilder();

@@ -1385,9 +1385,28 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
         if (mLayerType != LAYER_TYPE_NONE) b.append(" layer ").append(mLayerType);
         if (getClipToOutline()) b.append(" clipped to its outline");
         if (mClipBounds != null) b.append(" clipBounds ").append(mClipBounds.toShortString());
+        // Its background and foreground, with the colour where a drawable has one (a colour that came out wrong is seen so).
+        if (mBackground != null) b.append(" bg ").append(meglerDescribe(mBackground));
+        if (mForeground != null) b.append(" fg ").append(meglerDescribe(mForeground));
         if (meglerListable() && meglerListsOn()) b.append(" (its list)");
         if (why != null) b.append(": ").append(why);
         android.util.Log.d("ViewDraw", b.toString());
+    }
+    /* A drawable for trace-views: its class, its colour where it is a colour or a shape of one, its alpha. */
+    public static String meglerDescribeDrawable(android.graphics.drawable.Drawable d) { return meglerDescribe(d); }
+    static String meglerDescribe(android.graphics.drawable.Drawable d) {
+        StringBuilder b = new StringBuilder(d.getClass().getName());
+        try {
+            if (d instanceof android.graphics.drawable.ColorDrawable) b.append(" #").append(Integer.toHexString(((android.graphics.drawable.ColorDrawable) d).getColor()));
+            else if (d instanceof android.graphics.drawable.GradientDrawable) {
+                android.content.res.ColorStateList c = ((android.graphics.drawable.GradientDrawable) d).getColor();
+                if (c != null) b.append(" #").append(Integer.toHexString(c.getDefaultColor()));
+            }
+            if (d.getAlpha() != 255) b.append(" alpha ").append(d.getAlpha());
+        } catch (RuntimeException e) {
+            b.append(" (").append(e.getClass().getSimpleName()).append(')');
+        }
+        return b.toString();
     }
     /** As a parent draws a child: its position, transform, alpha and clip, then draw(). */
     void drawFromParent(Canvas c, ViewGroup parent) {

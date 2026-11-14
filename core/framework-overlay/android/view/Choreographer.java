@@ -131,6 +131,25 @@ public final class Choreographer {
         if (cb == null) throw new IllegalArgumentException("callback must not be null");
         remove(CALLBACK_ANIMATION, cb, null);
     }
+    /** For megler.ViewRoot's frame watch: what this choreographer waits for, said in a line. */
+    public synchronized String meglerState() {
+        long now = System.nanoTime();
+        StringBuilder b = new StringBuilder();
+        b.append("frame scheduled ").append(mScheduled).append(", in a frame ").append(mInFrame)
+         .append(", its frame's message queued ").append(mHandler.hasCallbacks(mDoFrame))
+         .append(", the last frame ").append(mLastFrame == 0 ? "never" : (now - mLastFrame) / 1_000_000L + " ms ago");
+        final String[] names = { "input", "animation", "insets animation", "traversal", "commit" };
+        for (int t = 0; t < mQueues.length; t++) {
+            ArrayList<Object[]> q = mQueues[t];
+            if (q.isEmpty()) continue;
+            b.append("; ").append(names[t]).append(' ').append(q.size()).append(':');
+            for (int i = 0; i < Math.min(3, q.size()); i++) {
+                Object[] e = q.get(i);
+                b.append(' ').append(e[0] == null ? "null" : e[0].getClass().getName()).append(" due in ").append(((Long) e[2] - now) / 1_000_000L).append(" ms");
+            }
+        }
+        return b.toString();
+    }
     private long mVsyncId;
     private FrameData frameData(long frameTimeNanos) {
         FrameTimeline t = new FrameTimeline();
