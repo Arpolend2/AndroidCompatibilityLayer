@@ -908,12 +908,12 @@ checks. ARM's main passes reported 9187 and 9346 checks; Windows's 8614
 and 8736. Both data-app runs passed `integrity-profile`; the Windows run
 included the cached ANGLE build.
 
-### HP control, 2026-11-15: profile comparison still pending
+### HP comparison, 2026-11-15
 
 The Elite x3 had Megler 711 and GmsCore 26.41.31 (`264131009`), unlike
 the Lumia's 26.43.30. An isolated test branch based on the source of 711
 (`6a6d1caf`) applies the profile draft while retaining its newer shared
-keystore implementation. The phone's test runtime is 713.
+keystore implementation. The experiment used test runtime 713.
 
 A small, separate diagnostic app, `megler.test.hpdevicekey`, binds the
 hosted DroidGuard service and calls this GMS version's
@@ -926,18 +926,30 @@ exception. No DGFRR error occurred in the captured log. This establishes
 neither a valid VM token nor this request's HTTP status: those were not
 captured. The raw log stays in ignored private build output.
 
-The phone ran out of battery before the profile-enabled run. Therefore
-there is no paired HP result and no evidence yet that the profile changes
-Google's acceptance. A signed normal package, 714, without an auto run is
-ready but was not installed before power-off.
+After charging, the paired profile-enabled run used the four identity
+fields from the supplied PIF 19.1 archive (Pixel 6 beta fingerprint,
+security patch 2025-04-05). The startup log confirms four Build fields and
+four native/Java properties applied, with the provider mode enabled.
+The trace records `engineGetCertificateChain` ending with
+`UnsupportedOperationException`, establishing that the stack-scoped
+provider path actually ran. The device-key call returned `false` after
+59.7 seconds and AppCertManager again logged a parsing exception. The
+request's HTTP status and the VM token's validity were not captured.
+This particular profile did not obtain a key; newer profiles remain
+untested. The diagnostic changes no protocol messages or TLS validation.
 
-An inherited `ui-update-all` flag was also present in
-`Pictures/Megler/diag/megler/flags`; deleting its LocalState copy alone did
-not disable it at the next start. Both sources are now disabled and the
-Megler process was stopped. Some client packages received the 713 test
-runtime before this was found. After charging, those packages must be
-updated to the normal runtime, preserving their data; select only that
-test version rather than asking for Update All again.
+The test-only enable flag and the app's `custom.pif.json` have been removed,
+and its process was stopped. Normal package 714, without an auto run, is
+installed on HP. The inherited `ui-update-all` source was removed from
+both LocalState and `Pictures/Megler/diag/megler/flags`. Its Pictures copy
+had previously recreated the LocalState flag after deletion there.
+Windows' installed-package list confirms that all 42 client packages
+which received test runtime 713 now use normal runtime 714, with no test
+713 package remaining in that list. Updates preserved their data and were
+requested individually. The three packages still using 711 were outside
+the update list. Final filesystem checks confirm that the profile,
+test flags and mirrored Update All source are absent; the main package
+retains only its pre-existing `keep-screen-on` flag.
 
 On this newer source base, the full ARM suite passed 33 result groups
 (main passes 9215 and 9374 checks). The full Windows retry passed 33
