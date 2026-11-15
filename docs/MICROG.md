@@ -1181,6 +1181,62 @@ archive is not the official osm0sis v19 package.
 [Property change](https://github.com/osm0sis/PlayIntegrityFork/commit/a645788294d35df755efc38ae669836f26b63177),
 [v19 release](https://github.com/osm0sis/PlayIntegrityFork/releases/tag/v19).
 
+A further audit pinned Falcon Integrity Fix at `0c12258` (2026-11-13).
+Its v3.30.2-tagged ZIP (`FALCONINTEGITY_FIX_V3.30.zip`, SHA-256
+`35d2d3772b14064341e0ec7f24c004c1a0738a6acbfc119d4d5bb500c5522505`)
+does contain a different keybox. The XML SHA-256 is
+`a71ab688e1ce8fc93758231bebfe579691971c164af17b31c8379e418b4a1e5a`.
+It has one matching EC signing key and four certificates, whose chain
+verifies locally and expires first on 2026-11-25 at 05:44:23 UTC. Its root
+matches Google's published new Key Attestation CA1 root. None of its four
+serials occurs in Google's list downloaded and refreshed on 2026-11-15.
+This is a current local validation result, not a server verdict.
+
+TAKR means Tricky Addon Keybox Repository. Its public API lists entry 41
+as hardware/RKP, EC, four certificates, uploaded 2026-11-13, nearest
+expiry 2026-11-25T05:44:23Z. Those metadata match Falcon's candidate, but
+no byte-for-byte identity was established with the TAKR download. The
+number is a repository entry, not an Android API or module version.
+Expiration is an upper limit, not protection against an earlier revocation.
+
+Falcon's `service.sh` checks through `kb_sync.sh --auto` after boot and
+every 3600 seconds by default (minimum 900). Its configured primary source
+is davidepalma.it/pib/keybox.xml; fallback is TrickyStoreOSS's module XML.
+Those endpoints do not currently return the bundled candidate: the primary
+has a revoked RSA intermediate and the fallback has the expired AOSP EC
+issuer described above. Thus a fresh bundled keybox does not prove that
+unattended replacement will find another valid one. The downloader uses
+curl -k / wget --no-check-certificate; that transport behavior was not
+copied into Megler. No downloaded module code was executed.
+
+The original evoker0/AlwaysStrong repository returned 404. The inspected
+BloodCorrupt/AlwaysStrongFork at `54c2a70` bundles TEE interception and PIF,
+with configurable periodic fingerprint/keybox refresh. Its keybox fetcher
+uses a project mirror (default plain HTTP evoker.qzz.io/key), detects changes
+by a locally computed hash and preserves the old file on fetch failure.
+It downloads replacement material; it does not mint Google identities.
+TrickyStore/TEE interception consumes that material to sign chains; PIF
+supplies the build profile. These are separate mechanisms. The supplied
+4PDA page could not be retrieved directly during this audit.
+
+A separate diagnostic APK loaded the Falcon candidate in ARM/qemu and
+verified five-certificate chains for newly generated EC and RSA keys in
+both software and explicitly configured experimental TEE modes. Each
+local-only run reports 5 checks, 0 failed and no Google request. A further
+fresh-data GMS 26.41.31 probe used the experimental mode: metadata shows
+GMS requesting attestation and successful five-certificate generation for
+its challenges. AppCertManager still reports `dito: Parsing Exception`
+and `Device key obtained=false`. The log has no ERR_CERT_INVALID or old
+DGFRR byteCode error. This run did not capture the device-key HTTP status,
+so the earlier HTTP 400 finding must not be assumed for this exchange.
+The guest harness reports 5 checks, 0 failed; that only validates the
+harness, not device-key issuance. No phone was modified for these probes.
+
+[Falcon source](https://github.com/AHMED2111X/falcon_integrity_fix),
+[TAKR](https://keybox.kowx712.cc/),
+[inspected AlwaysStrong fork](https://github.com/BloodCorrupt/AlwaysStrongFork),
+[Google published roots](https://android.googleapis.com/attestation/root).
+
 The regression uses fresh test-only EC and RSA authorities, not those
 supplied private keys. It exercises both key algorithms, PEM formats,
 exact challenge and caller binding, DER authorizations, sign/verify,
