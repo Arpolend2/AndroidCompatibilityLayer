@@ -4812,9 +4812,12 @@ static int run_microg(void)
     CHECK(find_line("E/MicroGTest: FAILED", 0) < 0);
     CHECK(find_line("FATAL EXCEPTION", 0) < 0);
     /* microG heard the boot (megler.MicroG.boot), with its device registration turned on, as Megler turns it on unless microG's
-       settings turned it off (Play Store has no Android ID without it), and its check-in trigger started the registration. */
+       settings turned it off (Play Store has no Android ID without it), and its check-in trigger started the registration: its
+       request went out. (Not its "Started Google device registration in foreground mode": microG starts a service in the
+       foreground only where PowerManager says it is not let past the battery optimizations, which no package is since the
+       framework says every one is.) */
     CHECK(find_line("I/MicroG: device registration turned on (checkin_enable_service)", 0) >= 0);
-    CHECK(find_line("GmsCheckinSvc: Started Google device registration", 0) >= 0);
+    CHECK(find_line("D/GmsCheckinClient: -- Request --", 0) >= 0);
     say_app_lines("/MicroGTest: ");
     return g_failed;
 }
