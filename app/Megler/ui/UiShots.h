@@ -15,6 +15,9 @@
 //   ui-update-<package>     the same for the one app of that Android package (ui-update-com.here.app.maps), outdated or not
 //   ui-uninstall-<package>  that app's package uninstalled, as its page's Uninstall does once asked (its APK into the library first)
 //   ui-probe-breakpoints    whether the system stops a thread at a hardware breakpoint (megler_probe_breakpoints), in the log
+//   ui-type-<text>          the text typed into the running app's field being edited, each '_' a space (a flag's name has
+//                           none): ui-type-never_gonna (megler_text_commit, as the keyboard's text goes)
+//   ui-enter-<n>            Enter in that field: its action, Search in a search box (megler_text_key)
 #pragma once
 
 namespace megler::app::ui {
