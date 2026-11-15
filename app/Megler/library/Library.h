@@ -190,6 +190,8 @@ private:
     void bundledCopied(const std::string& id);
     /// Under mutex_: the entry at `it` goes, its copy, splits and cache with it.
     void eraseLocked(std::vector<ApkEntry>::iterator it);
+    /// APKs a PC put in Pictures\Megler\apks over USB taken into the library (Library.cpp). Off the UI thread.
+    void takeUsbApks();
     void work();
     void analyse(const std::string& id);
     /// Under mutex_: an entry whose APK is an installed package's, from the cache: `marker` is its id.apk.installed, the
