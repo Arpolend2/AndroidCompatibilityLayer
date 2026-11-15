@@ -2319,12 +2319,20 @@ void removeUnusedServiceCopies() {
     std::string record, other;
     const std::string keep = files::read(shared + L"\\services\\gms-package.txt", record) ? iniValue(record, "cache") : std::string();
     const std::string keepMicroG = files::read(shared + L"\\services\\microg-package.txt", other) ? iniValue(other, "cache") : std::string();
+    // And each microG's of another name (variant-<package>.txt: MicroG RE's), which was removed here as soon as it was
+    // registered, and registered again at each listing (the HP Elite x3, 0.1.0.718).
+    std::vector<std::string> keepVariants;
+    for (const auto& name : files::list(shared + L"\\services", L"variant-*.txt")) {
+        std::string variant;
+        if (files::read(shared + L"\\services\\" + name, variant)) keepVariants.push_back(iniValue(variant, "cache"));
+    }
     uint64_t freed = 0;
     int removed = 0, left = 0;
     for (const auto& name : files::listFolders(shared + L"\\services", L"*")) {
         // Only the copies' folders, named by their tokens (hexadecimal and '-'): gsf and the registered copy stay.
         const std::string token = narrow(name);
         if (token.empty() || token == keep || token == keepMicroG || token.find_first_not_of("0123456789abcdef-") != std::string::npos) continue;
+        if (std::find(keepVariants.begin(), keepVariants.end(), token) != keepVariants.end()) continue;
         const std::wstring folder = shared + L"\\services\\" + name;
         const uint64_t size = treeSize(folder);
         if (files::removeTree(folder)) {
