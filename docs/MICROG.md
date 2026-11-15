@@ -1253,6 +1253,33 @@ to this request. Attestation can influence collected signals but replacing
 the XML alone does not establish what Google accepted. Request values,
 token bytes and raw traces remain in ignored diagnostic folders.
 
+A corrected pass-through capture of asgv.b retains the serialized request
+immediately before the original transport call. Static hook callbacks have
+no receiver slot; earlier private diagnostic attempts used the instance
+convention and are excluded from protocol evidence. The corrected run
+changes only the diagnostic manager's in-memory retry timestamp to ensure
+an attempt within the test window; it does not replace request fields,
+headers, token or TLS verification. The hook itself may affect VM signals.
+
+The captured request is 12142 bytes: field 1 is a 12091-byte base64 token,
+fields 2 and 3 are nonzero Android ID and session integers, field 4 contains
+SDK 34 and GMS version 264131009 (both fixed32), and field 6 is the literal
+`missing_token` set by GMS's builder. The header `device` agrees with field
+2, `app` is com.google.android.gms, and Content-Type is application/x-protobuf.
+The remaining header names are gmscoreFlow and gmsversion. No values of
+identifiers or token material are retained in this document.
+
+The token base64 decodes to a syntactically valid 9068-byte protobuf with
+length-delimited fields 1/2/3/5 of 6/9012/25/16 bytes. It contains no literal
+ERROR, Exception or TimeoutException markers. This rules out an absent
+token or a plain encoded exception for this attempt; it does not prove
+that Google accepts the opaque signal payload. The original transport
+continues and AppCertManager again reports Parsing Exception and no key.
+The control harness ends with 5 checks, 0 failed. No production code was
+changed and no phone was updated for this analysis. The server's specific
+reason remains unknown; empty token, zero/mismatched ID and wrong public
+GMS version are not supported explanations for this captured attempt.
+
 [Falcon source](https://github.com/AHMED2111X/falcon_integrity_fix),
 [TAKR](https://keybox.kowx712.cc/),
 [inspected AlwaysStrong fork](https://github.com/BloodCorrupt/AlwaysStrongFork),
