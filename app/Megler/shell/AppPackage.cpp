@@ -1285,9 +1285,20 @@ InstallResult installWithPackageManager(const std::wstring& path, const std::fun
             shellLog::write("app package: " + identity + " is installed on " + volumeSaid(all, was) + ", and the apps are kept on " +
                             volumeSaid(all, kept) + ": it is updated where it is, and moved after");
     }
+    /*
+     * The other ways tried after a refusal (below), each tried on a phone that refuses nothing: the flag
+     * test-install-skip-main leaves these tries out as if each were refused (and copies the package to the shared folder
+     * whatever drive it lies on), test-install-skip-novolume the try with no volume named, test-install-skip-copy the copy.
+     */
+    const bool skipMain = flagSet(L"test-install-skip-main");
+    if (skipMain) {
+        said = asTheStore = "not asked (the flag test-install-skip-main)";
+        denied = false;
+        shellLog::write("app package: the deployment engine's tries left out, as if refused: the flag test-install-skip-main");
+    }
     bool first = true;
     for (const DeploymentOptions options : tries) {
-        if (managerless) break;
+        if (managerless || skipMain) break;
         int32_t code = 0;
         /*
          * Each set of options asked of C++/WinRT's PackageManager, and where that is refused for access, of one made from an
@@ -1371,7 +1382,7 @@ InstallResult installWithPackageManager(const std::wstring& path, const std::fun
         return false;
     };
     if (!denied && !managerless) {
-        if (volume) {
+        if (volume && !flagSet(L"test-install-skip-novolume")) {
             progress("Installing it where Windows puts new apps…");
             if (addOnce(path, nullptr, "with no volume named")) return settled(all, identity, kept, progress);
         }
@@ -1380,7 +1391,8 @@ InstallResult installWithPackageManager(const std::wstring& path, const std::fun
         const std::wstring sharedOn = shared.empty() ? std::wstring() : placement::volumeOf(shared);
         shellLog::write("app package: " + file + " lies on " + driveSaid(path.substr(0, path.find_last_of(L'\\')), lies) + "; the shared folder is on " +
                         (shared.empty() ? std::string("no drive (there is none)") : driveSaid(shared, sharedOn)) + "; " + defaultVolumeSaid());
-        if (!lies.empty() && !sharedOn.empty() && _wcsicmp(lies.c_str(), sharedOn.c_str()) != 0) {
+        if (!lies.empty() && !sharedOn.empty() && (_wcsicmp(lies.c_str(), sharedOn.c_str()) != 0 || skipMain) &&
+            !flagSet(L"test-install-skip-copy")) {
             const uint64_t bytes = files::size(path);
             ULARGE_INTEGER room{}, total{};
             if (!GetDiskFreeSpaceExW(shared.c_str(), &room, &total, nullptr) || room.QuadPart < bytes + (256ull << 20)) {

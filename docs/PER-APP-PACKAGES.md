@@ -168,6 +168,25 @@ rule; where it refuses this one, the shell says so, without Interop Tools. The
 last refusal of any kind is kept in `LocalState\install-refusal.txt`, which Save
 All Logs takes along and its summary says ([STATUS.md](STATUS.md), "Logs").
 
+A package refused at every try for anything but access is tried each other way
+once (since 0.1.0.712): with no volume named (Megler's own update too; until
+then an app's package alone, since 0.1.0.699); from a copy in the shared
+folder's `install-copy`, where the package lies on another drive than the shared
+folder, as the folders' handles say past a junction (onto the volume named, then
+with none); and on a phone through `InstallationManager`, as the Store installs,
+from the copy where one was made. A user's Lumia 950 XL (15254.603, Megler 696)
+had every package refused at once with `0x80073CF9` ("Install failed", nothing
+more), Update All's and Megler 699's from GitHub alike; its Megler's LocalState,
+where the packages are made and the update downloaded, was on the memory card,
+the packages were to go to the phone's memory, and its apps had been installed by
+673, which named no volume. Which of these Windows refused them for is not known.
+The log says where the package lies, where the shared folder is (each drive's
+volume and size) and Windows's default package volume, and the refusal what each
+other way answered. On a phone that refuses nothing the flags
+`test-install-skip-main` (the engine's tries left out as if refused, and the copy
+made whatever drive the package is on), `test-install-skip-novolume` and
+`test-install-skip-copy` let each way be tried in turn.
+
 The engine is the only way since 2026-11-07 (the owner's wish): Megler asks the
 phone's Device Portal nothing, and needs neither the portal nor its
 authentication turned off. Before, the portal (`https://127.0.0.1`, the phone's
