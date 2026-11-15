@@ -365,6 +365,7 @@ public class Main extends Activity {
         keystoreCertificates(run);
         integrityProfile();
         integrityCallbacks();
+        step("keybox-attestation", () -> { detail = AttestationChecks.run(this, run); return true; });
         keystoreForeignKey();
         keystoreHosted();
         pathOps();

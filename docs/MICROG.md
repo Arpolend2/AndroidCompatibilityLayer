@@ -1086,6 +1086,114 @@ the comparison; Claude's data was not cleared. Raw logs and screenshots
 containing the owner's address stay out of commits.
 
 
+### Draft keybox-backed attestation
+
+A separate opt-in `megler.KeyboxAttestation` supplies the generation path
+that the module set uses when Android's keystore cannot attest. It loads
+an external signing key and certificate chain and signs the generated
+key's leaf certificate. This is software generation inside Megler, not a
+Windows TEE or an implementation of the closed-source TrickyStore 1.4.1
+binary. Google acceptance remains a separate test.
+
+Configuration belongs to the Android client app hosting GMS, in its
+internal data directory (`LocalState/apps/<package>/data`):
+
+```
+attestation/enabled
+attestation/keybox.xml
+attestation/config.properties       # optional
+```
+
+The marker enables the path; no keybox or private key is bundled into
+Megler's source or releases. `keybox.xml` accepts one AndroidAttestation
+keybox with one or two EC/RSA signing entries. Private keys may be PKCS#8,
+RSA PKCS#1 or EC SEC1 PEM; certificates are X.509 PEM. Inputs are bounded
+(1 MiB XML, 16 KiB settings), and DTD/entity declarations are refused.
+The chain's validity dates, CA/path-length and key-usage constraints,
+issuer names and signatures are checked, as is a sign/verify proof that
+the private key matches its first certificate. Revocation and Google's
+trust in the issuer are not established by these local checks.
+
+For a challenged EC/RSA key generation the leaf carries the newly
+created public key, exact challenge, requested subject/serial/dates,
+key usages and Android extension `1.3.6.1.4.1.11129.2.1.17`. Its application
+ID contains the actual caller package/version and SHA-256 signing
+certificate digests; hosted GMS uses its own context. Authorizations
+include purposes, algorithm, actual key size/curve or exponent, requested
+digests/paddings and validity dates, no-auth, creation time, generated
+origin, OS version and patch level. Device properties are included only
+when requested. The complete chain is persisted with the key through the
+existing app/shared-GMS keystore. An invalid configuration or failed
+certificate construction does not replace an existing key.
+
+A configured `setAttestKeyAlias` selects an existing local signing alias
+instead of the external keybox. A key created with PURPOSE_ATTEST_KEY
+alone receives CA and certificate-signing constraints so its descendants'
+chains can be checked. StrongBox, authenticated keys, unique IDs and
+serial/IMEI-style ID attestation requests remain unsupported and are
+refused, rather than silently downgraded. Without the enable marker,
+Megler retains its existing unimplemented-attestation exception.
+
+The default extension reports Software (0), with no fabricated TEE
+RootOfTrust. For an explicit TrickyStore-style experiment,
+`config.properties` accepts `securityLevel=1` and requires both
+`verifiedBootKey` and `verifiedBootHash` as 32-byte hexadecimal values.
+`deviceLocked` defaults to false and `verifiedBootState` to Unverified
+(2); these are configurable claims, not measured boot evidence from
+Windows. `osVersion` (e.g. 140000), `osPatchLevel` (YYYYMM),
+`vendorPatchLevel` and `bootPatchLevel` (YYYYMMDD) may be set explicitly.
+Otherwise OS version/patch reflect the current Build values. Applications
+must not interpret these experimental claims as physical hardware backing.
+If a PIF profile's `spoofProvider` is also enabled, its DroidGuard chain
+exception still applies; disable that mode to test chain consumption.
+
+The metadata-only flag `trace-attestation` logs requested algorithm,
+challenge length and whether keybox mode is active, without logging
+challenge bytes, alias names, keys or certificates. Successful generation
+logs only algorithm, chain length, challenge length and configured level.
+
+Static inspection of the supplied files found that the default TrickyStore
+EC issuer expired on 2026-01-08; its RSA issuer remains valid to 2035.
+The separate keybox embedded in PIF47 has matching EC and RSA private keys
+and chains which validate locally, with leaf issuer certificates valid to
+November 2028. A separate check of Google's public revocation list on
+2026-11-15 identifies both PIF47 signing certificates (EC and RSA) as
+`REVOKED`, reason `KEY_COMPROMISE`. Only the public list was downloaded;
+private keys and device/user data were not submitted. Consequently this
+sample can validate local import/signing mechanics, but is unsuitable as
+an unrevoked identity for a server-acceptance test. The runtime's offline
+chain validation does not query this list automatically. Sample material
+stays in isolated ignored build directories.
+[Google attestation certificate status](https://android.googleapis.com/attestation/status).
+
+A fresh upstream audit on 2026-11-15 pinned osm0sis/PlayIntegrityFork main
+at `d7e6a4d635b7463bbee7c9701f91ebfc6f5eb4ff` (2026-11-13). Neither its
+tracked files nor the official v19 release ZIP contains a keybox or a PEM
+private key. The ZIP SHA-256 is
+`83b4d5f32743805c5b5a69361d73b8ab9c095325e24f20711afa1abea837b58f`.
+The recent `a645788` change adds `ro.board.first_api_level` when missing;
+it does not issue or renew attestation certificates. `autopif4` downloads
+public Pixel build profiles and adjusts TrickyStore patch configuration,
+not keyboxes. Its RKP warning requires a separate keybox for some newer
+profiles. Upstream's README likewise distinguishes its property spoofing
+from TrickyStore with an unrevoked hardware keybox; the supplied PIF47
+archive is not the official osm0sis v19 package.
+[Property change](https://github.com/osm0sis/PlayIntegrityFork/commit/a645788294d35df755efc38ae669836f26b63177),
+[v19 release](https://github.com/osm0sis/PlayIntegrityFork/releases/tag/v19).
+
+The regression uses fresh test-only EC and RSA authorities, not those
+supplied private keys. It exercises both key algorithms, PEM formats,
+exact challenge and caller binding, DER authorizations, sign/verify,
+certificate-chain signatures, persistence across data-app runs, rejected
+XML entities/oversize challenges/StrongBox, invalid input preserving the
+previous alias, explicit experimental claims and a local signing alias.
+The full `tools/build-tests.sh arm` and `tools/build-tests.sh win` runs each
+finish with 33 result groups and 0 failed checks, sequentially under the
+shared `heavy.lock` with `MEGLER_JOBS=4`. The ARM data app passes both runs,
+including persisted-chain verification; its harness reports 470 and 485 checks,
+each with 0 failed. No phone has been updated with this draft and no
+successful Google device-key or Play Integrity result is established.
+
 **Following it on a phone** (flags in `Pictures\Megler\diag\<package>\flags`):
 `trace-syscalls` (a library's calls by number with the path each names:
 "/sys/fs/selinux/enforce" = -2 from `libdB21738DAE92C.so+0x2e18`, its own
