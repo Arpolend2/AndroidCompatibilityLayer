@@ -100,3 +100,9 @@ processor's libraries. An older one never replaces a later one.
 3. Compare the assets' SHA-256 digests (`gh release view vX.Y.Z.N --json assets`) with the files': Megler checks what it
    downloads against them, and refuses a package whose digest is not GitHub's.
 4. The notes say which file is for which Windows and processor, and the SHA-256 of each.
+5. The section the offer shows -- the notes' first `## What's new` heading down to the next `## ` heading, at most about
+   700 characters of it, under the offer's own few lines -- is short: a few lines, the details under a heading of another
+   name after it. Megler before 0.1.0.690 shows the offer in a dialog that does not scroll, and where its text is higher
+   than the phone's screen its buttons are below the screen: no Update, no Later (699's notes, a user's report of
+   2026-11-16). Since 690 the text scrolls and the buttons stay, and since 0.1.0.718 a `### ` sub-heading in it is shown
+   as a line "Fixed:" rather than as written.

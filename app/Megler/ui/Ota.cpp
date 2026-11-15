@@ -238,6 +238,23 @@ std::string whatsNew(const std::string& notes) {
         if (part[i] == '`' || part[i] == '\r') continue;
         out += part[i];
     }
+    // A sub-heading ("### Fixed") a line of its own, as a list item is, its marks taken off and a colon after it: the dialog
+    // said "### Fixed" as it is written.
+    std::string headed;
+    for (size_t i = 0; i < out.size();) {
+        size_t end = out.find('\n', i);
+        if (end == std::string::npos) end = out.size();
+        std::string line = out.substr(i, end - i);
+        const size_t mark = line.find_first_not_of(' ');
+        if (mark != std::string::npos && line[mark] == '#') {
+            const size_t words = line.find_first_not_of("# ", mark);
+            line = words == std::string::npos ? std::string() : "- " + line.substr(words) + ":";
+        }
+        headed += line;
+        if (end < out.size()) headed += '\n';
+        i = end + 1;
+    }
+    out.swap(headed);
     // Lines of a list item joined, the items one to a line.
     std::string joined;
     for (size_t i = 0; i < out.size(); i++) {
