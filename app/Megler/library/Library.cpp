@@ -356,7 +356,7 @@ void Library::afterStart() {
         if (startedCopies_) return;
         startedCopies_ = true;
         copies.swap(pendingCopies_);
-        if (appPackage::single().package == "com.google.android.gms") services = entries_;
+        if (appPackage::gmsName(appPackage::single().package)) services = entries_;
     }
     // Google Play services' own package: its APK registered for the other apps (appPackage::registerServiceApk), which at its
     // first start copies the APK, hundreds of megabytes, into the shared folder -- on a thread of its own, after the window
@@ -714,7 +714,7 @@ void Library::analyse(const std::string& id) {
             entry.report = std::move(parsed);
             entry.analysed = true;
             entry.iconPath = iconPath;
-            if (appPackage::single().package == "com.google.android.gms") service = entry;
+            if (appPackage::gmsName(appPackage::single().package)) service = entry;
             break;
         }
         // Added just now, for a package already in the library: it replaces the entries that were there, whatever their file

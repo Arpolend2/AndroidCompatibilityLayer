@@ -91,6 +91,20 @@ bool hasMicroG();
 std::wstring microgApk();
 /// Whether Google's own Google Play services is installed as an app of its own (registered for the apps to start with).
 bool hasGoogleServices();
+/// Whether `package` is a name Google Play services go by: com.google.android.gms, or another ending in .android.gms, as
+/// ReVanced's MicroG RE is app.revanced.android.gms (core's mg_apk_gms_name).
+bool gmsName(const std::string& package);
+/// Whether the library's app is Google Play services an app may host: Google's own or microG's, or a microG of another name
+/// (ApkReport::microg with gmsName): registerServiceApk registers it.
+bool serviceEntry(const ApkEntry& entry);
+/*
+ * A microG of another name than Google Play services' -- ReVanced's MicroG RE, app.revanced.android.gms -- that an app asks
+ * for, installed as an app and registered (registerServiceApk: <shared>\services\variant-<package>.txt): the one whose name's
+ * head ("app.revanced.", in place of "com.google.") begins one of `permissions`, the app's manifest's (YouTube ReVanced
+ * Extended's app.revanced.android.gms.permission.AD_ID). An app ReVanced patched binds to it by that name and no other, and
+ * the core hosts it under that name (megler_run_config.gms_package). Empty for none; `apk` gets its registered APK.
+ */
+std::string gmsVariantFor(const std::vector<std::string>& permissions, std::wstring& apk);
 std::wstring gsfApk();
 
 /// An app's own package, before its app starts: the app's private files that Megler handed over when it made the package

@@ -1710,8 +1710,17 @@ std::wstring serviceSplits(const std::wstring& apk) {
     return files::list(splits, L"*.apk").empty() ? std::wstring() : splits;
 }
 
+bool gmsName(const std::string& package) {
+    static const std::string tail = ".android.gms";
+    return package.size() > tail.size() && package.compare(package.size() - tail.size(), tail.size(), tail) == 0;
+}
+
+bool serviceEntry(const ApkEntry& entry) {
+    return entry.report.package == "com.google.android.gms" || (entry.report.microg && gmsName(entry.report.package));
+}
+
 bool registerServiceApk(const ApkEntry& entry, const std::string& installedFullName, bool replace) {
-    if (entry.report.package != "com.google.android.gms") return true;
+    if (!serviceEntry(entry)) return true;
     if (!entry.report.ok || installedFullName.empty() || installedFullName.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") != std::string::npos || !canRead(entry.path)) return false;
     const auto shared = sharedFolder();
     if (shared.empty()) return false;
@@ -1719,8 +1728,12 @@ bool registerServiceApk(const ApkEntry& entry, const std::string& installedFullN
     // second asking meanwhile copied the APK a second time, beside the first.)
     static std::mutex registering;
     std::lock_guard<std::mutex> lock(registering);
-    // microG's and Google's own are each registered apart: an app takes the one it is set to (ui/SettingsScreen.cpp).
-    const auto record = shared + (entry.report.microg ? L"\\services\\microg-package.txt" : L"\\services\\gms-package.txt");
+    // microG's and Google's own are each registered apart: an app takes the one it is set to (ui/SettingsScreen.cpp). A microG
+    // of another name has a record of its own, for the apps that ask for it by that name (gmsVariantFor).
+    const bool variant = entry.report.package != "com.google.android.gms";
+    const auto record = shared + (variant              ? L"\\services\\variant-" + widen(entry.report.package) + L".txt"
+                                  : entry.report.microg ? std::wstring(L"\\services\\microg-package.txt")
+                                                        : std::wstring(L"\\services\\gms-package.txt"));
     std::string previous;
     if (!replace && files::read(record, previous) && iniValue(previous, "package") == installedFullName) {
         const auto token = iniValue(previous, "cache");
@@ -1757,7 +1770,8 @@ bool registerServiceApk(const ApkEntry& entry, const std::string& installedFullN
     copyServiceSplits(entry, apk);
     if (!files::write(record + L".part", "package=" + installedFullName + "\ncache=" + token + "\n") || !files::flush(record + L".part") ||
         !files::move(record + L".part", record)) return false;
-    shellLog::write(std::string(entry.report.microg ? "microG: registered microG's " : "microG: registered Google's own ") + installedFullName);
+    shellLog::write(variant ? "microG: registered " + entry.report.package + ", a microG of its own name, for the apps that ask for it: " + installedFullName
+                            : std::string(entry.report.microg ? "microG: registered microG's " : "microG: registered Google's own ") + installedFullName);
     removeUnusedServiceCopies();
     return true;
 }
@@ -1765,7 +1779,9 @@ bool registerServiceApk(const ApkEntry& entry, const std::string& installedFullN
 void unregisterServiceApk(const std::string& installedFullName) {
     const auto shared = sharedFolder();
     if (shared.empty()) return;
-    for (const wchar_t* kind : {L"\\services\\gms-package.txt", L"\\services\\microg-package.txt"}) {
+    std::vector<std::wstring> kinds = {L"\\services\\gms-package.txt", L"\\services\\microg-package.txt"};
+    for (const auto& name : files::list(shared + L"\\services", L"variant-*.txt")) kinds.push_back(L"\\services\\" + name);
+    for (const auto& kind : kinds) {
         const auto record = shared + kind;
         std::string registered;
         if (files::read(record, registered) && iniValue(registered, "package") == installedFullName) files::remove(record);
@@ -1840,6 +1856,24 @@ std::wstring serviceApk(bool microg) {
 bool hasMicroG() { return !microgApk().empty(); }
 
 bool hasGoogleServices() { return !registeredApk(L"gms-package.txt").empty(); }
+
+std::string gmsVariantFor(const std::vector<std::string>& permissions, std::wstring& apk) {
+    const auto shared = sharedFolder();
+    if (shared.empty() || permissions.empty()) return {};
+    for (const auto& name : files::list(shared + L"\\services", L"variant-*.txt")) {
+        // variant-<package>.txt
+        if (name.size() <= 12) continue;
+        const std::string package = narrow(name.substr(8, name.size() - 8 - 4));
+        if (!gmsName(package)) continue;
+        const std::string head = package.substr(0, package.size() - std::string("android.gms").size());
+        if (std::none_of(permissions.begin(), permissions.end(), [&](const std::string& p) { return p.compare(0, head.size(), head) == 0; })) continue;
+        const std::wstring registered = registeredApk(name.c_str());
+        if (registered.empty()) continue;
+        apk = registered;
+        return package;
+    }
+    return {};
+}
 
 std::wstring gsfApk() {
     const auto shared = sharedFolder();

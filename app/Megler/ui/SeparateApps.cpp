@@ -273,7 +273,7 @@ void settleApks(const std::vector<appPackage::InstalledApp>& installed) {
 void registerInstalledServices(const std::vector<appPackage::InstalledApp>& installed) {
     if (appPackage::isSingleApp()) return;
     for (const ApkEntry& e : Library::instance().entries()) {
-        if (e.report.package != "com.google.android.gms" || e.installedPackage.empty()) continue;
+        if (!appPackage::serviceEntry(e) || e.installedPackage.empty()) continue;
         if (std::none_of(installed.begin(), installed.end(), [&](const appPackage::InstalledApp& a) { return a.fullName == e.installedPackage; }))
             continue;
         if (!appPackage::registerServiceApk(e, e.installedPackage, false))

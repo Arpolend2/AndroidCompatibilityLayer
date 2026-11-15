@@ -248,22 +248,37 @@ bool start(const ApkEntry& apk, winrt::Windows::UI::Xaml::Controls::SwapChainPan
     // (megler_appx_capabilities; -1, a report that names no permissions: both, as before).
     const int capabilities = apk.report.capabilities();
     const bool messages = capabilities < 0 || (capabilities & MEGLER_APPX_CAP_CHAT), calls = capabilities < 0 || (capabilities & MEGLER_APPX_CAP_CALL_HISTORY);
-    std::thread([window, audio, width, height, densityDpi, rotation, playStore, java, messages, calls] {
+    /*
+     * A microG of another name -- ReVanced's MicroG RE, app.revanced.android.gms -- is the Google Play services of an app that
+     * asks for it (its permissions name it: appPackage::gmsVariantFor), hosted under that name (megler_run_config.gms_package):
+     * an app ReVanced patched (YouTube ReVanced Extended) binds to it by that name and no other. Such a microG run as an app
+     * names itself, its private files being the hosted one's.
+     */
+    const std::vector<std::string> permissions = apk.report.permissions;
+    const std::string ownVariant = apk.report.microg && appPackage::gmsName(apk.report.package) && apk.report.package != "com.google.android.gms"
+                                       ? apk.report.package
+                                       : std::string();
+    std::thread([window, audio, width, height, densityDpi, rotation, playStore, java, messages, calls, permissions, ownVariant] {
         // The flags a diagnosis over USB asked for, in place before the run reads them (shell/PicturesDiag.h).
         picturesDiag::waitForFlags();
         megler_run_config config = {};
         config.apk_path = gApkPath.c_str();
         // Google's own Google Play services, or microG's where the app (or Megler) is set to it (ui/SettingsScreen.cpp).
         const bool microg = !playStore && settings::get(settings::googleServices, "") == "microg";
-        const std::string servicePath = narrow(appPackage::serviceApk(microg));
+        std::wstring variantApk;
+        const std::string variant = ownVariant.empty() ? appPackage::gmsVariantFor(permissions, variantApk) : std::string();
+        const std::string servicePath = !variant.empty() ? narrow(variantApk) : narrow(appPackage::serviceApk(microg));
         // Said as what was chosen: Google's own when its package is installed, else microG's even where the setting is Google's
         // own (the log said "Google's own" for microG then, and a user's Play Store failed with microG's settings).
         const bool usesMicroG = !servicePath.empty() && servicePath == narrow(appPackage::microgApk());
         shellLog::write(std::string("session: Google Play services: ") +
-                        (servicePath.empty() ? "none registered"
-                         : !usesMicroG     ? "Google's own"
-                         : microg          ? "microG's"
-                                           : "microG's (Google's own is not installed as an app of its own: the library installs it)"));
+                        (!variant.empty()      ? variant + ", a microG of its own name that the app asks for"
+                         : servicePath.empty() ? "none registered"
+                         : !usesMicroG         ? "Google's own"
+                         : microg              ? "microG's"
+                                               : "microG's (Google's own is not installed as an app of its own: the library installs it)") +
+                        (ownVariant.empty() ? std::string() : "; the app is " + ownVariant + ", a microG of its own name, and goes by it"));
+        config.gms_package = !variant.empty() ? variant.c_str() : !ownVariant.empty() ? ownVariant.c_str() : nullptr;
         config.gms_apk_path = servicePath.empty() ? nullptr : servicePath.c_str();
         // And its splits (Google's own from Play Store: a base and splits of the phone's density and languages), beside it.
         const std::string serviceSplits = narrow(appPackage::serviceSplits(widen(servicePath)));
