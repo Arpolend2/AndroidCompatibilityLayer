@@ -1309,6 +1309,59 @@ existing key, so it must not be reported as a newly observed issuance.
 No additional runtime change, phone update, merge or push follows from
 these negative controls.
 
+On the explicitly selected Android 11 Mi 4c, a fresh baseline through
+verified Android HTTPS again receives HTTP 400 with 1664 response bytes.
+A Java-only normal-Cronet call first gets ERR_CERT_INVALID. A later
+certificate-diagnostics-only Cronet control, with all certificate override
+code removed, establishes HTTP/2, cert_status=0 and a known root, then
+receives HTTP 400 and the protobuf end-group parsing exception. This is
+a stronger current transport control than the older certificate-bypass
+experiment. A separate shell-UID HTTPS probe sees Google's public WE2 /
+GTS Root R4 chain and no HTTP/HTTPS proxy configured; this does not establish
+that every possible network intermediary is absent.
+
+With separate explicit permission, a temporary GMS-only TrickyStoreOSS
+engine from Falcon and the audited new keybox were installed on Mi 4c.
+A fresh test-owned GMS alias receives five certificates, whose signatures
+and dates validate through the published new Google root and whose leaf
+has the attestation extension. The alias is removed afterward. A fresh
+verified-HTTPS device-key control still receives HTTP 400. The first
+attempt times out without status and is inconclusive; the bounded retry
+gets 400. The original device_key is backed up only on the phone, compared
+byte-for-byte before rollback, and retained unchanged.
+
+A further explicitly approved control adds only the official PIF v19
+classes.dex and arm64 Zygisk core with Falcon's profile. It executes none
+of Falcon's installer, updater, conflict-removal or global resetprop
+scripts. Vending/signature/provider-blocking modes are off. Native PIF
+startup confirms config/DEX reads, the property callback hook and
+EntryPoint.init; Java-side logs name MODEL, FINGERPRINT and SECURITY_PATCH.
+The GMS-owned attestation probe again validates the new five-certificate
+chain. No Frida session is attached to the DroidGuard/unstable process in
+this native-module control. The request is triggered and observed from
+GMS's main process. It receives HTTP 400, including once over HTTP/3.
+This is not a successful device-key control despite native PIF loading.
+
+Both temporary-module controls were rolled back and rebooted. The three
+session-created module/config directories are verified absent, the engine
+is no longer running and the original key is present; its bytes matched
+the on-phone backup immediately before removal of that backup. Existing
+root modules, denylist settings and account data were not changed. An
+initial remote-exit-code check incorrectly inferred a disable marker;
+explicit marker/file checks corrected that and it is not protocol evidence.
+
+Primary microG source at f686900c68aa84d1605b52304f6615f3593c6f50 identifies
+request field 6 as a GCM registration token, obtained with DeviceKeyRequest
+scope, unlike the literal in these Google GMS builds. An on-phone,
+verified-HTTPS diagnostic using its own check-in credentials receives
+`Invalid scope` for DeviceKeyRequest. Standard GCM scope succeeds and
+returns a 131-character registration token. Replacing only field 6 in one
+fresh original device-key protobuf with that token still gets HTTP 400;
+no original key is replaced and no credentials or token bytes leave the
+phone. Thus this protocol variation supplies neither a fix nor proof that
+Google's literal is malformed. GCM registration succeeds but device-key
+issuance does not; these outcomes must remain distinct.
+
 [Falcon source](https://github.com/AHMED2111X/falcon_integrity_fix),
 [TAKR](https://keybox.kowx712.cc/),
 [inspected AlwaysStrong fork](https://github.com/BloodCorrupt/AlwaysStrongFork),
