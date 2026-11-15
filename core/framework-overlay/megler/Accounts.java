@@ -390,6 +390,12 @@ public final class Accounts {
             while ((event = p.next()) != XmlResourceParser.END_DOCUMENT) {
                 if (event != XmlResourceParser.START_TAG || !"account-authenticator".equals(p.getName())) continue;
                 String type = p.getAttributeValue(NS, "accountType");
+                // A reference to a string resolved, as Android's TypedArray.getString does: MicroG RE's is
+                // @string/var_authenticator_account_type, "app.revanced", and its sign-in was found for no account type.
+                int typeRef = p.getAttributeResourceValue(NS, "accountType", 0);
+                if (typeRef != 0) {
+                    try { type = owner.getResources().getString(typeRef); } catch (Exception e) { return null; }
+                }
                 if (type == null) return null;
                 AuthenticatorDescription d = new AuthenticatorDescription(type, pkg, p.getAttributeResourceValue(NS, "label", 0),
                     p.getAttributeResourceValue(NS, "icon", 0), p.getAttributeResourceValue(NS, "smallIcon", 0),
