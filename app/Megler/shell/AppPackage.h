@@ -73,7 +73,8 @@ void unregisterServiceApk(const std::string& installedFullName);
 /// open, which Windows does not let go, stays until the next time. Slow: off the UI thread.
 void removeUnusedServiceCopies();
 /// The APKs apps' own packages handed over for Megler to install (<shared>\incoming) that are over an hour old: what was
-/// left there before Megler removed each once its request was answered (ui/AppShell.cpp). Slow: off the UI thread.
+/// left there before Megler removed each once its request was answered (ui/AppShell.cpp); and a package's copy left in
+/// <shared>\install-copy (installWithPackageManager). Slow: off the UI thread.
 void removeOldHandedApks();
 /// What the shared folder holds, said in the log once a run: each of its folders' size (an app's own storage the largest).
 /// The Device Portal cannot look there. Slow: off the UI thread.

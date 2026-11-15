@@ -1204,6 +1204,27 @@ InstallResult settled(const Volumes& all, const std::string& identity, int kept,
     return done;
 }
 
+/// The drive `folder` is on, as its handle says it (`volume`, placement::volumeOf: past a junction, the drive it really is
+/// on), with that drive's size: "\\?\Volume{...}, a drive of 59.4 GB".
+std::string driveSaid(const std::wstring& folder, const std::wstring& volume) {
+    ULARGE_INTEGER free{}, total{};
+    return (volume.empty() ? std::string("a drive Windows does not name") : narrow(volume)) +
+           (GetDiskFreeSpaceExW(folder.c_str(), &free, &total, nullptr) ? ", a drive of " + formattedByteCount(total.QuadPart)
+                                                                       : std::string(", a drive whose size Windows does not say"));
+}
+
+/// Where Windows puts new apps (PackageManager.GetDefaultPackageVolume), said.
+std::string defaultVolumeSaid() {
+    try {
+        const auto volume = winrt::Windows::Management::Deployment::PackageManager().GetDefaultPackageVolume();
+        if (!volume) return "Windows names no default package volume";
+        return "Windows's default package volume is " + narrow(std::wstring(volume.PackageStorePath())) + " (" + narrow(std::wstring(volume.Name())) +
+               (volume.IsSystemVolume() ? ", the system's)" : ")");
+    } catch (hresult_error const& e) {
+        return format("Windows's default package volume is not said (0x%08x)", unsigned(e.code()));
+    }
+}
+
 }  // namespace
 
 std::string accessDeniedText(const std::string& meanwhile) {
@@ -1309,46 +1330,105 @@ InstallResult installWithPackageManager(const std::wstring& path, const std::fun
         if (!(unsigned(options) & 0x8000) && asTheStore.empty()) asTheStore = said;
     }
     /*
-     * An app's package refused onto the volume named, and not for access: once more with none named, where Windows puts new
-     * apps. An app on another storage than the one chosen, which its install then says (settled), is more than no app; what
-     * Windows refuses a volume for on a phone nobody has written down. (Megler's own package is where it is.)
+     * Refused, and not for access: other ways, each tried once, in case one of them is what this phone refuses. A Lumia
+     * 950 XL's Megler 0.1.0.696 had every package refused at once with 0x80073CF9 ("Install failed", nothing more), at every
+     * set of options, for two days: its apps' packages from Update All and Megler 0.1.0.699 from GitHub alike. Its Megler's
+     * LocalState, where the packages are made and the update is downloaded, was on the memory card (that drive 59.4 GB, the
+     * shared folder's 26.2 GB), and every package was to go to the phone's memory, the volume named; its five apps had been
+     * installed by 0.1.0.673, which named none. Which of these Windows refused them for is not known, and each is tried:
+     *  - with no volume named: where Windows puts new apps, and a package that is installed where it is (an app on another
+     *    storage than the one chosen is said so after, settled, and is more than no app);
+     *  - from a copy in the shared folder, where the package lies on another drive than the shared folder: onto the volume
+     *    named, then with none named;
+     *  - on a phone, through InstallationManager, as the Store installs (below).
+     * The log says where the package lies and Windows's default volume; the refusal says what each way answered.
      */
-    if (volume && !identity.empty() && !denied) {
+    const std::string file = narrow(path.substr(path.find_last_of(L'\\') + 1));
+    std::string others;        // each other way and what it answered, for the refusal
+    std::wstring copyFolder;   // the shared folder's install-copy, where a copy was made
+    std::wstring copied;       // the copy
+    const auto addOnce = [&](const std::wstring& from, PackageVolume const& onto, const std::string& how) {
+        std::wstring source = L"file:///" + from;
+        std::replace(source.begin(), source.end(), L'\\', L'/');
+        int32_t code = 0;
+        std::string answer;
         try {
-            progress("Installing it where Windows puts new apps…");
             shellLog::flush();
             const DeploymentResult result =
-                PackageManager().AddPackageAsync(winrt::Windows::Foundation::Uri(uri), nullptr, DeploymentOptions::ForceApplicationShutdown).get();
+                addPackage(PackageManager(), winrt::Windows::Foundation::Uri(source), DeploymentOptions::ForceApplicationShutdown, onto);
             if (result.ErrorText().empty()) {
-                shellLog::write("app package: " + narrow(path.substr(path.find_last_of(L'\\') + 1)) +
-                                " installed by Windows's deployment engine with no volume named, after it was refused onto " +
-                                volumeSaid(all, kept) + ": " + said);
-                return settled(all, identity, kept, progress);
+                shellLog::write("app package: " + file + " installed by Windows's deployment engine " + how + ", after it was refused: " + said);
+                return true;
             }
-            shellLog::write(format("app package: the deployment engine refused it with no volume named too: 0x%08x ",
-                                   unsigned(result.ExtendedErrorCode())) + narrow(result.ErrorText()));
+            code = result.ExtendedErrorCode();
+            answer = format("0x%08x ", unsigned(code)) + narrow(result.ErrorText());
         } catch (hresult_error const& e) {
-            shellLog::write(format("app package: the deployment engine could not be asked with no volume named: 0x%08x ", unsigned(e.code())) +
-                            narrow(e.message()));
+            code = e.code();
+            answer = format("0x%08x ", unsigned(code)) + narrow(e.message());
+        }
+        shellLog::write("app package: the deployment engine refused it " + how + " too: " + answer);
+        others += "; " + how + format(", 0x%08x", unsigned(code));
+        return false;
+    };
+    if (!denied && !managerless) {
+        if (volume) {
+            progress("Installing it where Windows puts new apps…");
+            if (addOnce(path, nullptr, "with no volume named")) return settled(all, identity, kept, progress);
+        }
+        const std::wstring shared = sharedFolder();
+        const std::wstring lies = placement::volumeOf(path.substr(0, path.find_last_of(L'\\')));
+        const std::wstring sharedOn = shared.empty() ? std::wstring() : placement::volumeOf(shared);
+        shellLog::write("app package: " + file + " lies on " + driveSaid(path.substr(0, path.find_last_of(L'\\')), lies) + "; the shared folder is on " +
+                        (shared.empty() ? std::string("no drive (there is none)") : driveSaid(shared, sharedOn)) + "; " + defaultVolumeSaid());
+        if (!lies.empty() && !sharedOn.empty() && _wcsicmp(lies.c_str(), sharedOn.c_str()) != 0) {
+            const uint64_t bytes = files::size(path);
+            ULARGE_INTEGER room{}, total{};
+            if (!GetDiskFreeSpaceExW(shared.c_str(), &room, &total, nullptr) || room.QuadPart < bytes + (256ull << 20)) {
+                shellLog::write("app package: no room for a copy of " + file + " in the shared folder (" + formattedByteCount(room.QuadPart) +
+                                " free, " + formattedByteCount(bytes) + " to copy)");
+            } else {
+                copyFolder = shared + L"\\install-copy";
+                files::removeTree(copyFolder);
+                files::makeDirectory(copyFolder);
+                const std::wstring copy = copyFolder + L"\\" + path.substr(path.find_last_of(L'\\') + 1);
+                progress("Copying it to the shared folder's drive…");
+                uint64_t mended = 0;
+                if (!files::copyWhole(path, copy, mended)) {
+                    shellLog::write(format("app package: %s could not be copied to the shared folder (error %lu)", file.c_str(), GetLastError()));
+                } else {
+                    copied = copy;
+                    progress("Installing it from the copy…");
+                    const bool done = addOnce(copy, volume, std::string("from a copy in the shared folder") + (volume ? "" : ", no volume named")) ||
+                                      (volume && addOnce(copy, nullptr, "from a copy in the shared folder, no volume named"));
+                    if (done) {
+                        files::removeTree(copyFolder);
+                        return settled(all, identity, kept, progress);
+                    }
+                }
+            }
         }
     }
 #if !defined(MEGLER_XBOX)
     /*
-     * Refused for access every time (no packageManagement: a phone without its interop unlock's capability part), the
-     * Store's own way: InstallationManager, which installs a package of the calling app's publisher, as a company hub's app
-     * installs its company's.
+     * The Store's own way: InstallationManager, which installs a package of the calling app's publisher, as a company hub's
+     * app installs its company's. Where Windows's deployment engine refused Megler for access every time (no
+     * packageManagement: a phone without its interop unlock's capability part), and on a phone where it refused the package
+     * for anything else too (above). From the copy, where one was made.
      */
     std::string byInstallationManager;
-    if (denied || managerless) {
-        const std::string file = narrow(path.substr(path.find_last_of(L'\\') + 1));
-        if (installByInstallationManager(path, progress, byInstallationManager)) {
+    if (denied || managerless || platform::isMobile()) {
+        if (installByInstallationManager(copied.empty() ? path : copied, progress, byInstallationManager)) {
             shellLog::write("app package: " + file + " installed by InstallationManager, as the Store installs" +
-                            (managerless ? std::string(" (the flag no-package-manager)") : std::string(": Windows's deployment engine refused Megler for access")));
+                            (managerless ? std::string(" (the flag no-package-manager)")
+                                         : denied ? std::string(": Windows's deployment engine refused Megler for access")
+                                                  : ", after Windows's deployment engine refused it: " + said));
+            if (!copyFolder.empty()) files::removeTree(copyFolder);
             return settled(all, identity, kept, progress);
         }
         shellLog::write("app package: InstallationManager did not install " + file + " either: " + byInstallationManager);
     }
 #endif
+    if (!copyFolder.empty()) files::removeTree(copyFolder);
     // Refused for access every time: whether Megler's packages are installed here all the same (Windows has granted it the
     // capability before, and the refusal is this run's), for what is said (accessDeniedText).
     if (denied && !gInstalledBefore) {
@@ -1362,7 +1442,7 @@ InstallResult installWithPackageManager(const std::wstring& path, const std::fun
     if (!byInstallationManager.empty()) through = "; through InstallationManager, " + byInstallationManager;
 #endif
     const InstallResult refused{false, "Windows's deployment engine did not install it: as the Store installs, " + asTheStore +
-                                           "; as a developer's package, " + said + through,
+                                           "; as a developer's package, " + said + others + through,
                                 denied};
     if (denied) sayRefusedForAccess();
     rememberRefusal(path, refused);
@@ -2177,6 +2257,15 @@ void removeOldHandedApks() {
     if (isSingleApp()) return;
     const std::wstring shared = sharedFolder();
     if (shared.empty()) return;
+    // And a copy of a package left in install-copy (installWithPackageManager): Megler's own update, once installed, ends
+    // the Megler that would have removed it. Not while a package is being installed.
+    const std::wstring copies = shared + L"\\install-copy";
+    if (files::exists(copies) && gDeployMutex.try_lock()) {
+        const uint64_t size = treeSize(copies);
+        if (files::removeTree(copies))
+            shellLog::write("app package: a copy of a package left in the shared folder's install-copy removed (" + formattedByteCount(size) + ")");
+        gDeployMutex.unlock();
+    }
     const std::wstring incoming = shared + L"\\incoming";
     FILETIME now;
     GetSystemTimeAsFileTime(&now);
