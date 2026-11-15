@@ -1280,6 +1280,35 @@ changed and no phone was updated for this analysis. The server's specific
 reason remains unknown; empty token, zero/mismatched ID and wrong public
 GMS version are not supported explanations for this captured attempt.
 
+A combined control applies Falcon's Pixel 6a Canary profile with the new
+keybox and spoofProvider=0. The startup log confirms 13 Build fields and
+14 process properties, certificate-chain block false. Wildcards are
+expanded only to the explicitly supported build-id, system patch and
+product/board first-API properties; unsupported Vending modes are omitted.
+This is a controlled Megler port of the applicable profile, not execution
+of Falcon's Android module or all of its global resetprop operations.
+The captured request is 6929 bytes with a 6879-byte token (5159 decoded),
+nonzero matching ID and no plain error markers. AppCertManager still
+reports Parsing Exception and false. The earlier mislocated profile file
+was not applied and is excluded from this combined-control evidence.
+
+The same run reports check-in SUCCESS before the captured device-key
+request. Its request ID matches the persisted GSF GServices android_id
+(read-only equality comparison; the value is not exported). A further
+process restart on the same registered diagnostic database retains the
+profile/keybox and obtains a fresh token. Cronet explicitly reports HTTP
+400 and the key is still absent. This excludes merely waiting for the
+first check-in as a sufficient remedy for this control. Both completed
+controls report 5 harness checks, 0 failed, not a device-key success.
+
+A true positive reference exchange is still absent. No Android reference
+was connected over ADB at the end of these controls; an Android without
+root cannot expose GMS's private device-key file or decrypted HTTPS call
+through an ordinary diagnostic APK. External app success can also use an
+existing key, so it must not be reported as a newly observed issuance.
+No additional runtime change, phone update, merge or push follows from
+these negative controls.
+
 [Falcon source](https://github.com/AHMED2111X/falcon_integrity_fix),
 [TAKR](https://keybox.kowx712.cc/),
 [inspected AlwaysStrong fork](https://github.com/BloodCorrupt/AlwaysStrongFork),
