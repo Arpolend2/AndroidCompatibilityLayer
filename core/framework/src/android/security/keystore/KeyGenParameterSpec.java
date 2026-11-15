@@ -64,7 +64,7 @@ public final class KeyGenParameterSpec implements java.security.spec.AlgorithmPa
         public android.security.keystore.KeyGenParameterSpec.Builder setDigests(java.lang.String[] p0) { meglerProps.put("Digests", p0); return this; }
         public android.security.keystore.KeyGenParameterSpec.Builder setEncryptionPaddings(java.lang.String[] p0) { meglerProps.put("EncryptionPaddings", p0); return this; }
         public android.security.keystore.KeyGenParameterSpec.Builder setInvalidatedByBiometricEnrollment(boolean p0) { meglerProps.put("InvalidatedByBiometricEnrollment", Boolean.valueOf(p0)); return this; }
-        public android.security.keystore.KeyGenParameterSpec.Builder setIsStrongBoxBacked(boolean p0) { meglerProps.put("IsStrongBoxBacked", Boolean.valueOf(p0)); return this; }
+        public android.security.keystore.KeyGenParameterSpec.Builder setIsStrongBoxBacked(boolean p0) { meglerProps.put("StrongBoxBacked", Boolean.valueOf(p0)); return this; }
         public android.security.keystore.KeyGenParameterSpec.Builder setKeySize(int p0) { meglerProps.put("KeySize", Integer.valueOf(p0)); return this; }
         public android.security.keystore.KeyGenParameterSpec.Builder setKeyValidityEnd(java.util.Date p0) { meglerProps.put("KeyValidityEnd", p0); return this; }
         public android.security.keystore.KeyGenParameterSpec.Builder setKeyValidityForConsumptionEnd(java.util.Date p0) { meglerProps.put("KeyValidityForConsumptionEnd", p0); return this; }

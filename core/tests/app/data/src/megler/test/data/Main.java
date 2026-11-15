@@ -350,6 +350,18 @@ public class Main extends Activity {
         tls();
         networkTrust();
         keystore(run);
+        step("keystore-strongbox-spec", () -> {
+            android.security.keystore.KeyGenParameterSpec.Builder b = new android.security.keystore.KeyGenParameterSpec.Builder("megler-strongbox-spec", 4);
+            boolean unset = !b.build().isStrongBoxBacked();
+            b.setIsStrongBoxBacked(true);
+            android.security.keystore.KeyGenParameterSpec requested = b.build();
+            android.security.keystore.KeyGenParameterSpec copy = android.security.keystore.KeyGenParameterSpec.Builder.class
+                    .getConstructor(android.security.keystore.KeyGenParameterSpec.class).newInstance(requested).build();
+            boolean enabled = requested.isStrongBoxBacked() && copy.isStrongBoxBacked();
+            b.setIsStrongBoxBacked(false);
+            detail = "unset=" + unset + " enabled-and-copied=" + enabled + " reset=" + !b.build().isStrongBoxBacked();
+            return unset && enabled && !b.build().isStrongBoxBacked() && requested.isStrongBoxBacked();
+        });
         keystoreCertificates(run);
         integrityProfile();
         integrityCallbacks();
