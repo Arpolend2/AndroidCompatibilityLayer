@@ -371,7 +371,7 @@ public class PackageManager {
         for (ServiceInfo external : megler.MicroG.query(i, flags)) { ResolveInfo r = new ResolveInfo(); r.serviceInfo = external; l.add(r); }
         if (l.isEmpty() && !megler.MicroG.installed() && googleService(i)) {
             ResolveInfo r = new ResolveInfo(); ServiceInfo s = new ServiceInfo();
-            s.packageName = "com.google.android.gms"; s.name = "com.google.android.gms.chimera.GmsIntentOperationService"; s.exported = true; s.enabled = true;
+            s.packageName = megler.GooglePackages.GMS; s.name = "com.google.android.gms.chimera.GmsIntentOperationService"; s.exported = true; s.enabled = true;
             try { s.applicationInfo = megler.GooglePackages.applicationInfo(s.packageName); } catch (Exception e) {}
             r.serviceInfo = s; l.add(r);
         }
@@ -380,7 +380,7 @@ public class PackageManager {
     private static boolean googleService(Intent i) {
         String p = i.getComponent() != null ? i.getComponent().getPackageName() : i.getPackage();
         String a = i.getAction();
-        return "com.google.android.gms".equals(p) || (a != null && (a.startsWith("com.google.android.c2dm.intent.") || a.startsWith("com.google.android.gms.") || a.startsWith("com.google.firebase.")));
+        return megler.GooglePackages.GMS.equals(p) || (a != null && (a.startsWith("com.google.android.c2dm.intent.") || a.startsWith("com.google.android.gms.") || a.startsWith("com.google.firebase.")));
     }
     public List<ResolveInfo> queryBroadcastReceivers(Intent i, int flags) {
         ArrayList<ResolveInfo> l = new ArrayList<>();

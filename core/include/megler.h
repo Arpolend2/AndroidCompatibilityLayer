@@ -2052,6 +2052,13 @@ typedef struct megler_run_config {
     /* Optional Google Services Framework APK, shared by all client packages. */
     const char *gsf_apk_path;
     /*
+     * The package name gms_apk_path's Google Play services go by in the app, "com.google.android.gms" where NULL: a microG
+     * of another name -- ReVanced's MicroG RE, app.revanced.android.gms, which the apps ReVanced patched bind to and ask for by
+     * that name -- is hosted under its own. Such a microG run as an app names itself here, so that its private files are the
+     * hosted one's (the services' shared folder) as Google Play services' are.
+     */
+    const char *gms_package;
+    /*
      * An app in several APKs (megler_apk_report_splits): its splits, as a folder whose .apk files they are (the folder
      * megler_bundle_unpack makes), and as a list of paths; either may be left NULL. The app runs as one, as Android runs
      * an installed app with its splits: native libraries out of the split that has them, its resources and assets out of

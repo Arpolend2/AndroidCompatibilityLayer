@@ -2,8 +2,10 @@
 // It differs in one more package it answers for, the System WebView of the Android root, com.android.webview: installed,
 // with the version and the files its APK has (android.webkit.WebView.getCurrentWebViewPackage, which reads them from the
 // APK's manifest). And in Play Store's own meta-data, its derived APK id the newest there is (ownMetaData, which says why), and
-// in two flags of Play Store's that test its own updates (ownVersionCode). The rest is the original's, the made-up
-// com.google.android.webview included.
+// in two flags of Play Store's that test its own updates (ownVersionCode). And in the name Google Play services go by, GMS:
+// the hosted ones' (Native.gmsPackage, megler_run_config.gms_package), com.google.android.gms or a microG of another name --
+// ReVanced's MicroG RE, app.revanced.android.gms, which the apps ReVanced patched ask for and bind to by that name and no
+// other (gmsPrefix). The rest is the original's, the made-up com.google.android.webview included.
 //
 // Why. The package manager knows the app and, through this class, the packages it pretends are installed; every other name
 // is NameNotFoundException. The WebView is a package of its own whose code runs in the app, and its code asks the package
@@ -16,7 +18,7 @@ package megler;
  *  Google's release key (its public certificate, which every app signed with that key carries). Apps check this before using
  *  Google's libraries ("This app won't run without Google Play services"); the services themselves are what Megler answers in place. */
 public final class GooglePackages {
-    public static final String GMS = "com.google.android.gms", VENDING = "com.android.vending", GSF = "com.google.android.gsf",
+    public static final String GMS = gmsName(), VENDING = "com.android.vending", GSF = "com.google.android.gsf",
         /* the system WebView, at the version WebView.getCurrentWebViewPackage and the user agent give (Notion checks it is recent) */
         WEBVIEW = "com.google.android.webview";
     /** Google's release certificate (SHA-1 38:91:8a:45:3d:07:19:93:54:f8:b1:9a:f0:5e:c6:56:2c:ed:57:88) */
@@ -40,6 +42,21 @@ public final class GooglePackages {
         + "e62641aa99271dfd5228c5c587875ddb7f452758d661f6cc0cccb7352e424cc4365c523532f7325137593c4ae341f4db41edda0d0b1071a7c440f0fe"
         + "9ea01cb627ca674369d084bd2fd911ff06cdbf2cfa10dc0f893ae35762919048c7efc64c7144178342f70581c9de573af55b390dd7fdb9418631895d"
         + "5f759f30112687ff621410c069308a";
+    /** Megler: the name the hosted Google Play services go by in this app (see the top of the file). */
+    private static String gmsName() {
+        try {
+            String name = Native.gmsPackage();
+            if (name != null && !name.isEmpty()) return name;
+        } catch (Throwable t) {
+        }
+        return "com.google.android.gms";
+    }
+    /** Megler: what a microG of another name has in place of "com.google." at the head of its authorities and permissions
+     *  ("app.revanced." of app.revanced.android.gms's app.revanced.android.gsf.gservices), or null for Google's own name. */
+    public static String gmsPrefix() {
+        final String tail = "android.gms";
+        return GMS.equals("com.google.android.gms") || !GMS.endsWith(tail) ? null : GMS.substring(0, GMS.length() - tail.length());
+    }
     public static boolean is(String pkg) { return GMS.equals(pkg) || VENDING.equals(pkg) || GSF.equals(pkg) || WEBVIEW.equals(pkg) || systemWebView(pkg) != null; }
     /** Megler: the Android root's WebView package when pkg names it, else null (see the top of the file). */
     private static android.content.pm.PackageInfo systemWebView(String pkg) {

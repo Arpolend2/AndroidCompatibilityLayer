@@ -161,3 +161,6 @@
      * whole picture, 1 cut square). The caller waits (core/src/drivers/mg_java.c); the shell answers on a thread of its own.
      */
     public static native byte[] storageThumbnail(String path, int size, int mode);
+    /** The name the Google Play services this app hosts go by (megler_run_config.gms_package): com.google.android.gms, or a
+     *  microG of another name, ReVanced's MicroG RE's app.revanced.android.gms (megler.GooglePackages.GMS). */
+    public static native String gmsPackage();

@@ -481,7 +481,11 @@ static void other_apps_find(void *user)
  * registration turned on, the check-in's Android ID, the accounts it signed in.
  */
 #define SERVICES_GUEST "/data/megler-services"
-static bool service_package(const char *package) { return !strcmp(package, "com.google.android.gms") || !strcmp(package, "com.google.android.gsf"); }
+static bool service_package(const char *package)
+{
+    return !strcmp(package, "com.google.android.gms") || !strcmp(package, "com.google.android.gsf") ||
+           (g_config.gms_package && !strcmp(package, g_config.gms_package));
+}
 
 /*
  * microG's services keep theirs apart, <storage_dir>/services/data-microg: an app set to microG instead of Google's own
@@ -749,8 +753,11 @@ bool mg_run_start(const megler_run_config *config)
     g_config.apk_path = g_apk_path;
     g_config.gms_apk_path = config->gms_apk_path ? mg_strdup(config->gms_apk_path) : NULL;
     g_config.gms_splits_dir = config->gms_apk_path && config->gms_splits_dir && config->gms_splits_dir[0] ? mg_strdup(config->gms_splits_dir) : NULL;
+    g_config.gms_package = config->gms_package && config->gms_package[0] ? mg_strdup(config->gms_package) : NULL;
     g_services_microg = (config->gms_apk_path && mg_apk_is_microg(config->gms_apk_path)) ||
-                        (!strcmp(info.package, "com.google.android.gms") && mg_apk_is_microg(config->apk_path));
+                        ((!strcmp(info.package, "com.google.android.gms") || (g_config.gms_package && !strcmp(info.package, g_config.gms_package))) &&
+                         mg_apk_is_microg(config->apk_path));
+    if (g_config.gms_package) mg_info("run: Google Play services go by %s in this app", g_config.gms_package);
     if (g_services_microg) mg_info("run: Google Play services are microG's: their data is the shared folder's services/data-microg");
     g_config.gsf_apk_path = config->gsf_apk_path ? mg_strdup(config->gsf_apk_path) : NULL;
     /* The host's fonts are the caller's until this returns (megler.h), and read by the driver on the app's thread: kept. */

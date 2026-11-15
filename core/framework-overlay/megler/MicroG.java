@@ -266,7 +266,10 @@ public final class MicroG {
      * but microG's subscribedfeeds of its -- so another is not worth reading GmsCore for (until it was read for something else).
      */
     public static boolean mayBeGmsAuthority(String authority) {
-        return authority != null && (loaded() != null || authority.startsWith("com.google.") || "subscribedfeeds".equals(authority));
+        // (A microG of another name has its own at the head of its authorities: MicroG RE's app.revanced.android.gsf.gservices.)
+        String other = GooglePackages.gmsPrefix();
+        return authority != null && (loaded() != null || authority.startsWith("com.google.") || "subscribedfeeds".equals(authority) ||
+                                     (other != null && authority.startsWith(other)));
     }
     public static ContentProvider provider(String authority) {
         // (Every authority but the app's own and Android's few asks here: ContentResolver.)
