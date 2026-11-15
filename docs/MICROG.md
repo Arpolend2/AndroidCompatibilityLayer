@@ -1232,6 +1232,27 @@ so the earlier HTTP 400 finding must not be assumed for this exchange.
 The guest harness reports 5 checks, 0 failed; that only validates the
 harness, not device-key issuance. No phone was modified for these probes.
 
+A follow-up fresh-data control enables CronetUrlRequest, appr and DroidGuard
+call tracing. It observes the actual `/auth/devicekey` request followed by
+CronetUrlRequest.j HTTP 400 over h2 and the same `dito: Parsing Exception`.
+Other HTTP 200 responses in that run belong to earlier requests, not a
+successful device-key exchange. DroidGuard init succeeds and returns
+nonempty signal data; the old byteCode and TLS-certificate errors are absent.
+Thus the externally supplied candidate fixes neither the server refusal
+nor device-key issuance. No validity verdict for the signal token follows
+from its nonzero length or successful local generation.
+
+Static analysis of this exact release's appr.b also explains an early false
+return in the diagnostic: a process-local elapsed-time throttle precedes
+token collection and the network call. A fresh-process call may return its
+initial false result without sending anything; a later background call
+made the request above. The manager builds a protobuf with Android ID,
+session, DroidGuard result, SDK and GMS version, and explicitly sets the
+`missing_token` field itself. It does not directly append the keybox chain
+to this request. Attestation can influence collected signals but replacing
+the XML alone does not establish what Google accepted. Request values,
+token bytes and raw traces remain in ignored diagnostic folders.
+
 [Falcon source](https://github.com/AHMED2111X/falcon_integrity_fix),
 [TAKR](https://keybox.kowx712.cc/),
 [inspected AlwaysStrong fork](https://github.com/BloodCorrupt/AlwaysStrongFork),
