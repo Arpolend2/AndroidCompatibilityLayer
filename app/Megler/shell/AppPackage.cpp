@@ -1204,11 +1204,54 @@ InstallResult settled(const Volumes& all, const std::string& identity, int kept,
     return done;
 }
 
-/// The drive `folder` is on, as its handle says it (`volume`, placement::volumeOf: past a junction, the drive it really is
-/// on), with that drive's size: "\\?\Volume{...}, a drive of 59.4 GB".
-std::string driveSaid(const std::wstring& folder, const std::wstring& volume) {
+/*
+ * What tells the drive a folder is on from another, as the folder's handle says it (past a junction: a LocalState that
+ * Windows keeps on the memory card under a path in C:\Data): its volume's name (placement::volumeOf, "\\?\Volume{...}"),
+ * which a Lumia 650 does not say; its device, from its NT path ("\Device\HarddiskVolume12"); and its serial number. Each
+ * empty where Windows does not say it.
+ */
+struct DriveIds {
+    std::wstring volume, device, serial;
+};
+
+DriveIds driveIds(const std::wstring& folder) {
+    DriveIds ids;
+    ids.volume = placement::volumeOf(folder);
+    CREATEFILE2_EXTENDED_PARAMETERS params = {};
+    params.dwSize = sizeof(params);
+    params.dwFileFlags = FILE_FLAG_BACKUP_SEMANTICS;  // (the one way a folder is opened)
+    const HANDLE h = CreateFile2(folder.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING, &params);
+    if (h == INVALID_HANDLE_VALUE) return ids;
+    std::wstring path(1024, L'\0');
+    DWORD n = GetFinalPathNameByHandleW(h, path.data(), DWORD(path.size()), VOLUME_NAME_NT);
+    if (n >= path.size()) {
+        path.assign(size_t(n) + 1, L'\0');
+        n = GetFinalPathNameByHandleW(h, path.data(), DWORD(path.size()), VOLUME_NAME_NT);
+    }
+    if (n && n < path.size() && path.compare(0, 8, L"\\Device\\") == 0) {
+        path.resize(n);
+        ids.device = path.substr(0, path.find(L'\\', 8));
+    }
+    DWORD serial = 0;
+    if (GetVolumeInformationByHandleW(h, nullptr, 0, &serial, nullptr, nullptr, nullptr, 0)) ids.serial = widen(format("%08lx", serial));
+    CloseHandle(h);
+    return ids;
+}
+
+/// Whether `a` and `b` are one drive: 1, 0, or -1 where no way of telling is said for both.
+int sameDrive(const DriveIds& a, const DriveIds& b) {
+    if (!a.volume.empty() && !b.volume.empty()) return _wcsicmp(a.volume.c_str(), b.volume.c_str()) == 0;
+    if (!a.device.empty() && !b.device.empty()) return _wcsicmp(a.device.c_str(), b.device.c_str()) == 0;
+    if (!a.serial.empty() && !b.serial.empty()) return a.serial == b.serial;
+    return -1;
+}
+
+/// The drive `folder` is on (`ids`), said with its size: "\Device\HarddiskVolume12 (serial 1a2b3c4d), a drive of 59.4 GB".
+std::string driveSaid(const std::wstring& folder, const DriveIds& ids) {
+    std::string name = narrow(!ids.volume.empty() ? ids.volume : ids.device);
+    if (!ids.serial.empty()) name += (name.empty() ? "serial " : " (serial ") + narrow(ids.serial) + (name.empty() ? "" : ")");
     ULARGE_INTEGER free{}, total{};
-    return (volume.empty() ? std::string("a drive Windows does not name") : narrow(volume)) +
+    return (name.empty() ? std::string("a drive Windows does not name") : name) +
            (GetDiskFreeSpaceExW(folder.c_str(), &free, &total, nullptr) ? ", a drive of " + formattedByteCount(total.QuadPart)
                                                                        : std::string(", a drive whose size Windows does not say"));
 }
@@ -1349,15 +1392,15 @@ InstallResult installWithPackageManager(const std::wstring& path, const std::fun
      * installed by 0.1.0.673, which named none. Which of these Windows refused them for is not known, and each is tried:
      *  - with no volume named: where Windows puts new apps, and a package that is installed where it is (an app on another
      *    storage than the one chosen is said so after, settled, and is more than no app);
-     *  - from a copy in the shared folder, where the package lies on another drive than the shared folder: onto the volume
-     *    named, then with none named;
-     *  - on a phone, through InstallationManager, as the Store installs (below).
+     *  - from a copy in the shared folder, where the package lies on another drive than the shared folder or which drive is
+     *    not known: onto the volume named, then with none named.
+     * (Not InstallationManager, the Store's way: a Lumia 650 that installs everything otherwise had its AddPackageAsync
+     * answer 0x800703F0, ERROR_NO_TOKEN, as a company hub's install would without its company's enrollment token.)
      * The log says where the package lies and Windows's default volume; the refusal says what each way answered.
      */
     const std::string file = narrow(path.substr(path.find_last_of(L'\\') + 1));
     std::string others;        // each other way and what it answered, for the refusal
     std::wstring copyFolder;   // the shared folder's install-copy, where a copy was made
-    std::wstring copied;       // the copy
     const auto addOnce = [&](const std::wstring& from, PackageVolume const& onto, const std::string& how) {
         std::wstring source = L"file:///" + from;
         std::replace(source.begin(), source.end(), L'\\', L'/');
@@ -1386,13 +1429,15 @@ InstallResult installWithPackageManager(const std::wstring& path, const std::fun
             progress("Installing it where Windows puts new apps…");
             if (addOnce(path, nullptr, "with no volume named")) return settled(all, identity, kept, progress);
         }
-        const std::wstring shared = sharedFolder();
-        const std::wstring lies = placement::volumeOf(path.substr(0, path.find_last_of(L'\\')));
-        const std::wstring sharedOn = shared.empty() ? std::wstring() : placement::volumeOf(shared);
-        shellLog::write("app package: " + file + " lies on " + driveSaid(path.substr(0, path.find_last_of(L'\\')), lies) + "; the shared folder is on " +
-                        (shared.empty() ? std::string("no drive (there is none)") : driveSaid(shared, sharedOn)) + "; " + defaultVolumeSaid());
-        if (!lies.empty() && !sharedOn.empty() && (_wcsicmp(lies.c_str(), sharedOn.c_str()) != 0 || skipMain) &&
-            !flagSet(L"test-install-skip-copy")) {
+        const std::wstring shared = sharedFolder(), folder = path.substr(0, path.find_last_of(L'\\'));
+        const DriveIds lies = driveIds(folder), sharedOn = shared.empty() ? DriveIds{} : driveIds(shared);
+        const int same = shared.empty() ? -1 : sameDrive(lies, sharedOn);
+        shellLog::write("app package: " + file + " lies on " + driveSaid(folder, lies) + "; the shared folder is on " +
+                        (shared.empty() ? std::string("no drive (there is none)")
+                                        : driveSaid(shared, sharedOn) + (same < 0 ? ", whether the same is not known" : same ? ", the same" : ", another")) +
+                        "; " + defaultVolumeSaid());
+        // (Where whether they are one drive is not known, the copy is made too: it is a try more, made only after refusals.)
+        if (!shared.empty() && (same != 1 || skipMain) && !flagSet(L"test-install-skip-copy")) {
             const uint64_t bytes = files::size(path);
             ULARGE_INTEGER room{}, total{};
             if (!GetDiskFreeSpaceExW(shared.c_str(), &room, &total, nullptr) || room.QuadPart < bytes + (256ull << 20)) {
@@ -1408,7 +1453,6 @@ InstallResult installWithPackageManager(const std::wstring& path, const std::fun
                 if (!files::copyWhole(path, copy, mended)) {
                     shellLog::write(format("app package: %s could not be copied to the shared folder (error %lu)", file.c_str(), GetLastError()));
                 } else {
-                    copied = copy;
                     progress("Installing it from the copy…");
                     const bool done = addOnce(copy, volume, std::string("from a copy in the shared folder") + (volume ? "" : ", no volume named")) ||
                                       (volume && addOnce(copy, nullptr, "from a copy in the shared folder, no volume named"));
@@ -1422,19 +1466,16 @@ InstallResult installWithPackageManager(const std::wstring& path, const std::fun
     }
 #if !defined(MEGLER_XBOX)
     /*
-     * The Store's own way: InstallationManager, which installs a package of the calling app's publisher, as a company hub's
-     * app installs its company's. Where Windows's deployment engine refused Megler for access every time (no
-     * packageManagement: a phone without its interop unlock's capability part), and on a phone where it refused the package
-     * for anything else too (above). From the copy, where one was made.
+     * Refused for access every time (no packageManagement: a phone without its interop unlock's capability part), the
+     * Store's own way: InstallationManager, which installs a package of the calling app's publisher, as a company hub's app
+     * installs its company's. (A Lumia 650 with Megler 0.1.0.712 and the flag test-install-skip-main had it answer
+     * 0x800703F0, ERROR_NO_TOKEN: it may want the enrollment token a company hub's phone has. Not seen to install yet.)
      */
     std::string byInstallationManager;
-    if (denied || managerless || platform::isMobile()) {
-        if (installByInstallationManager(copied.empty() ? path : copied, progress, byInstallationManager)) {
+    if (denied || managerless) {
+        if (installByInstallationManager(path, progress, byInstallationManager)) {
             shellLog::write("app package: " + file + " installed by InstallationManager, as the Store installs" +
-                            (managerless ? std::string(" (the flag no-package-manager)")
-                                         : denied ? std::string(": Windows's deployment engine refused Megler for access")
-                                                  : ", after Windows's deployment engine refused it: " + said));
-            if (!copyFolder.empty()) files::removeTree(copyFolder);
+                            (managerless ? std::string(" (the flag no-package-manager)") : std::string(": Windows's deployment engine refused Megler for access")));
             return settled(all, identity, kept, progress);
         }
         shellLog::write("app package: InstallationManager did not install " + file + " either: " + byInstallationManager);

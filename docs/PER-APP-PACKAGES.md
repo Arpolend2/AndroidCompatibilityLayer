@@ -172,9 +172,14 @@ A package refused at every try for anything but access is tried each other way
 once (since 0.1.0.712): with no volume named (Megler's own update too; until
 then an app's package alone, since 0.1.0.699); from a copy in the shared
 folder's `install-copy`, where the package lies on another drive than the shared
-folder, as the folders' handles say past a junction (onto the volume named, then
-with none); and on a phone through `InstallationManager`, as the Store installs,
-from the copy where one was made. A user's Lumia 950 XL (15254.603, Megler 696)
+folder or which drive is not known, as the folders' handles say past a junction
+(the volume's name, which a Lumia 650 does not say, its NT device, or its serial
+number), onto the volume named and then with none. Not through
+`InstallationManager`: on a Lumia 650 that installs everything otherwise, its
+`AddPackageAsync` answered `0x800703F0` (ERROR_NO_TOKEN), as a company hub's
+install would without its company's enrollment token, so the way tried where
+Windows refuses Megler for access has not been seen to install either. A user's
+Lumia 950 XL (15254.603, Megler 696)
 had every package refused at once with `0x80073CF9` ("Install failed", nothing
 more), Update All's and Megler 699's from GitHub alike; its Megler's LocalState,
 where the packages are made and the update downloaded, was on the memory card,
@@ -185,7 +190,8 @@ volume and size) and Windows's default package volume, and the refusal what each
 other way answered. On a phone that refuses nothing the flags
 `test-install-skip-main` (the engine's tries left out as if refused, and the copy
 made whatever drive the package is on), `test-install-skip-novolume` and
-`test-install-skip-copy` let each way be tried in turn.
+`test-install-skip-copy` let each way be tried in turn (tried on the Lumia 650
+with 0.1.0.712: no volume named, then the copy).
 
 The engine is the only way since 2026-11-07 (the owner's wish): Megler asks the
 phone's Device Portal nothing, and needs neither the portal nor its
