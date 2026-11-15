@@ -526,8 +526,25 @@ void Library::takeUsbApks() {
             const std::string name = narrow(std::wstring(file.Name()));
             if (name.size() < 5 || _stricmp(name.c_str() + name.size() - 4, ".apk") != 0) continue;
             const std::string id = idFor(name);
+            const std::wstring target = directory_ + L"\\" + widen(id), part = target + L".usb-part";
             try {
-                file.CopyAsync(to, widen(id), NameCollisionOption::ReplaceExisting).get();
+                // Copied under a name of its own, and put in the place of a file of that name there only once that one is
+                // gone: a copy that replaced it kept its access rights, and a file the portal wrote there Megler cannot open
+                // (the Elite x3's copies of both APKs read "The file cannot be opened" so, 0.1.0.718).
+                files::remove(part);
+                file.CopyAsync(to, widen(id) + L".usb-part", NameCollisionOption::ReplaceExisting).get();
+                if (files::exists(target) && !files::remove(target)) {
+                    shellLog::write(format("library: %s could not be taken: the file of its name in the library could not be removed (error %lu)",
+                                           name.c_str(), GetLastError()));
+                    files::remove(part);
+                    continue;
+                }
+                if (!files::move(part, target)) {
+                    shellLog::write(format("library: %s could not be taken: its copy could not be named %s (error %lu)", name.c_str(), id.c_str(),
+                                           GetLastError()));
+                    files::remove(part);
+                    continue;
+                }
                 file.DeleteAsync(StorageDeleteOption::PermanentDelete).get();
                 shellLog::write("library: " + name + " taken from Pictures\\Megler\\apks as " + id);
                 added(id);
