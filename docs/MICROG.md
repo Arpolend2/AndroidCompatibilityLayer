@@ -1362,6 +1362,55 @@ phone. Thus this protocol variation supplies neither a fix nor proof that
 Google's literal is malformed. GCM registration succeeds but device-key
 issuance does not; these outcomes must remain distinct.
 
+A further reference uses the supplied Google Translate
+10.43.74.1015708864.6-release, versionCode 701119201, ARM32/minSdk 26.
+`apksigner verify` accepts its signature; the signer SHA-256 matches the
+published Translate certificate,
+`3d7a1223019aa39d9ea0e3436ab7c0896bfb4fb679f4de5fe7c23f326c8f994a`.
+The [version listing](https://www.apkmirror.com/apk/google-inc/google-translate/google-translate-10-43-74-1015708864-6-release-release/)
+provides the matching fingerprint.
+Translate can return a correct translation without obtaining Spatula:
+its `SpatulaAuthInterceptor` waits four seconds for the auth client, then
+continues without X-Goog-Spatula on interruption, failure or timeout.
+Translation success therefore does not establish device-key issuance.
+
+With separate explicit approval, the old device_key was temporarily
+renamed within GMS's files directory, GMS and Translate restarted, and
+Translate given fresh synthetic text. No Frida session was attached to
+any GMS process or the VM during this native-client control. The repeated
+PIF/TrickyStore setup uses the same approved files and scope described
+above. A 100-second live observation confirms PIF's native property hook,
+EntryPoint.init and Java Build spoofing, plus the TrickyStoreOSS process.
+Both fast refresh and AppCert report ERR_CERT_INVALID; no new device_key
+file appears. This run does not establish an HTTP refusal because TLS
+fails first. An earlier attempt did not confirm PIF logging: its diagnostic
+toggle missed a CRLF line ending, and a tail-limited log snapshot was
+insufficient. Only the live observation is used for the PIF loading claim.
+After each attempt the original key is restored and compared byte-for-byte
+with the on-phone backup. All three temporary module/config directories
+are removed, and the rebooted phone is checked for the original file,
+absence of the renamed file and absence of the temporary engine.
+
+The actual AppCertService in this Android GMS APK runs in
+com.google.android.gms.persistent, while DroidGuardService runs in
+com.google.android.gms.unstable. A corresponding instrumented control in
+persistent, using the existing global-Java-deoptimization diagnostic but
+no certificate override, also receives HTTP 400 over HTTP/2. Netlog records
+cert_status=0 and a known root. Thus moving the diagnostic call from the
+main process to the service's process does not supply a positive result.
+A separate observer without global deoptimization crashes before an HTTP
+result and is inconclusive. The native-client TLS failure and the
+instrumented HTTP refusal must not be conflated.
+
+A subsequent signal-only persistent-process diagnostic suppresses the
+device-key POST after collection. The returned token decodes to 2,416
+bytes and contains none of ERROR, EXCEPTION, STACK_TRACE or timeout
+markers; the client's `boij.b(Context, Throwable)` error-result generator
+is not called. This excludes that particular client-side exception wrapper
+for this collection, but does not prove that Google's VM considers the
+device trustworthy. Neither token contents nor existing key contents are
+exported. A successful fresh device-key issuance is still unobserved.
+
 [Falcon source](https://github.com/AHMED2111X/falcon_integrity_fix),
 [TAKR](https://keybox.kowx712.cc/),
 [inspected AlwaysStrong fork](https://github.com/BloodCorrupt/AlwaysStrongFork),
