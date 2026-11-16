@@ -245,6 +245,22 @@ public final class ResInflate {
             rd.setDrawable(d);
             return rd;
         }
+        case "com.android.internal.graphics.drawable.AnimationScaleListDrawable": {
+            /* The framework's own (progress_medium_material, the Material ProgressBar's spinner): a static item and an animated one,
+               Android drawing the animated one unless animations are off. There is no such class here: the animated item itself,
+               else the last. Without it every Material ProgressBar's drawable threw (ClassNotFoundException) and none spun. */
+            Drawable chosen = null;
+            int depth = p.getDepth() + 1, tt;
+            while ((tt = p.next()) != XmlPullParser.END_DOCUMENT && (p.getDepth() >= depth || tt != XmlPullParser.END_TAG)) {
+                if (tt != XmlPullParser.START_TAG || p.getDepth() > depth || !"item".equals(p.getName())) continue;
+                TypedArray a = attrs(r, t, as(p), S.LevelListDrawableItem);
+                Drawable d = a.getDrawable(S.LevelListDrawableItem_drawable);
+                a.recycle();
+                if (d == null) d = child(r, p, t);
+                if (d != null && (chosen == null || !(chosen instanceof android.graphics.drawable.Animatable))) chosen = d;
+            }
+            return chosen != null ? chosen : new ColorDrawable(0);
+        }
         case "level-list": {
             LevelListDrawable ld = new LevelListDrawable();
             int depth = p.getDepth() + 1, tt;
