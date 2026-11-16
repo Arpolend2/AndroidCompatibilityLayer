@@ -350,7 +350,22 @@ public class Main extends Activity {
         tls();
         networkTrust();
         keystore(run);
+        step("keystore-strongbox-spec", () -> {
+            android.security.keystore.KeyGenParameterSpec.Builder b = new android.security.keystore.KeyGenParameterSpec.Builder("megler-strongbox-spec", 4);
+            boolean unset = !b.build().isStrongBoxBacked();
+            b.setIsStrongBoxBacked(true);
+            android.security.keystore.KeyGenParameterSpec requested = b.build();
+            android.security.keystore.KeyGenParameterSpec copy = android.security.keystore.KeyGenParameterSpec.Builder.class
+                    .getConstructor(android.security.keystore.KeyGenParameterSpec.class).newInstance(requested).build();
+            boolean enabled = requested.isStrongBoxBacked() && copy.isStrongBoxBacked();
+            b.setIsStrongBoxBacked(false);
+            detail = "unset=" + unset + " enabled-and-copied=" + enabled + " reset=" + !b.build().isStrongBoxBacked();
+            return unset && enabled && !b.build().isStrongBoxBacked() && requested.isStrongBoxBacked();
+        });
         keystoreCertificates(run);
+        integrityProfile();
+        integrityCallbacks();
+        step("keybox-attestation", () -> { detail = AttestationChecks.run(this, run); return true; });
         keystoreForeignKey();
         keystoreHosted();
         pathOps();
@@ -4150,6 +4165,138 @@ public class Main extends Activity {
             detail = said;
             Log.i("DataTest", "keystore-foreign-key " + detail);
             return !"taken".equals(said) && !"StackOverflowError".equals(said);
+        });
+    }
+
+    private void integrityCallbacks() {
+        step("integrity-callbacks", () -> {
+            Class<?> nativeClass = Class.forName("megler.Native");
+            File marker = new File((String) nativeClass.getMethod("dataDir").invoke(null), "play-integrity-break");
+            if (marker.exists()) throw new IllegalStateException("Test requires its own marker");
+            Class<?> play = Class.forName("megler.PlayStore");
+            java.lang.reflect.Method bind = play.getDeclaredMethod("bind", android.content.Intent.class);
+            bind.setAccessible(true);
+            int calls = 0;
+            try {
+                // Toggle after binding too: a client can keep its service connection across requests.
+                for (int mode = 0; mode < 3; mode++) {
+                    boolean blocked = mode == 1;
+                    if (blocked) { if (!marker.createNewFile()) throw new java.io.IOException("Create PIB marker"); }
+                    else if (marker.exists() && !marker.delete()) throw new java.io.IOException("Remove PIB marker");
+                    for (int operation = 0; operation < 3; operation++) {
+                        boolean standard = operation != 0;
+                        final String service = "com.google.android.play.core.integrity.protocol."
+                                + (standard ? "IExpressIntegrityService" : "IIntegrityService");
+                        final String callbackDescriptor = service + "Callback";
+                        final int code = operation == 2 ? 3 : 2;
+                        final int[] responses = { 0 };
+                        final android.os.Bundle[] answer = { null };
+                        android.os.IBinder callback = new android.os.Binder() {
+                            @Override protected boolean onTransact(int transaction, android.os.Parcel data,
+                                    android.os.Parcel reply, int flags) throws android.os.RemoteException {
+                                if (transaction != code) throw new IllegalStateException("Wrong callback transaction");
+                                data.enforceInterface(callbackDescriptor);
+                                if (data.readInt() != 1) throw new IllegalStateException("Missing callback bundle");
+                                answer[0] = android.os.Bundle.CREATOR.createFromParcel(data);
+                                responses[0]++;
+                                return true;
+                            }
+                        };
+                        String action = standard ? "com.google.android.play.core.expressintegrityservice.BIND_EXPRESS_INTEGRITY_SERVICE"
+                                : "com.google.android.play.core.integrityservice.BIND_INTEGRITY_SERVICE";
+                        android.os.IBinder binder = (android.os.IBinder) bind.invoke(null,
+                                new android.content.Intent(action).setPackage("com.android.vending"));
+                        if (binder == null) return false;
+                        android.os.Parcel request = android.os.Parcel.obtain();
+                        try {
+                            request.writeInterfaceToken(service);
+                            request.writeInt(1);
+                            android.os.Bundle options = new android.os.Bundle();
+                            options.putString("package.name", getPackageName());
+                            options.writeToParcel(request, 0);
+                            request.writeStrongBinder(callback);
+                            if (!binder.transact(code, request, null, android.os.IBinder.FLAG_ONEWAY)) return false;
+                        } finally { request.recycle(); }
+                        android.os.Bundle b = answer[0];
+                        if (responses[0] != 1 || b == null || b.getInt("error", 0) != (blocked ? -8 : -1)
+                                || b.containsKey("token") || b.getBoolean("is.error.remediable", false) != blocked
+                                || b.containsKey("is.error.remediable") != (standard || blocked)) return false;
+                        calls++;
+                    }
+                }
+                detail = "classic, standard warm-up and token: " + calls + " callbacks; default, PIB and restored";
+                return calls == 9;
+            } finally { marker.delete(); }
+        });
+    }
+
+    private void integrityProfile() {
+        step("integrity-profile", () -> {
+            Class<?> profile = Class.forName("megler.IntegrityProfile");
+            java.lang.reflect.Method install = profile.getMethod("install");
+            Class<?> nativeClass = Class.forName("megler.Native");
+            File dir = new File((String) nativeClass.getMethod("dataDir").invoke(null));
+            File prop = new File(dir, "custom.pif.prop"), json = new File(dir, "custom.pif.json");
+            if (prop.exists() || json.exists()) throw new IllegalStateException("Test requires its own profile files");
+            java.lang.reflect.Field model = android.os.Build.class.getField("MODEL");
+            java.lang.reflect.Field initial = android.os.Build.VERSION.class.getField("DEVICE_INITIAL_SDK_INT");
+            Object oldModel = model.get(null), oldInitial = initial.get(null);
+            model.setAccessible(true);
+            initial.setAccessible(true);
+            java.lang.reflect.Method nativeGet = nativeClass.getMethod("systemProperty", String.class);
+            java.lang.reflect.Method nativeSet = nativeClass.getMethod("setSystemProperty", String.class, String.class);
+            Class<?> sysprops = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method javaGet = sysprops.getMethod("get", String.class);
+            java.lang.reflect.Method javaSet = sysprops.getMethod("set", String.class, String.class);
+            String oldJavaModel = (String) javaGet.invoke(null, "ro.product.model");
+            String oldNativeModel = (String) nativeGet.invoke(null, "ro.product.model");
+            java.security.KeyStore store = java.security.KeyStore.getInstance("AndroidKeyStore");
+            store.load(null);
+            try {
+                install.invoke(null);
+                boolean absent = DroidGuardProfileProbe.chain(store, "megler-test-cert-ec") != null;
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(prop)) {
+                    out.write(("ro.product.model=\nMODEL=Megler profile test # comment\nDEVICE_INITIAL_SDK_INT=25\n"
+                            + "ro.megler.pif.test=native-and-java\nspoofProvider=1\n").getBytes("UTF-8"));
+                }
+                install.invoke(null);
+                boolean fields = "Megler profile test".equals(model.get(null)) && initial.getInt(null) == 25;
+                boolean nativeProperties = "native-and-java".equals(nativeGet.invoke(null, "ro.megler.pif.test"))
+                        && "native-and-java".equals(javaGet.invoke(null, "ro.megler.pif.test"))
+                        && "Megler profile test".equals(nativeGet.invoke(null, "ro.product.model"))
+                        && "Megler profile test".equals(javaGet.invoke(null, "ro.product.model"));
+                boolean ordinary = store.getCertificateChain("megler-test-cert-ec") != null;
+                boolean blocked = false;
+                try { DroidGuardProfileProbe.chain(store, "megler-test-cert-ec"); }
+                catch (UnsupportedOperationException expected) { blocked = true; }
+
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(prop)) {
+                    out.write("MODEL=Must not be applied\nDEVICE_INITIAL_SDK_INT=bad\n".getBytes("UTF-8"));
+                }
+                install.invoke(null);
+                boolean invalid = "Megler profile test".equals(model.get(null)) && initial.getInt(null) == 25;
+                if (!prop.delete()) throw new java.io.IOException("Remove property profile");
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(json)) {
+                    out.write(("{\"MODEL\":\"JSON profile test\",\"DEVICE_INITIAL_SDK_INT\":24,"
+                            + "\"spoofProps\":0,\"spoofProvider\":0}").getBytes("UTF-8"));
+                }
+                install.invoke(null);
+                boolean jsonFields = "JSON profile test".equals(model.get(null)) && initial.getInt(null) == 24;
+                boolean propsDisabled = "Megler profile test".equals(nativeGet.invoke(null, "ro.product.model"));
+                boolean unblocked = DroidGuardProfileProbe.chain(store, "megler-test-cert-ec") != null;
+                detail = "absent=" + absent + " fields=" + fields + " properties=" + nativeProperties + " ordinary=" + ordinary
+                        + " blocked=" + blocked + " invalid=" + invalid + " json=" + jsonFields + " props-disabled=" + propsDisabled + " unblocked=" + unblocked;
+                Log.i("DataTest", "integrity-profile " + detail);
+                return absent && fields && nativeProperties && ordinary && blocked && invalid && jsonFields && propsDisabled && unblocked;
+            } finally {
+                prop.delete();
+                json.delete();
+                install.invoke(null);
+                model.set(null, oldModel);
+                initial.set(null, oldInitial);
+                javaSet.invoke(null, "ro.product.model", oldJavaModel);
+                nativeSet.invoke(null, "ro.product.model", oldNativeModel == null ? "" : oldNativeModel);
+            }
         });
     }
 

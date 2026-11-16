@@ -11,7 +11,7 @@
 // MX Player's Amazon sign-in storage (com.amazon.identity.auth.device, LocalDataStorageV2RSAKeyPairManager) three times a
 // start. The check is for apps that ask for BouncyCastle by name; here it is the platform's own key store using it, as
 // Android's AndroidKeyStore uses its keymaster. And in the certificates of its key pairs (X.509, self-signed, as Android's:
-// see selfSigned) and in a pair asked for with an attestation challenge (refused: see PairGen.generateKeyPair). Everything else is
+// see selfSigned) and in a pair asked for with an attestation challenge (opt-in external signer: see KeyboxAttestation). Everything else is
 // the original's, unchanged.
 package megler;
 
@@ -604,7 +604,7 @@ public final class KeyStoreProvider extends Provider {
     }
 
     /** DER: the tag, the length, the contents. */
-    private static byte[] der(int tag, byte[]... contents) {
+    static byte[] der(int tag, byte[]... contents) {
         int n = 0;
         for (byte[] c : contents) n += c.length;
         ByteArrayOutputStream out = new ByteArrayOutputStream(n + 5);
@@ -618,7 +618,7 @@ public final class KeyStoreProvider extends Provider {
     }
 
     /** A certificate's time: UTCTime from 1950 to 2049, GeneralizedTime otherwise (RFC 5280, 4.1.2.5). */
-    private static byte[] time(Date d) {
+    static byte[] time(Date d) {
         java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyyMMddHHmmss'Z'", Locale.US);
         f.setTimeZone(TimeZone.getTimeZone("UTC"));
         String s = f.format(d);
@@ -640,7 +640,11 @@ public final class KeyStoreProvider extends Provider {
 
     public static final class Store extends KeyStoreSpi {
         @Override public Key engineGetKey(String alias, char[] password) { Entry e = entry(alias, true); return e == null ? null : e.secretOrPrivate; }
-        @Override public Certificate[] engineGetCertificateChain(String alias) { Certificate[] c = certificates(alias); return c == null ? null : c.clone(); }
+        @Override public Certificate[] engineGetCertificateChain(String alias) {
+            if (IntegrityProfile.blocksCertificateChain()) throw new UnsupportedOperationException();
+            Certificate[] c = certificates(alias);
+            return c == null ? null : c.clone();
+        }
         @Override public Certificate engineGetCertificate(String alias) { Certificate[] c = certificates(alias); return c == null ? null : c[0]; }
         @Override public Date engineGetCreationDate(String alias) { Entry e = entry(alias, false); return e == null ? null : new Date(e.created); }
         @Override public void engineSetKeyEntry(String alias, Key key, char[] password, Certificate[] chain) {
@@ -730,14 +734,18 @@ public final class KeyStoreProvider extends Provider {
             mSpec = mKeySpec != null ? mKeySpec.getAlgorithmParameterSpec() : null;
         }
         @Override public KeyPair generateKeyPair() {
-            if (mKeySpec != null && mKeySpec.getAttestationChallenge() != null) {
+            boolean challenged = mKeySpec != null && mKeySpec.getAttestationChallenge() != null;
+            if (challenged && Native.flag("trace-attestation"))
+                android.util.Log.i("KeyboxAttestation", "Requested " + mAlgorithm + "; challenge bytes "
+                        + mKeySpec.getAttestationChallenge().length + "; keybox mode " + KeyboxAttestation.enabled());
+            if (challenged && !KeyboxAttestation.enabled()) {
                 // Android's key store attests a pair made with a challenge: its keymaster signs the pair's certificate, in a chain up to
                 // Google's root. There is no keymaster here, so the answer is a device's whose keymaster cannot attest
                 // (AndroidKeyStoreKeyPairGeneratorSpi): ProviderException, and nothing under the alias. Google Play services' device
                 // registration (check-in) asks for one and goes on without it ("Failed to generate key attestation"); given a pair
                 // whose certificate was not an X509Certificate it ended in a ClassCastException, every time, and Play Store never got
                 // an Android ID ("Server error", package 573).
-                remove(mAlias);
+                // Keep any earlier key under this alias: a failed generation must not delete it.
                 // Keymaster's KM_ERROR_UNIMPLEMENTED (-100), also returned by Android devices without
                 // attestation. Callers distinguish this from a provider failure with no cause.
                 throw new ProviderException("Failed to generate key pair.",
@@ -758,12 +766,15 @@ public final class KeyStoreProvider extends Provider {
                 if (mSpec != null) g.initialize(mSpec, random);
                 else if ("EC".equals(mAlgorithm)) g.initialize(new ECGenParameterSpec(mSize == 384 ? "secp384r1" : mSize == 521 ? "secp521r1" : "secp256r1"), random);
                 else g.initialize(new RSAKeyGenParameterSpec(mSize, RSAKeyGenParameterSpec.F4), random);
+                KeyboxAttestation.Issuer issuer = challenged ? KeyboxAttestation.issuer(mKeySpec, mAlgorithm) : null;
                 KeyPair kp = g.generateKeyPair();
                 if (mAlias != null) {
                     Entry e = new Entry();
                     e.secretOrPrivate = kp.getPrivate();
                     e.publicKey = kp.getPublic();
-                    try {
+                    if (issuer != null) {
+                        e.chain = KeyboxAttestation.chain(kp.getPublic(), mKeySpec, issuer);
+                    } else try {
                         e.chain = new byte[][] { selfSigned(kp.getPublic(), kp.getPrivate(), mKeySpec) };
                     } catch (GeneralSecurityException | RuntimeException x) {
                         android.util.Log.w("Megler", "AndroidKeyStore: no certificate for " + mAlias + ": " + x);
