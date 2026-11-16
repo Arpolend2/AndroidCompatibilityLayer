@@ -1,5 +1,8 @@
 # microG services
 
+For the current DroidGuard investigation and integration status, see
+[DroidGuard and Google service compatibility progress](DROIDGUARD-PROGRESS.md).
+
 Megler can use a separately installed `com.google.android.gms` microG APK as an
 optional service provider. Install the official microG Services APK in Megler
 as its own application. After installation, Megler copies its APK once into the
@@ -9,16 +12,17 @@ mounts the registered APK from the shared cache. Reinstalling or updating
 microG publishes a new cache entry, so already running clients can finish with
 the version they loaded. Uninstalling microG clears its registration, and
 clients stop using it after restart. If automatic publication fails, launching
-the standalone microG app retries registration. Installing Google’s proprietary
-GmsCore is not supported by this host.
+the standalone microG app retries registration. Compatibility work with Google's proprietary
+GmsCore is documented below and remains incomplete.
 
 GmsCore services currently execute inside each client process, with a separate
 Java class namespace and ELF library scope. The APK is installed and stored once,
 but Megler does not yet run a centralized microG daemon or provide Android
 cross-process Binder. Each client has its own service instances, but microG's
 state is one for all apps (see "Shared state"). Push delivery while clients are
-stopped and live cross-client provider state remain unfinished. Play Integrity
-is not implemented, and nothing here works around a check.
+stopped and live cross-client provider state remain unfinished. A successful Google Play Integrity
+verdict is not established. Opt-in compatibility profiles, synthetic error
+callbacks and external-keybox attestation are described in the progress report.
 
 ## Shared state
 
