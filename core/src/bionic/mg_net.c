@@ -311,6 +311,21 @@ bool mg_net_trace_wanted(void)
     return wanted != 0;
 }
 
+/*
+ * The flag no-quic: a datagram socket given port 443 for its peer is told the network is unreachable, so QUIC (HTTP/3, which
+ * Chromium's Cronet and WebView open that way) gives up at once and the app's requests go over TCP and TLS. For a diagnosis:
+ * with cronet-netlog, Cronet's own log has the decrypted bytes of TLS, not of QUIC.
+ */
+static bool no_quic(void)
+{
+    static int wanted = -1;
+    if (wanted < 0) {
+        wanted = mg_flag("no-quic") ? 1 : 0;
+        if (wanted) mg_info("network: no-quic: UDP to port 443 is refused (ENETUNREACH), QUIC's requests go over TCP");
+    }
+    return wanted != 0;
+}
+
 void mg_net_trace(const char *fmt, ...)
 {
     static volatile i32 said;
@@ -1503,6 +1518,10 @@ static int g_connect(int fd, const void *sa, u32 len)
     if (s->type != G_SOCK_STREAM) {
         /* A datagram socket: its peer is set, or with AF_UNSPEC taken away. */
         if (a.family && (e = addr_fits(s, &a, true)) != 0) goto out;
+        if (a.family && a.port == 443 && no_quic()) {
+            e = GE_NETUNREACH;
+            goto out;
+        }
         if (!mg_sock_connect(s->host, &a, &err)) e = gerr(err);
         else if (a.family && mg_net_trace_wanted() && !s->io_traced) {
             /* trace-net: a datagram socket with a peer of its own (QUIC's) is followed as a connection is. */
