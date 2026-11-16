@@ -362,7 +362,12 @@ with everything, the decrypted bytes of every request and response and so the
 account's cookies and tokens too, into `files/netlog-<n>/` of the app's data, at
 most 64 MB each; Cronet writes `netlog.json.inprogress/` as it goes; the
 constructor is hooked by `megler.CronetNetLog` through the runtime's own hooks,
-`dvm/mg_dvm_hook.c`; delete the folders after the diagnosis); and
+`dvm/mg_dvm_hook.c`; and every body the app hands Cronet whole,
+`UploadDataProviders.create`, YouTube's InnerTube requests, into
+`files/netlog-bodies/<n>.bin` with `index.txt` saying the URL the thread last asked
+a builder for; delete the folders after the diagnosis) with `no-quic` (UDP to port
+443 told the network is unreachable, so QUIC falls back to TCP and TLS, whose
+bytes the NetLog has; `bionic/mg_net.c`); and
 `trace-calls-<prefix>`, the prefix a class name with dots (every call of a method
 of a class whose name starts with it, with its thread and depth, and its return
 with the value or the exception it ends with; up to eight such flags; at most 8000
