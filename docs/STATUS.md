@@ -356,6 +356,13 @@ frames are copied; at most 6000 lines; `dvm/mg_dvm_object.c`); and
 `trace-nulls` (at a NullPointerException an instruction of the app's bytecode throws, once a place, which register
 was null and where the method last gave it its value: which call's result, which field, the constant null, a
 parameter; at most 320 lines; `dvm/mg_dvm_interp.c`); and
+`cronet-netlog` (an app that carries Cronet in its own code, as YouTube does: each
+`org.chromium.net.impl.CronetUrlRequestContext` it makes logs to Cronet's own NetLog
+with everything, the decrypted bytes of every request and response and so the
+account's cookies and tokens too, into `files/netlog-<n>/` of the app's data, at
+most 64 MB each; Cronet writes `netlog.json.inprogress/` as it goes; the
+constructor is hooked by `megler.CronetNetLog` through the runtime's own hooks,
+`dvm/mg_dvm_hook.c`; delete the folders after the diagnosis); and
 `trace-calls-<prefix>`, the prefix a class name with dots (every call of a method
 of a class whose name starts with it, with its thread and depth, and its return
 with the value or the exception it ends with; up to eight such flags; at most 8000
