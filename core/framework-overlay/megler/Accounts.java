@@ -83,8 +83,36 @@ public final class Accounts {
         }
         sEntries.clear();
         sEntries.addAll(read);
+        signOutIfDataCleared(f);
         if (sTold == null) { sTold = current(); sToldPasswords = passwords(); }
         return true;
+    }
+    /*
+     * Google's own Play services keep each Google account's sign-in (its long-lived token) in their private files, and the
+     * accounts are here. When the user clears those files (Clear Data on Google Play services), the core leaves a mark beside
+     * the accounts' file (mg_run_clear_data_if_asked), and the Google accounts go at the next reading of the accounts. An
+     * account that stayed was answered "sign in again" for every token asked of it -- on Android a notification that leads to
+     * the sign-in, here nothing: the Play Store said "Authentication is required" for good, with nowhere to sign in (a Lumia
+     * 950, 0.1.0.699). Without the account it offers the sign-in, as at its first start.
+     *
+     * At a process's first reading nobody there was told of the accounts yet, and nobody is told of a change: they are read
+     * without the Google ones. Read again in a process that knew them, they are told as removed, as any change of the file
+     * is. When the accounts cannot be written the mark stays, for the next process. (microG keeps the sign-in in the account
+     * itself, its password, and its accounts are in a file of their own: the core leaves no mark for it.)
+     */
+    private static final String GOOGLE_SIGNED_OUT = "google-signed-out";
+    private static void signOutIfDataCleared(File f) {
+        File mark = new File(f.getParentFile(), GOOGLE_SIGNED_OUT);
+        if (!mark.exists()) return;
+        int n = 0;
+        for (Iterator<Entry> i = sEntries.iterator(); i.hasNext(); ) {
+            if (!"com.google".equals(i.next().type)) continue;
+            i.remove();
+            n++;
+        }
+        if (n > 0 && !write()) return;
+        mark.delete();
+        android.util.Log.i("Megler", "accounts: Google Play services' data was cleared: " + n + " Google account(s) signed out with it");
     }
     private static void map(JSONObject o, Map<String, String> into) throws org.json.JSONException {
         if (o == null) return;
@@ -95,6 +123,11 @@ public final class Accounts {
     }
     /** Writes the accounts out, and says they changed. */
     private static void save() {
+        write();
+        changed();
+    }
+    /** Writes the accounts out: false when their file could not be written. */
+    private static boolean write() {
         File f = file(), next = new File(f.getPath() + ".new");
         f.getParentFile().mkdirs();
         try {
@@ -116,11 +149,12 @@ public final class Accounts {
             if (!next.renameTo(f)) throw new java.io.IOException("cannot rename " + next + " to " + f);
             sTime = f.lastModified();
             sLength = f.length();
+            return true;
         } catch (Exception ex) {
             android.util.Log.e("Megler", "accounts: " + f + " cannot be written", ex);
             next.delete();
+            return false;
         }
-        changed();
     }
     private static Entry find(Account a) {
         refresh();
@@ -356,6 +390,12 @@ public final class Accounts {
             while ((event = p.next()) != XmlResourceParser.END_DOCUMENT) {
                 if (event != XmlResourceParser.START_TAG || !"account-authenticator".equals(p.getName())) continue;
                 String type = p.getAttributeValue(NS, "accountType");
+                // A reference to a string resolved, as Android's TypedArray.getString does: MicroG RE's is
+                // @string/var_authenticator_account_type, "app.revanced", and its sign-in was found for no account type.
+                int typeRef = p.getAttributeResourceValue(NS, "accountType", 0);
+                if (typeRef != 0) {
+                    try { type = owner.getResources().getString(typeRef); } catch (Exception e) { return null; }
+                }
                 if (type == null) return null;
                 AuthenticatorDescription d = new AuthenticatorDescription(type, pkg, p.getAttributeResourceValue(NS, "label", 0),
                     p.getAttributeResourceValue(NS, "icon", 0), p.getAttributeResourceValue(NS, "smallIcon", 0),

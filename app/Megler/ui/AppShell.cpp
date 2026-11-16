@@ -485,6 +485,7 @@ void AppShell::poll() {
         uiShots::poll(*this);
         phoneAppsList::publish();
         tellAskedInstalls();
+        refreshDialogLive();
         // Google Play or not, asked at the first start; once wanted, Megler's own installed (ui/GooglePlay.h).
         googlePlay::tick(*this);
         // A newer Megler on GitHub, for this Windows and processor: offered, downloaded and installed (ui/Ota.h).
@@ -492,8 +493,8 @@ void AppShell::poll() {
         // An app's own package opens its app as soon as the library has it read: straight into the player when it can
         // run here, else its page, which says why not. Before the player, Megler's folders the app has not got are offered
         // (ui/SharedFolders.h), once the phone's folders are known, to an app that asks for the storage.
-        // Where what Megler put in the shared folder for it is not there (no shared folder, its APK or Android's files missing:
-        // the package and Megler on different storage, a memory card's and the phone's memory), the app is not opened, and its
+        // Where what Megler put in the shared folder for it is not there (no shared folder, its APK or Android's files
+        // missing), the app is not opened, and its
         // screen says why and what to do (ui/StartScreen.cpp): it showed the splash screen's picture for ever.
         if (appPackage::isSingleApp() && !singleAppOpened_ && !appPackage::singleAppProblem().empty()) singleAppOpened_ = true;
         if (appPackage::isSingleApp() && !singleAppOpened_) {
@@ -687,6 +688,24 @@ void AppShell::dialog(DialogSpec spec, std::function<void(int, std::string)> don
         }
         add(column, list);
     }
+    // What moves while the dialog is up (a download): Material's linear progress indicator and a line under it.
+    dialogLive_ = nullptr;
+    dialogLiveBar_ = nullptr;
+    dialogLiveText_ = nullptr;
+    dialogLiveShown_.clear();
+    if (spec.live) {
+        dialogLiveBar_ = ProgressBar();
+        dialogLiveBar_.Minimum(0);
+        dialogLiveBar_.Maximum(1);
+        dialogLiveBar_.IsIndeterminate(true);
+        dialogLiveBar_.Foreground(brush(p.primary));
+        dialogLiveBar_.Background(brush(p.secondaryContainer));
+        dialogLiveBar_.Margin(ThicknessHelper::FromLengths(0, 20, 0, 8));
+        add(column, dialogLiveBar_);
+        dialogLiveText_ = text("", font::bodyMedium, weightNormal(), p.onSurface);
+        add(column, dialogLiveText_);
+        dialogLive_ = std::move(spec.live);
+    }
     dialogField_ = nullptr;
     dialogSecret_ = nullptr;
     if (spec.field && spec.secret) {
@@ -717,12 +736,16 @@ void AppShell::dialog(DialogSpec spec, std::function<void(int, std::string)> don
             add(column, chips);
         }
     }
-    auto actions = hstack(8);
+    // Three buttons side by side are wider than a phone's window lets the sheet be, and the row would cut its last one off,
+    // the confirming one: there they stand one under the other, as Material stacks them, in the same order.
+    const bool stacked = spec.buttons.size() >= 3 && root_.ActualWidth() < 420;
+    auto actions = stacked ? vstack(0) : hstack(8);
     actions.HorizontalAlignment(HorizontalAlignment::Right);
     actions.Margin(ThicknessHelper::FromLengths(24, 24, 12, -8));
     for (size_t i = 0; i < spec.buttons.size(); ++i) {
         const bool confirming = i + 1 == spec.buttons.size();
         auto b = textButton(spec.buttons[i], [this, i] { closeDialog(int(i)); }, confirming && spec.destructive ? p.error : p.primary);
+        if (stacked) b.HorizontalAlignment(HorizontalAlignment::Right);
         add(actions, b);
     }
     // The content scrolls where it is higher than the window lets the sheet be, and the buttons stay below it: a phone's
@@ -756,6 +779,31 @@ void AppShell::dialog(DialogSpec spec, std::function<void(int, std::string)> don
         dialogField_.Focus(FocusState::Programmatic);
     }
     if (dialogSecret_) dialogSecret_.Focus(FocusState::Programmatic);
+    refreshDialogLive();
+}
+
+void AppShell::refreshDialogLive() {
+    if (!dialogOpen_ || !dialogLive_) return;
+    DialogSpec::Live now;
+    if (!dialogLive_(now)) {
+        closeDialog(-2);
+        return;
+    }
+    if ((dialogLiveBar_.Visibility() == Visibility::Visible) != now.bar) {
+        // (A bar that is not shown does not run either; the line keeps the bar's distance from the text above it.)
+        setVisible(dialogLiveBar_, now.bar);
+        dialogLiveText_.Margin(ThicknessHelper::FromLengths(0, now.bar ? 0 : 16, 0, 0));
+    }
+    const bool known = now.fraction >= 0 || !now.bar;
+    if (dialogLiveBar_.IsIndeterminate() == known) dialogLiveBar_.IsIndeterminate(!known);
+    if (known && now.bar) dialogLiveBar_.Value(now.fraction > 1 ? 1 : now.fraction);
+    if (now.text != dialogLiveShown_) {
+        dialogLiveShown_ = now.text;
+        dialogLiveText_.Text(hs(now.text));
+    }
+    // (No bar and nothing to say: no empty line kept under the text.)
+    const bool lined = now.bar || !now.text.empty();
+    if ((dialogLiveText_.Visibility() == Visibility::Visible) != lined) setVisible(dialogLiveText_, lined);
 }
 
 void AppShell::dialogWhenFree(DialogSpec spec, std::function<void(int, std::string)> done) {
@@ -780,6 +828,10 @@ void AppShell::closeDialog(int button) {
     dialogLayer_ = nullptr;
     dialogField_ = nullptr;
     dialogSecret_ = nullptr;
+    dialogLive_ = nullptr;
+    dialogLiveBar_ = nullptr;
+    dialogLiveText_ = nullptr;
+    dialogLiveShown_.clear();
     dialogOpen_ = false;
     auto done = std::move(dialogDone_);
     dialogDone_ = nullptr;
@@ -1221,20 +1273,18 @@ void AppShell::openLink(winrt::Windows::Foundation::Uri const& uri) {
             return;
         }
         /*
-         * The app's own package put the APK in its shared folder, which is Megler's only where both are on the same storage:
-         * Windows gives a package on a memory card the card's (or none), and Megler in the phone's memory does not see it.
+         * The app's own package put the APK in the shared folder's incoming\ (player/SystemHost.cpp, a copy), which is Megler's
+         * wherever either is installed (shell/Placement.h): one not there was not copied whole, or is gone since.
          */
         const std::wstring shared = appPackage::sharedFolder(), path = shared.empty() ? std::wstring() : shared + L"\\incoming\\" + widen(name);
         if (path.empty() || !files::exists(path)) {
             shellLog::write("app: " + name + " is not in " + (shared.empty() ? std::string("the shared folder: Windows gave Megler none") : narrow(path)) +
-                            ": the app that asked is likely on other storage than Megler (a memory card)");
-            phoneAppsList::installOutcome(name, "failed", "Megler did not find the APK in its shared folder: the app and Megler are on different storage.");
+                            ": nothing installed");
+            phoneAppsList::installOutcome(name, "failed", "Megler did not find the APK in its shared folder.");
             alert("Couldn't Install This APK",
                   "An app of the phone's own asked Megler to install " + name + ", and Megler did not find it in its shared folder" +
                       (shared.empty() ? std::string(" (Windows gave Megler none)") : std::string()) +
-                      ". As a rule, that is because the app and Megler are on different storage -- one on the memory card, the other in "
-                      "the phone's memory -- and Windows gives each storage a shared folder of its own. Keep them on the same storage: "
-                      "move the app (or Megler) to the phone's memory in Settings › System › Storage.");
+                      ". Ask the app for it again; if it stays so, save Megler's logs (Save All Logs, in Megler) and report it.");
             return;
         }
         installApkPath(path, name, "An app of the phone's own");

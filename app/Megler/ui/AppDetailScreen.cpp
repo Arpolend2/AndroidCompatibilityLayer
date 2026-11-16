@@ -245,9 +245,14 @@ private:
                                "Clear Cache", false, [this, package, title] { askClearCache(package, title); });
             }));
             add(manage, textButton("Clear Data", [this, package, title] {
+                // (Google's own Play services keep the Google accounts' sign-in in their data, and the accounts go with it:
+                // megler.Accounts. microG keeps it in the accounts themselves, which are not this data.)
+                const std::string accounts = package != "com.google.android.gms" ? ""
+                    : " With Google's own Play services (not microG) your Google accounts are signed in through this data: they "
+                      "are removed with it, and you sign in again afterwards.";
                 shell_.confirm("Clear " + title + "'s data?",
                                "Its private files, settings, databases and the accounts it keeps, and its Android/data folder, are deleted "
-                               "the next time it starts; its Android/obb files stay. If the app is open now, close it first.",
+                               "the next time it starts; its Android/obb files stay. If the app is open now, close it first." + accounts,
                                "Clear Data", true, [this, package, title] { askClearData(package, title); });
             }, p.error));
         }

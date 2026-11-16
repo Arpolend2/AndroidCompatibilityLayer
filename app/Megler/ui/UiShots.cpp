@@ -156,6 +156,13 @@ void poll(AppShell& shell) {
                 session::touch(0, 0, float(x), float(y));
                 session::touch(2, 0, float(x), float(y));
             }
+        } else if (flag.rfind(L"ui-type-", 0) == 0) {
+            // (The field being edited has it as the keyboard's text: a tap on the field first, and the keyboard up.)
+            std::wstring text = flag.substr(8);
+            std::replace(text.begin(), text.end(), L'_', L' ');
+            session::textCommit(narrow(text));
+        } else if (flag.rfind(L"ui-enter-", 0) == 0) {
+            session::textKey(MEGLER_TEXT_ENTER);
         } else if (flag.rfind(L"ui-dump-module-", 0) == 0) {
             // A DLL of the system's as it lies in memory (megler_dump_module), to read a fault in its code.
             const std::wstring module = flag.substr(15);

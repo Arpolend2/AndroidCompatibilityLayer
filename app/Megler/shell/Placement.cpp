@@ -170,26 +170,24 @@ Missing missingFor(const std::wstring& shared, const std::wstring& apk, const st
 }
 
 std::string missingText(Missing missing, const std::string& label, const std::wstring& shared, bool mobile) {
-    const std::string card = mobile ? "the memory card" : "another drive";
-    const std::string why = "That may be because the app and Megler are on different storage -- one on " + card + ", the other in the " +
-                            (mobile ? "phone's memory" : "system drive") + " -- and Windows keeps their shared folders apart here. ";
-    const std::string what = mobile ? "Keep the app where Megler is: in Megler's Settings, Apps' Storage, choose the storage Megler itself is on "
-                                      "(Megler moves its apps there), or move the app in the phone's Settings › System › Storage (Apps & games, "
-                                      "the app, Move), or install the app again from Megler's Library."
-                                    : "Keep the app where Megler is: in Megler's Settings, Apps' Storage, choose the drive Megler itself is on "
-                                      "(Megler moves its apps there), or move the app in Windows's Settings › Apps (the app, Move), or install "
-                                      "the app again from Megler's Library.";
+    // Where the app is installed has no part in it (Placement.h): said, for whoever moved the app and thinks of moving it back.
+    const std::string fromLibrary = "Open Megler and install the app again from its Library: Megler puts there anew what is missing. ";
+    const std::string rest = std::string("Moving the app changes nothing of this: the shared folder is one for Megler and all its apps, in the ") +
+                             (mobile ? "phone's memory, whether an app is there or on the memory card"
+                                     : "user's own folder, whichever drive an app is on") +
+                             ". If it stays so, save Megler's logs (Save All Logs, in Megler) and report it.";
     switch (missing) {
     case Missing::nothing:
         return {};
     case Missing::sharedFolder:
         return label + " can't start: Windows gave it no shared folder, which is where Megler keeps Android's files and the app's APK for "
-                       "it. That may be because the app is installed on " + card + ". " + what;
+                       "it. " + fromLibrary + rest;
     case Missing::apk:
-        return label + " can't start: its APK is not in its shared folder, or can't be read there (" + narrow(shared) + "). " + why + what;
+        return label + " can't start: its APK is not in Megler's shared folder, or can't be read there (" + narrow(shared) +
+               "). Install the app again with Megler -- its APK opened with Megler again, or the app from the store it came from. " + rest;
     case Missing::androidFiles:
         return label + " can't start: Android's files, which Megler puts in the shared folder for its apps, are not there (" + narrow(shared) +
-               "). " + why + what;
+               "). " + fromLibrary + rest;
     }
     return {};
 }

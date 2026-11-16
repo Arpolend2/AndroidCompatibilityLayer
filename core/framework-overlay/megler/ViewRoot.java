@@ -447,6 +447,55 @@ public final class ViewRoot implements ViewParent {
     /** Whether the frame being drawn draws only part of the screen (View.drawFromParent then skips what lies outside it). */
     public static boolean meglerDrawingPart() { return sDrawingPart; }
     public void requestLayout() { mLayoutRequested = true; scheduleFrame(); }
+    /*
+     * Views that asked for layout while this window was being laid out, as Android's ViewRootImpl keeps them
+     * (requestLayoutDuringLayout, mLayoutRequesters): after the pass, those still asking, attached and not under a GONE view
+     * have their requests and their parents' taken back and made again, and the window is measured and laid out a second
+     * time; what asks during that second pass asks again at the next frame. Without it the request stopped at a parent
+     * being laid out and was lost with that parent's own, and the view kept asking for good (View.requestLayout).
+     */
+    private final ArrayList<View> mLayoutRequesters = new ArrayList<>();
+    private boolean mHandlingLayoutInLayoutRequest;
+    private static int sSecondPassesSaid;
+    /** View.requestLayout, while this window is laid out: the view noted; false where it is to wait for the next frame. */
+    public boolean requestLayoutDuringLayout(View v) {
+        if (v.getParent() == null) return true;
+        if (!mLayoutRequesters.contains(v)) mLayoutRequesters.add(v);
+        return !mHandlingLayoutInLayoutRequest;
+    }
+    private ArrayList<View> validLayoutRequesters(boolean second) {
+        ArrayList<View> valid = new ArrayList<>();
+        for (View v : mLayoutRequesters) {
+            if (v == null || !v.isAttachedToWindow() || v.getParent() == null || (!second && !v.meglerLayoutForced())) continue;
+            boolean gone = false;
+            for (View p = v; p != null; p = p.getParent() instanceof View ? (View) p.getParent() : null)
+                if (p.getVisibility() == View.GONE) { gone = true; break; }
+            if (!gone) valid.add(v);
+        }
+        if (!second) for (View v : mLayoutRequesters) if (v != null) v.meglerUnforceLayoutUp();
+        mLayoutRequesters.clear();
+        return valid;
+    }
+    private void layoutRequestedDuringLayout(int ws, int hs, int w, int h) {
+        if (mLayoutRequesters.isEmpty()) return;
+        ArrayList<View> valid = validLayoutRequesters(false);
+        if (valid.isEmpty()) return;
+        mHandlingLayoutInLayoutRequest = true;
+        mInLayout = false;
+        for (View v : valid) {
+            if (sSecondPassesSaid < 10) { sSecondPassesSaid++; android.util.Log.i("MeglerViews", "requestLayout() called by " + v + " during layout: running second layout pass"); }
+            v.requestLayout();
+        }
+        mView.measure(ws, hs);
+        mInLayout = true;
+        mView.layout(0, 0, w, h);
+        mHandlingLayoutInLayoutRequest = false;
+        final ArrayList<View> again = validLayoutRequesters(true);
+        if (!again.isEmpty()) {
+            // (Asked again during the second pass: asked once more at the next frame, as Android posts them to its run queue.)
+            Choreographer.getMainThreadInstance().postCallback(Choreographer.CALLBACK_ANIMATION, () -> { for (View v : again) v.requestLayout(); }, null);
+        }
+    }
     public void requestApplyInsets() { mInsetsDirty = true; mLayoutRequested = true; scheduleFrame(); }
     public WindowInsets insets() { return mWindowInsets; }
     public int systemUi() { return mSystemUi; }
@@ -587,7 +636,54 @@ public final class ViewRoot implements ViewParent {
         sFrameRequests++;
         if (sScheduled) return;
         sScheduled = true;
+        sScheduledAt = System.nanoTime();
+        watchFrames();
         Choreographer.getMainThreadInstance().postCallback(Choreographer.CALLBACK_TRAVERSAL, ViewRoot::doFrame, null);
+    }
+    /*
+     * The frame watch: a frame asked for and not drawn 3 s later (the window not hidden) is said in the log, with what the main
+     * thread's choreographer waits for and the windows' states, once a stall -- from the main thread itself when its looper
+     * still runs (a probe posted to it), from the watch's thread when it does not answer in 2 s. YouTube's window froze for
+     * good after a playback error on the HP Elite x3 (0.1.0.707-708), its main thread idle, taps and Back reaching it, and
+     * no frame drawn; the log did not say where the frame went.
+     */
+    private static volatile long sScheduledAt;
+    private static volatile boolean sStallSaid;
+    private static int sStallsSaid;
+    private static Thread sWatch;
+    private static void watchFrames() {
+        if (sWatch != null) return;
+        sWatch = new Thread(() -> {
+            for (;;) {
+                try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
+                long at = sScheduledAt;
+                if (at == 0 || sStallSaid || sHostHidden || System.nanoTime() - at < 3_000_000_000L || sStallsSaid >= 20) continue;
+                sStallSaid = true;
+                sStallsSaid++;
+                final long asked = at;
+                final java.util.concurrent.CountDownLatch answered = new java.util.concurrent.CountDownLatch(1);
+                Handler h = sMain != null ? sMain : new Handler(Looper.getMainLooper());
+                h.postAtFrontOfQueue(() -> { sayStall(asked, "the main thread answers"); answered.countDown(); });
+                boolean ok = false;
+                try { ok = answered.await(2, java.util.concurrent.TimeUnit.SECONDS); } catch (InterruptedException e) { return; }
+                if (!ok) sayStall(asked, "the main thread does not answer in 2 s");
+            }
+        }, "megler-frame-watch");
+        sWatch.setDaemon(true);
+        sWatch.start();
+    }
+    private static void sayStall(long asked, String how) {
+        StringBuilder b = new StringBuilder();
+        b.append("a frame asked for ").append((System.nanoTime() - asked) / 1_000_000L).append(" ms ago is not drawn (").append(how)
+         .append("); scheduled ").append(sScheduled).append(", the window hidden ").append(sHostHidden).append("; choreographer: ")
+         .append(Choreographer.getMainThreadInstance().meglerState());
+        try {
+            // (From the watch's thread the list may change meanwhile: what could be read is said.)
+            for (ViewRoot r : new ArrayList<>(sRoots)) b.append("; ").append(r.mRemoved ? "(removed) " : "").append(r.windowState());
+        } catch (RuntimeException e) {
+            b.append("; the windows not read: ").append(e);
+        }
+        android.util.Log.w("MeglerFrames", b.toString());
     }
     /* The host's window is hidden whole (AppRunner.hostPause: minimized, the screen off): nothing is laid out or drawn until
        it comes back, as Android neither lays out nor draws a stopped app's windows; the whole screen is drawn again then. */
@@ -601,6 +697,8 @@ public final class ViewRoot implements ViewParent {
     }
     private static void doFrame() {
         sScheduled = false;
+        sScheduledAt = 0;
+        sStallSaid = false;
         if (sHostHidden) return;      /* (what asked for the frame waits: hostHidden asks for one as the window comes back) */
         Native.frameMark(1, 0);
         ArrayList<ViewRoot> roots = new ArrayList<>(sRoots);
@@ -717,6 +815,8 @@ public final class ViewRoot implements ViewParent {
         if (v.getPaddingLeft() != 0 || v.getPaddingTop() != 0 || v.getPaddingRight() != 0 || v.getPaddingBottom() != 0)
             b.append(" pad=").append(v.getPaddingLeft()).append(',').append(v.getPaddingTop()).append(',').append(v.getPaddingRight()).append(',').append(v.getPaddingBottom());
         if (v.getTranslationY() != 0f) b.append(" ty=").append(v.getTranslationY());
+        if (v.getBackground() != null) b.append(" bg=").append(View.meglerDescribeDrawable(v.getBackground()));
+        if (v.getForeground() != null) b.append(" fg=").append(View.meglerDescribeDrawable(v.getForeground()));
         if (v instanceof android.widget.TextView) {
             CharSequence tx = ((android.widget.TextView) v).getText();
             StringBuilder e = new StringBuilder();
@@ -826,7 +926,8 @@ public final class ViewRoot implements ViewParent {
             }
             mX = out.left; mLaidY = out.top; mY = mLaidY - mPan; mW = w; mH = h;
             mView.layout(0, 0, w, h);
-        } finally { mInLayout = false; }
+            layoutRequestedDuringLayout(ws, hs, w, h);
+        } finally { mInLayout = false; mHandlingLayoutInLayoutRequest = false; }
         mObserver.dispatchOnGlobalLayout();
         updatePan();
         /* (On the phone, the flag trace-views: a file of that name in the data folder's flags.) */

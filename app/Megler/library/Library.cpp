@@ -356,7 +356,7 @@ void Library::afterStart() {
         if (startedCopies_) return;
         startedCopies_ = true;
         copies.swap(pendingCopies_);
-        if (appPackage::single().package == "com.google.android.gms") services = entries_;
+        if (appPackage::gmsName(appPackage::single().package)) services = entries_;
     }
     // Google Play services' own package: its APK registered for the other apps (appPackage::registerServiceApk), which at its
     // first start copies the APK, hundreds of megabytes, into the shared folder -- on a thread of its own, after the window
@@ -377,6 +377,8 @@ void Library::afterStart() {
             SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
         }).detach();
     }
+    // APKs a PC put in Pictures\Megler\apks over USB, taken into the library on a thread of its own (takeUsbApks).
+    if (!appPackage::isSingleApp()) std::thread([this] { takeUsbApks(); }).detach();
     using Kind = bundledApks::Task::Kind;
     // The offers in the library: the stamp once each of them is made.
     struct Offers {
@@ -497,6 +499,64 @@ bool Library::isBundle(const std::string& pickedName) {
     };
     // (.apkm: APKMirror's, base.apk and split_*.apk with its info.json, which the core unpacks as it unpacks the others.)
     return endsWith(".apks") || endsWith(".xapk") || endsWith(".apkm");
+}
+
+/*
+ * APKs a PC put in Pictures\Megler\apks over USB (MTP shows Pictures to any PC): each copied into the library and read, as an
+ * APK picked in the phone's file manager is (added), and then removed from there; installing it is the user's, from its page,
+ * as for one picked. The way left where the Device Portal writes a file into Megler's LocalState and cannot give Megler the
+ * right to open it: an HP Elite x3's portal answered "Update file access failed" (Access is denied) to every upload on
+ * 2026-11-16, and the library said "The file cannot be opened" of each file so written. Plain APKs alone (a bundle is unpacked
+ * where it is picked in Megler). Once a start, after the window is shown.
+ */
+void Library::takeUsbApks() {
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (...) {
+    }
+    using namespace winrt::Windows::Storage;
+    try {
+        const auto meglerItem = KnownFolders::PicturesLibrary().TryGetItemAsync(L"Megler").get();
+        const StorageFolder megler = meglerItem ? meglerItem.try_as<StorageFolder>() : nullptr;
+        const auto apksItem = megler ? megler.TryGetItemAsync(L"apks").get() : nullptr;
+        const StorageFolder from = apksItem ? apksItem.try_as<StorageFolder>() : nullptr;
+        if (!from) return;
+        const StorageFolder to = StorageFolder::GetFolderFromPathAsync(directory_).get();
+        for (auto const& file : from.GetFilesAsync().get()) {
+            const std::string name = narrow(std::wstring(file.Name()));
+            if (name.size() < 5 || _stricmp(name.c_str() + name.size() - 4, ".apk") != 0) continue;
+            const std::string id = idFor(name);
+            const std::wstring target = directory_ + L"\\" + widen(id), part = target + L".usb-part";
+            try {
+                // Copied under a name of its own, and put in the place of a file of that name there only once that one is
+                // gone: a copy that replaced it kept its access rights, and a file the portal wrote there Megler cannot open
+                // (the Elite x3's copies of both APKs read "The file cannot be opened" so, 0.1.0.718).
+                files::remove(part);
+                file.CopyAsync(to, widen(id) + L".usb-part", NameCollisionOption::ReplaceExisting).get();
+                if (files::exists(target) && !files::remove(target)) {
+                    shellLog::write(format("library: %s could not be taken: the file of its name in the library could not be removed (error %lu)",
+                                           name.c_str(), GetLastError()));
+                    files::remove(part);
+                    continue;
+                }
+                if (!files::move(part, target)) {
+                    shellLog::write(format("library: %s could not be taken: its copy could not be named %s (error %lu)", name.c_str(), id.c_str(),
+                                           GetLastError()));
+                    files::remove(part);
+                    continue;
+                }
+                file.DeleteAsync(StorageDeleteOption::PermanentDelete).get();
+                shellLog::write("library: " + name + " taken from Pictures\\Megler\\apks as " + id);
+                added(id);
+            } catch (const hresult_error& e) {
+                shellLog::write("library: " + name + " in Pictures\\Megler\\apks could not be taken: " + narrow(e.message()));
+            }
+        }
+    } catch (const hresult_error& e) {
+        shellLog::write("library: Pictures\\Megler\\apks could not be looked at: " + narrow(e.message()));
+    } catch (...) {
+        shellLog::write("library: Pictures\\Megler\\apks could not be looked at");
+    }
 }
 
 std::string Library::idFor(const std::string& pickedName) {
@@ -714,7 +774,7 @@ void Library::analyse(const std::string& id) {
             entry.report = std::move(parsed);
             entry.analysed = true;
             entry.iconPath = iconPath;
-            if (appPackage::single().package == "com.google.android.gms") service = entry;
+            if (appPackage::gmsName(appPackage::single().package)) service = entry;
             break;
         }
         // Added just now, for a package already in the library: it replaces the entries that were there, whatever their file

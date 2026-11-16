@@ -1,0 +1,2 @@
+
+    // Megler: lock() asks the table of this process's file locks first (FileDispatcherImpl.java.replace); nothing is added.

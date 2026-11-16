@@ -3633,14 +3633,15 @@ static int run_data(void)
                                             and an https URL through Android's HTTP client; or, where its library is not in the Android root, the
                                             stand-in that fails politely), the app's network security configuration (an authority of its own
                                             trusted for the names it gives it, the rest refused, pins), Android's key store's key pairs and their
-                                            X.509 certificates (and an attestation challenge refused, and a key no provider takes refused at once),
+                                            X.509 certificates (and an attestation challenge refused, and a key no provider takes refused at once;
+                                            and Google Play services' keys in an app's process, one store in their shared data and not the app's),
                                             and the list of decoders: the stand-in's H.264, AAC and MP3 (mg_codec_standin.c), and no H.265. And
                                             the phone's sensors, the stand-in's (mg_sensor_standin.c), listed and listened to. And
                                             android.test.base, which an app made for Android 10 or before has: junit.framework.Assert
                                             as Facebook's SDK asserts the main thread, its failures worded as Android's, a TestSuite
                                             of a TestCase's class run. */
                                          "battery", "connectivity", "dns-servers", "system-libs", "apache-http-legacy", "apache-http-client", "junit-assert", "junit-messages", "junit-test-case", "preloaded-drawables", "location", "sensors", "timezone", "locale", "phone-number", "tls", "tls-loopback", "tls-https",
-                                         "network-trust", "network-trust-domains", "network-trust-pins", "keystore", "keystore-certificates", "keystore-foreign-key", "path-op", "text-path", "base64-streams", "piped-streams", "trace-bytes", "codecs",
+                                         "network-trust", "network-trust-domains", "network-trust-pins", "keystore", "keystore-strongbox-spec", "keystore-certificates", "integrity-profile", "integrity-callbacks", "keybox-attestation", "keystore-foreign-key", "keystore-hosted", "path-op", "text-path", "base64-streams", "piped-streams", "trace-bytes", "codecs",
                                          /* And what Android's WebView asks of the platform before it shows a page, each answered as Android
                                             answers it: the app's id within its user (UserHandle.getAppId), whether cleartext HTTP is
                                             permitted (NetworkSecurityPolicy), a compatibility change's state for the app's target
@@ -3671,7 +3672,7 @@ static int run_data(void)
                                             makes one. And a proxy of an interface of 600 methods. And sound from Java: an
                                             AudioTrack written to, a MediaPlayer of a WAV and of an Ogg Vorbis asset, a SoundPool. */
                                          "xml", "asset-fd", "tasks", "wrapper-receiver", "viewgroup-flag", "text-drawables", "pfd-dup", "pfd-parcel",
-                                         "theme-selfref", "queue-next", "storage-stats", "broadcast-explicit", "service-stop-thread", "start-ids", "process-scope", "job-scheduler", "downloads", "rollback-service", "art-manager", "progress-subclass", "telephony", "microphone", "biometric", "ordered-broadcast", "hardware-accelerated", "descendant-invalidated", "image-matrix-before-layout", "delegate-last-scope", "asset-manager-manifest", "big-asset", "file-available", "path-iterator", "mutable-context", "exec", "crc32c", "nine-patch-constructors", "subscription-ids", "filter-categories", "intent-categories", "broadcast-identity", "arrays-ranges", "collection-factories", "unmodifiable-collectors", "objects-java9", "thread-stack", "icu-number", "audio-route", "expand-template", "list-fragment", "fragment-saved-state", "stub-said", "handler-thread", "managed-dialog", "input-format", "dialog-of-stopped", "zip-path-validator", "list-row-click", "animation-listener", "animation-set", "wait-interrupt", "looper-interrupt", "circular-reveal", "animator-values", "detached-animator", "animator-listener", "animator-not-animation", "observer-merged", "typeface-descriptor", "device-provisioned", "users", "start-asked", "pending-intent-creator", "pending-intent-flags", "pending-intent-options", "alarm-replace-cancel", "alarm-listeners", "wake-lock", "cell-info-update", "messenger-forwarded", "insets-builder", "insets-consumed", "insets-siblings", "broadcast-handler", "prefs-spaced-key", "prefs-null-key", "account-removed", "sync", "package-installer", "batch-operations", "wifi", "media-metadata", "playback-state", "remote-user-info", "media-key-controller", "container-state", "context-params", "theme-accent", "phone-apps", "phone-apps-activities", "phone-apps-signatures", "check-signatures", "install-intent", "install-session", "install-splits", "bitmap-bytes", "bitmap-reuse", "file-read-only", "file-times", "component-state", "adaptive-icon", "idle-handler", "uri-builder", "url-query-sanitizer", "html-tag-handler", "stats-manager", "credential-manager", "many-interfaces", "proxy-many-methods", "apk-path", "archive-meta-data", "maps-paths", "apk-optimization",
+                                         "theme-selfref", "queue-next", "storage-stats", "broadcast-explicit", "service-stop-thread", "start-ids", "process-scope", "job-scheduler", "downloads", "rollback-service", "art-manager", "progress-subclass", "telephony", "microphone", "biometric", "ordered-broadcast", "hardware-accelerated", "descendant-invalidated", "invalidate-override", "image-matrix-before-layout", "delegate-last-scope", "asset-manager-manifest", "big-asset", "file-available", "path-iterator", "mutable-context", "exec", "crc32c", "nine-patch-constructors", "subscription-ids", "filter-categories", "intent-categories", "broadcast-identity", "arrays-ranges", "collection-factories", "unmodifiable-collectors", "objects-java9", "thread-stack", "icu-number", "audio-route", "expand-template", "list-fragment", "fragment-saved-state", "stub-said", "handler-thread", "managed-dialog", "input-format", "dialog-of-stopped", "zoom-buttons", "zip-path-validator", "list-row-click", "animation-listener", "animation-set", "wait-interrupt", "looper-interrupt", "circular-reveal", "animator-values", "detached-animator", "animator-listener", "animator-not-animation", "observer-merged", "typeface-descriptor", "device-provisioned", "users", "start-asked", "pending-intent-creator", "pending-intent-flags", "pending-intent-options", "alarm-replace-cancel", "alarm-listeners", "wake-lock", "cell-info-update", "messenger-forwarded", "insets-builder", "insets-consumed", "insets-siblings", "broadcast-handler", "broadcast-unregistered", "prefs-spaced-key", "prefs-null-key", "account-removed", "sync", "google-signed-out", "package-installer", "batch-operations", "wifi", "media-metadata", "playback-state", "remote-user-info", "media-key-controller", "container-state", "context-params", "theme-accent", "phone-apps", "phone-apps-activities", "phone-apps-signatures", "check-signatures", "install-intent", "install-session", "install-splits", "bitmap-bytes", "bitmap-reuse", "file-read-only", "file-times", "component-state", "adaptive-icon", "idle-handler", "uri-builder", "url-query-sanitizer", "html-tag-handler", "stats-manager", "credential-manager", "many-interfaces", "proxy-many-methods", "apk-path", "archive-meta-data", "maps-paths", "apk-optimization",
                                          /* And an <inset> whose insets are fractions of its bounds, WhatsApp's adaptive icon's 0.01% among them. */
                                          "inset-fraction",
                                          /* And a WorkSource through a Parcel and back, as a location request of Google Play services' carries one. */
@@ -3728,6 +3729,24 @@ static int run_data(void)
                                          /* And a table whose rows and cells leave layout_width or layout_height out inflates, with Android's
                                             sizes for what is left out (Device Info HW). */
                                          "table-cells",
+                                         /* And a grid whose cells leave them out inflates: what is left out is wrap_content (YouTube's
+                                            res/lzI.xml). */
+                                         "grid-cells",
+                                         /* And a LayerDrawable has a constant state, whose copy is a drawable of its kind with the layers'
+                                            copies: a ripple, a layer list with ids and insets, a transition (YouTube's watch page). */
+                                         "layer-copy",
+                                         /* And a reference that comes to @null is no value in a styled attribute array: a tint that is a
+                                            colour @null by day leaves the image without one (WhatsApp's settings on a PC). */
+                                         "null-reference",
+                                         /* And BidiFormatter wraps a text in an embedding with marks where its direction is not the
+                                            context's, and gives it as it is where it is (Deezer's search). */
+                                         "bidi-wrap",
+                                         /* And a context's setTheme puts the new style onto the theme it has made, the same object, so
+                                            what took the theme before sees the switch (YouTube's dark theme). */
+                                         "theme-switch",
+                                         /* And Choreographer's vsync callbacks are called at the next frame with its data, and one removed
+                                            is not (YouTube's watch page waited for one for ever). */
+                                         "vsync-callback",
                                          /* And PrecomputedText is the text it was made of -- characters, spans, paragraphs and the parameters
                                             it was made with -- so a SpannableString of one keeps the spans, and a TextView shows it (Ozon's
                                             chat). */
@@ -4010,6 +4029,14 @@ static int run_data(void)
     /* And a bundle in a reply of its binder, holding an object of its process's class: given this process's loader, the
        object is of this process's class (Bundle.setClassLoader, as WhatsApp reads Google Play services' TokenData). */
     CHECK(wait_line("I/DataTest: process-bundle note=in a bundle", 0, 30) >= 0);
+    /*
+     * And a file's lock between the two processes, which are class scopes of one virtual machine (the libcore overlay's
+     * FileLockTable): the other's tryLock() answers null and its lock() waits, where the library's one table of locks threw
+     * OverlappingFileLockException; within one process it still does. A lock lasts while its channel is open; shared locks
+     * are held together.
+     */
+    CHECK(wait_line("I/DataTest: file-locks-across-scopes same=overlapping other=null waits=waiting then=granted back=null forgotten=null "
+                    "closed=locked shared=locked exclusive=null", 0, 60) >= 0);
     /* The jobs of the step "job-scheduler", run: the one scheduled with its extra, the one given work with both pieces, in order. */
     CHECK(wait_line("I/DataTest: job 41 said=hello", 0, 30) >= 0);
     CHECK(wait_line("I/DataTest: job 42 work=one,two,", 0, 30) >= 0);
@@ -4101,6 +4128,10 @@ static int run_data(void)
     expect_line("I/DataTest: decor-reparent ok", &at, 30);
     /* An alert with a message taller than the screen fits on it, its button wholly there to be pressed. */
     expect_line("I/DataTest: dialog-tall ok", &at, 30);
+    /* A dialog without a window title is told "at most" for its height and never "exactly" (megler.DecorView.makeContent, as
+       Android's screen_simple): a content that measures its parts with its own height spec, as Telegram's alert, has them
+       one under the other inside the window. And the activity's content still fills its window. */
+    expect_line("I/DataTest: dialog-wrap ok", &at, 30);
     /* A panel window's root view draws on the window's frame, hardware accelerated, and a SurfaceView straight in that root on
        one that does not say so (megler.ViewRoot.ScreenCanvas): where a WebView in a window of its own is drawn by its functor. */
     expect_line("I/DataTest: panel-root ok", &at, 30);
@@ -4781,9 +4812,12 @@ static int run_microg(void)
     CHECK(find_line("E/MicroGTest: FAILED", 0) < 0);
     CHECK(find_line("FATAL EXCEPTION", 0) < 0);
     /* microG heard the boot (megler.MicroG.boot), with its device registration turned on, as Megler turns it on unless microG's
-       settings turned it off (Play Store has no Android ID without it), and its check-in trigger started the registration. */
+       settings turned it off (Play Store has no Android ID without it), and its check-in trigger started the registration: its
+       request went out. (Not its "Started Google device registration in foreground mode": microG starts a service in the
+       foreground only where PowerManager says it is not let past the battery optimizations, which no package is since the
+       framework says every one is.) */
     CHECK(find_line("I/MicroG: device registration turned on (checkin_enable_service)", 0) >= 0);
-    CHECK(find_line("GmsCheckinSvc: Started Google device registration", 0) >= 0);
+    CHECK(find_line("D/GmsCheckinClient: -- Request --", 0) >= 0);
     say_app_lines("/MicroGTest: ");
     return g_failed;
 }

@@ -2,7 +2,8 @@
 // makes in its texture with OpenGL ES: they stay on the graphics processor, the shell keeping each under the texture's id
 // (SurfaceTexture.meglerGpuId), and draw() has the shell draw the newest there (Canvas.meglerDrawTexture), where every frame
 // was read back into the memory, drawn into a bitmap of the texture's and uploaded again to be drawn. Released with the view,
-// the texture's id is let go (Gfx.textureGone). Everything else is the original's, unchanged.
+// the texture's id is let go (Gfx.textureGone). getBitmap(Bitmap) draws such a frame into the bitmap there too, scaled.
+// Everything else is the original's, unchanged.
 package android.view;
 
 import android.graphics.Bitmap;
@@ -142,7 +143,19 @@ public class TextureView extends View {
     public Bitmap getBitmap() { return getWidth() > 0 && getHeight() > 0 ? getBitmap(getWidth(), getHeight()) : null; }
     public Bitmap getBitmap(int w, int h) { return isAvailable() && w > 0 && h > 0 ? getBitmap(Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)) : null; }
     public Bitmap getBitmap(Bitmap b) {
-        Bitmap f = mTexture != null ? mTexture.meglerFront() : null;
+        SurfaceTexture t = mTexture;
+        if (b != null && t != null && t.meglerGpuNewest()) {
+            // A frame on the graphics processor (a video decoded there): drawn into the bitmap there, scaled, as draw() draws
+            // it into the view; only the bitmap's own pixels are read when the app reads them. Through the texture's front
+            // bitmap it was read back whole and drawn again from memory: YouTube's ambient mode asks for a small bitmap of
+            // its 1080p video three times a second, and each cost a 1920x1080 read-back and upload (some 200 ms), the window
+            // shown four times a second (0.1.0.704, HP Elite x3).
+            Canvas c = new Canvas(b);
+            c.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR);
+            c.meglerDrawTexture(t.meglerGpuIdGiven(), 0, 0, b.getWidth(), b.getHeight(), 255);
+            return b;
+        }
+        Bitmap f = t != null ? t.meglerFront() : null;
         if (b != null && f != null) { Canvas c = new Canvas(b); c.drawBitmap(f, null, new Rect(0, 0, b.getWidth(), b.getHeight()), mPaint); }
         return b;
     }

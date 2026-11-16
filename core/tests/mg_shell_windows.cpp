@@ -27,6 +27,10 @@
 //     asked every time --, the groups a manifest asks for, and Google Play services' own location in Megler's settings;
 //   - the versions of the apps' own packages (shell/PackageVersions.h): which Megler made one, the next one a build makes
 //     of an app (Aurora Store's update of an app made its package again with the same version, 0x80073CFB), Windows' order;
+//   - Megler's own update as its screens tell of it (shell/OwnUpdate.h): how fast its download comes -- not known at
+//     first, the mean of its last five seconds, nothing coming, anew after a pause --, how long it has left, and the line
+//     that says how far it is; and of the file fetched with the browser instead, the names in Pictures\Megler that are
+//     Megler's packages for one Windows and processor, a whole package's end, the folder as its owner finds it, the text;
 //   - the phone's picker and camera for an app (player/PickerHost.cpp): Windows' picker's filter, start and view for the
 //     MIME types an app asks for, the flags that answer a request in place of the user (pick-cancel, pick-file-<name>), and
 //     files handed over copied into the request's folder -- a name already there made unique, one missing a failure -- with
@@ -46,6 +50,7 @@
 #include "shell/AppPackage.h"
 #include "shell/BundledApks.h"
 #include "shell/Files.h"
+#include "shell/OwnUpdate.h"
 #include "shell/PackageVersions.h"
 #include "shell/Placement.h"
 #include "shell/Platform.h"
@@ -363,18 +368,26 @@ void testMissing(const std::wstring& root) {
     const std::wstring card = root + L"\\missing\\card-shared";
     files::makeDirectories(card);
     check(placement::missingFor(card, card + L"\\apks\\MeglerApp.x\\0123\\app.apk", card + L"\\android\\0.1.0.0") == Missing::apk,
-          "another storage's shared folder, with nothing of Megler's in it");
+          "a shared folder with nothing of Megler's in it");
     for (const Missing missing : {Missing::sharedFolder, Missing::apk, Missing::androidFiles}) {
         const std::string text = placement::missingText(missing, "Telegram", shared, true);
-        check(text.rfind("Telegram can't start: ", 0) == 0 && text.find("Settings › System › Storage") != std::string::npos &&
-                  text.find("install the app again from Megler's Library") != std::string::npos,
-              "its screen says why and what to do: " + text);
+        check(text.rfind("Telegram can't start: ", 0) == 0 && text.find("nstall the app again") != std::string::npos &&
+                  text.find("Moving the app changes nothing of this") != std::string::npos &&
+                  text.find("whether an app is there or on the memory card") != std::string::npos &&
+                  text.find("Apps' Storage") == std::string::npos && text.find("Settings › System › Storage") == std::string::npos &&
+                  text.find("different storage") == std::string::npos,
+              "its screen says what it lacks and what to do, and not to move the app: " + text);
     }
     check(placement::missingText(Missing::nothing, "Telegram", shared, true).empty(), "nothing missing, nothing said");
-    check(placement::missingText(Missing::apk, "Telegram", shared, true).find("Megler's Settings, Apps' Storage") != std::string::npos,
-          "and that Megler's Settings move its apps to where Megler is");
-    check(placement::missingText(Missing::apk, "Telegram", shared, false).find("Settings › Apps") != std::string::npos,
-          "on desktop Windows, the system drive and Settings › Apps");
+    check(placement::missingText(Missing::androidFiles, "Telegram", shared, true).find("install the app again from its Library") != std::string::npos &&
+              placement::missingText(Missing::sharedFolder, "Telegram", shared, true).find("install the app again from its Library") != std::string::npos &&
+              placement::missingText(Missing::apk, "Telegram", shared, true).find("its APK opened with Megler again") != std::string::npos &&
+              placement::missingText(Missing::apk, "Telegram", shared, true).find("from its Library") == std::string::npos,
+          "Android's files come back with an install from the Library; an APK that is gone has to be brought again");
+    const std::string onPc = placement::missingText(Missing::apk, "Telegram", shared, false);
+    check(onPc.find("whichever drive an app is on") != std::string::npos && onPc.find("memory card") == std::string::npos &&
+              onPc.find("phone") == std::string::npos,
+          "on desktop Windows, drives, and no phone or memory card: " + onPc);
     // What Megler says of itself at its start: nothing with a shared folder, wherever it is -- its apps find the one shared
     // folder from either storage -- and that no app can be installed where Windows gave it none.
     check(placement::meglerOnCardText(false, false, true).empty() && placement::meglerOnCardText(true, false, false).empty() &&
@@ -1020,6 +1033,130 @@ void testPackageVersions() {
           "Windows' order: the same is not older; Megler 0.1.0.682's own version is older than its apps' packages");
 }
 
+/// Megler's own update as its screens tell of it (shell/OwnUpdate.h): the download's speed, the time it has left, its line;
+/// and the file fetched with the browser: its name, its end, its folder, the text.
+void testOwnUpdate() {
+    printf("Megler's own update\n");
+    namespace ou = ownUpdate;
+    const auto about = [](double value, double wanted) { return value > wanted * 0.97 && value < wanted * 1.03; };
+    {
+        ou::Speed speed;
+        check(speed.at(0) < 0, "a download nothing was measured of: its speed is not known");
+        speed.add(1000, 0);
+        check(speed.at(1000) < 0 && speed.at(5999) < 0, "one moment measured: not known yet");
+        check(speed.at(6000) == 0, "... and nothing coming once five seconds passed with no more");
+        speed.add(1500, 500000);
+        check(speed.at(1500) < 0, "half a second measured: not known yet");
+        speed.add(2000, 1000000);
+        check(about(speed.at(2000), 1000000), "a second measured, 1,000,000 bytes in it: 1,000,000 bytes a second");
+        check(about(speed.at(6999), 1000000) && speed.at(7000) == 0, "it stands for five seconds after the last bytes, then nothing is coming");
+        // A pause is not how fast it comes now: measured anew after it.
+        speed.add(8000, 1100000);
+        check(speed.at(8000) < 0, "the first bytes after a pause of six seconds: not known yet, not the pause's mean");
+        speed.add(9000, 2100000);
+        check(about(speed.at(9000), 1000000), "... and a second later the speed since the pause");
+        speed.reset();
+        check(speed.at(9000) < 0, "reset: not known");
+    }
+    {
+        // Five seconds at 1,000,000 bytes a second, then five at 100,000: the mean is of the last five.
+        ou::Speed speed;
+        uint64_t bytes = 0;
+        for (uint64_t ms = 0; ms <= 5000; ms += 100, bytes += 100000) speed.add(ms, bytes);
+        bytes -= 100000;
+        check(about(speed.at(5000), 1000000), "five seconds at 1,000,000 bytes a second");
+        for (uint64_t ms = 5100; ms <= 10000; ms += 100) speed.add(ms, bytes += 10000);
+        check(about(speed.at(10000), 100000), "then five at 100,000: the last five seconds' mean, 100,000");
+        check(about(speed.at(10400), 100000), "... said so between the chunks too");
+    }
+    {
+        // A fast download's chunks, hundreds to the second: the same speed, whatever is kept of them.
+        ou::Speed speed;
+        uint64_t bytes = 0;
+        for (uint64_t ms = 0; ms <= 20000; ms += 3, bytes += 6000) speed.add(ms, bytes);
+        check(about(speed.at(20001), 2000000), "a chunk every 3 ms for twenty seconds, 2,000,000 bytes a second");
+        // A clock that went back (it does not: GetTickCount64) is the last moment again.
+        speed.add(100, bytes + 1);
+        check(speed.at(20001) > 0, "a moment before the last one is taken for the last one");
+    }
+    check(ou::timeLeft(0) == "less than a minute" && ou::timeLeft(59.9) == "less than a minute", "0 and 59.9 seconds: less than a minute");
+    check(ou::timeLeft(60) == "about a minute" && ou::timeLeft(89) == "about a minute", "60 and 89 seconds: about a minute");
+    check(ou::timeLeft(90) == "about 2 minutes" && ou::timeLeft(3540) == "about 59 minutes", "90 seconds: about 2 minutes; 59 minutes");
+    check(ou::timeLeft(3599) == "about an hour" && ou::timeLeft(3660) == "about an hour 1 minute", "3599 seconds: about an hour; 61 minutes");
+    check(ou::timeLeft(7500) == "about 2 hours 5 minutes", "125 minutes: about 2 hours 5 minutes");
+    check(ou::timeLeft(86399) == "about 24 hours" && ou::timeLeft(86400) == "more than a day", "a day: more than a day");
+    const uint64_t got = 12897485, total = uint64_t(371) << 20; // 12.3 MB of 371 MB
+    const double fast = 1.25 * 1048576;
+    check(ou::progressLine(got, total, fast) == "12.3 MB of 371 MB (3%), 1.25 MB/s, about 5 minutes left",
+          "the line: " + ou::progressLine(got, total, fast));
+    check(ou::progressLine(got, total, -1) == "12.3 MB of 371 MB (3%)", "... with the speed not known yet: " + ou::progressLine(got, total, -1));
+    check(ou::progressLine(got, total, 0) == "12.3 MB of 371 MB (3%), nothing coming now" &&
+              ou::progressLine(got, total, 0.4) == "12.3 MB of 371 MB (3%), nothing coming now",
+          "... with nothing coming: " + ou::progressLine(got, total, 0));
+    check(ou::progressLine(total, total, fast) == "371 MB of 371 MB (100%), 1.25 MB/s", "... all of it here: " + ou::progressLine(total, total, fast));
+    check(ou::progressLine(uint64_t(2) << 20, 0, 524288) == "2.00 MB, 512 KB/s",
+          "... of a size not known: " + ou::progressLine(uint64_t(2) << 20, 0, 524288));
+    check(ou::progressLine(0, 0, -1) == "0 bytes", "... of nothing yet: " + ou::progressLine(0, 0, -1));
+
+    // The names in Pictures\Megler that are Megler's packages for one Windows and processor.
+    check(ou::versionInName("Megler_0.1.0.700_ARM.appx", "ARM") == "0.1.0.700" && ou::versionInName("Megler_0.1.0.700_ARM.msix", "ARM") == "0.1.0.700",
+          "Megler_0.1.0.700_ARM.appx (and .msix) is the phone's 0.1.0.700");
+    check(ou::versionInName("Megler_0.1.0.700_ARM (1).appx", "ARM") == "0.1.0.700" && ou::versionInName("Megler_0.1.0.700_ARM(12).appx", "ARM") == "0.1.0.700",
+          "... and so is a browser's second download of it, \"Megler_0.1.0.700_ARM (1).appx\"");
+    check(ou::versionInName("Megler_0.1.0.700_RT_ARM.appx", "ARM").empty() && ou::versionInName("Megler_0.1.0.700_ARM64.appx", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.700_Xbox_x64.appx", "x64").empty(),
+          "RT_ARM's and ARM64's are not the phone's, nor an Xbox's a computer's");
+    check(ou::versionInName("Megler_0.1.0.700_RT_ARM.appx", "RT_ARM") == "0.1.0.700" && ou::versionInName("Megler_0.1.0.700_Xbox_x64.appx", "Xbox_x64") == "0.1.0.700" &&
+              ou::versionInName("Megler_12.3.45.6789_x64.appx", "x64") == "12.3.45.6789",
+          "each Windows and processor takes its own");
+    check(ou::versionInName("Megler_0.1.0.700_ARM.appx.part", "ARM").empty() && ou::versionInName("Megler_0.1.0.700_ARM.appx.crdownload", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.700_ARM.zip", "ARM").empty() && ou::versionInName("Megler_0.1.0.700_ARM", "ARM").empty(),
+          "a download that is not over, a .zip, a name without its ending: not packages");
+    check(ou::versionInName("Megler_0.1.700_ARM.appx", "ARM").empty() && ou::versionInName("Megler_0.1.0.x_ARM.appx", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.700.1_ARM.appx", "ARM").empty() && ou::versionInName("Megler_0.1.0._ARM.appx", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.7000000000_ARM.appx", "ARM").empty(),
+          "a version that is not four numbers: not a package");
+    check(ou::versionInName("megler_0.1.0.700_ARM.appx", "ARM").empty() && ou::versionInName("Megler_0.1.0.700_ARM.appx", "").empty() &&
+              ou::versionInName("", "ARM").empty() && ou::versionInName("Megler_0.1.0.700", "ARM").empty() && ou::versionInName("Megler.cer", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.700_ARM (1.appx", "ARM").empty() && ou::versionInName("Megler_0.1.0.700_ARM ().appx", "ARM").empty() &&
+              ou::versionInName("Megler_0.1.0.700_ARM (1) (2).appx", "ARM").empty(),
+          "another name, no suffix, a mark that is not a browser's: not packages");
+    {
+        // A whole package ends with the archive's end record; a copy whose size was set first ends with zeros meanwhile.
+        std::vector<unsigned char> tail(100, 0);
+        check(!ou::endsAsZip(tail.data(), tail.size()) && !ou::endsAsZip(tail.data(), 0) && !ou::endsAsZip(nullptr, 100) && !ou::endsAsZip(tail.data(), 21),
+              "zeros, nothing, less than the record: not a package's end");
+        const unsigned char record[22] = {'P', 'K', 5, 6};
+        memcpy(tail.data() + 78, record, 22);
+        check(ou::endsAsZip(tail.data(), tail.size()) && ou::endsAsZip(tail.data() + 78, 22), "the archive's end record at the file's end: a whole package's");
+        check(!ou::endsAsZip(tail.data(), tail.size() - 1), "... cut short by a byte: not one");
+        memset(tail.data(), 0, tail.size());
+        memcpy(tail.data() + 73, record, 22);
+        tail[73 + 20] = 5;
+        check(ou::endsAsZip(tail.data(), tail.size()), "... with the archive's comment of 5 bytes after it: a whole package's");
+        tail[73 + 20] = 4;
+        check(!ou::endsAsZip(tail.data(), tail.size()), "... with a comment that does not reach the end: not one");
+    }
+    check(ou::folderPlace("C:\\Data\\Users\\Public\\Pictures\\Megler", true) == "This device › Pictures › Megler" && ou::folderPlace("", true) == "This device › Pictures › Megler",
+          "the phone's own Pictures\\Megler: " + ou::folderPlace("C:\\Data\\Users\\Public\\Pictures\\Megler", true));
+    check(ou::folderPlace("D:\\Pictures\\Megler", true) == "SD card › Pictures › Megler", "the memory card's: " + ou::folderPlace("D:\\Pictures\\Megler", true));
+    check(ou::folderPlace("C:\\Users\\me\\Pictures\\Megler", false) == "C:\\Users\\me\\Pictures\\Megler" && ou::folderPlace("", false) == "the folder Megler in Pictures",
+          "a computer's: its path");
+    {
+        const std::string url = "https://github.com/Computershik73/megler-w10m/releases/download/v0.1.0.700/Megler_0.1.0.700_ARM.appx";
+        const std::string phone = ou::browserText("Megler_0.1.0.700_ARM.appx", url, uint64_t(371) << 20, "SD card › Pictures › Megler", true);
+        const std::string computer = ou::browserText("Megler_0.1.0.700_x64.appx", url, 0, "C:\\Users\\me\\Pictures\\Megler", false);
+        check(phone.rfind("Megler_0.1.0.700_ARM.appx (371 MB) by its direct link:\n" + url + "\n\n1. ", 0) == 0, "the browser's way: the file, its size, its link on a line of its own");
+        check(phone.find("move the file from Downloads to SD card › Pictures › Megler: hold it, then Move to.\n3. ") != std::string::npos &&
+                  phone.find("over USB") != std::string::npos,
+              "... on a phone: File Explorer's Move to, and the way from a computer");
+        check(computer.rfind("Megler_0.1.0.700_x64.appx by its direct link:\n", 0) == 0 &&
+                  computer.find("2. Move the file from Downloads to C:\\Users\\me\\Pictures\\Megler, or save it there at once.\n3. ") != std::string::npos &&
+                  computer.find("over USB") == std::string::npos && computer.find("phone") == std::string::npos,
+              "... on a computer: the folder's path, and nothing of a phone");
+    }
+}
+
 /// What a folder's files take, its folders' too (files::treeSize: an app's data and cache in its own package's Settings).
 void testTreeSize(const std::wstring& root) {
     printf("a folder's size with its folders' (files::treeSize)\n");
@@ -1288,6 +1425,7 @@ int wmain(int argc, wchar_t** argv) {
     testBundled();
     testSharedApks(root);
     testPackageVersions();
+    testOwnUpdate();
     testTreeSize(root);
     testPermissions();
     testPicker(root);

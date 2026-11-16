@@ -5,7 +5,27 @@ updates itself from them over the air (`app/Megler/ui/Ota.cpp`): it asks GitHub'
 most once in six hours (Settings › Updates: at start, or only when asked; Check Now), and offers the newest that has a
 package for it. Taken, the package is downloaded into `LocalState\update`, its size and its SHA-256 checked against what
 GitHub says of the asset, and installed as an update copied to `Pictures\Megler` is: Windows's deployment engine (on an
-Xbox, the console's Device Portal) closes Megler and installs the new one, and Megler is opened again.
+Xbox, the console's Device Portal) closes Megler and installs the new one, and Megler is opened again. While it comes, a
+dialog (and, hidden, a card in the Library) says how far it is, how fast it comes and how long it has left.
+
+Where that download is too slow, the package can be fetched with the browser: **In Browser** (in the offer, in the
+download's dialog and in a failed download's; not on an Xbox) shows the asset's own direct link --
+`https://github.com/Computershik73/megler-w10m/releases/download/v<version>/Megler_<version>_<suffix>.appx`, which a
+browser saves as a file, not the release's page --, opens it in the browser (Download) or copies it (Copy Link), and says
+where the file is to be put: the folder `Megler` in Pictures (on a phone `This device › Pictures › Megler`, or the memory
+card's). From then on Megler's own download gives way, and Megler looks there every ten seconds for two hours, and at
+every start: once the file is whole and of the size GitHub says, Windows is asked to install it. Windows checks the
+package's signature as it installs it; the SHA-256 is not compared on this way. `LocalState\update-browser.txt` keeps
+which version is fetched so; once that Megler is installed, its file is removed from `Pictures\Megler`.
+
+`Pictures\Megler` takes the package of this Megler's own Windows and processor, by the same name as the release's asset
+(a browser's second download, `Megler_<version>_<suffix> (1).appx`, too); `Megler.cer` beside it is needed on an Xbox
+alone. A file that does not end as a whole package does -- still being copied, or cut short -- is not tried, and the
+Library says so.
+
+For a test, the flag `LocalState\flags\ota-again` has the newest release offered though it is not newer than the Megler
+that asks, so that what follows an offer can be tried without a release made for it (all but the end of the browser's
+way: a file in `Pictures\Megler` that is not newer than the Megler that finds it is not installed).
 
 Megler finds its package by name alone, so every release keeps to these rules.
 
@@ -80,3 +100,9 @@ processor's libraries. An older one never replaces a later one.
 3. Compare the assets' SHA-256 digests (`gh release view vX.Y.Z.N --json assets`) with the files': Megler checks what it
    downloads against them, and refuses a package whose digest is not GitHub's.
 4. The notes say which file is for which Windows and processor, and the SHA-256 of each.
+5. The section the offer shows -- the notes' first `## What's new` heading down to the next `## ` heading, at most about
+   700 characters of it, under the offer's own few lines -- is short: a few lines, the details under a heading of another
+   name after it. Megler before 0.1.0.690 shows the offer in a dialog that does not scroll, and where its text is higher
+   than the phone's screen its buttons are below the screen: no Update, no Later (699's notes, a user's report of
+   2026-11-16). Since 690 the text scrolls and the buttons stay, and since 0.1.0.718 a `### ` sub-heading in it is shown
+   as a line "Fixed:" rather than as written.

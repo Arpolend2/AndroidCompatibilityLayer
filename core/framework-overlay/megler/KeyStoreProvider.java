@@ -1,5 +1,6 @@
 // Overlay of core/framework/src/megler/KeyStoreProvider.java (tools/build-framework.sh).
-// It differs in how the keys are kept (each by its algorithm and encoding, not serialized objects: see "the keys" below), and
+// It differs in how the keys are kept (each by its algorithm and encoding, not serialized objects: see "the keys" below), in
+// whose they are (Google Play services' are one store in their shared data, whichever process asks: see "Whose keys"), and
 // in PairGen.generateKeyPair, which takes the generator of another provider from that provider's service
 // instead of KeyPairGenerator.getInstance(algorithm, provider), and initialises it with a SecureRandom of its own.
 //
@@ -10,7 +11,7 @@
 // MX Player's Amazon sign-in storage (com.amazon.identity.auth.device, LocalDataStorageV2RSAKeyPairManager) three times a
 // start. The check is for apps that ask for BouncyCastle by name; here it is the platform's own key store using it, as
 // Android's AndroidKeyStore uses its keymaster. And in the certificates of its key pairs (X.509, self-signed, as Android's:
-// see selfSigned) and in a pair asked for with an attestation challenge (refused: see PairGen.generateKeyPair). Everything else is
+// see selfSigned) and in a pair asked for with an attestation challenge (opt-in external signer: see KeyboxAttestation). Everything else is
 // the original's, unchanged.
 package megler;
 
@@ -29,9 +30,9 @@ import javax.crypto.spec.SecretKeySpec;
 
 /**
  * "AndroidKeyStore": Android's hardware-backed key store, as a JCA provider apps find by that name. Keys here are ordinary keys made
- * by the other providers (conscrypt, BouncyCastle) and kept in the app's own data, which the app's container protects: what apps do with
- * them (EncryptedSharedPreferences, Tink, signing) works the same. KeyGenerator (AES, HMAC) and KeyPairGenerator (RSA, EC) take
- * KeyGenParameterSpec and store the key under its alias.
+ * by the other providers (conscrypt, BouncyCastle) and kept in the app's own data (Google Play services' in theirs), which the app's
+ * container protects: what apps do with them (EncryptedSharedPreferences, Tink, signing) works the same. KeyGenerator (AES, HMAC)
+ * and KeyPairGenerator (RSA, EC) take KeyGenParameterSpec and store the key under its alias.
  */
 public final class KeyStoreProvider extends Provider {
     public static final String NAME = "AndroidKeyStore";
@@ -52,7 +53,8 @@ public final class KeyStoreProvider extends Provider {
         try { Security.addProvider(new BCWorkaround()); } catch (Throwable t) { android.util.Log.w("Megler", "AndroidKeyStoreBCWorkaround not installed: " + t); }
     }
 
-    // ---- the keys: alias -> key (and for a pair, its public key), kept in a file of the app's
+    // ---- the keys: alias -> key (and for a pair, its public key), kept in a file: an app's in its own data, Google Play
+    // services' in theirs
     /*
      * The file holds each key by its algorithm and its standard encoding -- a secret key's bytes, a private key's PKCS#8, a
      * public key's X.509 -- each entry read on its own, made again by the providers there are at the time. It held the key
@@ -68,34 +70,165 @@ public final class KeyStoreProvider extends Provider {
         Key secretOrPrivate;
         PublicKey publicKey;
         long created = System.currentTimeMillis();
-        /** A key pair's certificates, leaf first, each as its encoding (kept in a file of their own: see chainFile). */
+        /** A key pair's certificates, leaf first, each as its encoding (kept in a file of their own: see Box.chainFile). */
         byte[][] chain;
         transient Certificate[] certificates;
+        /** The box it is in. */
+        transient Box home;
     }
-    private static LinkedHashMap<String, Entry> sKeys;
     private static final int FORMAT = 2;
     private static final int KIND_NONE = 0, KIND_SECRET = 1, KIND_PRIVATE = 2;
-    private static File oldFile() { return new File(Native.dataDir(), ".megler_keystore"); }
-    private static File file() { return new File(Native.dataDir(), ".megler_keystore2"); }
-    static synchronized LinkedHashMap<String, Entry> meglerKeys() {
-        if (sKeys != null) return sKeys;
-        sKeys = new LinkedHashMap<>();
-        File f = file(), old = oldFile();
-        if (f.isFile()) {
-            read(f);
-            readChains();
-        } else if (old.isFile()) {
-            readOld(old);
-            if (!sKeys.isEmpty()) {
-                android.util.Log.i("Megler", "AndroidKeyStore: " + sKeys.size() + " keys of the old file kept the new way");
-                save();
-            }
+
+    /*
+     * Whose keys (view). An app's are in a file of its own data folder. Google Play services' are in a file of their data
+     * folder, the one every process that runs them has (MicroG.SHARED; the private folder of the Google Play services app
+     * is that same folder): one store, whichever process asks.
+     *
+     * They were the keys of the app whose process asked. Google Play services keep their data in the shared folder and
+     * encrypt it with keys of this store (Tink: an AES key under the alias mobstore_encrypt, and the key set it protects in
+     * a file of theirs). So the process that happened to make the key set could read it and no other: "Keystore cannot load
+     * the key with ID: mobstore_encrypt" and "Failed to initialize encryption" in Play Store, in Google Play services' own
+     * app and in other apps (18 users' logs of 681-699; the Lumia 650's Play Store with 701).
+     *
+     * The keys their earlier data left in the apps' own stores are wanted until that data is cleared. The mark
+     * .megler-keystore-shared beside their data folder says that there are none: run/mg_run.c writes it where they have no
+     * data yet (mg_run_services_key_store: a first start, and after Clear Data). Without it a call of theirs also looks in
+     * the hosting app's own store, and in the imports -- a second file of the shared folder, where each key found in an
+     * app's own store and used is copied, for the other processes. Of an alias in both the newer key is the one: a key is
+     * made when a key set is, so the newest belongs to the key set that is there now. With the mark the shared store is
+     * the only one.
+     *
+     * Their code never changes the keys of an app's own store (an alias can be in both: androidx's
+     * _androidx_security_master_key_). What it makes goes to the shared store. What it deletes of the app's is hidden from
+     * it while the process runs (sGone); at the next start it is found again, unless another was made under the alias, as
+     * the code that deletes a key does.
+     */
+    /** One store: a file of keys, the file of their certificates beside it, and what was read of them. */
+    static final class Box {
+        final File file, chainFile, lockFile;
+        /** Other processes write it too: read again when the file is another, changed with the lock file held. */
+        final boolean shared;
+        /** An app's own: where it has no file, the one of before format 2 beside it is read, once. */
+        final boolean old;
+        LinkedHashMap<String, Entry> keys;
+        /** The keys' file as it was when read: its time and its length (0 and 0: none). */
+        long stamp = -1, length = -1;
+        Box(File f, boolean shared, boolean old) {
+            file = f;
+            chainFile = new File(f.getPath() + ".certs");
+            lockFile = new File(f.getPath() + ".lock");
+            this.shared = shared;
+            this.old = old;
         }
-        return sKeys;
+        File oldFile() { return new File(file.getParentFile(), ".megler_keystore"); }
+    }
+    private static final String KEYS = ".megler_keystore2", MARK = ".megler-keystore-shared";
+    /* One Box for a file, whoever asks. */
+    private static final HashMap<String, Box> sBoxes = new HashMap<>();
+    private static Box box(File f, boolean shared, boolean old) {
+        Box b = sBoxes.get(f.getPath());
+        if (b == null) sBoxes.put(f.getPath(), b = new Box(f, shared, old));
+        return b;
     }
 
-    private static void read(File f) {
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(f)))) {
+    /**
+     * What a call sees. `main`: where its keys are made, and looked for first. For Google Play services whose data is older
+     * than the shared store, also `imports` and, in an app's process, `app`: the app's own store, which they only read.
+     */
+    private static final class View {
+        final Box main, app, imports;
+        View(Box main, Box app, Box imports) { this.main = main; this.app = app; this.imports = imports; }
+    }
+    private static File sServices;   // MicroG.SHARED, once it was seen to be there
+    private static File sTestRoot;
+    private static Thread sTestThread;
+    /* The app's own aliases Google Play services deleted in this process, and those copied to the imports (alias/created). */
+    private static final HashSet<String> sGone = new HashSet<>(), sExported = new HashSet<>();
+
+    /**
+     * For the tests: from now on the calling thread's key store calls are Google Play services' in an app's process, with
+     * the folder `root` in the place of /data/megler-services (their data in root/com.google.android.gms, the mark
+     * root/.megler-keystore-shared); null ends it.
+     */
+    public static synchronized void hostedForTests(String root) {
+        sTestRoot = root == null ? null : new File(root);
+        sTestThread = root == null ? null : Thread.currentThread();
+    }
+
+    private static View view() {
+        boolean itself = false;
+        File root = null;
+        if (sTestRoot != null && Thread.currentThread() == sTestThread) {
+            root = sTestRoot;
+        } else {
+            itself = GooglePackages.GMS.equals(Native.packageName());
+            if (itself || MicroG.calledByHosted()) {
+                if (sServices == null) {
+                    File f = new File(MicroG.SHARED);
+                    if (f.isDirectory()) sServices = f;
+                }
+                root = sServices;
+            }
+        }
+        Box own = box(new File(Native.dataDir(), KEYS), itself, true);
+        if (root == null) return new View(own, null, null);
+        File data = new File(root, GooglePackages.GMS);
+        Box main = itself ? own : box(new File(data, KEYS), true, false);
+        if (new File(root, MARK).exists()) return new View(main, null, null);
+        return new View(main, itself ? null : own, box(new File(data, KEYS + ".hosts"), true, false));
+    }
+
+    /** A box's keys: read at first, and a shared one's again when its file is not the one that was read. */
+    private static LinkedHashMap<String, Entry> keys(Box b) {
+        if (b.keys != null && (!b.shared || (b.file.lastModified() == b.stamp && b.file.length() == b.length))) return b.keys;
+        // A shared one's file is read with the lock held: who writes puts a new file in its place, which a file held open
+        // could refuse.
+        boolean there = b.file.exists();
+        boolean locked = b.shared && (there || (b.old && b.keys == null && b.oldFile().isFile())) && lock(b);
+        try {
+            load(b, locked || !b.shared || !there);
+        } finally {
+            if (locked) unlock(b);
+        }
+        return b.keys;
+    }
+
+    /*
+     * A box's keys as its files have them now. `sure`: nobody writes the files meanwhile (the lock is held, or there is no
+     * file), so the file's time and length stand for what was read, and it is not read again until they are others. Where
+     * the file cannot be read, what was read before stays; and so do the keys that cannot be written down (encodable),
+     * which are in no file.
+     */
+    private static void load(Box b, boolean sure) {
+        long stamp = b.file.lastModified(), length = b.file.length();
+        LinkedHashMap<String, Entry> now = new LinkedHashMap<>();
+        boolean good = true, fromOld = false;
+        if (stamp != 0 || length != 0) {
+            good = read(b, now);
+        } else if (b.old && b.keys == null && b.oldFile().isFile()) {
+            readOld(b.oldFile(), now);
+            fromOld = !now.isEmpty();
+        }
+        if (b.keys != null) {
+            if (!good) now = b.keys;
+            else for (Map.Entry<String, Entry> m : b.keys.entrySet()) if (!now.containsKey(m.getKey()) && !encodable(m.getValue())) now.put(m.getKey(), m.getValue());
+        }
+        for (Entry e : now.values()) e.home = b;
+        b.keys = now;
+        if (sure) {
+            b.stamp = stamp;
+            b.length = length;
+        }
+        if (fromOld) {
+            android.util.Log.i("Megler", "AndroidKeyStore: " + now.size() + " keys of the old file kept the new way");
+            save(b);
+        }
+    }
+
+    /* False when the keys' file could not be read to its end (the keys before that are in `keys`). */
+    private static boolean read(Box b, LinkedHashMap<String, Entry> keys) {
+        boolean good = true;
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(b.file)))) {
             int format = in.readInt(), n = in.readInt();
             if (format != FORMAT) throw new IOException("format " + format);
             for (int i = 0; i < n; i++) {
@@ -112,14 +245,17 @@ public final class KeyStoreProvider extends Provider {
                     if (kind == KIND_SECRET) e.secretOrPrivate = new SecretKeySpec(key, algorithm);
                     else if (kind == KIND_PRIVATE) e.secretOrPrivate = KeyFactory.getInstance(algorithm).generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(key));
                     if (hasPublic) e.publicKey = KeyFactory.getInstance(publicAlgorithm).generatePublic(new java.security.spec.X509EncodedKeySpec(pub));
-                    sKeys.put(alias, e);
+                    keys.put(alias, e);
                 } catch (GeneralSecurityException x) {
                     android.util.Log.w("Megler", "AndroidKeyStore: the key " + alias + " (" + algorithm + ") could not be made again: " + x);
                 }
             }
         } catch (IOException x) {
-            android.util.Log.w("Megler", "AndroidKeyStore: could not read the keys: " + x);
+            android.util.Log.w("Megler", "AndroidKeyStore: could not read the keys: " + x + " (" + b.file + ")");
+            good = false;
         }
+        readChains(b, keys);
+        return good;
     }
 
     private static byte[] bytes(DataInputStream in) throws IOException {
@@ -132,7 +268,7 @@ public final class KeyStoreProvider extends Provider {
 
     /* The old file: the key objects, serialized; a class the framework has not, looked for in GmsCore's loader too. */
     @SuppressWarnings("unchecked")
-    private static void readOld(File f) {
+    private static void readOld(File f, LinkedHashMap<String, Entry> into) {
         try (ObjectInputStream in = new ObjectInputStream(new FileInputStream(f)) {
             @Override protected Class<?> resolveClass(ObjectStreamClass d) throws IOException, ClassNotFoundException {
                 try {
@@ -145,7 +281,7 @@ public final class KeyStoreProvider extends Provider {
             }
         }) {
             LinkedHashMap<String, Entry> keys = (LinkedHashMap<String, Entry>) in.readObject();
-            if (keys != null) sKeys.putAll(keys);
+            if (keys != null) into.putAll(keys);
         } catch (Exception e) {
             android.util.Log.w("Megler", "AndroidKeyStore: could not read the keys of the old file: " + e);
         }
@@ -157,12 +293,10 @@ public final class KeyStoreProvider extends Provider {
      * encoding.
      */
     private static final int CHAIN_FORMAT = 1;
-    private static File chainFile() { return new File(Native.dataDir(), ".megler_keystore2.certs"); }
 
-    private static void readChains() {
-        File f = chainFile();
-        if (!f.isFile()) return;
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(f)))) {
+    private static void readChains(Box b, LinkedHashMap<String, Entry> keys) {
+        if (!b.chainFile.isFile()) return;
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(b.chainFile)))) {
             int format = in.readInt(), n = in.readInt();
             if (format != CHAIN_FORMAT) throw new IOException("format " + format);
             for (int i = 0; i < n; i++) {
@@ -171,18 +305,46 @@ public final class KeyStoreProvider extends Provider {
                 if (count < 1 || count > 16) throw new IOException("a chain of " + count + " certificates");
                 byte[][] chain = new byte[count][];
                 for (int j = 0; j < count; j++) chain[j] = bytes(in);
-                Entry e = sKeys.get(alias);
+                Entry e = keys.get(alias);
                 if (e != null) e.chain = chain;
             }
         } catch (IOException x) {
-            android.util.Log.w("Megler", "AndroidKeyStore: could not read the keys' certificates: " + x);
+            android.util.Log.w("Megler", "AndroidKeyStore: could not read the keys' certificates: " + x + " (" + b.chainFile + ")");
         }
     }
 
-    static synchronized void save() {
-        File f = file(), part = new File(f.getPath() + ".part");
+    /*
+     * A box's keys written down: the certificates' file first and the keys' file last, each whole in a file beside it that
+     * then takes its place. Another process reads both again when the keys' file is another (keys), and the certificates of
+     * those keys are there by then.
+     */
+    private static void save(Box b) {
         ArrayList<Map.Entry<String, Entry>> kept = new ArrayList<>();
-        for (Map.Entry<String, Entry> m : sKeys.entrySet()) if (encodable(m.getValue())) kept.add(m);
+        for (Map.Entry<String, Entry> m : b.keys.entrySet()) if (encodable(m.getValue())) kept.add(m);
+        File parent = b.file.getParentFile();
+        if (parent != null) parent.mkdirs();
+        File chainPart = new File(b.chainFile.getPath() + ".part");
+        boolean chains = true;
+        try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(chainPart)))) {
+            ArrayList<Map.Entry<String, Entry>> chained = new ArrayList<>();
+            for (Map.Entry<String, Entry> m : kept) if (m.getValue().chain != null) chained.add(m);
+            out.writeInt(CHAIN_FORMAT);
+            out.writeInt(chained.size());
+            for (Map.Entry<String, Entry> m : chained) {
+                out.writeUTF(m.getKey());
+                out.writeInt(m.getValue().chain.length);
+                for (byte[] c : m.getValue().chain) {
+                    out.writeInt(c.length);
+                    out.write(c);
+                }
+            }
+        } catch (Exception e) {
+            android.util.Log.w("Megler", "AndroidKeyStore: could not save the keys' certificates: " + e);
+            chainPart.delete();
+            chains = false;
+        }
+        if (chains && !chainPart.renameTo(b.chainFile)) android.util.Log.w("Megler", "AndroidKeyStore: could not save the keys' certificates: " + chainPart + " could not take the place of " + b.chainFile);
+        File part = new File(b.file.getPath() + ".part");
         try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(part)))) {
             out.writeInt(FORMAT);
             out.writeInt(kept.size());
@@ -195,16 +357,16 @@ public final class KeyStoreProvider extends Provider {
                 out.writeByte(kind);
                 if (kind != KIND_NONE) {
                     out.writeUTF(k.getAlgorithm());
-                    byte[] b = k.getEncoded();
-                    out.writeInt(b.length);
-                    out.write(b);
+                    byte[] bytes = k.getEncoded();
+                    out.writeInt(bytes.length);
+                    out.write(bytes);
                 }
                 out.writeBoolean(e.publicKey != null);
                 if (e.publicKey != null) {
                     out.writeUTF(e.publicKey.getAlgorithm());
-                    byte[] b = e.publicKey.getEncoded();
-                    out.writeInt(b.length);
-                    out.write(b);
+                    byte[] bytes = e.publicKey.getEncoded();
+                    out.writeInt(bytes.length);
+                    out.write(bytes);
                 }
             }
         } catch (Exception e) {
@@ -212,30 +374,68 @@ public final class KeyStoreProvider extends Provider {
             part.delete();
             return;
         }
-        if (!part.renameTo(f)) {
-            android.util.Log.w("Megler", "AndroidKeyStore: could not save the keys: " + part + " could not take the place of " + f);
+        if (!part.renameTo(b.file)) {
+            android.util.Log.w("Megler", "AndroidKeyStore: could not save the keys: " + part + " could not take the place of " + b.file);
             return;
         }
-        File c = chainFile(), chainPart = new File(c.getPath() + ".part");
-        try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(chainPart)))) {
-            ArrayList<Map.Entry<String, Entry>> chained = new ArrayList<>();
-            for (Map.Entry<String, Entry> m : kept) if (m.getValue().chain != null) chained.add(m);
-            out.writeInt(CHAIN_FORMAT);
-            out.writeInt(chained.size());
-            for (Map.Entry<String, Entry> m : chained) {
-                out.writeUTF(m.getKey());
-                out.writeInt(m.getValue().chain.length);
-                for (byte[] b : m.getValue().chain) {
-                    out.writeInt(b.length);
-                    out.write(b);
-                }
+        // A shared one's time goes forward at every writing, whatever the grain of the file times: with the length as it was
+        // (a key deleted, another made under its alias), the time is all that tells another process the file from the one it read.
+        long stamp = b.file.lastModified();
+        if (b.shared && b.stamp > 0 && stamp <= b.stamp && b.file.setLastModified(b.stamp + 1000)) stamp = b.file.lastModified();
+        b.stamp = stamp;
+        b.length = b.file.length();
+    }
+
+    /*
+     * A shared box's lock: the file <keys' file>.lock, made by the one process that holds it and deleted when that is done
+     * (a reading; or a reading, a change and a writing: milliseconds). One a process left behind when it ended, older than
+     * ten seconds, is taken away. False where it cannot be had within two seconds, or cannot be made at all: the caller goes
+     * on without it, as every caller did before there was one. (A process Windows suspends while it holds the lock writes
+     * when it runs again, over what others wrote meanwhile: it would have to be suspended within those milliseconds.)
+     */
+    private static boolean lock(Box b) {
+        for (long end = System.nanoTime() + 2000000000L;;) {
+            try {
+                if (b.lockFile.createNewFile()) return true;
+            } catch (IOException e) {
+                return false;
             }
-        } catch (Exception e) {
-            android.util.Log.w("Megler", "AndroidKeyStore: could not save the keys' certificates: " + e);
-            chainPart.delete();
+            long made = b.lockFile.lastModified();
+            boolean left = made != 0 && Math.abs(System.currentTimeMillis() - made) > 10000;
+            if (left && b.lockFile.delete()) continue;
+            if (System.nanoTime() - end >= 0) {
+                android.util.Log.w("Megler", "AndroidKeyStore: " + b.lockFile + " is held by another process: going on without it");
+                return false;
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+    }
+    private static void unlock(Box b) { b.lockFile.delete(); }
+
+    private interface Change {
+        /** Whether it changed them. */
+        boolean apply(LinkedHashMap<String, Entry> keys);
+    }
+    /** A box's keys changed, and written down when `c` says they are others: a shared one's as its files have them now, its lock held. */
+    private static void change(Box b, Change c) {
+        if (!b.shared) {
+            if (c.apply(keys(b))) save(b);
             return;
         }
-        if (!chainPart.renameTo(c)) android.util.Log.w("Megler", "AndroidKeyStore: could not save the keys' certificates: " + chainPart + " could not take the place of " + c);
+        File parent = b.file.getParentFile();
+        if (parent != null) parent.mkdirs();
+        boolean locked = lock(b);
+        try {
+            load(b, locked);
+            if (c.apply(b.keys)) save(b);
+        } finally {
+            if (locked) unlock(b);
+        }
     }
 
     /* Whether an entry can be written down: its keys give their encodings. */
@@ -243,20 +443,107 @@ public final class KeyStoreProvider extends Provider {
         if (e.secretOrPrivate != null && e.secretOrPrivate.getEncoded() == null) return false;
         return e.publicKey == null || e.publicKey.getEncoded() != null;
     }
-    static synchronized void put(String alias, Entry e) { meglerKeys().put(alias, e); save(); }
+
+    /*
+     * The entry under an alias, as the view has it: its main store's; else (Google Play services with data older than the
+     * shared store) the newer of the app's own and the imports'. `taken`: the caller gets the key itself, so one found in
+     * the app's own store goes to the imports (export).
+     */
+    private static Entry find(View v, String alias, boolean taken) {
+        if (alias == null) return null;
+        Entry e = keys(v.main).get(alias);
+        if (e != null || v.imports == null) return e;
+        Entry own = v.app != null && !sGone.contains(alias) ? keys(v.app).get(alias) : null;
+        Entry imported = keys(v.imports).get(alias);
+        if (own == null || (imported != null && imported.created >= own.created)) return imported;
+        if (taken) export(v, alias, own);
+        return own;
+    }
+
+    /* A key of the app's own store that Google Play services use, copied to the imports for the other processes: once in a process, and where the imports have none as new. */
+    private static void export(View v, String alias, Entry e) {
+        if (!sExported.add(alias + "/" + e.created) || !encodable(e)) return;
+        Box imports = v.imports;
+        change(imports, keys -> {
+            Entry there = keys.get(alias);
+            if (there != null && there.created >= e.created) return false;
+            Entry copy = new Entry();
+            copy.secretOrPrivate = e.secretOrPrivate;
+            copy.publicKey = e.publicKey;
+            copy.created = e.created;
+            copy.chain = e.chain;
+            copy.home = imports;
+            keys.put(alias, copy);
+            return true;
+        });
+    }
+
+    static synchronized Entry entry(String alias, boolean taken) { return find(view(), alias, taken); }
+
+    private static ArrayList<String> aliases(View v) {
+        LinkedHashSet<String> all = new LinkedHashSet<>(keys(v.main).keySet());
+        if (v.imports != null) {
+            if (v.app != null) for (String a : keys(v.app).keySet()) if (!sGone.contains(a)) all.add(a);
+            all.addAll(keys(v.imports).keySet());
+        }
+        return new ArrayList<>(all);
+    }
+    static synchronized ArrayList<String> aliases() { return aliases(view()); }
+
+    /** The store read, where it was not yet (KeyStore.load). */
+    static synchronized void touch() { keys(view().main); }
+
+    static synchronized void put(String alias, Entry e) {
+        Box main = view().main;
+        e.home = main;
+        change(main, keys -> {
+            keys.put(alias, e);
+            return true;
+        });
+    }
+
+    /** What is under an alias gone, as the view has it (the app's own, for Google Play services: hidden); whether there was anything. */
+    static synchronized boolean remove(String alias) {
+        if (alias == null) return false;
+        View v = view();
+        boolean had = drop(v.main, alias);
+        if (v.imports != null) {
+            if (drop(v.imports, alias)) had = true;
+            if (v.app != null && keys(v.app).containsKey(alias) && sGone.add(alias)) had = true;
+        }
+        return had;
+    }
+    private static boolean drop(Box b, String alias) {
+        if (!keys(b).containsKey(alias)) return false;
+        change(b, keys -> keys.remove(alias) != null);
+        return true;
+    }
 
     /**
      * An entry's certificates: the X.509 ones it was made or given with; for a key pair made before they were kept, a self-signed one
-     * made now as Android makes it, kept from then on. Null for a secret key or no entry.
+     * made now as Android makes it, kept from then on in the store the entry is in. Null for a secret key or no entry.
      */
     static synchronized Certificate[] certificates(String alias) {
-        Entry e = meglerKeys().get(alias);
+        Entry e = find(view(), alias, true);
         if (e == null || e.publicKey == null) return null;
         if (e.certificates != null) return e.certificates;
         if (e.chain == null && e.secretOrPrivate instanceof PrivateKey) {
             try {
-                e.chain = new byte[][] { selfSigned(e.publicKey, (PrivateKey) e.secretOrPrivate, null) };
-                save();
+                byte[][] made = new byte[][] { selfSigned(e.publicKey, (PrivateKey) e.secretOrPrivate, null) };
+                byte[][][] kept = { made };
+                byte[] key = e.publicKey.getEncoded();
+                if (e.home != null && key != null) change(e.home, keys -> {
+                    // (A shared store was read again: the entry is another object, and may be another key or have a certificate by now.)
+                    Entry now = keys.get(alias);
+                    if (now == null || now.publicKey == null || !Arrays.equals(key, now.publicKey.getEncoded())) return false;
+                    if (now.chain != null) {
+                        kept[0] = now.chain;
+                        return false;
+                    }
+                    now.chain = made;
+                    return true;
+                });
+                e.chain = kept[0];
             } catch (GeneralSecurityException | RuntimeException x) {
                 android.util.Log.w("Megler", "AndroidKeyStore: no certificate for " + alias + ": " + x);
             }
@@ -317,7 +604,7 @@ public final class KeyStoreProvider extends Provider {
     }
 
     /** DER: the tag, the length, the contents. */
-    private static byte[] der(int tag, byte[]... contents) {
+    static byte[] der(int tag, byte[]... contents) {
         int n = 0;
         for (byte[] c : contents) n += c.length;
         ByteArrayOutputStream out = new ByteArrayOutputStream(n + 5);
@@ -331,7 +618,7 @@ public final class KeyStoreProvider extends Provider {
     }
 
     /** A certificate's time: UTCTime from 1950 to 2049, GeneralizedTime otherwise (RFC 5280, 4.1.2.5). */
-    private static byte[] time(Date d) {
+    static byte[] time(Date d) {
         java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyyMMddHHmmss'Z'", Locale.US);
         f.setTimeZone(TimeZone.getTimeZone("UTC"));
         String s = f.format(d);
@@ -352,10 +639,14 @@ public final class KeyStoreProvider extends Provider {
     }
 
     public static final class Store extends KeyStoreSpi {
-        @Override public Key engineGetKey(String alias, char[] password) { Entry e = meglerKeys().get(alias); return e == null ? null : e.secretOrPrivate; }
-        @Override public Certificate[] engineGetCertificateChain(String alias) { Certificate[] c = certificates(alias); return c == null ? null : c.clone(); }
+        @Override public Key engineGetKey(String alias, char[] password) { Entry e = entry(alias, true); return e == null ? null : e.secretOrPrivate; }
+        @Override public Certificate[] engineGetCertificateChain(String alias) {
+            if (IntegrityProfile.blocksCertificateChain()) throw new UnsupportedOperationException();
+            Certificate[] c = certificates(alias);
+            return c == null ? null : c.clone();
+        }
         @Override public Certificate engineGetCertificate(String alias) { Certificate[] c = certificates(alias); return c == null ? null : c[0]; }
-        @Override public Date engineGetCreationDate(String alias) { Entry e = meglerKeys().get(alias); return e == null ? null : new Date(e.created); }
+        @Override public Date engineGetCreationDate(String alias) { Entry e = entry(alias, false); return e == null ? null : new Date(e.created); }
         @Override public void engineSetKeyEntry(String alias, Key key, char[] password, Certificate[] chain) {
             Entry e = new Entry();
             e.secretOrPrivate = key;
@@ -372,19 +663,25 @@ public final class KeyStoreProvider extends Provider {
             e.chain = encodings(new Certificate[] { cert });
             put(alias, e);
         }
-        @Override public void engineDeleteEntry(String alias) { synchronized (KeyStoreProvider.class) { meglerKeys().remove(alias); save(); } }
-        @Override public Enumeration<String> engineAliases() { synchronized (KeyStoreProvider.class) { return Collections.enumeration(new ArrayList<>(meglerKeys().keySet())); } }
-        @Override public boolean engineContainsAlias(String alias) { return meglerKeys().containsKey(alias); }
-        @Override public int engineSize() { return meglerKeys().size(); }
-        @Override public boolean engineIsKeyEntry(String alias) { Entry e = meglerKeys().get(alias); return e != null && e.secretOrPrivate != null; }
-        @Override public boolean engineIsCertificateEntry(String alias) { Entry e = meglerKeys().get(alias); return e != null && e.secretOrPrivate == null; }
+        @Override public void engineDeleteEntry(String alias) { remove(alias); }
+        @Override public Enumeration<String> engineAliases() { return Collections.enumeration(aliases()); }
+        @Override public boolean engineContainsAlias(String alias) { return entry(alias, false) != null; }
+        @Override public int engineSize() { return aliases().size(); }
+        @Override public boolean engineIsKeyEntry(String alias) { Entry e = entry(alias, false); return e != null && e.secretOrPrivate != null; }
+        @Override public boolean engineIsCertificateEntry(String alias) { Entry e = entry(alias, false); return e != null && e.secretOrPrivate == null; }
         @Override public String engineGetCertificateAlias(Certificate cert) {
-            for (Map.Entry<String, Entry> e : meglerKeys().entrySet()) if (e.getValue().publicKey != null && e.getValue().publicKey.equals(cert.getPublicKey())) return e.getKey();
+            synchronized (KeyStoreProvider.class) {
+                View v = view();
+                for (String alias : aliases(v)) {
+                    Entry e = find(v, alias, false);
+                    if (e != null && e.publicKey != null && e.publicKey.equals(cert.getPublicKey())) return alias;
+                }
+            }
             return null;
         }
         @Override public void engineStore(OutputStream stream, char[] password) {}
-        @Override public void engineLoad(InputStream stream, char[] password) { meglerKeys(); }
-        @Override public void engineLoad(KeyStore.LoadStoreParameter param) { meglerKeys(); }
+        @Override public void engineLoad(InputStream stream, char[] password) { touch(); }
+        @Override public void engineLoad(KeyStore.LoadStoreParameter param) { touch(); }
     }
 
     private static String aliasOf(AlgorithmParameterSpec spec) {
@@ -437,16 +734,18 @@ public final class KeyStoreProvider extends Provider {
             mSpec = mKeySpec != null ? mKeySpec.getAlgorithmParameterSpec() : null;
         }
         @Override public KeyPair generateKeyPair() {
-            if (mKeySpec != null && mKeySpec.getAttestationChallenge() != null) {
+            boolean challenged = mKeySpec != null && mKeySpec.getAttestationChallenge() != null;
+            if (challenged && Native.flag("trace-attestation"))
+                android.util.Log.i("KeyboxAttestation", "Requested " + mAlgorithm + "; challenge bytes "
+                        + mKeySpec.getAttestationChallenge().length + "; keybox mode " + KeyboxAttestation.enabled());
+            if (challenged && !KeyboxAttestation.enabled()) {
                 // Android's key store attests a pair made with a challenge: its keymaster signs the pair's certificate, in a chain up to
                 // Google's root. There is no keymaster here, so the answer is a device's whose keymaster cannot attest
                 // (AndroidKeyStoreKeyPairGeneratorSpi): ProviderException, and nothing under the alias. Google Play services' device
                 // registration (check-in) asks for one and goes on without it ("Failed to generate key attestation"); given a pair
                 // whose certificate was not an X509Certificate it ended in a ClassCastException, every time, and Play Store never got
                 // an Android ID ("Server error", package 573).
-                synchronized (KeyStoreProvider.class) {
-                    if (meglerKeys().remove(mAlias) != null) save();
-                }
+                // Keep any earlier key under this alias: a failed generation must not delete it.
                 // Keymaster's KM_ERROR_UNIMPLEMENTED (-100), also returned by Android devices without
                 // attestation. Callers distinguish this from a provider failure with no cause.
                 throw new ProviderException("Failed to generate key pair.",
@@ -467,12 +766,15 @@ public final class KeyStoreProvider extends Provider {
                 if (mSpec != null) g.initialize(mSpec, random);
                 else if ("EC".equals(mAlgorithm)) g.initialize(new ECGenParameterSpec(mSize == 384 ? "secp384r1" : mSize == 521 ? "secp521r1" : "secp256r1"), random);
                 else g.initialize(new RSAKeyGenParameterSpec(mSize, RSAKeyGenParameterSpec.F4), random);
+                KeyboxAttestation.Issuer issuer = challenged ? KeyboxAttestation.issuer(mKeySpec, mAlgorithm) : null;
                 KeyPair kp = g.generateKeyPair();
                 if (mAlias != null) {
                     Entry e = new Entry();
                     e.secretOrPrivate = kp.getPrivate();
                     e.publicKey = kp.getPublic();
-                    try {
+                    if (issuer != null) {
+                        e.chain = KeyboxAttestation.chain(kp.getPublic(), mKeySpec, issuer);
+                    } else try {
                         e.chain = new byte[][] { selfSigned(kp.getPublic(), kp.getPrivate(), mKeySpec) };
                     } catch (GeneralSecurityException | RuntimeException x) {
                         android.util.Log.w("Megler", "AndroidKeyStore: no certificate for " + mAlias + ": " + x);

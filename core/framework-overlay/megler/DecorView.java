@@ -15,6 +15,22 @@
 // (WindowInsets.meglerToChildren), as they did before consumed insets ended their dispatch (WindowInsets, overlaid): the
 // content's own listeners are told of the window's insets with nothing left in them.
 //
+// And in what the content frame is told of the window's height (makeContent): in a window without a title bar the frame
+// fills what the stack has left, with no weight, as the content of Android's screen_simple layout does. The original gave
+// it height 0 and weight 1 in every window. That is the same in a window of a set size; in one that wraps its content, a
+// dialog, LinearLayout measures a weighted child twice: as tall as it likes within the screen, and then again at exactly
+// the height it answered. Android's dialogs without a window title (every AlertDialog, and an app's own with
+// windowNoTitle) are never told "exactly": their content hears "at most the screen" and nothing else. Telegram's own
+// AlertDialog counts on that. Its container measures the title's frame and the row of buttons with the height it was
+// itself given, so told "exactly 337" it made each of the two 337 pixels high, itself 787, and the message and the
+// buttons lay below the window's 337: "Log out?" was a title on an empty card that could not be answered.
+//
+// And in the theme's windowBackgroundFallback (draw, backgroundFallback): a window without a background has it drawn where
+// its content does not reach -- the status bar's strip the content is kept off, the navigation bar's -- as Android's
+// DecorView does (BackgroundFallback); the framework's themes make it ?attr/colorBackground. YouTube takes its window's
+// background away once it has started and makes the status bar's colour transparent, and its status bar was black here
+// (with the dark icons of a light status bar on it), where Android shows its page's colour.
+//
 // Everything else is the original's, unchanged.
 package megler;
 
@@ -184,7 +200,13 @@ public final class DecorView extends FrameLayout {
             @Override public void onViewRemoved(View child) { super.onViewRemoved(child); traceContent("taken away", child); }
         };
         mContent.setId(android.R.id.content);
-        mStack.addView(mContent, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f));
+        /* Under a title bar the frame takes what is left by its weight, as screen_title's content (height 0, weight 1).
+           Without one it is screen_simple's: match_parent and no weight, which as the stack's last child is the same room
+           (what the bar and the tabs above it left), but told as the window was told its own -- "exactly" in a window
+           of a set size, "at most" in one that wraps its content, and then not measured a second time (see the top). */
+        boolean weighted = !actionBar && (titleBar || customTitle);
+        mStack.addView(mContent, weighted ? new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f)
+                                          : new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
         addView(mStack, new FrameLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
         return mContent;
     }
@@ -289,10 +311,37 @@ public final class DecorView extends FrameLayout {
         if (mStack == null || mStack.getParent() != this || !(mStack.getLayoutParams() instanceof FrameLayout.LayoutParams)) return null;
         return (FrameLayout.LayoutParams) mStack.getLayoutParams();
     }
+    /* The theme's windowBackgroundFallback, read once, the first time the window has no background to draw. */
+    private Drawable mFallback;
+    private boolean mFallbackRead;
+    private Drawable backgroundFallback() {
+        if (!mFallbackRead) {
+            mFallbackRead = true;
+            try {
+                TypedArray a = getContext().obtainStyledAttributes(new int[] { android.R.attr.windowBackgroundFallback });
+                mFallback = a.getDrawable(0);
+                a.recycle();
+            } catch (RuntimeException e) {
+                mFallback = null;
+            }
+        }
+        return mFallback;
+    }
     @Override public void draw(Canvas c) {
         if (mBackground != null) {
             mBackground.setBounds(0, 0, getWidth(), getHeight());
             mBackground.draw(c);
+        } else if (!mWindow.isFloating() && stackParams() != null) {
+            // No window background: the theme's fallback where the content stack does not reach (Android's BackgroundFallback,
+            // which fills the decor's padding around its content root the same way).
+            Drawable f = backgroundFallback();
+            int l = mStack.getLeft(), t = mStack.getTop(), r = mStack.getRight(), b = mStack.getBottom(), w = getWidth(), h = getHeight();
+            if (f != null && r > l && b > t) {
+                if (t > 0) { f.setBounds(0, 0, w, t); f.draw(c); }
+                if (b < h) { f.setBounds(0, b, w, h); f.draw(c); }
+                if (l > 0) { f.setBounds(0, t, l, b); f.draw(c); }
+                if (r < w) { f.setBounds(r, t, w, b); f.draw(c); }
+            }
         }
         super.draw(c);
         // the bars' own colours over the areas the content was kept out of

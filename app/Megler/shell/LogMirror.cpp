@@ -17,6 +17,8 @@ namespace megler::app::logMirror {
 namespace {
 
 constexpr auto kPeriod = std::chrono::seconds(30), kFirstPass = std::chrono::seconds(10);
+// The first pass of a package that has no folder yet: its first run, or its first since Megler removed the folder.
+constexpr auto kFirstPassNew = std::chrono::seconds(2);
 constexpr uint64_t kPiece = 1u << 20;  // what is read and appended at a time
 
 std::mutex gMutex;
@@ -177,9 +179,13 @@ void run() {
     uint64_t asked = 0;
     {
         // Out of the way of the start, the busiest time of a phone's storage (an app's libraries, its classes, Google Play
-        // services' APK): the first pass ten seconds in, or as soon as now() asks (suspended at once).
+        // services' APK): the first pass ten seconds in, or as soon as now() asks (suspended at once). Two seconds in where
+        // the package has no folder yet: there is nothing of runs before to copy then, and an app that ended in its first
+        // seconds -- a game that went at its maker's logo, A8++ in 0.1.0.699 -- left no folder at all, nor anything of
+        // itself in Save All Logs' ZIP, at that run or at the next that ended as soon.
+        const bool firstRun = !files::exists(gDir);
         std::unique_lock<std::mutex> lock(gMutex);
-        gWake.wait_for(lock, kFirstPass, [] { return gAsked != 0; });
+        gWake.wait_for(lock, firstRun ? kFirstPassNew : kFirstPass, [] { return gAsked != 0; });
         asked = gAsked;
     }
     for (;;) {

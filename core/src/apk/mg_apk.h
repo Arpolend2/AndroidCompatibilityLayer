@@ -100,6 +100,9 @@ typedef struct mg_apk_info {
 bool mg_apk_read_info(const char *apk_path, mg_apk_info *info);
 /* Whether the APK is microG's Google Play services (it has files under org/microg/), not Google's own. */
 bool mg_apk_is_microg(const char *path);
+/* Whether `package` is a name Google Play services go by: com.google.android.gms, or another ending in .android.gms, as
+ * ReVanced's MicroG RE is app.revanced.android.gms (with mg_apk_is_microg, a microG the shell hosts for the apps that ask for it). */
+bool mg_apk_gms_name(const char *package);
 /*
  * The same for an app in several APKs: the base at apk_path and its splits, read as one app, as Android has it once the
  * splits are installed -- the base's manifest, the native libraries of every APK, the icon wherever the densest picture

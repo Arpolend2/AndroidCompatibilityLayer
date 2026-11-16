@@ -766,6 +766,669 @@ the loopback probe inside `init`. Check for the socket exception well before
 the 60-second deadline, then for a device-key token without the encoded
 error, the response status and the stored key.
 
+**Draft module assessment (2026-11-15).** The supplied
+`PlayIntegrityFix_v19.1.zip` is 127130 bytes, SHA-256
+`bbc618e794d8bb11add4d8f54c8ed53dfee5c6df07b49813bcbd5154c0c89c7c`.
+Its module metadata names chiteroman and version 19.1. The installer and
+boot scripts were read, its DEX was decompiled, and the native libraries'
+imports, exports and strings were inspected. This identifies the local
+sample; it does not authenticate it as an upstream release. All analysis
+files are in ignored build folders.
+
+The archive contains ARM32/ARM64 Zygisk libraries, a Java DEX, root
+installation/boot scripts and a WebUI. Its bundled profile describes a
+Pixel 6 Android 16 beta with security patch 2025-04-05. The Action script
+downloads Android release/OTA metadata and writes a replacement profile.
+The boot scripts change build/debug/boot properties, adjust Magisk's
+DenyList and change access to SELinux files on a permissive Android
+system. These scripts depend on Android root/module infrastructure.
+
+Its Java payload has three relevant mechanisms. It changes configured
+`Build`/`Build.VERSION` fields, wraps the AndroidKeyStore provider, and
+optionally replaces the platform package's reported signing certificate.
+The wrapper delegates key operations except
+`engineGetCertificateChain`: a caller whose stack contains
+`droidguard` receives `UnsupportedOperationException`. That suppresses
+the chain a working keystore would otherwise return. It does not
+generate an attested key or obtain an AppCertManager device key.
+
+The current PlayIntegrityFork was inspected at
+`d7e6a4d635b7463bbee7c9701f91ebfc6f5eb4ff`; the latest release reported
+by GitHub on this date was v19. Its native code scopes configuration to
+the GMS unstable process and, for separate options, Play Store.
+It hooks `__system_property_read_callback` with ShadowHook and injects
+Java code for typed Build-field changes. The provider wrapper retains the
+DroidGuard certificate-chain exception. Defaults enable Build, property
+and provider changes; platform-signature and Play Store overrides are
+optional. The repository supplies a configuration template, so a working
+device profile is another input to an experiment.
+[PlayIntegrityFork native code](https://github.com/osm0sis/PlayIntegrityFork/blob/d7e6a4d635b7463bbee7c9701f91ebfc6f5eb4ff/app/src/main/cpp/main.cpp),
+[provider wrapper](https://github.com/osm0sis/PlayIntegrityFork/blob/d7e6a4d635b7463bbee7c9701f91ebfc6f5eb4ff/app/src/main/java/es/chiteroman/playintegrityfix/CustomKeyStoreSpi.java),
+[configuration template](https://github.com/osm0sis/PlayIntegrityFork/blob/d7e6a4d635b7463bbee7c9701f91ebfc6f5eb4ff/module/example.pif.prop).
+
+TrickyStore's current release documentation was inspected at
+`55d65f305e04110b87210d86cc12b64a1b7e151d`; its latest release was
+1.4.1. The project states that releases from 1.1.0 are closed-source.
+The last public tag, 1.0.3 at
+`6f82e4011b770e390d1157928c6cf45df99b7d7d`, was read as an architectural
+baseline. Its injector and Binder interceptors reach Android keystore2.
+They can replace a returned certificate chain or intercept challenged
+key generation and synthesize key metadata and a chain. The certificate
+builder uses the configured keybox's private key and certificates to
+sign the generated leaf and rewrites attestation data including
+RootOfTrust. Current documentation also describes fallback generation
+and configurable patch levels; the closed release's implementation was
+not audited.
+[Current TrickyStore documentation](https://github.com/5ec1cff/TrickyStore/blob/55d65f305e04110b87210d86cc12b64a1b7e151d/README.md),
+[open generation interceptor](https://github.com/5ec1cff/TrickyStore/blob/6f82e4011b770e390d1157928c6cf45df99b7d7d/service/src/main/java/io/github/a13e300/tricky_store/SecurityLevelInterceptor.kt),
+[open certificate builder](https://github.com/5ec1cff/TrickyStore/blob/6f82e4011b770e390d1157928c6cf45df99b7d7d/service/src/main/java/io/github/a13e300/tricky_store/keystore/CertHack.java).
+
+For Megler the relevant boundaries are:
+
+| Mechanism | Existing Megler behaviour | What a useful experiment would establish |
+| --- | --- | --- |
+| PIF's certificate-chain exception | A challenged `PairGen.generateKeyPair` fails with `KeyStoreException(-100)` before a new chain exists. Ordinary chain retrieval is implemented. | Whether the failing device-key program actually reaches chain retrieval and changes its request when that call throws. |
+| Build/property profile | Java Build fields and native properties already describe a synthetic Android device. They are shared within the app's process. | Whether one consistent profile, scoped to hosted GMS, changes Google's reply with the same GMS version and transport. |
+| Platform-signature replacement | `PlatformSigner` reads the framework-res APK's certificate. PIF's optional replacement is another platform identity. | Whether that reported identity is a relevant input to this particular rejection. |
+| TrickyStore key generation and chain rewriting | Megler implements its keystore directly in Java, without Android's keystore2/KeyMint services. Software-attestation experiments above still received HTTP 400. | Whether a specified, verifiable attestation chain changes the server result while keeping generated keys and certificates consistent. |
+
+The attestation keybox signs Android key-attestation certificates.
+AppCertManager's `device_key` is the response from Google's
+`/auth/devicekey` service and supplies material for Spatula signatures.
+One does not supply the other. Neither inspected project's code
+demonstrates a successful device-key exchange inside Megler.
+
+The draft now implements PlayIntegrityFork's three default mechanisms as
+an opt-in `megler.IntegrityProfile`, applied before `Application.onCreate`.
+It reads the first existing file in the Android app's internal data directory
+(`Native.dataDir()`, the directory returned by `Context.getDataDir()`):
+`custom.pif.prop`, `custom.pif.json`, `pif.prop`, then `pif.json`.
+For Transit in its Windows package, this is
+`LocalState\apps\com.thetransitapp.droid\data\custom.pif.prop`.
+A profile belongs to the client app hosting GMS; a profile in a separate
+GMS app's data directory does not configure Transit. Restart the client
+process after installing, changing or removing it.
+
+The UTF-8 property format accepts `name=value` lines, blank lines and `#`
+comments. JSON accepts an object with string or scalar values. Files are
+limited to 64 KiB. The three switches default to `1` when a file exists:
+
+```properties
+spoofBuild=1
+spoofProps=1
+spoofProvider=1
+# Add the chosen profile's Build fields and explicit system properties here.
+# DEVICE_INITIAL_SDK_INT=25
+# ro.board.first_api_level=25
+```
+
+`spoofBuild` applies named scalar fields of `Build` or `Build.VERSION`
+using their declared types. `spoofProps` applies explicit property names
+containing a dot to both Java `SystemProperties` and Megler's native
+property table, which serves bionic's property get/read/callback APIs.
+When both switches are enabled, common Build identity fields are also
+mirrored to their corresponding properties; explicit property entries
+win over those inferred values. Property values must fit 91 UTF-8 bytes.
+Unknown Build fields, invalid field types and unsupported options reject
+the profile before it is applied. Empty values are ignored.
+
+`spoofProvider` makes `AndroidKeyStore.getCertificateChain` throw
+`UnsupportedOperationException` when a class name in the calling stack
+contains `droidguard`, case-insensitively, as in the upstream wrapper.
+Other callers keep their ordinary certificate chains. It does not change
+challenged key generation, generate an attestation chain, or obtain a
+Google device key. With no profile, all three mechanisms are inactive.
+The startup log reports field/property counts and whether the chain block
+is enabled, without logging profile values.
+
+There is one significant scope difference from Zygisk: Build fields and
+system properties affect the entire opted-in app process, including its
+client code, because Megler hosts GMS in that same process. The provider
+exception is restricted by the caller's stack. This draft does not
+implement wildcard properties, `spoofSignature`, `spoofVendingSdk` or
+`spoofVendingFinger`; enabling those optional upstream modes rejects the
+profile. It supplies no fingerprint and downloads no replacement profile.
+It does not install or execute the module's root scripts or native hooks.
+
+The data test app covers missing configuration, property and JSON parsing,
+typed fields, Java/native property agreement, the scoped chain exception,
+invalid input preserving the previous values, and disabled modes. These
+checks establish local behaviour. To establish usefulness for devicekey,
+compare a fresh request with and without a chosen profile, then verify an
+HTTP success, a stored key loaded at the next start and a Google
+network-location result. The earlier native Cronet control on Android also
+returned HTTP 400, so that response alone cannot identify a Megler-specific
+API defect. No successful server exchange with this profile has yet been
+observed.
+
+Validation (2026-11-15): `tools/build-tests.sh arm` and
+`tools/build-tests.sh win`, with the shared heavy-build lock and
+`MEGLER_JOBS=4`, each completed with 33 result groups and zero failed
+checks. ARM's main passes reported 9187 and 9346 checks; Windows's 8614
+and 8736. Both data-app runs passed `integrity-profile`; the Windows run
+included the cached ANGLE build.
+
+### HP comparison, 2026-11-15
+
+The Elite x3 had Megler 711 and GmsCore 26.41.31 (`264131009`), unlike
+the Lumia's 26.43.30. An isolated test branch based on the source of 711
+(`6a6d1caf`) applies the profile draft while retaining its newer shared
+keystore implementation. The experiment used test runtime 713.
+
+A small, separate diagnostic app, `megler.test.hpdevicekey`, binds the
+hosted DroidGuard service and calls this GMS version's
+`appr.a(Context).b()` off the main thread. It installs no interception
+hooks. Its own class names contain no `droidguard`, so they cannot
+accidentally satisfy the profile's certificate-chain stack check.
+With the profile disabled, the service bound and the device-key call
+returned `false` after 37.5 seconds. AppCertManager logged a parsing
+exception. No DGFRR error occurred in the captured log. This establishes
+neither a valid VM token nor this request's HTTP status: those were not
+captured. The raw log stays in ignored private build output.
+
+After charging, the paired profile-enabled run used the four identity
+fields from the supplied PIF 19.1 archive (Pixel 6 beta fingerprint,
+security patch 2025-04-05). The startup log confirms four Build fields and
+four native/Java properties applied, with the provider mode enabled.
+The trace records `engineGetCertificateChain` ending with
+`UnsupportedOperationException`, establishing that the stack-scoped
+provider path actually ran. The device-key call returned `false` after
+59.7 seconds and AppCertManager again logged a parsing exception. The
+request's HTTP status and the VM token's validity were not captured.
+This particular profile did not obtain a key; newer profiles remain
+untested. The diagnostic changes no protocol messages or TLS validation.
+
+The test-only enable flag and the app's `custom.pif.json` have been removed,
+and its process was stopped. Normal package 714, without an auto run, is
+installed on HP. The inherited `ui-update-all` source was removed from
+both LocalState and `Pictures/Megler/diag/megler/flags`. Its Pictures copy
+had previously recreated the LocalState flag after deletion there.
+Windows' installed-package list confirms that all 42 client packages
+which received test runtime 713 now use normal runtime 714, with no test
+713 package remaining in that list. Updates preserved their data and were
+requested individually. The three packages still using 711 were outside
+the update list. Final filesystem checks confirm that the profile,
+test flags and mirrored Update All source are absent; the main package
+retains only its pre-existing `keep-screen-on` flag.
+
+On this newer source base, the full ARM suite passed 33 result groups
+(main passes 9215 and 9374 checks). The full Windows retry passed 33
+result groups (8639 and 8761 checks). Every final group reported zero
+failures. The first Windows run failed its intermittent shell check
+"asked again, Megler's other settings kept" once; no runtime code changed
+before the successful full retry. Both data-app profile runs passed.
+
+### Supplied 4PDA module set, 2026-11-15
+
+The two supplied screenshots describe Reddit login on rooted Android,
+using Play Integrity Break's intervention, synthetic error and synthetic
+response settings. The second post adds SUSFS kernel-version presentation
+for a kernel whose name contains `WILD`. The live forum pages could not
+be fetched; their text was read from the supplied screenshots. These are
+claims about a Reddit login flow, not a demonstrated `/auth/devicekey`
+exchange, a Play Integrity verdict or a Google Wi-Fi fix in Megler.
+[First post](https://4pda.to/forum/index.php?showtopic=738196&view=findpost&p=145071657),
+[follow-up](https://4pda.to/forum/index.php?showtopic=738196&view=findpost&p=145989144).
+
+Each supplied archive was copied to its own ignored analysis directory,
+hashed, checked for traversal/symlinks and unpacked without executing its
+installers or Android binaries on the host. Static DEX analysis used jadx.
+The PIF DEX decompiled without reported errors; PIB, TrickyStore service
+and LSPosed framework reported 20, 10 and 2 decompiler errors respectively.
+This is a partial static audit, not a proof of all native behaviour.
+The module README and script instructions were treated as sample contents.
+
+| Supplied file | SHA-256 |
+| --- | --- |
+| `Zygisk+Next-v1.5.0.zip` | `474d58abc208c0779e7f8f1d8449db755a874d475c13b9cf8decf74bc171933b` |
+| `Tricky-Store-v1.4.1-248-3b07ee3-release.zip` | `0bc227c59b9b4baa77d8c46ff310c276a88114e4dcf7ed10d886023924183454` |
+| `Play_Integrity47.zip` | `06a93bbbcbe4d94fb5dc2d6e1e651684a74c1568973984e8c118a70c26ac7ec3` |
+| `ksu_module_susfs_1.5.2+.zip` | `abcd6bf456ea8189298d9e496faa440201d90e4f0bd93b83c0527589001c9376` |
+| `pib-64-64.apk` | `f9c69912a37123398a2c2602fb6d1a5e1420cff4f2ff93b49da2d6dd30dc70d4` |
+| `LSPosed-v2.2.0-7854-release.apk` | `74d89370b4b17a94c130089b2868c3d6f289ab8c5c5715ba43a909d4bd6e216b` |
+| `LSPosed-v2.2.0-7854-release.zip` | `725915707f88a4f5ebecddab908cb217aa0a6d98955db5885bc9fadda81e75b8` |
+
+- **Play Integrity Break 64**, package `it.eldavo.pib`, versionCode
+  `7304742`: `assets/xposed_init` names `XposedEntry`. Its hook is installed
+  in the main Play Store process. `deliverSyntheticBlockedResponse`
+  invokes the callback with a Bundle containing `error` and
+  `is.error.remediable`, and the original request is short-circuited.
+  The supplied configuration defaults to `-8` and `true`. This is
+  `TOO_MANY_REQUESTS`, not a token or successful integrity verdict.
+  It can also suppress delivery or delay it, log events and optionally
+  send telemetry. Those extra modes are not part of this Megler change.
+- **Play_Integrity47**: metadata names `Play Integrity Fix [KEYBOX]` v47,
+  rather than the previously examined chiteroman 19.1 sample. Its Java
+  provider has the same DroidGuard-stack chain exception. Its template
+  adds wildcard properties; boot scripts change root/boot properties.
+  Its installer backs up/removes an existing TrickyStore keybox, chooses
+  a bundled `*.@fateh7` file and copies that to TrickyStore. Its profile
+  updater obtains Android build metadata using wget with certificate
+  verification disabled. None of those scripts was run.
+- **TrickyStore 1.4.1**: the bundle supplies `service.apk`, native libraries,
+  target list and a default software keybox (two private keys and four
+  certificates). No key contents are recorded here. Its installer calls
+  it a software keybox; presence in the ZIP proves neither hardware
+  provenance nor acceptance by Google. The current service/native
+  implementation is not fully audited. This port does not import it or
+  fabricate an attestation chain.
+- **Zygisk Next 1.5.0**: a root/Zygisk injection runtime for Android's
+  init/zygote processes. Megler has neither Android init/zygote nor ART.
+  It is not an integrity-result provider. No binaries are redistributed.
+- **LSPosed 2.2.0 (7854)**: ART hooks supplied by LSPlant plus a daemon and
+  manager. The separate supplied manager APK exactly matches the ZIP's
+  `manager.apk`. Megler already has its own Xposed method-hook primitives
+  for Aliuhook; that does not establish compatibility with the entire
+  LSPosed daemon, its ART implementation or its manager.
+- **SUSFS 1.5.2-R28**: root hiding controls for a SUSFS-patched Linux kernel
+  through `ksu_susfs`. The shown kernel setting calls `set_uname` with the
+  chosen release/build. Megler already supplies a synthetic Linux `uname`
+  and `/proc/version` (`4.4.0-megler`), with no `WILD` suffix. This does not
+  prove other environment checks pass; installing KernelSU scripts cannot
+  change the Windows kernel.
+
+The upstream PIB README explicitly limits its mechanism to applications
+that tolerate integrity errors; it does not obtain BASIC/DEVICE/STRONG
+verdicts or supply a working keybox.
+[PIB project explanation](https://github.com/ElDavoo/PlayIntegrityBreak/blob/pib/README.md),
+[Google's error codes](https://developer.android.com/google/play/integrity/reference/com/google/android/play/core/integrity/model/IntegrityErrorCode).
+
+#### Opt-in PIB error response in Megler
+
+The runtime now provides the supplied PIB's default synthetic blocked
+response without requiring its injection stack. Place a file named
+`play-integrity-break` in the selected app package's `LocalState/flags`
+(or `Pictures/Megler/diag/<Android package>/flags`), then restart that app.
+A same-named marker in its Android internal data directory is also accepted
+for test harnesses. This is independent of `pif.json` and applies only in
+the selected client process.
+
+Classic integrity-token requests, standard warm-up and standard-token
+requests return a single callback with `error=-8` and
+`is.error.remediable=true`. No token is returned and no request reaches
+Google through these local Play Integrity endpoints. With the switch off,
+Megler retains its previous `API_NOT_AVAILABLE` (-1) response. Age Signals,
+GMS DroidGuard requests and `/auth/devicekey` are unchanged. An application
+or its server decides what to do with either error.
+
+The data-app regression exercises all three transactions in default,
+PIB-enabled and restored modes, checks the callback descriptor/code,
+remediability and absence of a token, and removes its test marker.
+Full validation on this draft: ARM and Windows each reported 33 result
+groups and zero failed checks (main passes 9215/9374 and 8639/8761).
+`integrity-callbacks` passed both data-app runs. Heavy work was serialized
+under `heavy.lock` with `MEGLER_JOBS=4`.
+
+This implementation is a protocol-behaviour counterpart, not a port of
+all seven supplied packages. Reddit login, device-key issuance and Wi-Fi
+positioning with this change have not been demonstrated on a phone.
+
+#### Claude login comparison on HP
+
+The owner installed `com.anthropic.claude` on HP and repeated the same
+email sign-in action. On its original runtime 714 the log records one
+classic token request answered `API_NOT_AVAILABLE`; the UI asks for a
+Google Play update or a Google account. Normal runtime 716 carries this
+Java change, has no auto run, and was installed as a compact package with
+optional bundled Google APK installers omitted. The already installed
+Google apps and their data were retained. Only Claude's client package
+was updated; no Update All command was used.
+
+With `play-integrity-break` enabled only for Claude, its log records two
+classic token requests answered `PIB synthetic error -8, remediable`, and
+zero old API_NOT_AVAILABLE replies. The UI changes to an app-verification
+failure and says the sign-in email could not be sent. There is no fatal
+exception in the captured run. Thus the PIB mode executes on HP, but its
+default response does not unblock this Claude login flow. It does not
+establish what all other PIB settings or applications would do, and it
+provides no device-key result. The experimental flag was removed after
+the comparison; Claude's data was not cleared. Raw logs and screenshots
+containing the owner's address stay out of commits.
+
+
+### Draft keybox-backed attestation
+
+A separate opt-in `megler.KeyboxAttestation` supplies the generation path
+that the module set uses when Android's keystore cannot attest. It loads
+an external signing key and certificate chain and signs the generated
+key's leaf certificate. This is software generation inside Megler, not a
+Windows TEE or an implementation of the closed-source TrickyStore 1.4.1
+binary. Google acceptance remains a separate test.
+
+Configuration belongs to the Android client app hosting GMS, in its
+internal data directory (`LocalState/apps/<package>/data`):
+
+```
+attestation/enabled
+attestation/keybox.xml
+attestation/config.properties       # optional
+```
+
+The marker enables the path; no keybox or private key is bundled into
+Megler's source or releases. `keybox.xml` accepts one AndroidAttestation
+keybox with one or two EC/RSA signing entries. Private keys may be PKCS#8,
+RSA PKCS#1 or EC SEC1 PEM; certificates are X.509 PEM. Inputs are bounded
+(1 MiB XML, 16 KiB settings), and DTD/entity declarations are refused.
+The chain's validity dates, CA/path-length and key-usage constraints,
+issuer names and signatures are checked, as is a sign/verify proof that
+the private key matches its first certificate. Revocation and Google's
+trust in the issuer are not established by these local checks.
+
+For a challenged EC/RSA key generation the leaf carries the newly
+created public key, exact challenge, requested subject/serial/dates,
+key usages and Android extension `1.3.6.1.4.1.11129.2.1.17`. Its application
+ID contains the actual caller package/version and SHA-256 signing
+certificate digests; hosted GMS uses its own context. Authorizations
+include purposes, algorithm, actual key size/curve or exponent, requested
+digests/paddings and validity dates, no-auth, creation time, generated
+origin, OS version and patch level. Device properties are included only
+when requested. The complete chain is persisted with the key through the
+existing app/shared-GMS keystore. An invalid configuration or failed
+certificate construction does not replace an existing key.
+
+A configured `setAttestKeyAlias` selects an existing local signing alias
+instead of the external keybox. A key created with PURPOSE_ATTEST_KEY
+alone receives CA and certificate-signing constraints so its descendants'
+chains can be checked. StrongBox, authenticated keys, unique IDs and
+serial/IMEI-style ID attestation requests remain unsupported and are
+refused, rather than silently downgraded. Without the enable marker,
+Megler retains its existing unimplemented-attestation exception.
+
+The default extension reports Software (0), with no fabricated TEE
+RootOfTrust. For an explicit TrickyStore-style experiment,
+`config.properties` accepts `securityLevel=1` and requires both
+`verifiedBootKey` and `verifiedBootHash` as 32-byte hexadecimal values.
+`deviceLocked` defaults to false and `verifiedBootState` to Unverified
+(2); these are configurable claims, not measured boot evidence from
+Windows. `osVersion` (e.g. 140000), `osPatchLevel` (YYYYMM),
+`vendorPatchLevel` and `bootPatchLevel` (YYYYMMDD) may be set explicitly.
+Otherwise OS version/patch reflect the current Build values. Applications
+must not interpret these experimental claims as physical hardware backing.
+If a PIF profile's `spoofProvider` is also enabled, its DroidGuard chain
+exception still applies; disable that mode to test chain consumption.
+
+The metadata-only flag `trace-attestation` logs requested algorithm,
+challenge length and whether keybox mode is active, without logging
+challenge bytes, alias names, keys or certificates. Successful generation
+logs only algorithm, chain length, challenge length and configured level.
+
+Static inspection of the supplied files found that the default TrickyStore
+EC issuer expired on 2026-01-08; its RSA issuer remains valid to 2035.
+The separate keybox embedded in PIF47 has matching EC and RSA private keys
+and chains which validate locally, with leaf issuer certificates valid to
+November 2028. A separate check of Google's public revocation list on
+2026-11-15 identifies both PIF47 signing certificates (EC and RSA) as
+`REVOKED`, reason `KEY_COMPROMISE`. Only the public list was downloaded;
+private keys and device/user data were not submitted. Consequently this
+sample can validate local import/signing mechanics, but is unsuitable as
+an unrevoked identity for a server-acceptance test. The runtime's offline
+chain validation does not query this list automatically. Sample material
+stays in isolated ignored build directories.
+[Google attestation certificate status](https://android.googleapis.com/attestation/status).
+
+A fresh upstream audit on 2026-11-15 pinned osm0sis/PlayIntegrityFork main
+at `d7e6a4d635b7463bbee7c9701f91ebfc6f5eb4ff` (2026-11-13). Neither its
+tracked files nor the official v19 release ZIP contains a keybox or a PEM
+private key. The ZIP SHA-256 is
+`83b4d5f32743805c5b5a69361d73b8ab9c095325e24f20711afa1abea837b58f`.
+The recent `a645788` change adds `ro.board.first_api_level` when missing;
+it does not issue or renew attestation certificates. `autopif4` downloads
+public Pixel build profiles and adjusts TrickyStore patch configuration,
+not keyboxes. Its RKP warning requires a separate keybox for some newer
+profiles. Upstream's README likewise distinguishes its property spoofing
+from TrickyStore with an unrevoked hardware keybox; the supplied PIF47
+archive is not the official osm0sis v19 package.
+[Property change](https://github.com/osm0sis/PlayIntegrityFork/commit/a645788294d35df755efc38ae669836f26b63177),
+[v19 release](https://github.com/osm0sis/PlayIntegrityFork/releases/tag/v19).
+
+A further audit pinned Falcon Integrity Fix at `0c12258` (2026-11-13).
+Its v3.30.2-tagged ZIP (`FALCONINTEGITY_FIX_V3.30.zip`, SHA-256
+`35d2d3772b14064341e0ec7f24c004c1a0738a6acbfc119d4d5bb500c5522505`)
+does contain a different keybox. The XML SHA-256 is
+`a71ab688e1ce8fc93758231bebfe579691971c164af17b31c8379e418b4a1e5a`.
+It has one matching EC signing key and four certificates, whose chain
+verifies locally and expires first on 2026-11-25 at 05:44:23 UTC. Its root
+matches Google's published new Key Attestation CA1 root. None of its four
+serials occurs in Google's list downloaded and refreshed on 2026-11-15.
+This is a current local validation result, not a server verdict.
+
+TAKR means Tricky Addon Keybox Repository. Its public API lists entry 41
+as hardware/RKP, EC, four certificates, uploaded 2026-11-13, nearest
+expiry 2026-11-25T05:44:23Z. Those metadata match Falcon's candidate, but
+no byte-for-byte identity was established with the TAKR download. The
+number is a repository entry, not an Android API or module version.
+Expiration is an upper limit, not protection against an earlier revocation.
+
+Falcon's `service.sh` checks through `kb_sync.sh --auto` after boot and
+every 3600 seconds by default (minimum 900). Its configured primary source
+is davidepalma.it/pib/keybox.xml; fallback is TrickyStoreOSS's module XML.
+Those endpoints do not currently return the bundled candidate: the primary
+has a revoked RSA intermediate and the fallback has the expired AOSP EC
+issuer described above. Thus a fresh bundled keybox does not prove that
+unattended replacement will find another valid one. The downloader uses
+curl -k / wget --no-check-certificate; that transport behavior was not
+copied into Megler. No downloaded module code was executed.
+
+The original evoker0/AlwaysStrong repository returned 404. The inspected
+BloodCorrupt/AlwaysStrongFork at `54c2a70` bundles TEE interception and PIF,
+with configurable periodic fingerprint/keybox refresh. Its keybox fetcher
+uses a project mirror (default plain HTTP evoker.qzz.io/key), detects changes
+by a locally computed hash and preserves the old file on fetch failure.
+It downloads replacement material; it does not mint Google identities.
+TrickyStore/TEE interception consumes that material to sign chains; PIF
+supplies the build profile. These are separate mechanisms. The supplied
+4PDA page could not be retrieved directly during this audit.
+
+A separate diagnostic APK loaded the Falcon candidate in ARM/qemu and
+verified five-certificate chains for newly generated EC and RSA keys in
+both software and explicitly configured experimental TEE modes. Each
+local-only run reports 5 checks, 0 failed and no Google request. A further
+fresh-data GMS 26.41.31 probe used the experimental mode: metadata shows
+GMS requesting attestation and successful five-certificate generation for
+its challenges. AppCertManager still reports `dito: Parsing Exception`
+and `Device key obtained=false`. The log has no ERR_CERT_INVALID or old
+DGFRR byteCode error. This run did not capture the device-key HTTP status,
+so the earlier HTTP 400 finding must not be assumed for this exchange.
+The guest harness reports 5 checks, 0 failed; that only validates the
+harness, not device-key issuance. No phone was modified for these probes.
+
+A follow-up fresh-data control enables CronetUrlRequest, appr and DroidGuard
+call tracing. It observes the actual `/auth/devicekey` request followed by
+CronetUrlRequest.j HTTP 400 over h2 and the same `dito: Parsing Exception`.
+Other HTTP 200 responses in that run belong to earlier requests, not a
+successful device-key exchange. DroidGuard init succeeds and returns
+nonempty signal data; the old byteCode and TLS-certificate errors are absent.
+Thus the externally supplied candidate fixes neither the server refusal
+nor device-key issuance. No validity verdict for the signal token follows
+from its nonzero length or successful local generation.
+
+Static analysis of this exact release's appr.b also explains an early false
+return in the diagnostic: a process-local elapsed-time throttle precedes
+token collection and the network call. A fresh-process call may return its
+initial false result without sending anything; a later background call
+made the request above. The manager builds a protobuf with Android ID,
+session, DroidGuard result, SDK and GMS version, and explicitly sets the
+`missing_token` field itself. It does not directly append the keybox chain
+to this request. Attestation can influence collected signals but replacing
+the XML alone does not establish what Google accepted. Request values,
+token bytes and raw traces remain in ignored diagnostic folders.
+
+A corrected pass-through capture of asgv.b retains the serialized request
+immediately before the original transport call. Static hook callbacks have
+no receiver slot; earlier private diagnostic attempts used the instance
+convention and are excluded from protocol evidence. The corrected run
+changes only the diagnostic manager's in-memory retry timestamp to ensure
+an attempt within the test window; it does not replace request fields,
+headers, token or TLS verification. The hook itself may affect VM signals.
+
+The captured request is 12142 bytes: field 1 is a 12091-byte base64 token,
+fields 2 and 3 are nonzero Android ID and session integers, field 4 contains
+SDK 34 and GMS version 264131009 (both fixed32), and field 6 is the literal
+`missing_token` set by GMS's builder. The header `device` agrees with field
+2, `app` is com.google.android.gms, and Content-Type is application/x-protobuf.
+The remaining header names are gmscoreFlow and gmsversion. No values of
+identifiers or token material are retained in this document.
+
+The token base64 decodes to a syntactically valid 9068-byte protobuf with
+length-delimited fields 1/2/3/5 of 6/9012/25/16 bytes. It contains no literal
+ERROR, Exception or TimeoutException markers. This rules out an absent
+token or a plain encoded exception for this attempt; it does not prove
+that Google accepts the opaque signal payload. The original transport
+continues and AppCertManager again reports Parsing Exception and no key.
+The control harness ends with 5 checks, 0 failed. No production code was
+changed and no phone was updated for this analysis. The server's specific
+reason remains unknown; empty token, zero/mismatched ID and wrong public
+GMS version are not supported explanations for this captured attempt.
+
+A combined control applies Falcon's Pixel 6a Canary profile with the new
+keybox and spoofProvider=0. The startup log confirms 13 Build fields and
+14 process properties, certificate-chain block false. Wildcards are
+expanded only to the explicitly supported build-id, system patch and
+product/board first-API properties; unsupported Vending modes are omitted.
+This is a controlled Megler port of the applicable profile, not execution
+of Falcon's Android module or all of its global resetprop operations.
+The captured request is 6929 bytes with a 6879-byte token (5159 decoded),
+nonzero matching ID and no plain error markers. AppCertManager still
+reports Parsing Exception and false. The earlier mislocated profile file
+was not applied and is excluded from this combined-control evidence.
+
+The same run reports check-in SUCCESS before the captured device-key
+request. Its request ID matches the persisted GSF GServices android_id
+(read-only equality comparison; the value is not exported). A further
+process restart on the same registered diagnostic database retains the
+profile/keybox and obtains a fresh token. Cronet explicitly reports HTTP
+400 and the key is still absent. This excludes merely waiting for the
+first check-in as a sufficient remedy for this control. Both completed
+controls report 5 harness checks, 0 failed, not a device-key success.
+
+A true positive reference exchange is still absent. No Android reference
+was connected over ADB at the end of these controls; an Android without
+root cannot expose GMS's private device-key file or decrypted HTTPS call
+through an ordinary diagnostic APK. External app success can also use an
+existing key, so it must not be reported as a newly observed issuance.
+No additional runtime change, phone update, merge or push follows from
+these negative controls.
+
+On the explicitly selected Android 11 Mi 4c, a fresh baseline through
+verified Android HTTPS again receives HTTP 400 with 1664 response bytes.
+A Java-only normal-Cronet call first gets ERR_CERT_INVALID. A later
+certificate-diagnostics-only Cronet control, with all certificate override
+code removed, establishes HTTP/2, cert_status=0 and a known root, then
+receives HTTP 400 and the protobuf end-group parsing exception. This is
+a stronger current transport control than the older certificate-bypass
+experiment. A separate shell-UID HTTPS probe sees Google's public WE2 /
+GTS Root R4 chain and no HTTP/HTTPS proxy configured; this does not establish
+that every possible network intermediary is absent.
+
+With separate explicit permission, a temporary GMS-only TrickyStoreOSS
+engine from Falcon and the audited new keybox were installed on Mi 4c.
+A fresh test-owned GMS alias receives five certificates, whose signatures
+and dates validate through the published new Google root and whose leaf
+has the attestation extension. The alias is removed afterward. A fresh
+verified-HTTPS device-key control still receives HTTP 400. The first
+attempt times out without status and is inconclusive; the bounded retry
+gets 400. The original device_key is backed up only on the phone, compared
+byte-for-byte before rollback, and retained unchanged.
+
+A further explicitly approved control adds only the official PIF v19
+classes.dex and arm64 Zygisk core with Falcon's profile. It executes none
+of Falcon's installer, updater, conflict-removal or global resetprop
+scripts. Vending/signature/provider-blocking modes are off. Native PIF
+startup confirms config/DEX reads, the property callback hook and
+EntryPoint.init; Java-side logs name MODEL, FINGERPRINT and SECURITY_PATCH.
+The GMS-owned attestation probe again validates the new five-certificate
+chain. No Frida session is attached to the DroidGuard/unstable process in
+this native-module control. The request is triggered and observed from
+GMS's main process. It receives HTTP 400, including once over HTTP/3.
+This is not a successful device-key control despite native PIF loading.
+
+Both temporary-module controls were rolled back and rebooted. The three
+session-created module/config directories are verified absent, the engine
+is no longer running and the original key is present; its bytes matched
+the on-phone backup immediately before removal of that backup. Existing
+root modules, denylist settings and account data were not changed. An
+initial remote-exit-code check incorrectly inferred a disable marker;
+explicit marker/file checks corrected that and it is not protocol evidence.
+
+Primary microG source at f686900c68aa84d1605b52304f6615f3593c6f50 identifies
+request field 6 as a GCM registration token, obtained with DeviceKeyRequest
+scope, unlike the literal in these Google GMS builds. An on-phone,
+verified-HTTPS diagnostic using its own check-in credentials receives
+`Invalid scope` for DeviceKeyRequest. Standard GCM scope succeeds and
+returns a 131-character registration token. Replacing only field 6 in one
+fresh original device-key protobuf with that token still gets HTTP 400;
+no original key is replaced and no credentials or token bytes leave the
+phone. Thus this protocol variation supplies neither a fix nor proof that
+Google's literal is malformed. GCM registration succeeds but device-key
+issuance does not; these outcomes must remain distinct.
+
+A further reference uses the supplied Google Translate
+10.43.74.1015708864.6-release, versionCode 701119201, ARM32/minSdk 26.
+`apksigner verify` accepts its signature; the signer SHA-256 matches the
+published Translate certificate,
+`3d7a1223019aa39d9ea0e3436ab7c0896bfb4fb679f4de5fe7c23f326c8f994a`.
+The [version listing](https://www.apkmirror.com/apk/google-inc/google-translate/google-translate-10-43-74-1015708864-6-release-release/)
+provides the matching fingerprint.
+Translate can return a correct translation without obtaining Spatula:
+its `SpatulaAuthInterceptor` waits four seconds for the auth client, then
+continues without X-Goog-Spatula on interruption, failure or timeout.
+Translation success therefore does not establish device-key issuance.
+
+With separate explicit approval, the old device_key was temporarily
+renamed within GMS's files directory, GMS and Translate restarted, and
+Translate given fresh synthetic text. No Frida session was attached to
+any GMS process or the VM during this native-client control. The repeated
+PIF/TrickyStore setup uses the same approved files and scope described
+above. A 100-second live observation confirms PIF's native property hook,
+EntryPoint.init and Java Build spoofing, plus the TrickyStoreOSS process.
+Both fast refresh and AppCert report ERR_CERT_INVALID; no new device_key
+file appears. This run does not establish an HTTP refusal because TLS
+fails first. An earlier attempt did not confirm PIF logging: its diagnostic
+toggle missed a CRLF line ending, and a tail-limited log snapshot was
+insufficient. Only the live observation is used for the PIF loading claim.
+After each attempt the original key is restored and compared byte-for-byte
+with the on-phone backup. All three temporary module/config directories
+are removed, and the rebooted phone is checked for the original file,
+absence of the renamed file and absence of the temporary engine.
+
+The actual AppCertService in this Android GMS APK runs in
+com.google.android.gms.persistent, while DroidGuardService runs in
+com.google.android.gms.unstable. A corresponding instrumented control in
+persistent, using the existing global-Java-deoptimization diagnostic but
+no certificate override, also receives HTTP 400 over HTTP/2. Netlog records
+cert_status=0 and a known root. Thus moving the diagnostic call from the
+main process to the service's process does not supply a positive result.
+A separate observer without global deoptimization crashes before an HTTP
+result and is inconclusive. The native-client TLS failure and the
+instrumented HTTP refusal must not be conflated.
+
+A subsequent signal-only persistent-process diagnostic suppresses the
+device-key POST after collection. The returned token decodes to 2,416
+bytes and contains none of ERROR, EXCEPTION, STACK_TRACE or timeout
+markers; the client's `boij.b(Context, Throwable)` error-result generator
+is not called. This excludes that particular client-side exception wrapper
+for this collection, but does not prove that Google's VM considers the
+device trustworthy. Neither token contents nor existing key contents are
+exported. A successful fresh device-key issuance is still unobserved.
+
+[Falcon source](https://github.com/AHMED2111X/falcon_integrity_fix),
+[TAKR](https://keybox.kowx712.cc/),
+[inspected AlwaysStrong fork](https://github.com/BloodCorrupt/AlwaysStrongFork),
+[Google published roots](https://android.googleapis.com/attestation/root).
+
+The regression uses fresh test-only EC and RSA authorities, not those
+supplied private keys. It exercises both key algorithms, PEM formats,
+exact challenge and caller binding, DER authorizations, sign/verify,
+certificate-chain signatures, persistence across data-app runs, rejected
+XML entities/oversize challenges/StrongBox, invalid input preserving the
+previous alias, explicit experimental claims and a local signing alias.
+The full `tools/build-tests.sh arm` and `tools/build-tests.sh win` runs each
+finish with 33 result groups and 0 failed checks, sequentially under the
+shared `heavy.lock` with `MEGLER_JOBS=4`. The ARM data app passes both runs,
+including persisted-chain verification; its harness reports 470 and 485 checks,
+each with 0 failed. No phone has been updated with this draft and no
+successful Google device-key or Play Integrity result is established.
+
 **Following it on a phone** (flags in `Pictures\Megler\diag\<package>\flags`):
 `trace-syscalls` (a library's calls by number with the path each names:
 "/sys/fs/selinux/enforce" = -2 from `libdB21738DAE92C.so+0x2e18`, its own

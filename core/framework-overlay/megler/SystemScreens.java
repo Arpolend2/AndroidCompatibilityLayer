@@ -234,7 +234,10 @@ public final class SystemScreens {
             add(this, column, button(this, "Clear storage", v -> new AlertDialog.Builder(this)
                     .setTitle("Clear app storage?")
                     .setMessage("All this app's data will be deleted permanently: its files, settings, accounts and databases. "
-                            + "The app closes now, and its data goes before it next starts.")
+                            + "The app closes now, and its data goes before it next starts."
+                            // (Google's own Play services keep the Google accounts' sign-in in their data: megler.Accounts.)
+                            + (GooglePackages.GMS.equals(getPackageName()) && !MicroG.isMicroG()
+                                    ? " Your Google accounts are signed in through this data: they are removed with it, and you sign in again afterwards." : ""))
                     .setPositiveButton("Delete", (d, w) -> clear())
                     .setNegativeButton("Cancel", null)
                     .show()), 8);

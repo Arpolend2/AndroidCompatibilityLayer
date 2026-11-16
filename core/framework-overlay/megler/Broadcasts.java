@@ -86,6 +86,19 @@ public final class Broadcasts {
         synchronized (sReceivers) { for (Object[] e : sReceivers) if (e[0] == r) return true; }
         return false;
     }
+    /*
+     * Whether a broadcast on its way to `target` -- sent, and waiting its turn on the receiver's thread -- has nobody to go to
+     * any more: its receiver was unregistered meanwhile. Android gives it to no one then (LoadedApk's ReceiverDispatcher is
+     * forgotten at unregisterReceiver, and what was posted for it returns at once; an ordered broadcast goes on to the next
+     * receiver). Here it was still given: a receiver that unregisters itself at the first broadcast it hears, to hear one
+     * only, heard every other that was sent before its turn came. This registration it is, not the receiver: registered
+     * again, the receiver hears what is sent from then on. (A manifest's receiver is made for its broadcast, and stays.)
+     */
+    private static boolean gone(Object[] target) {
+        if (target[3] == null) return false;
+        synchronized (sReceivers) { for (Object[] e : sReceivers) if (e == target) return false; }
+        return true;
+    }
     /**
      * The battery has become another: its charge, its status or what it is plugged into. The driver calls this on the main thread when the
      * core's has (mg_java.c, battery_news), and here are Android's broadcasts for it, in Android's order: ACTION_POWER_CONNECTED or
@@ -141,6 +154,7 @@ public final class Broadcasts {
         // among its extras made again by its own classes, megler.Processes.forLoader.) Each hears it with a PendingResult of
         // its own, as on Android: what goAsync takes, and who sent the broadcast (getSentFromUid) where the sender shared it.
         for (Object[] target : targets) (target[3] != null ? (Handler) target[3] : main).post(() -> {
+            if (gone(target)) return;
             BroadcastReceiver r = (BroadcastReceiver) target[0];
             BroadcastReceiver.PendingResult p = r.meglerBegin(false, 0, null, null, null);
             if (sender != null) p.meglerSentFrom((Integer) sender[0], (String) sender[1]);
@@ -204,6 +218,8 @@ public final class Broadcasts {
         }
         final Object[] target = targets.get(at);
         (target[3] != null ? (Handler) target[3] : main).post(() -> {
+            // (Unregistered since the broadcast was sent: it goes on to the next, with the result as it stands.)
+            if (gone(target)) { next(targets, at + 1, i, code, data, extras, last, scheduler, ctx, sender); return; }
             final BroadcastReceiver r = (BroadcastReceiver) target[0];
             final BroadcastReceiver.PendingResult[] mine = new BroadcastReceiver.PendingResult[1];
             mine[0] = r.meglerBegin(true, code, data, extras, () -> {

@@ -350,8 +350,24 @@ public class Main extends Activity {
         tls();
         networkTrust();
         keystore(run);
+        step("keystore-strongbox-spec", () -> {
+            android.security.keystore.KeyGenParameterSpec.Builder b = new android.security.keystore.KeyGenParameterSpec.Builder("megler-strongbox-spec", 4);
+            boolean unset = !b.build().isStrongBoxBacked();
+            b.setIsStrongBoxBacked(true);
+            android.security.keystore.KeyGenParameterSpec requested = b.build();
+            android.security.keystore.KeyGenParameterSpec copy = android.security.keystore.KeyGenParameterSpec.Builder.class
+                    .getConstructor(android.security.keystore.KeyGenParameterSpec.class).newInstance(requested).build();
+            boolean enabled = requested.isStrongBoxBacked() && copy.isStrongBoxBacked();
+            b.setIsStrongBoxBacked(false);
+            detail = "unset=" + unset + " enabled-and-copied=" + enabled + " reset=" + !b.build().isStrongBoxBacked();
+            return unset && enabled && !b.build().isStrongBoxBacked() && requested.isStrongBoxBacked();
+        });
         keystoreCertificates(run);
+        integrityProfile();
+        integrityCallbacks();
+        step("keybox-attestation", () -> { detail = AttestationChecks.run(this, run); return true; });
         keystoreForeignKey();
+        keystoreHosted();
         pathOps();
         textPath();
         base64Streams();
@@ -427,6 +443,7 @@ public class Main extends Activity {
                     d3.recycle();
                     r3.recycle();
                     Log.i("DataTest", "process-bundle note=" + inBundle);
+                    fileLocksAcrossScopes(b);
                 }
                 @Override public void onServiceDisconnected(android.content.ComponentName n) {}
             }, BIND_AUTO_CREATE);
@@ -711,6 +728,56 @@ public class Main extends Activity {
             ((android.view.ViewGroup) holder.getParent()).removeView(holder);
             detail = "calls=" + afterLeaf + " child=" + child + " target=" + target;
             return afterLeaf == 1 && child && target;
+        });
+        // A view's own invalidate() is not what the framework calls where Android calls its hidden invalidate(boolean): as a
+        // child is added to a group or removed, as a view is enabled, selected, padded, clipped, given a background or laid
+        // out. Telegram's UndoView invalidates two of its fields in its invalidate(), and its constructor sets them after its
+        // first addView: the Profile screen ended there. An app's own call, and a posted one, still reach it.
+        step("invalidate-override", () -> {
+            final int[] calls = new int[1];
+            android.widget.FrameLayout group = new android.widget.FrameLayout(this) {
+                @Override public void invalidate() { calls[0]++; super.invalidate(); }
+            };
+            android.view.View child = new android.view.View(this) {
+                @Override public void invalidate() { calls[0]++; super.invalidate(); }
+            };
+            group.addView(child, new android.widget.FrameLayout.LayoutParams(10, 10));
+            int added = calls[0];
+            group.setPadding(1, 2, 3, 4);
+            group.setEnabled(false);
+            group.setSelected(true);
+            group.setActivated(true);
+            group.setClipChildren(false);
+            group.setClipToPadding(false);
+            group.setBackground(new android.graphics.drawable.ColorDrawable(0xff102030));
+            group.setBackgroundColor(0xff405060);
+            group.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null);
+            group.setClipToOutline(true);
+            group.invalidateOutline();
+            group.setClipBounds(new android.graphics.Rect(0, 0, 5, 5));
+            child.setEnabled(false);
+            child.setPadding(1, 1, 1, 1);
+            int set = calls[0] - added;
+            group.measure(android.view.View.MeasureSpec.makeMeasureSpec(40, android.view.View.MeasureSpec.EXACTLY),
+                android.view.View.MeasureSpec.makeMeasureSpec(40, android.view.View.MeasureSpec.EXACTLY));
+            group.layout(0, 0, 40, 40);
+            int laid = calls[0] - added - set;
+            group.removeView(child);
+            group.addView(child);
+            group.removeViewAt(0);
+            group.addView(child, 0);
+            group.removeViews(0, 1);
+            group.addView(child);
+            group.removeAllViews();
+            int removed = calls[0] - added - set - laid;
+            // The hidden one itself, as the framework calls it (the SDK an app is built with does not have it: by reflection).
+            android.view.View.class.getMethod("invalidate", boolean.class).invoke(group, true);
+            int hidden =calls[0] - added - set - laid - removed;
+            group.invalidate();
+            child.invalidate();
+            int own = calls[0] - added - set - laid - removed - hidden;
+            detail = "added " + added + " set " + set + " laid " + laid + " removed " + removed + " hidden " + hidden + " own " + own;
+            return added == 0 && set == 0 && laid == 0 && removed == 0 && hidden == 0 && own == 2;
         });
         // An image matrix set before the view is laid out, then the scale type made MATRIX, as Material's FloatingActionButton
         // does as it is made: once laid out, the view draws by that matrix.
@@ -1332,6 +1399,38 @@ public class Main extends Activity {
             detail = "focused=" + focused + " hidden=" + hidden + " shown=" + shown + " closed=" + closed + " gone=" + gone;
             return focused && hidden && shown && gone;
         });
+        // The zoom buttons' controller, which Chromium's WebView makes for a WebView with the built-in zoom and reaches into at
+        // once and at every scroll of its page (AwZoomControls: getZoomControls().getLayoutParams(), .setVisibility(GONE)): its
+        // container and its controls are there, the controls in the container with a FrameLayout's parameters, and hidden when
+        // told; the buttons themselves never come up, and the listener hears nothing (android.widget.ZoomButtonsController,
+        // overlaid). Both answered null, and Royal Revolt 2 ended in the WebView's fatal error when its news page was laid out.
+        step("zoom-buttons", () -> {
+            android.widget.ZoomButtonsController zoom = new android.widget.ZoomButtonsController(new android.view.View(this));
+            final boolean[] told = { false };
+            zoom.setOnZoomListener(new android.widget.ZoomButtonsController.OnZoomListener() {
+                @Override public void onVisibilityChanged(boolean visible) { told[0] = true; }
+                @Override public void onZoom(boolean zoomIn) { told[0] = true; }
+            });
+            android.view.View controls = zoom.getZoomControls();
+            android.view.ViewGroup container = zoom.getContainer();
+            boolean made = controls != null && container != null && controls.getParent() == container && controls == zoom.getZoomControls();
+            boolean params = made && controls.getLayoutParams() instanceof android.widget.FrameLayout.LayoutParams;
+            if (params) ((android.widget.FrameLayout.LayoutParams) controls.getLayoutParams()).gravity = android.view.Gravity.RIGHT;
+            if (made) controls.setVisibility(android.view.View.GONE);
+            zoom.setZoomInEnabled(false);
+            zoom.setZoomOutEnabled(true);
+            zoom.setZoomSpeed(100);
+            zoom.setFocusable(true);
+            zoom.setAutoDismissed(false);
+            zoom.setVisible(true);
+            boolean hidden = made && controls.getVisibility() == android.view.View.GONE && !zoom.isVisible() && !told[0] && !zoom.isAutoDismissed();
+            // And one made of no view at all has nothing to make them of: null, and the setters are no errors.
+            android.widget.ZoomButtonsController none = new android.widget.ZoomButtonsController(null);
+            none.setZoomInEnabled(true);
+            boolean empty = none.getZoomControls() == null && none.getContainer() == null && !none.isVisible();
+            detail = "made=" + made + " params=" + params + " hidden=" + hidden + " empty=" + empty;
+            return made && params && hidden && empty;
+        });
         // Android 14's ZipPathValidator, which OsmAnd clears as it starts: there, and a ZIP entry named with ".." still reads.
         step("zip-path-validator", () -> {
             Class<?> v = Class.forName("dalvik.system.ZipPathValidator");
@@ -1859,6 +1958,48 @@ public class Main extends Activity {
             sendBroadcast(new android.content.Intent("megler.test.ON_HANDLER"));
             return true;
         });
+        // A receiver unregistered hears nothing more -- a broadcast already on its way to it too, sent and waiting its turn on
+        // the receiver's thread -- as on Android. One that unregisters itself at the first broadcast it hears, to hear one only,
+        // heard the second of two sent together. An ordered broadcast goes on past a receiver unregistered since it was sent:
+        // to the result receiver here, the first receiver having unregistered the second.
+        step("broadcast-unregistered", () -> {
+            final android.os.HandlerThread thread = new android.os.HandlerThread("broadcast-unregistered");
+            thread.start();
+            final android.os.Handler on = new android.os.Handler(thread.getLooper());
+            final java.util.concurrent.atomic.AtomicInteger heard = new java.util.concurrent.atomic.AtomicInteger();
+            final StringBuffer order = new StringBuffer();
+            // (The receivers' thread waits until both broadcasts are sent: both are in its queue when the first is heard.)
+            final java.util.concurrent.CountDownLatch sent = new java.util.concurrent.CountDownLatch(1);
+            on.post(() -> { try { sent.await(); } catch (InterruptedException e) {} });
+            registerReceiver(new android.content.BroadcastReceiver() {
+                @Override public void onReceive(Context c, android.content.Intent i) { heard.incrementAndGet(); c.unregisterReceiver(this); }
+            }, new android.content.IntentFilter("megler.test.UNREGISTERED"), null, on);
+            sendBroadcast(new android.content.Intent("megler.test.UNREGISTERED"));
+            sendBroadcast(new android.content.Intent("megler.test.UNREGISTERED"));
+            sent.countDown();
+            final android.content.BroadcastReceiver second = new android.content.BroadcastReceiver() {
+                @Override public void onReceive(Context c, android.content.Intent i) { order.append("second "); }
+            };
+            android.content.IntentFilter before = new android.content.IntentFilter("megler.test.UNREGISTERED_ORDERED");
+            before.setPriority(10);
+            registerReceiver(new android.content.BroadcastReceiver() {
+                @Override public void onReceive(Context c, android.content.Intent i) {
+                    order.append("first ");
+                    c.unregisterReceiver(second);
+                    c.unregisterReceiver(this);
+                }
+            }, before, null, on);
+            registerReceiver(second, new android.content.IntentFilter("megler.test.UNREGISTERED_ORDERED"), null, on);
+            final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+            sendOrderedBroadcast(new android.content.Intent("megler.test.UNREGISTERED_ORDERED"), null, new android.content.BroadcastReceiver() {
+                @Override public void onReceive(Context c, android.content.Intent i) { order.append("result"); done.countDown(); }
+            }, on, 0, null, null);
+            // (The result comes on the same thread, after the two broadcasts above had their turn.)
+            boolean finished = done.await(20, java.util.concurrent.TimeUnit.SECONDS);
+            thread.quitSafely();
+            detail = "heard " + heard.get() + " of 2 sent, ordered: " + order + ", finished " + finished;
+            return finished && heard.get() == 1 && "first result".equals(order.toString());
+        });
         // Preferences whose keys have spaces (GmsCore keys some by an account, "Account {name=..., type=com.google}"): what
         // one run commits, the next reads from the file whole.
         step("prefs-spaced-key", () -> {
@@ -1930,6 +2071,30 @@ public class Main extends Activity {
             detail = "types=" + (types == null ? "null" : types.length) + " typed=" + typed + " syncable=" + syncable + " master=" + master + " off=" + off + " on=" + on
                      + " listening=" + (listening != null);
             return typed && syncable == (run == 1 ? -1 : 1) && master && off && on && listening != null;
+        });
+        // Google's own Play services' data cleared -- the core's mark beside the accounts' file -- the Google accounts go at the
+        // next reading of the accounts, the others stay, and the mark goes: their sign-in was in the cleared files, and an
+        // account left behind could only be told "sign in again" (the Play Store's "Authentication is required" for good, with
+        // nowhere to sign in). Without the mark nothing goes.
+        step("google-signed-out", () -> {
+            final android.accounts.AccountManager am = android.accounts.AccountManager.get(this);
+            final android.accounts.Account google = new android.accounts.Account("signed out by run " + run, "com.google");
+            final android.accounts.Account other = new android.accounts.Account("kept by run " + run, "megler.test.kept");
+            int googleWere = am.getAccountsByType(google.type).length, otherWere = am.getAccountsByType(other.type).length;
+            boolean added = am.addAccountExplicitly(google, null, null) && am.addAccountExplicitly(other, null, null);
+            File accounts = (File) Class.forName("megler.Accounts").getMethod("file").invoke(null);
+            File mark = new File(accounts.getParentFile(), "google-signed-out");
+            // (The accounts are read again when their file changed: its time moved, as another process's writing moves it.)
+            boolean unmarked = accounts.setLastModified(accounts.lastModified() + 4000) && am.getAccountsByType(google.type).length == googleWere + 1;
+            new java.io.FileOutputStream(mark).close();
+            boolean moved = accounts.setLastModified(accounts.lastModified() + 4000);
+            int googleNow = am.getAccountsByType(google.type).length, otherNow = am.getAccountsByType(other.type).length;
+            boolean markGone = !mark.exists();
+            am.removeAccountExplicitly(google);
+            am.removeAccountExplicitly(other);
+            detail = "added " + added + " unmarked " + unmarked + " moved " + moved + " google " + googleWere + " -> " + googleNow
+                     + " other " + otherWere + " -> " + otherNow + " mark gone " + markGone + " in " + accounts.getParent();
+            return added && unmarked && moved && googleNow == 0 && otherNow == otherWere + 1 && markGone;
         });
         step("package-installer", () -> {
             android.content.pm.PackageInstaller installer = getPackageManager().getPackageInstaller();
@@ -2235,6 +2400,64 @@ public class Main extends Activity {
             android.view.View decor = dialog.getWindow().getDecorView();
             boolean fits = ok.isShown() && ok.getHeight() > 0 && at[1] >= 0 && at[1] + ok.getHeight() <= screen && decor.getHeight() <= screen;
             Log.i("DataTest", "dialog-tall " + (fits ? "ok" : "FAILED") + " button=" + at[1] + "+" + ok.getHeight() + " screen=" + screen + " dialog=" + decor.getHeight());
+            dialog.dismiss();
+            wrapDialog();
+        }, 500);
+    }
+
+    /**
+     * A dialog without a window title whose content measures its parts with the height it was itself told, as Telegram's own
+     * AlertDialog does (the title's frame and the row of buttons are each given the container's height spec): the window wraps
+     * its content, so the content is told "at most" and never "exactly", as under Android's screen_simple, and the title, the
+     * message and the button lie one under the other inside the window. Told "exactly" the height it had answered, the title
+     * and the button were each as tall as the whole dialog, and the message and the button lay below the window. And the
+     * activity's own content, in a window of a set size, still fills what the window has for it.
+     */
+    private void wrapDialog() {
+        final int[] modes = new int[16], count = { 0 };
+        final android.widget.TextView title = new android.widget.TextView(this), message = new android.widget.TextView(this), button = new android.widget.TextView(this);
+        title.setText("Log out");
+        message.setText("Are you sure you want to log out?");
+        button.setText("OK");
+        final android.view.ViewGroup box = new android.view.ViewGroup(this) {
+            @Override protected void onMeasure(int ws, int hs) {
+                if (count[0] < modes.length) modes[count[0]++] = MeasureSpec.getMode(hs);
+                int width = MeasureSpec.getSize(ws), exact = MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY);
+                title.measure(exact, hs);
+                button.measure(exact, hs);
+                int left = Math.max(0, MeasureSpec.getSize(hs) - title.getMeasuredHeight() - button.getMeasuredHeight());
+                message.measure(exact, MeasureSpec.makeMeasureSpec(left, MeasureSpec.AT_MOST));
+                setMeasuredDimension(width, title.getMeasuredHeight() + message.getMeasuredHeight() + button.getMeasuredHeight());
+            }
+            @Override protected void onLayout(boolean changed, int l, int t, int r, int b) {
+                int y = 0;
+                for (android.view.View v : new android.view.View[] { title, message, button }) {
+                    v.layout(0, y, r - l, y + v.getMeasuredHeight());
+                    y += v.getMeasuredHeight();
+                }
+            }
+        };
+        box.addView(title);
+        box.addView(message);
+        box.addView(button);
+        final android.app.Dialog dialog = new android.app.Dialog(this);
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+        dialog.setContentView(box, new android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+        dialog.show();
+        new android.os.Handler().postDelayed(() -> {
+            android.view.View decor = dialog.getWindow().getDecorView();
+            boolean atMost = count[0] > 0;
+            for (int i = 0; i < count[0]; i++) atMost &= modes[i] == android.view.View.MeasureSpec.AT_MOST;
+            int[] top = new int[2], at = new int[2];
+            decor.getLocationOnScreen(top);
+            button.getLocationOnScreen(at);
+            int line = message.getHeight();
+            boolean inside = line > 0 && title.getHeight() > 0 && title.getHeight() <= 2 * line && button.getHeight() > 0 && button.getHeight() <= 2 * line
+                && button.isShown() && at[1] >= top[1] && at[1] + button.getHeight() <= top[1] + decor.getHeight();
+            android.view.View content = findViewById(android.R.id.content), stack = (android.view.View) content.getParent();
+            boolean fills = content.getHeight() > 0 && content.getBottom() == stack.getHeight();
+            Log.i("DataTest", "dialog-wrap " + (atMost && inside && fills ? "ok" : "FAILED") + " measures=" + count[0] + " atMost=" + atMost + " title=" + title.getHeight()
+                + " message=" + line + " button=" + (at[1] - top[1]) + "+" + button.getHeight() + " dialog=" + decor.getHeight() + " activity=" + content.getBottom() + "/" + stack.getHeight());
             dialog.dismiss();
             panelRoot();
         }, 500);
@@ -3945,6 +4168,234 @@ public class Main extends Activity {
         });
     }
 
+    private void integrityCallbacks() {
+        step("integrity-callbacks", () -> {
+            Class<?> nativeClass = Class.forName("megler.Native");
+            File marker = new File((String) nativeClass.getMethod("dataDir").invoke(null), "play-integrity-break");
+            if (marker.exists()) throw new IllegalStateException("Test requires its own marker");
+            Class<?> play = Class.forName("megler.PlayStore");
+            java.lang.reflect.Method bind = play.getDeclaredMethod("bind", android.content.Intent.class);
+            bind.setAccessible(true);
+            int calls = 0;
+            try {
+                // Toggle after binding too: a client can keep its service connection across requests.
+                for (int mode = 0; mode < 3; mode++) {
+                    boolean blocked = mode == 1;
+                    if (blocked) { if (!marker.createNewFile()) throw new java.io.IOException("Create PIB marker"); }
+                    else if (marker.exists() && !marker.delete()) throw new java.io.IOException("Remove PIB marker");
+                    for (int operation = 0; operation < 3; operation++) {
+                        boolean standard = operation != 0;
+                        final String service = "com.google.android.play.core.integrity.protocol."
+                                + (standard ? "IExpressIntegrityService" : "IIntegrityService");
+                        final String callbackDescriptor = service + "Callback";
+                        final int code = operation == 2 ? 3 : 2;
+                        final int[] responses = { 0 };
+                        final android.os.Bundle[] answer = { null };
+                        android.os.IBinder callback = new android.os.Binder() {
+                            @Override protected boolean onTransact(int transaction, android.os.Parcel data,
+                                    android.os.Parcel reply, int flags) throws android.os.RemoteException {
+                                if (transaction != code) throw new IllegalStateException("Wrong callback transaction");
+                                data.enforceInterface(callbackDescriptor);
+                                if (data.readInt() != 1) throw new IllegalStateException("Missing callback bundle");
+                                answer[0] = android.os.Bundle.CREATOR.createFromParcel(data);
+                                responses[0]++;
+                                return true;
+                            }
+                        };
+                        String action = standard ? "com.google.android.play.core.expressintegrityservice.BIND_EXPRESS_INTEGRITY_SERVICE"
+                                : "com.google.android.play.core.integrityservice.BIND_INTEGRITY_SERVICE";
+                        android.os.IBinder binder = (android.os.IBinder) bind.invoke(null,
+                                new android.content.Intent(action).setPackage("com.android.vending"));
+                        if (binder == null) return false;
+                        android.os.Parcel request = android.os.Parcel.obtain();
+                        try {
+                            request.writeInterfaceToken(service);
+                            request.writeInt(1);
+                            android.os.Bundle options = new android.os.Bundle();
+                            options.putString("package.name", getPackageName());
+                            options.writeToParcel(request, 0);
+                            request.writeStrongBinder(callback);
+                            if (!binder.transact(code, request, null, android.os.IBinder.FLAG_ONEWAY)) return false;
+                        } finally { request.recycle(); }
+                        android.os.Bundle b = answer[0];
+                        if (responses[0] != 1 || b == null || b.getInt("error", 0) != (blocked ? -8 : -1)
+                                || b.containsKey("token") || b.getBoolean("is.error.remediable", false) != blocked
+                                || b.containsKey("is.error.remediable") != (standard || blocked)) return false;
+                        calls++;
+                    }
+                }
+                detail = "classic, standard warm-up and token: " + calls + " callbacks; default, PIB and restored";
+                return calls == 9;
+            } finally { marker.delete(); }
+        });
+    }
+
+    private void integrityProfile() {
+        step("integrity-profile", () -> {
+            Class<?> profile = Class.forName("megler.IntegrityProfile");
+            java.lang.reflect.Method install = profile.getMethod("install");
+            Class<?> nativeClass = Class.forName("megler.Native");
+            File dir = new File((String) nativeClass.getMethod("dataDir").invoke(null));
+            File prop = new File(dir, "custom.pif.prop"), json = new File(dir, "custom.pif.json");
+            if (prop.exists() || json.exists()) throw new IllegalStateException("Test requires its own profile files");
+            java.lang.reflect.Field model = android.os.Build.class.getField("MODEL");
+            java.lang.reflect.Field initial = android.os.Build.VERSION.class.getField("DEVICE_INITIAL_SDK_INT");
+            Object oldModel = model.get(null), oldInitial = initial.get(null);
+            model.setAccessible(true);
+            initial.setAccessible(true);
+            java.lang.reflect.Method nativeGet = nativeClass.getMethod("systemProperty", String.class);
+            java.lang.reflect.Method nativeSet = nativeClass.getMethod("setSystemProperty", String.class, String.class);
+            Class<?> sysprops = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method javaGet = sysprops.getMethod("get", String.class);
+            java.lang.reflect.Method javaSet = sysprops.getMethod("set", String.class, String.class);
+            String oldJavaModel = (String) javaGet.invoke(null, "ro.product.model");
+            String oldNativeModel = (String) nativeGet.invoke(null, "ro.product.model");
+            java.security.KeyStore store = java.security.KeyStore.getInstance("AndroidKeyStore");
+            store.load(null);
+            try {
+                install.invoke(null);
+                boolean absent = DroidGuardProfileProbe.chain(store, "megler-test-cert-ec") != null;
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(prop)) {
+                    out.write(("ro.product.model=\nMODEL=Megler profile test # comment\nDEVICE_INITIAL_SDK_INT=25\n"
+                            + "ro.megler.pif.test=native-and-java\nspoofProvider=1\n").getBytes("UTF-8"));
+                }
+                install.invoke(null);
+                boolean fields = "Megler profile test".equals(model.get(null)) && initial.getInt(null) == 25;
+                boolean nativeProperties = "native-and-java".equals(nativeGet.invoke(null, "ro.megler.pif.test"))
+                        && "native-and-java".equals(javaGet.invoke(null, "ro.megler.pif.test"))
+                        && "Megler profile test".equals(nativeGet.invoke(null, "ro.product.model"))
+                        && "Megler profile test".equals(javaGet.invoke(null, "ro.product.model"));
+                boolean ordinary = store.getCertificateChain("megler-test-cert-ec") != null;
+                boolean blocked = false;
+                try { DroidGuardProfileProbe.chain(store, "megler-test-cert-ec"); }
+                catch (UnsupportedOperationException expected) { blocked = true; }
+
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(prop)) {
+                    out.write("MODEL=Must not be applied\nDEVICE_INITIAL_SDK_INT=bad\n".getBytes("UTF-8"));
+                }
+                install.invoke(null);
+                boolean invalid = "Megler profile test".equals(model.get(null)) && initial.getInt(null) == 25;
+                if (!prop.delete()) throw new java.io.IOException("Remove property profile");
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(json)) {
+                    out.write(("{\"MODEL\":\"JSON profile test\",\"DEVICE_INITIAL_SDK_INT\":24,"
+                            + "\"spoofProps\":0,\"spoofProvider\":0}").getBytes("UTF-8"));
+                }
+                install.invoke(null);
+                boolean jsonFields = "JSON profile test".equals(model.get(null)) && initial.getInt(null) == 24;
+                boolean propsDisabled = "Megler profile test".equals(nativeGet.invoke(null, "ro.product.model"));
+                boolean unblocked = DroidGuardProfileProbe.chain(store, "megler-test-cert-ec") != null;
+                detail = "absent=" + absent + " fields=" + fields + " properties=" + nativeProperties + " ordinary=" + ordinary
+                        + " blocked=" + blocked + " invalid=" + invalid + " json=" + jsonFields + " props-disabled=" + propsDisabled + " unblocked=" + unblocked;
+                Log.i("DataTest", "integrity-profile " + detail);
+                return absent && fields && nativeProperties && ordinary && blocked && invalid && jsonFields && propsDisabled && unblocked;
+            } finally {
+                prop.delete();
+                json.delete();
+                install.invoke(null);
+                model.set(null, oldModel);
+                initial.set(null, oldInitial);
+                javaSet.invoke(null, "ro.product.model", oldJavaModel);
+                nativeSet.invoke(null, "ro.product.model", oldNativeModel == null ? "" : oldNativeModel);
+            }
+        });
+    }
+
+    /**
+     * Google Play services' key store in an app's process: one store in their shared data folder, not the app's own
+     * (megler.KeyStoreProvider; its hostedForTests makes this thread's calls theirs, a folder of this app standing for
+     * /data/megler-services). Their keys were the hosting app's, so what one process encrypted in the shared folder no other
+     * could read ("Keystore cannot load the key with ID: mobstore_encrypt" in the Play Store and others, 681-701). Checked:
+     * while their data is older than the shared store, a key of the app's own store is found by them and copied to the
+     * imports when they take it; a key they make is in the shared store and not in the app's; their delete of the app's
+     * alias hides it from them and leaves the app its key; what another process wrote is read again; a lock file a process
+     * left behind is taken away; and with the mark (.megler-keystore-shared) the shared store is the only one.
+     */
+    private void keystoreHosted() {
+        step("keystore-hosted", () -> {
+            final java.lang.reflect.Method hosted = Class.forName("megler.KeyStoreProvider").getMethod("hostedForTests", String.class);
+            final File root = new File(getFilesDir(), "keystore-hosted"), data = new File(root, "com.google.android.gms");
+            final File keys = new File(data, ".megler_keystore2"), imports = new File(data, ".megler_keystore2.hosts"),
+                    lock = new File(data, ".megler_keystore2.lock"), mark = new File(root, ".megler-keystore-shared");
+            deleteAll(root);
+            final String tag = Long.toString(System.nanoTime(), 36);
+            final String mine = "megler-hosted-app-" + tag, only = "megler-hosted-only-" + tag, theirs = "megler-hosted-gms-" + tag,
+                    other = "megler-hosted-other-" + tag, late = "megler-hosted-late-" + tag;
+            java.security.KeyStore store = java.security.KeyStore.getInstance("AndroidKeyStore");
+            store.load(null);
+            try {
+                keystoreAes(mine);
+                keystoreAes(only);
+                byte[] own = store.getKey(mine, null).getEncoded();
+                // Theirs from here: the app's key is seen, and is in the imports once they have taken it.
+                hosted.invoke(null, root.getPath());
+                boolean seen = store.containsAlias(mine) && !imports.exists();
+                java.security.Key taken = store.getKey(mine, null);
+                boolean imported = own != null && taken != null && Arrays.equals(own, taken.getEncoded()) && imports.isFile();
+                // A key they make: in the shared store, and no key of the app's.
+                keystoreAes(theirs);
+                boolean made = keys.isFile() && store.getKey(theirs, null) != null;
+                hosted.invoke(null, (Object) null);
+                boolean apart = !store.containsAlias(theirs) && store.containsAlias(mine);
+                // Their delete of the app's alias: gone for them, and from the imports; the app has its key.
+                hosted.invoke(null, root.getPath());
+                long importsWith = imports.length();
+                store.deleteEntry(mine);
+                long importsWithout = imports.length();
+                boolean hidden = !store.containsAlias(mine) && store.getKey(mine, null) == null && importsWithout < importsWith;
+                hosted.invoke(null, (Object) null);
+                boolean kept = store.containsAlias(mine) && Arrays.equals(own, store.getKey(mine, null).getEncoded());
+                // Another process's writing: the file as it was with a key they have deleted since, put back.
+                hosted.invoke(null, root.getPath());
+                keystoreAes(other);
+                byte[] with = new byte[(int) keys.length()];
+                try (java.io.RandomAccessFile in = new java.io.RandomAccessFile(keys, "r")) {
+                    in.readFully(with);
+                }
+                store.deleteEntry(other);
+                boolean deleted = !store.containsAlias(other);
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(keys)) {
+                    out.write(with);
+                }
+                boolean reread = store.containsAlias(other) && store.getKey(other, null) != null;
+                // A lock a process left behind a minute ago: taken away, not waited for and then gone without.
+                boolean left = lock.createNewFile() && lock.setLastModified(System.currentTimeMillis() - 60000);
+                long start = System.nanoTime();
+                keystoreAes(late);
+                long ms = (System.nanoTime() - start) / 1000000;
+                boolean unlocked = left && !lock.exists() && store.containsAlias(late);
+                // The mark: the app's store and the imports are not theirs any more, the shared store is.
+                boolean before = store.containsAlias(only) && store.getKey(only, null) != null && imports.length() > importsWithout;
+                boolean marked = mark.createNewFile();
+                boolean alone = marked && !store.containsAlias(only) && store.getKey(only, null) == null && store.getKey(theirs, null) != null
+                        && store.containsAlias(late) && !java.util.Collections.list(store.aliases()).contains(only);
+                detail = "seen=" + seen + " imported=" + imported + " made=" + made + " apart=" + apart + " hidden=" + hidden + " kept=" + kept
+                        + " deleted=" + deleted + " reread=" + reread + " unlocked=" + unlocked + " (" + ms + " ms) before=" + before + " alone=" + alone;
+                Log.i("DataTest", "keystore-hosted " + detail);
+                return seen && imported && made && apart && hidden && kept && deleted && reread && unlocked && before && alone;
+            } finally {
+                hosted.invoke(null, (Object) null);
+                store.deleteEntry(mine);
+                store.deleteEntry(only);
+                deleteAll(root);
+            }
+        });
+    }
+
+    private static void keystoreAes(String alias) throws Exception {
+        javax.crypto.KeyGenerator aes = javax.crypto.KeyGenerator.getInstance("AES", "AndroidKeyStore");
+        aes.init(new android.security.keystore.KeyGenParameterSpec.Builder(alias, android.security.keystore.KeyProperties.PURPOSE_ENCRYPT
+                | android.security.keystore.KeyProperties.PURPOSE_DECRYPT).setKeySize(256)
+                .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE).build());
+        aes.generateKey();
+    }
+
+    private static void deleteAll(File f) {
+        File[] in = f.listFiles();
+        if (in != null) for (File c : in) deleteAll(c);
+        f.delete();
+    }
+
     /**
      * The certificates of Android's key store's key pairs, as Google Play services' device registration and many apps read them: an
      * X509Certificate (which they cast to), self-signed with the pair's key, with the spec's subject, serial number and dates (one
@@ -4418,15 +4869,138 @@ public class Main extends Activity {
         };
     }
 
+    /** Asks the service Elsewhere for one of its file lock answers (codes 4 to 8). */
+    private static String askLock(android.os.IBinder b, int code, String path, boolean shared) throws android.os.RemoteException {
+        android.os.Parcel data = android.os.Parcel.obtain(), reply = android.os.Parcel.obtain();
+        try {
+            data.writeString(path);
+            data.writeInt(shared ? 1 : 0);
+            data.setDataPosition(0);
+            b.transact(code, data, reply, 0);
+            reply.setDataPosition(0);
+            return reply.readString();
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    /**
+     * A file's lock between this process and Elsewhere's, as between two processes of Android: while one holds it the
+     * other's tryLock() answers null and its lock() waits; a lock lasts while its channel is open, its FileLock forgotten
+     * or not; two shared locks may be held together, and an exclusive one beside a shared one may not. Within one process a
+     * second lock is the program's error, OverlappingFileLockException. Here the two are class scopes of one virtual
+     * machine, where the library's one table of locks gave the error to the other process too (the Play Store's value store,
+     * Google Play services' configuration). In a thread of its own, for the waits; said in one line of the log.
+     */
+    private void fileLocksAcrossScopes(final android.os.IBinder b) {
+        new Thread(() -> {
+            StringBuilder said = new StringBuilder();
+            try {
+                File f = new File(getFilesDir(), "scopes.lock");
+                String path = f.getPath();
+                java.io.RandomAccessFile mine = new java.io.RandomAccessFile(f, "rw"), again = new java.io.RandomAccessFile(f, "rw");
+                java.nio.channels.FileLock lock = mine.getChannel().lock();
+                String same;
+                try {
+                    same = again.getChannel().tryLock() == null ? "null" : "locked";
+                } catch (java.nio.channels.OverlappingFileLockException e) {
+                    same = "overlapping";
+                }
+                said.append("same=").append(same);
+                said.append(" other=").append(askLock(b, 4, path, false));
+                // The other process waits for it, and has it once this one lets it go.
+                askLock(b, 6, path, false);
+                Thread.sleep(700);
+                said.append(" waits=").append(askLock(b, 7, null, false));
+                lock.release();
+                String then = "";
+                for (int i = 0; i < 150 && !"granted".equals(then = askLock(b, 7, null, false)); i++) Thread.sleep(100);
+                said.append(" then=").append(then);
+                said.append(" back=").append(mine.getChannel().tryLock() == null ? "null" : "locked");
+                // It forgets its FileLock and keeps the channel: still its lock. It closes the channel: nobody's.
+                askLock(b, 8, null, false);
+                System.gc();
+                said.append(" forgotten=").append(mine.getChannel().tryLock() == null ? "null" : "locked");
+                askLock(b, 5, null, false);
+                java.nio.channels.FileLock back = mine.getChannel().tryLock();
+                said.append(" closed=").append(back == null ? "null" : "locked");
+                if (back != null) back.release();
+                java.nio.channels.FileLock shared = mine.getChannel().lock(0, Long.MAX_VALUE, true);
+                said.append(" shared=").append(askLock(b, 4, path, true));
+                said.append(" exclusive=").append(askLock(b, 4, path, false));
+                askLock(b, 5, null, false);
+                shared.release();
+                again.close();
+                mine.close();
+            } catch (Throwable e) {
+                said.append(" ").append(e);
+            }
+            Log.i("DataTest", "file-locks-across-scopes " + said);
+        }, "file-locks").start();
+    }
+
     /**
      * A service in another process (android:process=":elsewhere"), as Play Store's download service is: asked through its
      * binder, it says the name of the process it runs in (its ActivityManager's, for this pid), the app's static sMarker as
      * its process has it, and the kind of loader its class came from.
      */
     public static final class Elsewhere extends android.app.Service {
+        // What this process does with the file of fileLocksAcrossScopes, asked by codes 4 to 8: 4 opens it and tries its lock
+        // (shared or not), 5 closes it, 6 starts a thread that waits for the lock, 7 says how that went, 8 forgets the
+        // FileLock and keeps the channel.
+        private static java.io.RandomAccessFile sLockFile;
+        private static java.nio.channels.FileLock sLock;
+        private static volatile String sLockWait = "idle";
+        private static void closeLockFile() throws java.io.IOException {
+            if (sLockFile != null) sLockFile.close();
+            sLockFile = null;
+            sLock = null;
+        }
+        static String fileLock(int code, final String path, boolean shared) {
+            try {
+                if (code == 4) {
+                    closeLockFile();
+                    sLockFile = new java.io.RandomAccessFile(path, "rw");
+                    sLock = sLockFile.getChannel().tryLock(0, Long.MAX_VALUE, shared);
+                    return sLock == null ? "null" : "locked";
+                }
+                if (code == 5) {
+                    closeLockFile();
+                    return "closed";
+                }
+                if (code == 6) {
+                    closeLockFile();
+                    sLockWait = "waiting";
+                    new Thread(() -> {
+                        try {
+                            java.io.RandomAccessFile file = new java.io.RandomAccessFile(path, "rw");
+                            java.nio.channels.FileLock lock = file.getChannel().lock();
+                            sLockFile = file;
+                            sLock = lock;
+                            sLockWait = "granted";
+                        } catch (Throwable e) {
+                            sLockWait = String.valueOf(e);
+                        }
+                    }, "file-lock-wait").start();
+                    return "started";
+                }
+                if (code == 7) return sLockWait;
+                sLock = null;
+                System.gc();
+                return "forgotten";
+            } catch (Throwable e) {
+                return String.valueOf(e);
+            }
+        }
         @Override public android.os.IBinder onBind(android.content.Intent intent) {
             return new android.os.Binder() {
                 @Override protected boolean onTransact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) {
+                    if (code >= 4 && code <= 8) {
+                        String path = data.readString();
+                        reply.writeString(fileLock(code, path, data.readInt() != 0));
+                        return true;
+                    }
                     if (code == 3) {
                         // a bundle holding a bundle with a Note of this process's class, in the reply
                         android.os.Bundle details = new android.os.Bundle();
@@ -6644,6 +7218,213 @@ public class Main extends Activity {
                 + " " + c3.width + "x" + c3.height + ", laid out " + first.getWidth() + "x" + first.getHeight() + " " + second.getWidth() + "x" + second.getHeight()
                 + " value " + value.getWidth() + "x" + value.getHeight() + " x " + x.getWidth() + "x" + x.getHeight();
             return rows && cells && laid;
+        });
+        // A grid whose cells leave layout_width or layout_height out inflates, and what is left out is WRAP_CONTENT
+        // (GridLayout.LayoutParams, setBaseAttributes). It ended in "You must supply a layout_height attribute" (YouTube's
+        // res/lzI.xml, a ViewStub's layout). And it is measured and laid out: each cell has a width and a height.
+        step("grid-cells", () -> {
+            final int wrap = android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
+            android.widget.GridLayout grid = (android.widget.GridLayout) android.view.LayoutInflater.from(this).inflate(R.layout.grid_cells, null);
+            android.view.View name = grid.getChildAt(0), value = grid.getChildAt(1), x = grid.getChildAt(2), y = grid.getChildAt(3);
+            android.view.ViewGroup.LayoutParams p1 = name.getLayoutParams(), p2 = value.getLayoutParams(), p3 = x.getLayoutParams(), p4 = y.getLayoutParams();
+            boolean cells = p1 instanceof android.widget.GridLayout.LayoutParams && p1.width == wrap && p1.height == wrap && p2.width == 40 && p2.height == wrap
+                && p3.width == 30 && p3.height == 12 && p4.width == wrap && p4.height == 14;
+            grid.measure(android.view.View.MeasureSpec.makeMeasureSpec(300, android.view.View.MeasureSpec.EXACTLY), android.view.View.MeasureSpec.makeMeasureSpec(0, android.view.View.MeasureSpec.UNSPECIFIED));
+            grid.layout(0, 0, grid.getMeasuredWidth(), grid.getMeasuredHeight());
+            boolean laid = grid.getWidth() == 300 && grid.getHeight() > 0 && name.getWidth() > 0 && name.getHeight() > 0 && value.getWidth() == 40
+                && value.getHeight() > 0 && x.getWidth() == 30 && x.getHeight() == 12 && y.getWidth() > 0 && y.getHeight() == 14
+                && value.getLeft() >= name.getRight() && x.getTop() >= name.getBottom() && y.getLeft() >= x.getRight() && y.getTop() >= name.getBottom();
+            detail = "cells " + p1.width + "x" + p1.height + " " + p2.width + "x" + p2.height + " " + p3.width + "x" + p3.height + " " + p4.width + "x" + p4.height
+                + ", laid out " + grid.getWidth() + "x" + grid.getHeight() + " name " + name.getWidth() + "x" + name.getHeight() + " value " + value.getWidth() + "x"
+                + value.getHeight() + " at " + value.getLeft() + " x " + x.getWidth() + "x" + x.getHeight() + " at " + x.getLeft() + "," + x.getTop()
+                + " y " + y.getWidth() + "x" + y.getHeight() + " at " + y.getLeft() + "," + y.getTop();
+            return cells && laid;
+        });
+        // A LayerDrawable has a constant state, and its copy is a drawable of its own kind with the layers' copies at their
+        // ids and insets (LayerDrawable.meglerCopy): a ripple made in code is copied so for each view it is the background of
+        // (getConstantState().newDrawable().mutate(): YouTube's watch page, which stopped on the null state). Checked: a
+        // ripple's copy is a ripple with its content's copy, and draws it; a layer list's copy has the layers' ids and
+        // insets and its own layers, and the original keeps its own; a transition's copy is a transition that cross-fades
+        // as it does; and a layer without a constant state is the copy's layer too.
+        step("layer-copy", () -> {
+            android.graphics.drawable.ColorDrawable content = new android.graphics.drawable.ColorDrawable(0xff112233);
+            android.graphics.drawable.RippleDrawable ripple = new android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(0x40ffffff), content, new android.graphics.drawable.ColorDrawable(0xffffffff));
+            android.graphics.drawable.Drawable.ConstantState rs = ripple.getConstantState();
+            android.graphics.drawable.Drawable rc = rs != null ? rs.newDrawable().mutate() : null;
+            android.graphics.drawable.Drawable rl = rc instanceof android.graphics.drawable.RippleDrawable
+                && ((android.graphics.drawable.RippleDrawable) rc).getNumberOfLayers() == 1 ? ((android.graphics.drawable.RippleDrawable) rc).getDrawable(0) : null;
+            boolean rippled = rc != ripple && rl instanceof android.graphics.drawable.ColorDrawable && rl != content
+                && ((android.graphics.drawable.ColorDrawable) rl).getColor() == 0xff112233 && ripple.getDrawable(0) == content
+                && rl.getCallback() == rc && content.getCallback() == ripple;
+            int pixel = 0;
+            boolean shown = false;
+            if (rc != null) {
+                android.view.View v = new android.view.View(this);
+                v.setBackground(rc);
+                android.graphics.Bitmap bm = android.graphics.Bitmap.createBitmap(8, 8, android.graphics.Bitmap.Config.ARGB_8888);
+                rc.setBounds(0, 0, 8, 8);
+                rc.draw(new android.graphics.Canvas(bm));
+                pixel = bm.getPixel(4, 4);
+                shown = v.getBackground() == rc && pixel == 0xff112233;
+            }
+            android.graphics.drawable.LayerDrawable layers = new android.graphics.drawable.LayerDrawable(new android.graphics.drawable.Drawable[] {
+                new android.graphics.drawable.ColorDrawable(0xff000000), new android.graphics.drawable.ColorDrawable(0xff00ff00) });
+            layers.setId(1, android.R.id.progress);
+            layers.setLayerInset(1, 10, 2, 30, 4);
+            android.graphics.drawable.Drawable.ConstantState ls = layers.getConstantState();
+            android.graphics.drawable.Drawable lc = ls != null ? ls.newDrawable(getResources()) : null;
+            boolean laid = false;
+            String at = "none";
+            if (lc != null && lc.getClass() == android.graphics.drawable.LayerDrawable.class) {
+                android.graphics.drawable.LayerDrawable l2 = (android.graphics.drawable.LayerDrawable) lc;
+                l2.setBounds(0, 0, 100, 50);
+                android.graphics.drawable.Drawable top = l2.findDrawableByLayerId(android.R.id.progress);
+                at = top != null ? top.getBounds().toShortString() : "no layer of the id";
+                laid = l2 != layers && l2.getNumberOfLayers() == 2 && top != null && top != layers.getDrawable(1)
+                    && top.getBounds().equals(new android.graphics.Rect(10, 2, 70, 46))
+                    && l2.getDrawable(0).getBounds().equals(new android.graphics.Rect(0, 0, 100, 50)) && top.getCallback() == l2
+                    && layers.getDrawable(1).getCallback() == layers && ls == layers.getConstantState();
+            }
+            android.graphics.drawable.TransitionDrawable tr = new android.graphics.drawable.TransitionDrawable(new android.graphics.drawable.Drawable[] {
+                new android.graphics.drawable.ColorDrawable(0xffff0000), new android.graphics.drawable.ColorDrawable(0xff0000ff) });
+            tr.setCrossFadeEnabled(true);
+            android.graphics.drawable.Drawable tc = tr.getConstantState() != null ? tr.getConstantState().newDrawable() : null;
+            boolean crossed = tc instanceof android.graphics.drawable.TransitionDrawable && tc != tr
+                && ((android.graphics.drawable.TransitionDrawable) tc).getNumberOfLayers() == 2 && ((android.graphics.drawable.TransitionDrawable) tc).isCrossFadeEnabled();
+            android.graphics.drawable.Drawable plain = new android.graphics.drawable.Drawable() {
+                @Override public void draw(android.graphics.Canvas c) {}
+                @Override public void setAlpha(int a) {}
+                @Override public void setColorFilter(android.graphics.ColorFilter f) {}
+                @Override public int getOpacity() { return android.graphics.PixelFormat.TRANSLUCENT; }
+            };
+            android.graphics.drawable.LayerDrawable over = new android.graphics.drawable.LayerDrawable(new android.graphics.drawable.Drawable[] { plain });
+            android.graphics.drawable.Drawable oc = over.getConstantState() != null ? over.getConstantState().newDrawable() : null;
+            boolean shared = plain.getConstantState() == null && oc instanceof android.graphics.drawable.LayerDrawable && oc != over
+                && ((android.graphics.drawable.LayerDrawable) oc).getDrawable(0) == plain;
+            detail = "rippled=" + rippled + " shown=" + shown + " (pixel " + Integer.toHexString(pixel) + ") laid=" + laid + " (the layer at " + at
+                + ") crossed=" + crossed + " shared=" + shared;
+            Log.i("DataTest", "layer-copy " + detail);
+            return rippled && shown && laid && crossed && shared;
+        });
+        // A reference that comes to @null is no value in a styled attribute array: WhatsApp tints an image of its settings
+        // with a colour that is @null by day and a colour by night (app:tint="@color/..."), and AppCompat asks hasValue and
+        // getResourceId before it reads a colour list. Android's ApplyStyle turns a reference resolved to @null back into
+        // TYPE_NULL; here the entry stayed a reference with the colour's id, so AppCompat went on to getXml of the colour --
+        // "Resource ID #0x7f060748 type #0x1 is not valid" as the settings opened. From a layout's attribute, from a style and
+        // without a theme; the value itself stays the reference to nothing it is on Android; by night it is the colour.
+        step("null-reference", () -> {
+            final int[] attrs = { android.R.attr.tint };
+            android.content.res.XmlResourceParser parser = getResources().getLayout(R.layout.null_tint);
+            int token;
+            while ((token = parser.next()) != org.xmlpull.v1.XmlPullParser.START_TAG && token != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) { }
+            android.util.AttributeSet set = android.util.Xml.asAttributeSet(parser);
+            android.content.res.TypedArray a = obtainStyledAttributes(set, attrs);
+            boolean xml = !a.hasValue(0) && a.getResourceId(0, -1) == -1 && a.getColorStateList(0) == null && a.getIndexCount() == 0;
+            a.recycle();
+            a = getResources().obtainAttributes(set, attrs);
+            boolean plain = !a.hasValue(0) && a.getResourceId(0, -1) == -1;
+            a.recycle();
+            parser.close();
+            a = obtainStyledAttributes(R.style.NullTint, attrs);
+            boolean style = !a.hasValue(0) && a.getResourceId(0, -1) == -1 && a.getColorStateList(0) == null;
+            a.recycle();
+            android.util.TypedValue v = new android.util.TypedValue();
+            getResources().getValue(R.color.null_by_day, v, true);
+            boolean value = v.type == android.util.TypedValue.TYPE_REFERENCE && v.data == 0 && v.string == null;
+            android.widget.ImageView image = (android.widget.ImageView) android.view.LayoutInflater.from(this).inflate(R.layout.null_tint, null);
+            boolean view = image.getImageTintList() == null;
+            android.content.res.Configuration night = new android.content.res.Configuration(getResources().getConfiguration());
+            night.uiMode = (night.uiMode & ~android.content.res.Configuration.UI_MODE_NIGHT_MASK) | android.content.res.Configuration.UI_MODE_NIGHT_YES;
+            android.content.Context dark = createConfigurationContext(night);
+            a = dark.obtainStyledAttributes(R.style.NullTint, attrs);
+            int tint = a.getColor(0, 0);
+            boolean byNight = a.hasValue(0) && tint == 0xFFC8C8C9;
+            a.recycle();
+            detail = "xml=" + xml + " plain=" + plain + " style=" + style + " value=" + value + " (type " + v.type + ", data " + v.data + ") view=" + view
+                + " night=" + byNight + " (" + Integer.toHexString(tint) + ")";
+            Log.i("DataTest", "null-reference " + detail);
+            return xml && plain && style && value && view && byNight;
+        });
+        // BidiFormatter wraps a text as Android's does: as it is where its direction is the context's, in an embedding with
+        // marks around it where it is not. Each unicodeWrap gave null (a generated class), and Deezer's search stopped at its
+        // first result: an R8 null check of what unicodeWrap gave for "title • artist".
+        step("bidi-wrap", () -> {
+            final String heb = "שלום", lrm = "‎", rlm = "‏";
+            android.text.BidiFormatter ltr = android.text.BidiFormatter.getInstance(java.util.Locale.US);
+            String same = ltr.unicodeWrap("Album • Artist");
+            boolean plain = "Album • Artist".equals(same) && ltr.unicodeWrap((String) null) == null && !ltr.isRtlContext()
+                && ltr.getStereoReset();
+            boolean other = (lrm + "‫" + heb + "‬" + lrm).equals(ltr.unicodeWrap(heb)) && ltr.isRtl(heb) && !ltr.isRtl("abc")
+                && (heb).equals(ltr.unicodeWrap(heb, android.text.TextDirectionHeuristics.FIRSTSTRONG_LTR, false).replace("‫", "").replace("‬", ""));
+            android.text.BidiFormatter rtl = android.text.BidiFormatter.getInstance(true);
+            boolean inRtl = rtl.isRtlContext() && (rlm + "‪" + "abc" + "‬" + rlm).equals(rtl.unicodeWrap("abc")) && heb.equals(rtl.unicodeWrap(heb))
+                && android.text.BidiFormatter.getInstance(new java.util.Locale("ar")).isRtlContext()
+                && "x".equals(new android.text.BidiFormatter.Builder(false).stereoReset(false).build().unicodeWrap("x", false));
+            // A mark after a left-to-right text that ends right to left, in a left-to-right context.
+            boolean mark = ("a " + heb + lrm).equals(ltr.unicodeWrap("a " + heb)) && ("a " + heb).equals(ltr.unicodeWrap("a " + heb, false));
+            android.text.SpannableString spanned = new android.text.SpannableString("bold");
+            Object bold = new android.text.style.StyleSpan(android.graphics.Typeface.BOLD);
+            spanned.setSpan(bold, 0, 4, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            CharSequence wrapped = ltr.unicodeWrap(spanned);
+            boolean spans = wrapped instanceof android.text.Spanned && "bold".equals(wrapped.toString())
+                && ((android.text.Spanned) wrapped).getSpanStart(bold) == 0 && ((android.text.Spanned) wrapped).getSpanEnd(bold) == 4;
+            detail = "plain=" + plain + " other=" + other + " rtl=" + inRtl + " mark=" + mark + " spans=" + spans;
+            Log.i("DataTest", "bidi-wrap " + detail);
+            return plain && other && inRtl && mark && spans;
+        });
+        // A context's setTheme puts the new style onto the theme it has already made, the same object, as Android's ContextImpl
+        // does: YouTube switches to its dark theme after its start, and what had the theme before resolved its text colour
+        // in the light one (dark titles on a dark page). Here with a context of this app's resources: the theme taken
+        // before the switch says the new style's colour, the context gives the same theme, and a style set again changes
+        // nothing.
+        step("theme-switch", () -> {
+            android.content.Context ctx = createConfigurationContext(getResources().getConfiguration());
+            android.content.res.Resources.Theme before = ctx.getTheme();
+            ctx.setTheme(R.style.ProbeTheme);
+            int first = foreground(before);
+            ctx.setTheme(R.style.SwitchedTheme);
+            int second = foreground(before);
+            boolean same = ctx.getTheme() == before;
+            ctx.setTheme(R.style.SwitchedTheme);
+            boolean again = ctx.getTheme() == before && foreground(before) == 0xFF333333;
+            detail = "first=" + Integer.toHexString(first) + " second=" + Integer.toHexString(second) + " same=" + same + " again=" + again;
+            Log.i("DataTest", "theme-switch " + detail);
+            return (first == 0xFF111111 || first == 0xFF222222) && second == 0xFF333333 && same && again;
+        });
+        // Choreographer's vsync callbacks (Android 13) are called at the next frame, on the choreographer's looper, with the
+        // frame's data; one removed before its frame is not. They were signatures alone, and YouTube's watch page, which waits
+        // for one, left the panel under its player empty and its controls hidden.
+        step("vsync-callback", () -> {
+            final android.os.HandlerThread ht = new android.os.HandlerThread("vsync");
+            ht.start();
+            final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+            final Object[] got = new Object[6];
+            new android.os.Handler(ht.getLooper()).post(() -> {
+                final android.view.Choreographer c = android.view.Choreographer.getInstance();
+                got[0] = c.getLooper() == ht.getLooper();
+                android.view.Choreographer.VsyncCallback removed = data -> got[1] = "called";
+                c.postVsyncCallback(removed);
+                c.removeVsyncCallback(removed);
+                c.postVsyncCallback(data -> {
+                    android.view.Choreographer.FrameTimeline t = data.getPreferredFrameTimeline();
+                    android.view.Choreographer.FrameTimeline[] all = data.getFrameTimelines();
+                    got[2] = data.getFrameTimeNanos() > 0 && data.getFrameTimeNanos() == c.getFrameTimeNanos();
+                    got[3] = t != null && all != null && all.length >= 1 && all[0] == t && t.getVsyncId() > 0
+                        && t.getExpectedPresentationTimeNanos() > data.getFrameTimeNanos() && t.getDeadlineNanos() > data.getFrameTimeNanos();
+                    got[4] = android.os.Looper.myLooper() == ht.getLooper();
+                    got[5] = c.getLastFrameTimeNanos() == data.getFrameTimeNanos();
+                    done.countDown();
+                });
+            });
+            boolean called = done.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            Thread.sleep(50);
+            ht.quitSafely();
+            detail = "called=" + called + " looper=" + got[0] + " removed=" + (got[1] == null ? "not called" : got[1]) + " data=" + got[2]
+                + " timeline=" + got[3] + " onLooper=" + got[4] + " last=" + got[5];
+            Log.i("DataTest", "vsync-callback " + detail);
+            return called && Boolean.TRUE.equals(got[0]) && got[1] == null && Boolean.TRUE.equals(got[2]) && Boolean.TRUE.equals(got[3])
+                && Boolean.TRUE.equals(got[4]) && Boolean.TRUE.equals(got[5]);
         });
         // PrecomputedText is the text it was made of: its characters and its spans, its paragraphs (each ends after its line
         // feed) and the parameters a Builder was told. It was signatures alone -- no characters, getSpans null -- so a

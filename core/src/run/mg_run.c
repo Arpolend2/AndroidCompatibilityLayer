@@ -481,7 +481,11 @@ static void other_apps_find(void *user)
  * registration turned on, the check-in's Android ID, the accounts it signed in.
  */
 #define SERVICES_GUEST "/data/megler-services"
-static bool service_package(const char *package) { return !strcmp(package, "com.google.android.gms") || !strcmp(package, "com.google.android.gsf"); }
+static bool service_package(const char *package)
+{
+    return !strcmp(package, "com.google.android.gms") || !strcmp(package, "com.google.android.gsf") ||
+           (g_config.gms_package && !strcmp(package, g_config.gms_package));
+}
 
 /*
  * microG's services keep theirs apart, <storage_dir>/services/data-microg: an app set to microG instead of Google's own
@@ -547,6 +551,55 @@ static bool asked_at_start(const char *storage_dir, const char *folder, const ch
 bool mg_run_clear_data_asked(const char *storage_dir, const char *package) { return asked_at_start(storage_dir, "clear-data", package); }
 bool mg_run_clear_cache_asked(const char *storage_dir, const char *package) { return asked_at_start(storage_dir, "clear-cache", package); }
 
+/*
+ * Google's own Play services keep each Google account's sign-in (its long-lived token) in their private files, while the
+ * account itself is in the services' shared accounts (megler.Accounts: <storage_dir>/services/data/accounts), which are not
+ * the package's data. With the files cleared the account stayed, and every request for a token of it was answered "sign in
+ * again" -- on Android a notification that leads to the sign-in, here nothing: the Play Store said "Authentication is
+ * required" for good, with nowhere to sign in (a Lumia 950, 0.1.0.699). So the Google accounts go with the data: a file
+ * beside the accounts' says so, and megler.Accounts takes them out when it first reads the accounts. microG keeps the
+ * sign-in in the account itself (its password): its accounts stay good, and stay.
+ */
+#define GOOGLE_SIGNED_OUT "google-signed-out"
+static void sign_google_accounts_out(const char *storage_dir)
+{
+    char *accounts = mg_sprintf("%s/services/data/accounts/accounts.json", storage_dir);
+    char *mark = mg_sprintf("%s/services/data/accounts/" GOOGLE_SIGNED_OUT, storage_dir);
+    mg_stat st;
+    if (mg_path_stat(accounts, &st, NULL)) {
+        if (mg_file_write_all(mark, "1", 1)) mg_info("run: Google Play services' data was cleared: the Google accounts are signed out with it (%s)", mark);
+        else mg_warn("run: Google Play services' data was cleared, and %s could not be written: the Google accounts stay, signed in no more", mark);
+    }
+    free(accounts);
+    free(mark);
+}
+
+/*
+ * The keys Google Play services make in Android's key store (megler.KeyStoreProvider) are kept with the services' data, in
+ * their folder of the services' shared one: one store for the services in every app's process, as their data is one. They
+ * were kept in the store of whichever app's process had made them: the services in another app found the encrypted data
+ * and not its key ("Keystore cannot load the key with ID: mobstore_encrypt", in users' logs of 681 to 699). Data begun that
+ * way still has its keys in the apps' own stores, and megler.KeyStoreProvider looks there too for as long as that data
+ * lives. This mark says the data here was begun with the shared store: it is written when the services' folder is not
+ * there -- at the first start of anything, and when Clear Data has just removed it (mg_run_clear_data_if_asked, which
+ * mg_run_files calls first) -- and, beside that folder and not in it, it stays. With it the shared store is the only one
+ * the services have, and a key left in an app's store by data that was cleared since is never taken for the new data's.
+ */
+#define KEYSTORE_SHARED ".megler-keystore-shared"
+void mg_run_services_key_store(const char *storage_dir)
+{
+    char *services = mg_sprintf("%s/services/%s", storage_dir, services_folder());
+    char *gms = mg_sprintf("%s/com.google.android.gms", services), *mark = mg_sprintf("%s/" KEYSTORE_SHARED, services);
+    mg_stat st;
+    if (!mg_path_stat(gms, &st, NULL) && !mg_path_stat(mark, &st, NULL)) {
+        if (mg_path_mkdirs(services) && mg_file_write_all(mark, "1", 1)) mg_info("run: Google Play services' data begins here: their keys are the shared key store's and no app's (%s)", mark);
+        else mg_warn("run: %s could not be written: Google Play services' key store goes on looking in the apps' own", mark);
+    }
+    free(services);
+    free(gms);
+    free(mark);
+}
+
 bool mg_run_clear_data_if_asked(const char *data_dir, const char *storage_dir, const char *package)
 {
     char *ask = mg_sprintf("%s/clear-data/%s", storage_dir, package), *internal, *own, *external;
@@ -565,6 +618,7 @@ bool mg_run_clear_data_if_asked(const char *data_dir, const char *storage_dir, c
     mg_path_remove(ask, NULL);
     if (t.failed) mg_warn("run: the app's data was cleared, as asked, but for %d file(s) or folder(s) that could not be removed (%d files removed)", t.failed, t.files);
     else mg_info("run: the app's data was cleared, as asked: %d files removed from %s and %s", t.files, internal, external);
+    if (!strcmp(package, "com.google.android.gms") && !g_services_microg) sign_google_accounts_out(storage_dir);
     free(ask);
     free(internal);
     free(own);
@@ -620,6 +674,7 @@ void mg_run_files(const char *data_dir, const char *storage_dir, const char *pac
     left_behind left;
     mg_run_clear_data_if_asked(data_dir, storage_dir, package);
     mg_run_clear_cache_if_asked(data_dir, storage_dir, package);
+    mg_run_services_key_store(storage_dir);
     internal = internal_dir(data_dir, storage_dir, package);
     mg_fs_configure(package, internal, own);
     mg_path_mkdirs(services);
@@ -698,8 +753,11 @@ bool mg_run_start(const megler_run_config *config)
     g_config.apk_path = g_apk_path;
     g_config.gms_apk_path = config->gms_apk_path ? mg_strdup(config->gms_apk_path) : NULL;
     g_config.gms_splits_dir = config->gms_apk_path && config->gms_splits_dir && config->gms_splits_dir[0] ? mg_strdup(config->gms_splits_dir) : NULL;
+    g_config.gms_package = config->gms_package && config->gms_package[0] ? mg_strdup(config->gms_package) : NULL;
     g_services_microg = (config->gms_apk_path && mg_apk_is_microg(config->gms_apk_path)) ||
-                        (!strcmp(info.package, "com.google.android.gms") && mg_apk_is_microg(config->apk_path));
+                        ((!strcmp(info.package, "com.google.android.gms") || (g_config.gms_package && !strcmp(info.package, g_config.gms_package))) &&
+                         mg_apk_is_microg(config->apk_path));
+    if (g_config.gms_package) mg_info("run: Google Play services go by %s in this app", g_config.gms_package);
     if (g_services_microg) mg_info("run: Google Play services are microG's: their data is the shared folder's services/data-microg");
     g_config.gsf_apk_path = config->gsf_apk_path ? mg_strdup(config->gsf_apk_path) : NULL;
     /* The host's fonts are the caller's until this returns (megler.h), and read by the driver on the app's thread: kept. */

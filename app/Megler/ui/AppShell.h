@@ -113,9 +113,19 @@ public:
         /// offer a permission's: a tap on one closes the dialog with the index buttons.size() + its own.
         std::vector<std::pair<std::string, std::string>> choices;
         int chosen = -1;                     // the choice marked as things stand; -1: none
+        /// What moves while the dialog is up, under its text: a bar of how far it is (`fraction`, 0 to 1; less than 0, a bar
+        /// that says only that something goes on) and a line. Asked when the dialog is shown and at every poll; false
+        /// closes the dialog, and `done` gets -2 (a download's, ui/Ota.cpp). Without `bar`, the line alone: where a thing
+        /// stands that has no measure (a file looked for).
+        struct Live {
+            std::string text;
+            double fraction = -1;
+            bool bar = true;
+        };
+        std::function<bool(Live&)> live;
     };
-    /// `done` gets the index of the button pressed (-1: dismissed, by Back or a tap beside it; buttons.size() and on: a choice)
-    /// and the field's text.
+    /// `done` gets the index of the button pressed (-1: dismissed, by Back or a tap beside it; -2: closed by its `live`;
+    /// buttons.size() and on: a choice) and the field's text.
     void dialog(DialogSpec spec, std::function<void(int button, std::string text)> done);
     /// The same, shown once no other is up (dialog drops a second): a question an app asked for that must be answered, as a
     /// permission's (player/PermissionHost.h), waits its turn.
@@ -166,6 +176,8 @@ private:
     void applyFullScreen(bool fullScreen, unsigned orientations, bool hideStatus, bool hideNavigation, bool lightStatus);
     void applyVisibleBounds();
     void poll();
+    /// The dialog's moving part (DialogSpec::live) asked and shown, the dialog closed when it says so.
+    void refreshDialogLive();
     void updateDisplayRequest();
     Stack& currentStack();
 
@@ -201,6 +213,10 @@ private:
     winrt::Windows::UI::Xaml::Controls::TextBox dialogField_{nullptr};
     winrt::Windows::UI::Xaml::Controls::PasswordBox dialogSecret_{nullptr};
     std::function<void(int, std::string)> dialogDone_;
+    std::function<bool(DialogSpec::Live&)> dialogLive_; // the dialog's moving part, with its bar and its line
+    winrt::Windows::UI::Xaml::Controls::ProgressBar dialogLiveBar_{nullptr};
+    winrt::Windows::UI::Xaml::Controls::TextBlock dialogLiveText_{nullptr};
+    std::string dialogLiveShown_;
     std::deque<std::pair<DialogSpec, std::function<void(int, std::string)>>> waitingDialogs_; // dialogWhenFree's, in turn
     winrt::Windows::UI::Xaml::DispatcherTimer timer_{nullptr};
     winrt::Windows::UI::Core::CoreDispatcher dispatcher_{nullptr};

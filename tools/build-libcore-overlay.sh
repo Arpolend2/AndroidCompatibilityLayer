@@ -11,7 +11,7 @@ JDK="${MEGLER_JDK:-/c/Program Files/Java/jdk1.8.0_202}"
 SDK="${MEGLER_ANDROID_SDK:-$USERPROFILE/Documents}"
 DEX="$OUT/megler-libcore.dex"
 if [ -f "$DEX" ] && [ -z "$(find "$SRC/javax/net/ssl" "$OVERLAY" "$0" -type f -newer "$DEX" -print -quit)" ]; then exit 0; fi
-rm -rf "$OUT/sourcepath" "$OUT/classes"
+rm -rf "$OUT/sourcepath" "$OUT/classes" "$OUT/stubs"
 mkdir -p "$OUT/src" "$OUT/classes" "$OUT/dex"
 python - "$(cygpath -m "$SRC")" "$(cygpath -m "$OVERLAY")" "$(cygpath -m "$OUT")" <<'PY'
 from pathlib import Path
@@ -50,8 +50,23 @@ for uses in sorted(overlay.rglob('*.java.uses')):
 for source in sorted(overlay.rglob('*.java')):
     files.append('"' + source.as_posix() + '"')
 (out / 'sources.arg').write_text('\n'.join(files), encoding='utf-8')
+# What a class's source uses of the platform's classes outside its package that the SDK's android.jar does not have
+# (FileDispatcherImpl: dalvik.system.BlockGuard) is named in <Class>.java.stubs, a path under AOSP's libcore on each line.
+# Those sources are compiled apart and are on javac's class path only: the classes stay the boot image's own, and none of
+# them goes into the overlay.
+stubs = []
+for names in sorted(overlay.rglob('*.java.stubs')):
+    for name in names.read_text(encoding='utf-8').split():
+        stubs.append('"' + (src.parents[3] / name).as_posix() + '"')
+(out / 'stubs.arg').write_text('\n'.join(stubs), encoding='utf-8')
 PY
-"$JDK/bin/javac" -source 8 -target 8 -encoding UTF-8 -cp "$(cygpath -m "$SDK/platforms/android-29/android.jar")" -sourcepath "$(cygpath -m "$OUT/sourcepath")" -implicit:class -d "$(cygpath -m "$OUT/classes")" "@$(cygpath -m "$OUT/sources.arg")"
+CP="$(cygpath -m "$SDK/platforms/android-29/android.jar")"
+if [ -s "$OUT/stubs.arg" ]; then
+  mkdir -p "$OUT/stubs"
+  "$JDK/bin/javac" -source 8 -target 8 -encoding UTF-8 -nowarn -cp "$CP" -d "$(cygpath -m "$OUT/stubs")" "@$(cygpath -m "$OUT/stubs.arg")"
+  CP="$CP;$(cygpath -m "$OUT/stubs")"
+fi
+"$JDK/bin/javac" -source 8 -target 8 -encoding UTF-8 -cp "$CP" -sourcepath "$(cygpath -m "$OUT/sourcepath")" -implicit:class -d "$(cygpath -m "$OUT/classes")" "@$(cygpath -m "$OUT/sources.arg")"
 (cd "$OUT/classes" && "$JDK/bin/jar" cf ../classes.jar .)
 "$JDK/bin/java" -cp "$(cygpath -m "$SDK/build-tools/29.0.3/lib/d8.jar")" com.android.tools.r8.D8 --release --min-api 26 --lib "$(cygpath -m "$SDK/platforms/android-29/android.jar")" --output "$(cygpath -m "$OUT/dex")" "$(cygpath -m "$OUT/classes.jar")"
 mv "$OUT/dex/classes.dex" "$DEX"

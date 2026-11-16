@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Main's step "null-reference": a colour that is @null by day and a colour by night (values-night), as the one
+     WhatsApp tints an image of its settings with, and a style that names it. -->
+<resources>
+    <color name="null_by_day">@null</color>
+    <style name="NullTint">
+        <item name="android:tint">@color/null_by_day</item>
+    </style>
+</resources>

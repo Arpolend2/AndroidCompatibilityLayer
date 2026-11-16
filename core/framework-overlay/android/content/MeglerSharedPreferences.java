@@ -44,7 +44,7 @@ public final class MeglerSharedPreferences implements SharedPreferences {
     private static boolean sharedFile(File f) {
         String path = f.getAbsolutePath();
         if (path.startsWith("/data/megler-services/")) return true;
-        String gms = "com.google.android.gms";
+        String gms = megler.GooglePackages.GMS;
         return (path.startsWith("/data/data/" + gms + "/") || path.startsWith("/data/user/0/" + gms + "/")) && gms.equals(megler.Native.packageName());
     }
     private void see() { seenTime = file.lastModified(); seenLength = file.length(); }

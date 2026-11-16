@@ -1434,6 +1434,13 @@ static void microg_seen(const mg_zip_entry *e, void *user)
     *(bool *)user = true;
 }
 
+bool mg_apk_gms_name(const char *package)
+{
+    static const char tail[] = ".android.gms";
+    size_t n = package ? strlen(package) : 0, t = sizeof(tail) - 1;
+    return n > t && !strcmp(package + n - t, tail);
+}
+
 /* Whether the APK is microG's Google Play services: it has files under org/microg/ (its address formats, among others). */
 bool mg_apk_is_microg(const char *path)
 {
@@ -1612,7 +1619,8 @@ static char *report(const char *apk_path, char *const *splits, int nsplits, cons
     mg_jkey(&j, "supported", false);
     mg_jraw(&j, info->supported ? "true" : "false");
     /* Google Play services that are microG's: the shell keeps them apart from Google's own, each app taking the one it is set to. */
-    if (!strcmp(info->package, "com.google.android.gms") && mg_apk_is_microg(apk_path)) {
+    /* (And a microG of another name, ReVanced's MicroG RE, app.revanced.android.gms: the shell hosts it for the apps that ask for it.) */
+    if (mg_apk_gms_name(info->package) && mg_apk_is_microg(apk_path)) {
         mg_jkey(&j, "microg", false);
         mg_jraw(&j, "true");
     }

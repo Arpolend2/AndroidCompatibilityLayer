@@ -1,0 +1,185 @@
+// Overlay of core/framework/src/android/view/Choreographer.java (tools/build-framework.sh).
+// It differs in postVsyncCallback and removeVsyncCallback, which were signatures alone, the frame data they give,
+// getLooper and the frame times (getLastFrameTimeNanos and the like), which were nulls and zeros.
+// Everything else is the original's.
+package android.view;
+
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
+import java.util.ArrayList;
+
+/** Frames at 60 Hz on the main looper: input is already in, then animations, then the window's traversal (ViewRoot). */
+public final class Choreographer {
+    public interface FrameCallback { void doFrame(long frameTimeNanos); }
+    public static final int CALLBACK_INPUT = 0, CALLBACK_ANIMATION = 1, CALLBACK_INSETS_ANIMATION = 2, CALLBACK_TRAVERSAL = 3, CALLBACK_COMMIT = 4;
+    private static final long FRAME_NS = 16_666_667L;
+    private static final ThreadLocal<Choreographer> sThread = new ThreadLocal<>();
+    private static Choreographer sMain;
+    private final Handler mHandler;
+    @SuppressWarnings("unchecked")
+    private final ArrayList<Object[]>[] mQueues = new ArrayList[5];   /* {callback (Runnable or FrameCallback), token, dueNanos} */
+    private final ArrayList<Object[]> mReady = new ArrayList<>();
+    private boolean mScheduled, mInFrame;
+    private long mLastFrame;
+    private final Runnable mDoFrame = this::doFrame;
+
+    private Choreographer(Looper l) { mHandler = new Handler(l); for (int i = 0; i < 5; i++) mQueues[i] = new ArrayList<>(); }
+    public static Choreographer getInstance() {
+        Choreographer c = sThread.get();
+        if (c == null) {
+            Looper l = Looper.myLooper() != null ? Looper.myLooper() : Looper.getMainLooper();
+            if (l == Looper.getMainLooper() && sMain != null) c = sMain;
+            else { c = new Choreographer(l); if (l == Looper.getMainLooper()) sMain = c; }
+            sThread.set(c);
+        }
+        return c;
+    }
+    public static Choreographer getMainThreadInstance() { if (sMain == null) sMain = new Choreographer(Looper.getMainLooper()); return sMain; }
+    public static long getFrameDelay() { return 16; }
+    public static void setFrameDelay(long d) {}
+    public long getFrameTime() { return mLastFrame / 1_000_000L; }
+    public long getFrameTimeNanos() { return mLastFrame; }
+    public long getFrameIntervalNanos() { return FRAME_NS; }
+
+    private synchronized void add(int type, Object cb, Object token, long delayMs) {
+        mQueues[type].add(new Object[] { cb, token, System.nanoTime() + delayMs * 1_000_000L });
+        schedule();
+    }
+    private void schedule() {
+        if (mScheduled || mInFrame) return;
+        mScheduled = true;
+        long now = System.nanoTime(), next = Math.max(now, mLastFrame + FRAME_NS);
+        mHandler.postDelayed(mDoFrame, Math.max(0, (next - now) / 1_000_000L));
+    }
+    /* Android's own, which apps reach by reflection (TikTok Lite posts a commit callback through it). */
+    private void postCallbackDelayedInternal(int type, Object action, Object token, long delayMs) { add(type, action, token, delayMs); }
+    public void postCallback(int type, Runnable r, Object token) { add(type, r, token, 0); }
+    public void postCallbackDelayed(int type, Runnable r, Object token, long delayMs) { add(type, r, token, delayMs); }
+    public void removeCallbacks(int type, Runnable r, Object token) { remove(type, r, token); }
+    public void postFrameCallback(FrameCallback cb) { add(CALLBACK_ANIMATION, cb, null, 0); }
+    public void postFrameCallbackDelayed(FrameCallback cb, long delayMs) { add(CALLBACK_ANIMATION, cb, null, delayMs); }
+    public void removeFrameCallback(FrameCallback cb) { remove(CALLBACK_ANIMATION, cb, null); }
+    private synchronized void remove(int type, Object cb, Object token) {
+        ArrayList<Object[]> q = mQueues[type];
+        for (int i = q.size() - 1; i >= 0; i--) { Object[] e = q.get(i); if ((cb == null || e[0] == cb) && (token == null || e[1] == token)) q.remove(i); }
+    }
+
+    private void doFrame() {
+        long now = System.nanoTime();
+        synchronized (this) {
+            mScheduled = false;
+            mInFrame = true;
+            mLastFrame = now;
+        }
+        try {
+            for (int type = 0; type < mQueues.length; type++) {
+                synchronized (this) {
+                    ArrayList<Object[]> queue = mQueues[type];
+                    int keep = 0;
+                    int count = queue.size();
+                    long due = System.nanoTime();
+                    for (int i = 0; i < count; i++) {
+                        Object[] entry = queue.get(i);
+                        if ((Long) entry[2] <= due) mReady.add(entry);
+                        else queue.set(keep++, entry);
+                    }
+                    while (queue.size() > keep) queue.remove(queue.size() - 1);
+                }
+                for (int i = 0; i < mReady.size(); i++) {
+                    Object callback = mReady.get(i)[0];
+                    if (callback instanceof FrameCallback) ((FrameCallback) callback).doFrame(now);
+                    else if (callback instanceof VsyncCallback) ((VsyncCallback) callback).onVsync(frameData(now));
+                    else ((Runnable) callback).run();
+                }
+                mReady.clear();
+            }
+        } finally {
+            mReady.clear();
+            synchronized (this) {
+                mInFrame = false;
+                for (ArrayList<Object[]> queue : mQueues) {
+                    if (!queue.isEmpty()) {
+                        schedule();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // ---- generated by tools/compat/fillmembers.py: the platform's members this class does not write (signatures only)
+    public static android.view.Choreographer getSfInstance() { return null; }
+    public static void releaseInstance() {}
+    public static long subtractFrameDelay(long p0) { return 0L; }
+    /* The frame's times as Android's has them: the frame shown one interval after it began, its deadline then too. */
+    public long getExpectedPresentationTimeMillis() { return (mLastFrame + FRAME_NS) / 1_000_000L; }
+    public long getFrameDeadline() { return mLastFrame + FRAME_NS; }
+    public long getLastFrameTimeNanos() { return mLastFrame; }
+    public long getLatestExpectedPresentTimeNanos() { return mLastFrame + FRAME_NS; }
+    public android.os.Looper getLooper() { return mHandler.getLooper(); }
+    public void onWaitForBufferRelease(long p0) {}
+    /*
+     * A vsync callback (Android 13) is called at the next frame, as a frame callback is, with the frame's data: its time and
+     * one timeline, the frame shown an interval later. Both were signatures alone, and what waited for one waited for ever:
+     * YouTube's watch page left the panel under its player empty and showed no controls when the video was tapped (0.1.0.704).
+     */
+    public void postVsyncCallback(android.view.Choreographer.VsyncCallback cb) {
+        if (cb == null) throw new IllegalArgumentException("callback must not be null");
+        add(CALLBACK_ANIMATION, cb, null, 0);
+    }
+    public void removeVsyncCallback(android.view.Choreographer.VsyncCallback cb) {
+        if (cb == null) throw new IllegalArgumentException("callback must not be null");
+        remove(CALLBACK_ANIMATION, cb, null);
+    }
+    /** For megler.ViewRoot's frame watch: what this choreographer waits for, said in a line. */
+    public synchronized String meglerState() {
+        long now = System.nanoTime();
+        StringBuilder b = new StringBuilder();
+        b.append("frame scheduled ").append(mScheduled).append(", in a frame ").append(mInFrame)
+         .append(", its frame's message queued ").append(mHandler.hasCallbacks(mDoFrame))
+         .append(", the last frame ").append(mLastFrame == 0 ? "never" : (now - mLastFrame) / 1_000_000L + " ms ago");
+        final String[] names = { "input", "animation", "insets animation", "traversal", "commit" };
+        for (int t = 0; t < mQueues.length; t++) {
+            ArrayList<Object[]> q = mQueues[t];
+            if (q.isEmpty()) continue;
+            b.append("; ").append(names[t]).append(' ').append(q.size()).append(':');
+            for (int i = 0; i < Math.min(3, q.size()); i++) {
+                Object[] e = q.get(i);
+                b.append(' ').append(e[0] == null ? "null" : e[0].getClass().getName()).append(" due in ").append(((Long) e[2] - now) / 1_000_000L).append(" ms");
+            }
+        }
+        return b.toString();
+    }
+    private long mVsyncId;
+    private FrameData frameData(long frameTimeNanos) {
+        FrameTimeline t = new FrameTimeline();
+        t.meglerProps.put("VsyncId", ++mVsyncId);
+        t.meglerProps.put("ExpectedPresentationTimeNanos", frameTimeNanos + FRAME_NS);
+        t.meglerProps.put("DeadlineNanos", frameTimeNanos + FRAME_NS);
+        FrameData d = new FrameData();
+        d.meglerProps.put("FrameTimeNanos", frameTimeNanos);
+        d.meglerProps.put("FrameTimelines", new FrameTimeline[] { t });
+        d.meglerProps.put("PreferredFrameTimeline", t);
+        return d;
+    }
+    // ---- end of generated members
+    // ---- generated by tools/compat/genstubs.py: the platform's nested classes this class does not write
+    public static class FrameData {
+        private final java.util.HashMap<String, Object> meglerProps = new java.util.HashMap<>();
+        public long getFrameTimeNanos() { return (meglerProps.get("FrameTimeNanos") instanceof Long ? (Long) meglerProps.get("FrameTimeNanos") : 0L); }
+        public android.view.Choreographer.FrameTimeline[] getFrameTimelines() { return (android.view.Choreographer.FrameTimeline[]) meglerProps.get("FrameTimelines"); }
+        public android.view.Choreographer.FrameTimeline getPreferredFrameTimeline() { return (android.view.Choreographer.FrameTimeline) meglerProps.get("PreferredFrameTimeline"); }
+        protected FrameData() {}
+    }
+    public static class FrameTimeline {
+        private final java.util.HashMap<String, Object> meglerProps = new java.util.HashMap<>();
+        public long getDeadlineNanos() { return (meglerProps.get("DeadlineNanos") instanceof Long ? (Long) meglerProps.get("DeadlineNanos") : 0L); }
+        public long getExpectedPresentationTimeNanos() { return (meglerProps.get("ExpectedPresentationTimeNanos") instanceof Long ? (Long) meglerProps.get("ExpectedPresentationTimeNanos") : 0L); }
+        public long getVsyncId() { return (meglerProps.get("VsyncId") instanceof Long ? (Long) meglerProps.get("VsyncId") : 0L); }
+        protected FrameTimeline() {}
+    }
+    public interface VsyncCallback {
+        void onVsync(android.view.Choreographer.FrameData p0);
+    }
+    // ---- end of generated nested classes
+}

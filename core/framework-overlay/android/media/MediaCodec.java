@@ -340,6 +340,13 @@ public final class MediaCodec {
             if (drawSurfaceTexture(o, s.meglerTexture)) rendered(o);
             return;
         }
+        // A SurfaceView's surface: a picture decoded on the graphics processor stays there, as a TextureView's does, the view
+        // drawing it from the shell's copy (or the shell laying it under the views); nothing read back and drawn again.
+        if (s.meglerView instanceof android.view.SurfaceView) {
+            android.view.SurfaceView sv = (android.view.SurfaceView) s.meglerView;
+            int id = sv.meglerGpuId(), shown = id != 0 ? megler.MediaCodecNative.showFrame(o.frame, id) : 0;
+            if (shown != 0) { sv.meglerGpuFrame(mOutW, mOutH, mScaling, shown == 2); rendered(o); return; }
+        }
         if (mFrame == null || mFrame.getWidth() != mOutW || mFrame.getHeight() != mOutH) mFrame = Bitmap.createBitmap(mOutW, mOutH, Bitmap.Config.ARGB_8888);
         if (!megler.MediaCodecNative.renderFrame(o.frame, mFrame)) return;
         Canvas c;

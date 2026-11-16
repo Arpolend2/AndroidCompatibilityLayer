@@ -1035,6 +1035,10 @@ public class Resources {
                         else { v.setTo(r); v.resourceId = r.resourceId != 0 ? r.resourceId : ref; }
                     } else v.resourceId = ref;
                 }
+                // A reference that came to @null -- a colour that is @null by day, as the one WhatsApp tints an image of its
+                // settings with -- is no value: Android's ApplyStyle turns it back to TYPE_NULL once resolved, so hasValue says
+                // no and no resource id is told. Left a reference with the colour's id, it sent AppCompat to getXml of the colour.
+                if (v.type == TypedValue.TYPE_REFERENCE && v.data == 0) continue;
                 a.set(k, v);
             }
             if (xp != null) a.mXml = xp;

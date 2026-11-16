@@ -137,6 +137,9 @@
     public static native void mediaSessionMetadata(String title, String artist, String album, int[] art, int artWidth, int artHeight);
     /** A switch for trying something on the phone (core: mg_flag): on when a file of that name is in the data folder's flags. */
     public static native boolean flag(String name);
+    /** The native property store, shared with bionic's __system_property_* entry points. */
+    public static native String systemProperty(String name);
+    public static native void setSystemProperty(String name, String value);
     /** Asks the core to clear this app's data when it next starts (megler.h, megler_ask_clear_data): Android's Clear storage. */
     public static native boolean askClearData();
     /** Asks the core to clear this app's cache when it next starts (megler.h, megler_ask_clear_cache): Android's Clear cache. */
@@ -161,3 +164,6 @@
      * whole picture, 1 cut square). The caller waits (core/src/drivers/mg_java.c); the shell answers on a thread of its own.
      */
     public static native byte[] storageThumbnail(String path, int size, int mode);
+    /** The name the Google Play services this app hosts go by (megler_run_config.gms_package): com.google.android.gms, or a
+     *  microG of another name, ReVanced's MicroG RE's app.revanced.android.gms (megler.GooglePackages.GMS). */
+    public static native String gmsPackage();

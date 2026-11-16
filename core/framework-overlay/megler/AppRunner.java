@@ -150,6 +150,7 @@ public final class AppRunner {
         Native.mainStarted();
         android.webkit.MimeTypeMap.meglerInstallDefault();
         KeyStoreProvider.install();
+        IntegrityProfile.install();
         Looper.prepareMainLooper();
         sHandler = new Handler(Looper.getMainLooper());
         /* as RuntimeInit: every exception nothing caught is logged before any handler has it (its LoggingHandler, the pre-handler
@@ -163,6 +164,8 @@ public final class AppRunner {
         Manifest.read();
         Screen.started();
         installClassLoader();
+        // (the flag cronet-netlog: Cronet's own network log of an app that carries Cronet, hooked before any of its code runs)
+        CronetNetLog.install(classLoader());
         installComponentFactory();
         ContextImpl base = ContextImpl.app();
         // As Android's handleBindApplication, before the app's code can make anything of TLS: its network security configuration.

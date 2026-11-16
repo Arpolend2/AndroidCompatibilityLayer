@@ -314,6 +314,10 @@ N(bridge_hook0)
         refuse(m, h ? "it is hooked already" : "too many methods are hooked");
         return;
     }
+    if (strncmp(cb->cls->name, "megler/", 7) == 0) {
+        mg_info("dvm: Megler hooked %s.%s%s for a diagnosis (%s)", m->cls->name, m->name, m->sig, cb->cls->name);
+        return;
+    }
     n = mg_atomic_add(&g_said, 1);
     if (n == 1)
         mg_info("dvm: the app hooks methods through Xposed's XposedBridge: the runtime hooks them itself (mg_dvm_hook.c), each call going to the app's "
@@ -420,6 +424,8 @@ static const mg_jhle k_bridge[] = {
     { XB, "invokeConstructor0", "(Ljava/lang/Object;Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)Z", bridge_invokeConstructor0 },
     { XB, "disableProfileSaver", "()Z", bridge_true },
     { XB, "disableHiddenApiRestrictions", "()Z", bridge_true },
+    /* The same hook for Megler's own diagnoses of an app's code (megler.Hooks: the flag cronet-netlog, megler.CronetNetLog). */
+    { "megler/Hooks", "hook0", "(Ljava/lang/Object;Ljava/lang/reflect/Member;Ljava/lang/reflect/Method;)Ljava/lang/reflect/Method;", bridge_hook0 },
     { NULL, NULL, NULL, NULL },
 };
 

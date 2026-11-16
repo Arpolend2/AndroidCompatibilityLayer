@@ -2,7 +2,8 @@
 // It differs in two more services it answers: Play Integrity's, the classic one (BIND_INTEGRITY_SERVICE,
 // IIntegrityService.requestIntegrityToken) and the standard one (BIND_EXPRESS_INTEGRITY_SERVICE, IExpressIntegrityService:
 // warm up, request), each answering every request with the error API_NOT_AVAILABLE (-1), as Play does on a phone where the
-// Integrity API is not available. The rest is the original's, unchanged.
+// Integrity API is not available. An opt-in play-integrity-break switch instead sends PIB 64's
+// synthetic blocked response: TOO_MANY_REQUESTS (-8), remediable. The rest is unchanged.
 //
 // Why. An integrity token is a verdict Google's servers sign about a certified Android phone, attested by its hardware; there
 // is none to give here, and none is made up. Without these the bind failed ("Failed to bind to the service"), which the
@@ -66,16 +67,25 @@ final class PlayStore {
     /** Play Integrity's error for an API that is not available (IntegrityErrorCode / StandardIntegrityErrorCode.API_NOT_AVAILABLE). */
     private static final int API_NOT_AVAILABLE = -1;
 
-    /** A request's arguments read (its Bundle, then the callback), and the callback told API_NOT_AVAILABLE by `answer`. */
+    /** PIB 64's default blocked response, enabled only in the app whose process owns this flag/profile. */
+    private static boolean breakIntegrity() {
+        return Native.flag("play-integrity-break")
+                || new java.io.File(Native.dataDir(), "play-integrity-break").isFile();
+    }
+
+    /** Read the request and answer its callback; the optional PIB mode supplies an error, never a token. */
     private static boolean refuse(Parcel data, String service, String callbackDescriptor, int answer, boolean standard, String what) throws RemoteException {
         data.enforceInterface(service);
         if (data.readInt() != 0) Bundle.CREATOR.createFromParcel(data);
         IBinder callback = data.readStrongBinder();
         if (callback == null) return true;
-        android.util.Log.i("Megler", "Play Integrity asked (" + what + "): answering API_NOT_AVAILABLE, there being no Integrity API here");
+        boolean blocked = breakIntegrity();
+        int error = blocked ? -8 : API_NOT_AVAILABLE;
+        android.util.Log.i("Megler", "Play Integrity asked (" + what + "): answering "
+                + (blocked ? "PIB synthetic error -8, remediable" : "API_NOT_AVAILABLE"));
         Bundle b = new Bundle();
-        b.putInt("error", API_NOT_AVAILABLE);
-        if (standard) b.putBoolean("is.error.remediable", false);
+        b.putInt("error", error);
+        if (standard || blocked) b.putBoolean("is.error.remediable", blocked);
         Parcel p = Parcel.obtain();
         p.writeInterfaceToken(callbackDescriptor);
         p.writeInt(1);

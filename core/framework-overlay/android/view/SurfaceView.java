@@ -30,6 +30,12 @@
 // interface no one saw (package 681). And hidden (setVisibility other than VISIBLE), the surface is destroyed and made
 // again when shown, as Android's is.
 // Everything else is the original's, unchanged.
+// And MediaCodec's pictures decoded on the graphics processor (meglerGpuId, meglerGpuFrame): the surface has an id the shell
+// keeps them under, as a TextureView's texture has, and onDraw draws the newest from there (Canvas.meglerDrawTexture),
+// scaled to the view or cropped to it as the codec's scaling mode says, where the shell lays it under the views as it
+// does a TextureView's. The codec drew each picture read back into a bitmap into this surface's canvas, and the window
+// drew that canvas's bitmap, read back and sent up again: three 1920x1080 copies through the memory a picture, and
+// YouTube's 1080p video, a SurfaceView's, was shown at four pictures a second (0.1.0.707, HP Elite x3).
 package android.view;
 
 import android.content.Context;
@@ -52,6 +58,11 @@ public class SurfaceView extends View {
     private int mFixedW, mFixedH, mFormat = PixelFormat.OPAQUE, mSurfaceW, mSurfaceH;
     /** Android's sublayer of the surface: -2 under the window (APPLICATION_MEDIA_SUBLAYER), -1 a media overlay, 1 on top. */
     private int mSubLayer = -2;
+    /* MediaCodec's pictures on the graphics processor (meglerGpuFrame): the id the shell keeps them under, when the newest came
+       (0: the newest frame is a bitmap, or none), its size, and the codec's scaling mode. */
+    private int mGpuId;
+    private volatile long mGpuAt;
+    private volatile int mGpuW, mGpuH, mGpuScaling;
     private final Paint mClear = new Paint(), mBlit = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final SurfaceHolder mHolder = new SurfaceHolder() {
         public void addCallback(Callback c) { synchronized (mCallbacks) { if (!mCallbacks.contains(c)) mCallbacks.add(c); } }
@@ -143,6 +154,10 @@ public class SurfaceView extends View {
         // Told whether or not EGL drew on it: the windows native code has of the surface go with it (core/src/drivers/mg_java_ndk.c).
         mGL = false;
         megler.EGLNative.forget(this);
+        // The shell's copy of MediaCodec's pictures for the surface let go (a 1080p picture is some 8 MB there).
+        int gpu;
+        synchronized (mLock) { gpu = mGpuId; mGpuId = 0; mGpuAt = 0; }
+        if (gpu != 0) megler.Gfx.textureGone(gpu);
         synchronized (mLock) { mCreated = false; mHasFrame = false; mLock.notifyAll(); }
     }
     /** Software drawing: a canvas on the back buffer (kept from the last frame, as Android's is). */
@@ -176,6 +191,7 @@ public class SurfaceView extends View {
             if (f != null && f.getWidth() == mFront.getWidth() && f.getHeight() == mFront.getHeight()) { mBackCanvas.meglerRelease(); mBack = f; mBackCanvas = new Canvas(mBack); mBackCanvas.drawBitmap(mFront, 0, 0, null); }
             else { mBack = null; if (mBackCanvas != null) mBackCanvas.meglerRelease(); mBackCanvas = null; }
             mHasFrame = true;
+            mGpuAt = 0;
             mLocked = false;
             mLock.notifyAll();
         }
@@ -194,10 +210,34 @@ public class SurfaceView extends View {
             mBack = null;
             mBackCanvas = null;
             mHasFrame = true;
+            mGpuAt = 0;
             mDrawn = false;
         }
         postInvalidate();
         return true;
+    }
+    /**
+     * The id the shell keeps MediaCodec's pictures for this surface under, decoded on the graphics processor (as a TextureView's
+     * texture's, SurfaceTexture.meglerGpuId); 0 while there is no surface, or EGL draws on it.
+     */
+    public int meglerGpuId() {
+        synchronized (mLock) {
+            if (!mCreated || mGL) return 0;
+            if (mGpuId == 0) mGpuId = android.graphics.SurfaceTexture.meglerNewGpuId();
+            return mGpuId;
+        }
+    }
+    /**
+     * A picture of the id, w x h, is the shell's now: the surface's newest frame, drawn scaled to the view (cropped to it with
+     * VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING). `shown`: the shell has composed the window with it already, the video
+     * lying under the views, and the view is not drawn again for it.
+     */
+    public void meglerGpuFrame(int w, int h, int scaling, boolean shown) {
+        mGpuW = w;
+        mGpuH = h;
+        mGpuScaling = scaling;
+        mGpuAt = System.nanoTime();
+        if (!shown) postInvalidate();
     }
     /** Whether the window has drawn the last frame posted as a bitmap (true when none waits). */
     public boolean meglerFrameDrawn() { synchronized (mLock) { return mDrawn || !mCreated; } }
@@ -205,6 +245,21 @@ public class SurfaceView extends View {
         super.draw(c);
     }
     @Override protected void onDraw(Canvas c) {
+        int gpu = mGpuId;
+        if (gpu != 0 && mGpuAt != 0 && !mGL) {
+            int w = getWidth(), h = getHeight(), vw = mGpuW, vh = mGpuH;
+            if (mGpuScaling == android.media.MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING && vw > 0 && vh > 0) {
+                float sc = Math.max((float) w / vw, (float) h / vh), sw = vw * sc, sh = vh * sc;
+                int save = c.save();
+                c.clipRect(0, 0, w, h);
+                c.meglerDrawTexture(gpu, (w - sw) / 2, (h - sh) / 2, (w + sw) / 2, (h + sh) / 2, 255);
+                c.restoreToCount(save);
+            } else {
+                c.meglerDrawTexture(gpu, 0, 0, w, h, 255);
+            }
+            synchronized (mLock) { mDrawn = true; }
+            return;
+        }
         synchronized (mLock) {
             if (mHasFrame && mFront != null && !mGL) {
                 if (mFront.getWidth() == getWidth() && mFront.getHeight() == getHeight()) c.drawBitmap(mFront, 0, 0, mBlit);

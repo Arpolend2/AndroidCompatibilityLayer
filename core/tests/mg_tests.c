@@ -5747,6 +5747,17 @@ static void test_guest_kinds(const char *libdir)
     /* dlsym(RTLD_DEFAULT), which is the app's: its own libraries, never the runtime's. */
     CHECK(mg_ld_sym(NULL, "t_same_app_only") != NULL && mg_ld_sym(NULL, "t_same_runtime_only") == NULL && mg_ld_sym(NULL, "t_ruser_which") == NULL);
     CHECK(mg_ld_lib_of(mg_ld_sym(NULL, "t_same_which")) == same);
+    /* dlsym's own handles -- 32-bit bionic's RTLD_DEFAULT and RTLD_NEXT, 64-bit bionic's (0 and -1) -- are the app's
+       libraries, never a library: -1 was read as one at 0x127 (the Play Store's sign-in on an x64 PC, 0.1.0.699). */
+    {
+        void *(*sym)(void *, const char *) = (void *(*)(void *, const char *))mg_bionic_find("dlsym");
+        void *want = mg_ld_sym(NULL, "t_same_app_only");
+        CHECK(sym != NULL && want != NULL);
+        if (sym) {
+            CHECK(sym(NULL, "t_same_app_only") == want && sym((void *)~(mg_addr)0, "t_same_app_only") == want);
+            CHECK(sym((void *)(mg_addr)0xFFFFFFFFu, "t_same_app_only") == want && sym((void *)(mg_addr)0xFFFFFFFEu, "t_same_app_only") == want);
+        }
+    }
     /* And by kind: where the runtime looks for its classes' native methods, and the app for its own. */
     CHECK(mg_ld_sym_among(true, "t_same_which", &in) != NULL && in == rsame);
     CHECK(mg_ld_sym_among(false, "t_same_which", &in) != NULL && in == same);

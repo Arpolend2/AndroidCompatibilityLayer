@@ -7,6 +7,7 @@
 #include "library/Library.h"
 #include "shell/AppPackage.h"
 #include "shell/BundledApks.h"
+#include "shell/OwnUpdate.h"
 #include "shell/Strings.h"
 #include "ui/AppShell.h"
 #include "ui/Components.h"
@@ -104,7 +105,9 @@ public:
         setVisible(updateCard_, false);
         add(column_, updateCard_);
 
-        // A newer Megler downloaded from GitHub (ui/Ota.h), while it comes.
+        // A newer Megler downloaded from GitHub (ui/Ota.h), while it comes: how far, how fast, how long yet. Tapped, its
+        // dialog again (which Hide closed), with its Stop. And one fetched with the browser, while its file is waited for in
+        // Pictures\Megler: where the file stands, and tapped, how to get it.
         otaTitle_ = text("", font::titleMedium, weightMedium(), p.onSurface);
         otaBar_ = ProgressBar();
         otaBar_.Minimum(0);
@@ -118,9 +121,10 @@ public:
         add(otaColumn, otaBar_);
         add(otaColumn, otaDetail_);
         otaCard_ = card(otaColumn, 12, 16);
-        otaCard_.Margin(ThicknessHelper::FromLengths(0, 8, 0, 8));
-        setVisible(otaCard_, false);
-        add(column_, otaCard_);
+        otaButton_ = button(otaCard_, [this] { ota::showProgress(shell_); }, ButtonKind::rounded, "Megler's download");
+        otaButton_.Margin(ThicknessHelper::FromLengths(0, 8, 0, 8));
+        setVisible(otaButton_, false);
+        add(column_, otaButton_);
 
         // The copy of a picked APK, while it runs.
         importTitle_ = text("", font::titleMedium, weightMedium(), p.onSurface);
@@ -232,14 +236,27 @@ public:
                                                    "rule within a minute: leave the phone on, then open Megler again."));
             updateText_.Foreground(brush(updating.empty() ? palette().error : palette().onSurface));
         }
-        std::string otaVersion;
-        uint64_t otaGot = 0, otaTotal = 0;
-        const bool otaComing = ota::downloading(otaVersion, otaGot, otaTotal);
-        setVisible(otaCard_, otaComing);
-        if (otaComing) {
-            otaTitle_.Text(hs("Downloading Megler " + otaVersion));
-            otaBar_.Value(otaTotal ? double(otaGot) / double(otaTotal) : 0);
-            otaDetail_.Text(hs(formattedByteCount(otaGot) + " of " + formattedByteCount(otaTotal) + " from GitHub; then it is checked and installed"));
+        // (Installed, it is the card above: appPackage::selfUpdateVersion.)
+        const ota::Progress coming = ota::progress();
+        const bool otaComing = coming.kind == ota::Progress::Kind::downloading, otaAwaited = coming.kind == ota::Progress::Kind::waiting;
+        setVisible(otaButton_, otaComing || otaAwaited);
+        if (otaComing || otaAwaited) {
+            const std::string title = otaComing ? "Downloading Megler " + coming.version : "Megler " + coming.version + " with the browser";
+            if (title != otaTitleShown_) {
+                otaTitleShown_ = title;
+                otaTitle_.Text(hs(title));
+                setVisible(otaBar_, otaComing);
+            }
+            if (otaComing) otaBar_.Value(coming.total ? double(coming.got) / double(coming.total) : 0);
+            // (Why a file that came was not installed is the card above's to say.)
+            const std::string detail =
+                otaComing ? ownUpdate::progressLine(coming.got, coming.total, coming.bytesPerSecond) + ". Tap for more, or to stop it."
+                          : (coming.state.empty() || !failed.empty() ? "Megler looks for " + coming.file + " in Pictures\\Megler" : coming.state) +
+                                ". Tap for how to get it.";
+            if (detail != otaDetailShown_) {
+                otaDetailShown_ = detail;
+                otaDetail_.Text(hs(detail));
+            }
         }
         const std::string working = separateApps::working();
         setVisible(workCard_, !working.empty());
@@ -390,9 +407,11 @@ private:
     UIElement view_{nullptr};
     StackPanel column_{nullptr};
     Border otaCard_{nullptr};
+    Button otaButton_{nullptr};
     TextBlock otaTitle_{nullptr};
     ProgressBar otaBar_{nullptr};
     TextBlock otaDetail_{nullptr};
+    std::string otaTitleShown_, otaDetailShown_;
     Border importCard_{nullptr};
     TextBlock importTitle_{nullptr};
     ProgressBar importBar_{nullptr};

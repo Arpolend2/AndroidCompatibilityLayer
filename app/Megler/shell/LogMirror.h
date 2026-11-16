@@ -3,11 +3,13 @@
 // (shell/LogArchive.h) finds them all: a package cannot read another's LocalState, and a phone without the Device Portal
 // has no other way to them.
 //
-//   at start (ten seconds in, out of the way of the start's own reading, or at once when it is suspended), after
+//   at start (ten seconds in, out of the way of the start's own reading, two where the package has no folder yet, or at
+//     once when it is suspended), after
 //     shellLog::initialize has put the runs before aside: those runs' logs, which are whole -- the mirror's copy of the run
 //     before, rotated as LocalState's was, gets the lines it lacked (those after its last copy, a crash's among them), and
 //     is copied anew only where it is no beginning of LocalState's;
-//   while the package runs: megler.log's new lines every 30 s, and at once as it is suspended and as it exits; the other
+//   while the package runs: megler.log's new lines every 30 s, and at once as it is suspended, as the app ends (the line
+//     that says why among them) and as the package exits; the other
 //     files (names()) whenever they have changed, and flags.txt, the names of its flags (LocalState\flags);
 // so a run that ended in a crash is there whole from the package's next start, and the part before the crash at once.
 //
@@ -50,7 +52,8 @@ std::string tailNote(uint64_t start, uint64_t size);
 
 /// The mirror started, on a thread of its own. Once a run, after shellLog::initialize.
 void start();
-/// megler.log's new lines copied now, waited for 1 s at most: as the package is suspended, and as it exits.
+/// megler.log's new lines copied now, waited for 1 s at most: as the package is suspended, as the app ends, and as the
+/// package exits.
 void now();
 /// Megler, with the list of the apps' packages: the folders of those no longer installed removed. Off the UI thread.
 void removeUninstalled(const std::vector<appPackage::InstalledApp>& installed);

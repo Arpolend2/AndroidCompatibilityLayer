@@ -2590,6 +2590,45 @@ generate key attestation"), as it does on such a device. The data app's
 `keystore-certificates` step checks both kinds of certificate, a chain set
 with a key, the refusal, and, on the second run, the first run's certificate.
 
+Google Play services' keys are one store, whichever process runs them: the file
+`.megler_keystore2` of their data folder, which every process that hosts them
+has (`/data/megler-services/com.google.android.gms`; the Google Play services
+app's own data folder is that same folder). They were the keys of the app
+whose process asked, in that app's own data, while the data they protect is
+shared: Tink's key set in the services' preferences is encrypted with the AES
+key `mobstore_encrypt` of this store, so the process that happened to make the
+key set could read it and every other one failed with "Keystore cannot load the
+key with ID: mobstore_encrypt" and "Failed to initialize encryption" (the Play
+Store, the services' own app and others, in eighteen users' logs of 681 to 699
+and on the Lumia 650 with 701). `KeyStoreProvider.view` tells whose call it is
+(`MicroG.calledByHosted`: the closest class loader of an app on the stack is
+GmsCore's; or the process is the Google Play services app's) and gives it the
+shared store. Other processes write that file too, so it is read again when its
+time or length is another, and changed -- read, changed, written to a file
+beside it that takes its place -- with `.megler_keystore2.lock` held, a file
+made with `createNewFile` (`CREATE_NEW` on the host) and deleted after; one a
+process left behind is taken away after ten seconds.
+
+The keys their earlier data left in the apps' own stores are wanted until that
+data is cleared, and nothing says which app's is the one that fits. So
+`mg_run_services_key_store` (`run/mg_run.c`, at every app's start) leaves the
+mark `.megler-keystore-shared` beside the services' data folder where there is
+no such folder yet: a first start, or Clear Data on Google Play services. With
+the mark the shared store is the only one. Without it a call of theirs that
+finds nothing in the shared store looks in the hosting app's own store and in
+the imports (`.megler_keystore2.hosts`, in the shared folder), where a key
+found in an app's own store and taken is copied for the other processes; of an
+alias in both, the newer key is the one. So a key set made in the Google Play
+services app's own process is readable everywhere at once, and one made in
+another app's process once that app has run again. Their code never changes
+an app's own store: what it makes goes to the shared one, and what it deletes
+of the app's is hidden from it while the process runs. The data app's
+`keystore-hosted` step makes its own thread's calls theirs
+(`KeyStoreProvider.hostedForTests`, a folder of the app in the place of
+`/data/megler-services`) and checks the import, the two stores kept apart, the
+delete, a file another process wrote read again, a lock left behind, and the
+mark; `mg_storage_tests.c` checks when the mark is written.
+
 `android.util.Base64OutputStream` and `Base64InputStream` encode and decode
 as they go, with `Base64`'s flags as `Base64.encode` and `decode` take them
 (`MeglerBase64Coder`, in the overlay): lines of 76 and a line end, the last
@@ -2618,6 +2657,38 @@ Besides `DelegateLastClassLoader` and TLS's newer methods there is
 two default methods of Java 9 (`update(byte[])`, `update(ByteBuffer)`). The
 data app's "crc32c" step checks the standard check value, the defaults, a
 direct buffer and `Adler32` through the interface.
+
+**File locks between an app's processes** are the overlay's too
+(`sun/nio/ch/FileLockTable.java`, Megler's own in place of Android 9's). A
+`FileChannel`'s lock is the process's, held against other processes: while one
+holds it, another's `tryLock()` answers null and its `lock()` waits; within
+one process the library keeps one table of its locks, and an overlapping one
+is `OverlappingFileLockException`, an unchecked exception. What Android runs
+as several processes is one virtual machine here (an app's other processes
+and hosted Google Play services are class scopes, `megler.Processes`), so the
+second process got the exception where it expected null or a wait: the Play
+Store's value store, which its main and `:background` processes both write
+("VS: Failed to update class", 0.1.0.699), and Google Play services'
+`.config.lock`, taken by its own process and its `.unstable` one. The table
+now knows whose each lock is, the class scope of the code that takes it
+(`SharedFileLockTable.scope()`, a native of `dvm/mg_dvm_art.c`: the innermost
+frame of an app's or a service's code, else the thread's owner). Within a
+scope the rule is Android's for one process; between scopes it is the
+system's for two: null from `tryLock()`, a wait in `lock()` until the other
+lock is released or its channel closed, shared locks held together. Since
+`FileChannelImpl` adds a lock to the table before it asks the system, `add()`
+only notes it for the asking thread, and `FileDispatcherImpl.lock()` (a
+`.java.replace` of one line) asks `SharedFileLockTable.contend()` before its
+native call, which grants every lock here (`fcntl` in `bionic/mg_libc_io.c`).
+A lock lasts while its channel is open, even with its `FileLock` collected
+(AndroidX's `ProcessLock` keeps only the channel). An asynchronous channel
+asks the system from another thread: its locks are granted at once. Not
+modelled: locks between two apps' processes, which are Windows processes with
+a table each; deadlock detection; fairness. `FileDispatcherImpl`'s source
+uses `dalvik.system.BlockGuard`, which the SDK's `android.jar` lacks: a
+`.java.stubs` file names AOSP sources that are compiled for javac's class
+path only and are not put in the overlay. The data app says the checks in one
+line, "file-locks-across-scopes", after its "process-scope" step.
 
 **Java 9 and 10's collection factories** are added that way to Android 9's
 `List`, `Set` and `Map` (Android's `Map.java` says it took them out):

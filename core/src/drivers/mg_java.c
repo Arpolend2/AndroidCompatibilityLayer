@@ -591,6 +591,9 @@ N(Native_nothing) { (void)c; }
 N(Native_dataDir) { c->ret.l = mg_dvm_new_string(mg_fs_internal_dir()); }
 N(Native_externalDir) { c->ret.l = mg_dvm_new_string(mg_fs_external_dir()); }
 N(Native_packageName) { c->ret.l = mg_dvm_new_string(J.package); }
+/* The package name the hosted Google Play services go by (megler_run_config.gms_package): a microG of another name, MicroG RE's. */
+static const char *gms_package(void) { return J.config->gms_package ? J.config->gms_package : "com.google.android.gms"; }
+N(Native_gmsPackage) { c->ret.l = mg_dvm_new_string(gms_package()); }
 /*
  * The screen as it is now (mg_run_surface: megler_run_config's until megler_set_surface says otherwise), for DisplayMetrics,
  * Configuration, Display and the windows' layout; the framework asks again when an EV_SURFACE event says it changed.
@@ -623,6 +626,20 @@ N(Native_displayRotation)
 N(Native_uptimeNanos) { c->ret.j = (i64)mg_time_monotonic_ns(); }
 /* flag(name): a switch for trying something on the phone (mg_flag): a file of that name in the data folder's flags. */
 N(Native_flag) { c->ret.z = mg_flag(text_of(c->args[0].l)); }
+N(Native_systemProperty)
+{
+    const char *name = c->args[0].l ? text_of(c->args[0].l) : NULL;
+    const char *value = name ? mg_sysprop(name) : NULL;
+    c->ret.l = value ? mg_dvm_new_string(value) : NULL;
+}
+N(Native_setSystemProperty)
+{
+    if (!c->args[0].l || !c->args[1].l) {
+        mg_dvm_throw("java/lang/NullPointerException", "system property");
+        return;
+    }
+    mg_sysprop_set(text_of(c->args[0].l), text_of(c->args[1].l));
+}
 
 /*
  * listFolder(String path): a folder of the app's storage listed with each entry's kind, size and time, for the media
@@ -1538,6 +1555,8 @@ static const mg_jhle k_native[] = {
     { "megler/Native", "nativeLooperPrepare", NULL, Native_looperPrepare },
     { "megler/Native", "nativeLooperPoll", NULL, Native_looperPoll },
     { "megler/Native", "dataDir", NULL, Native_dataDir },
+    { "megler/Native", "systemProperty", NULL, Native_systemProperty },
+    { "megler/Native", "setSystemProperty", NULL, Native_setSystemProperty },
     { "megler/Native", "externalDir", NULL, Native_externalDir },
     { "megler/Native", "battery", NULL, Native_battery },
     { "megler/Native", "batteryTechnology", NULL, Native_batteryTechnology },
@@ -1552,6 +1571,7 @@ static const mg_jhle k_native[] = {
     { "megler/Native", "biometricCancel", NULL, Native_biometricCancel },
     { "megler/Native", "audioRoute", NULL, Native_audioRoute },
     { "megler/Native", "packageName", NULL, Native_packageName },
+    { "megler/Native", "gmsPackage", NULL, Native_gmsPackage },
     { "megler/Native", "screenWidth", NULL, Native_screenWidth },
     { "megler/Native", "screenHeight", NULL, Native_screenHeight },
     { "megler/Native", "density", NULL, Native_density },
@@ -2345,7 +2365,7 @@ static void mount_apk(void)
     int i;
     if (name > path) dir[name - path - 1] = 0;
     mg_fs_mount(guest_dir, dir);
-    if (J.config->gms_apk_path && strcmp(J.package, "com.google.android.gms")) {
+    if (J.config->gms_apk_path && strcmp(J.package, "com.google.android.gms") && strcmp(J.package, gms_package())) {
         mg_fs_mount("/system/priv-app/GmsCore/GmsCore.apk", J.config->gms_apk_path);
         if (J.config->gms_splits_dir) mount_gms_splits();
     }
