@@ -1,4 +1,4 @@
-Name:       ru.androidcompatibilitylayer.AndroidCompatibilityLayer
+Name:       ru.androidcompatibilitylayer.appmanager
 Summary:    AndroidCompatibilityLayer for Aurora OS
 Version:    0.1.0
 Release:    1

@@ -8,7 +8,7 @@
 class ExternalApkReceiver : public QObject
 {
     Q_OBJECT
-    Q_CLASSINFO("D-Bus Interface", "ru.androidcompatibilitylayer.AndroidCompatibilityLayer")
+    Q_CLASSINFO("D-Bus Interface", "ru.androidcompatibilitylayer.appmanager")
 public:
     explicit ExternalApkReceiver(QObject *parent = nullptr);
     ~ExternalApkReceiver() override;

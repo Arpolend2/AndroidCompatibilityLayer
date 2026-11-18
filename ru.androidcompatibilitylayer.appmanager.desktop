@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 X-Nemo-Application-Type=silica-qt5
-Icon=ru.androidcompatibilitylayer.AndroidCompatibilityLayer
-Exec=/usr/bin/ru.androidcompatibilitylayer.AndroidCompatibilityLayer %u
+Icon=ru.androidcompatibilitylayer.appmanager
+Exec=/usr/bin/ru.androidcompatibilitylayer.appmanager %u
 MimeType=application/vnd.android.package-archive;application/x-apks;application/x-xapk;application/zip;
 Name=Android App Manager
 Name[ru]=Менеджер приложений Android
@@ -10,7 +10,7 @@ Name[ru]=Менеджер приложений Android
 [X-Application]
 Permissions=Internet;UserDirs;Camera;Sensors;Audio;Bluetooth;Location
 OrganizationName=ru.androidcompatibilitylayer
-ApplicationName=AndroidCompatibilityLayer
-ExecDBus=/usr/bin/ru.androidcompatibilitylayer.AndroidCompatibilityLayer
-ExportDBusInterfaces=ru.androidcompatibilitylayer.AndroidCompatibilityLayer
+ApplicationName=appmanager
+ExecDBus=/usr/bin/ru.androidcompatibilitylayer.appmanager
+ExportDBusInterfaces=ru.androidcompatibilitylayer.appmanager
 Intents=OpenURI

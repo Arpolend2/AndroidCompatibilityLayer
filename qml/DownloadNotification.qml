@@ -54,12 +54,12 @@ Item {
     Notification {
         id: notification
         appName: qsTr("Android App Manager")
-        appIcon: "ru.androidcompatibilitylayer.AndroidCompatibilityLayer"
+        appIcon: "ru.androidcompatibilitylayer.appmanager"
     }
     Notification {
         id: previewNotification
         appName: qsTr("Android App Manager")
-        appIcon: "ru.androidcompatibilitylayer.AndroidCompatibilityLayer"
+        appIcon: "ru.androidcompatibilitylayer.appmanager"
     }
     Timer {
         id: updateTimer

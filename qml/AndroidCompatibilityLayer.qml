@@ -17,14 +17,14 @@ ApplicationWindow {
         id: rpmErrorBanner
         objectName: "rpmErrorBanner"
         appName: qsTr("Android App Manager")
-        appIcon: "ru.androidcompatibilitylayer.AndroidCompatibilityLayer"
+        appIcon: "ru.androidcompatibilitylayer.appmanager"
         previewSummary: qsTr("Android App Manager")
     }
     Notification {
         id: signatureBanner
         objectName: "signatureBanner"
         appName: qsTr("Android App Manager")
-        appIcon: "ru.androidcompatibilitylayer.AndroidCompatibilityLayer"
+        appIcon: "ru.androidcompatibilitylayer.appmanager"
         previewSummary: qsTr("Android App Manager")
         previewBody: qsTr("Only add apps you trust. APK signatures are not verified.")
     }

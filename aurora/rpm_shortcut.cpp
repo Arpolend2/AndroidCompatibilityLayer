@@ -18,8 +18,8 @@
 
 namespace {
 
-const char kMainBinary[] = "/usr/bin/ru.androidcompatibilitylayer.AndroidCompatibilityLayer";
-const char kMainIcon[] = "/usr/share/icons/hicolor/172x172/apps/ru.androidcompatibilitylayer.AndroidCompatibilityLayer.png";
+const char kMainBinary[] = "/usr/bin/ru.androidcompatibilitylayer.appmanager";
+const char kMainIcon[] = "/usr/share/icons/hicolor/172x172/apps/ru.androidcompatibilitylayer.appmanager.png";
 
 QImage iconImage(const QString &dataUri)
 {
@@ -66,7 +66,7 @@ QString RpmShortcut::create(const QString &package, const QString &label, const 
     desktop.path = "/usr/share/applications/" + name + ".desktop";
     desktop.content = "[Desktop Entry]\nType=Application\nX-Nemo-Application-Type=silica-qt5\nIcon=" + name
         + "\nExec=" + kMainBinary + " --run-package " + package.toStdString()
-        + "\nName=" + title + "\n\n[X-Application]\nOrganizationName=ru.androidcompatibilitylayer\nApplicationName=AndroidCompatibilityLayer\n";
+        + "\nName=" + title + "\n\n[X-Application]\nOrganizationName=ru.androidcompatibilitylayer\nApplicationName=appmanager\n";
     pkg.files.push_back(desktop);
 
     const QImage image = iconImage(iconDataUri);

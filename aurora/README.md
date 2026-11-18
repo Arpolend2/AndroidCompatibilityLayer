@@ -1,7 +1,7 @@
 # AndroidCompatibilityLayer for Aurora
 
 The app is displayed as Android App Manager (Менеджер приложений Android in Russian).
-The installed application ID is `ru.androidcompatibilitylayer.AndroidCompatibilityLayer`.
+The installed application ID is `ru.androidcompatibilitylayer.appmanager`.
 It differs from earlier builds, so existing private data is not automatically
 migrated and previously created shortcut RPMs may no longer work.
 
@@ -59,7 +59,7 @@ composition.
 
 Open the repository's `CMakeLists.txt` in Aurora IDE and select an aarch64
 Aurora SDK kit matching the device's OS version. Build and deploy the
-`ru.androidcompatibilitylayer.AndroidCompatibilityLayer` application and launch it on the device.
+`ru.androidcompatibilitylayer.appmanager` application and launch it on the device.
 
 The RPM build disables optional test targets to speed up IDE configuration.
 For tests, configure CMake separately with `ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS=ON`

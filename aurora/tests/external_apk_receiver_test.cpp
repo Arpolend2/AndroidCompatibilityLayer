@@ -12,8 +12,8 @@
 
 int main(int argc, char **argv)
 {
-    qputenv("AURORA_APP_ID", "ru.androidcompatibilitylayer.AndroidCompatibilityLayer");
-    qputenv("AURORA_APP_INSTANCE_ID", "ru.androidcompatibilitylayer.AndroidCompatibilityLayer");
+    qputenv("AURORA_APP_ID", "ru.androidcompatibilitylayer.appmanager");
+    qputenv("AURORA_APP_INSTANCE_ID", "ru.androidcompatibilitylayer.appmanager");
     QCoreApplication app(argc, argv);
     ExternalApkReceiver receiver;
     QString path, rejection, error;
@@ -35,8 +35,8 @@ int main(int argc, char **argv)
     }
 
     QDBusConnection bus = QDBusConnection::sessionBus();
-    QDBusMessage call = QDBusMessage::createMethodCall(QStringLiteral("ru.androidcompatibilitylayer.AndroidCompatibilityLayer"),
-        QStringLiteral("/ru/androidcompatibilitylayer/AndroidCompatibilityLayer"), QStringLiteral("ru.androidcompatibilitylayer.AndroidCompatibilityLayer"),
+    QDBusMessage call = QDBusMessage::createMethodCall(QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+        QStringLiteral("/ru/androidcompatibilitylayer/appmanager"), QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
         QStringLiteral("openFile"));
     call << (QStringList() << QStringLiteral("file:///home/user/My%20app.apk"));
     if (!bus.send(call)) return 1;
@@ -45,7 +45,7 @@ int main(int argc, char **argv)
     timeout.stop();
     if (path != QLatin1String("/home/user/My app.apk") || !rejection.isEmpty()) return 1;
 
-    QDBusMessage introspect = QDBusMessage::createMethodCall(QStringLiteral("ru.androidcompatibilitylayer.AndroidCompatibilityLayer"),
+    QDBusMessage introspect = QDBusMessage::createMethodCall(QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
         QStringLiteral("/ru/omp/RuntimeManager/IntentHandler1"), QStringLiteral("org.freedesktop.DBus.Introspectable"),
         QStringLiteral("Introspect"));
     QDBusPendingCallWatcher watcher(bus.asyncCall(introspect));
@@ -63,7 +63,7 @@ int main(int argc, char **argv)
         return 1;
     }
     path.clear();
-    QDBusMessage intent = QDBusMessage::createMethodCall(QStringLiteral("ru.androidcompatibilitylayer.AndroidCompatibilityLayer"),
+    QDBusMessage intent = QDBusMessage::createMethodCall(QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
         QStringLiteral("/ru/omp/RuntimeManager/IntentHandler1"),
         QStringLiteral("ru.omp.RuntimeManager.IntentHandler1"), QStringLiteral("HandleIntent"));
     QVariantMap params;

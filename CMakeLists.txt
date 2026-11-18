@@ -8,7 +8,7 @@ if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION AND NOT ANDROID_COMP
     message(FATAL_ERROR "GPU composition requires ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL")
 endif()
 
-set(APP_ID ru.androidcompatibilitylayer.AndroidCompatibilityLayer)
+set(APP_ID ru.androidcompatibilitylayer.appmanager)
 
 find_package(Qt5 COMPONENTS Core Gui Qml Quick Multimedia Sensors Network DBus Positioning LinguistTools REQUIRED)
 find_package(PkgConfig REQUIRED)

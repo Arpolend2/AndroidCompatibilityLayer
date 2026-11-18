@@ -162,7 +162,7 @@ static int buildStandaloneRpm(const QString &package)
     const QString iconData = selected.value(QStringLiteral("icon")).toString();
     const int comma = iconData.indexOf(QLatin1Char(','));
     if (comma >= 0) icon.loadFromData(QByteArray::fromBase64(iconData.mid(comma + 1).toLatin1()));
-    if (icon.isNull()) icon.load(QStringLiteral("/usr/share/icons/hicolor/172x172/apps/ru.androidcompatibilitylayer.AndroidCompatibilityLayer.png"));
+    if (icon.isNull()) icon.load(QStringLiteral("/usr/share/icons/hicolor/172x172/apps/ru.androidcompatibilitylayer.appmanager.png"));
     bool ok = !base.isEmpty() && !selected.isEmpty();
     if (!ok) {
         error = QCoreApplication::translate("RpmBuilder", "The app or RPM output directory is unavailable.");
@@ -262,7 +262,7 @@ int main(int argc, char *argv[])
     const QString standaloneId = QString::fromLocal8Bit(qgetenv("AURORA_APP_ID"));
     const QString standalonePrefix = QStringLiteral("ru.androidcompatibilitylayer.");
     app->setApplicationName(standalone && standaloneId.startsWith(standalonePrefix)
-        ? standaloneId.mid(standalonePrefix.size()) : QStringLiteral("AndroidCompatibilityLayer"));
+        ? standaloneId.mid(standalonePrefix.size()) : QStringLiteral("appmanager"));
     if (mode != "--build-standalone") {
         QString errorLogError;
         const QString label = standalone ? app->applicationName()
