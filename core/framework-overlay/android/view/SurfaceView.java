@@ -18,7 +18,7 @@
 // for every surface, EGL or not, since native code's windows of it (ANativeWindow_fromSurface) are no longer valid from then on.
 // And a frame that is a whole bitmap already, which the camera's preview posts (android.hardware.Camera, the overlay's):
 // meglerPostBitmap makes it the front buffer as it is, without drawing it into a canvas of the surface's, which on the
-// graphics processor would cost a canvas's read-back for every picture; onDraw scales it to the view as it does any frame.
+// graphics processor would cost a canvas's read-back for every picture; meglerDrawSurface scales it to the view as it does any frame.
 // meglerFrameDrawn says whether the window has drawn the last one, so that a camera faster than the window skips pictures
 // the window would never show.
 // And the surface's place among the window's views, as Android orders a SurfaceView's surface (its sublayer): under the
@@ -31,7 +31,7 @@
 // again when shown, as Android's is.
 // Everything else is the original's, unchanged.
 // And MediaCodec's pictures decoded on the graphics processor (meglerGpuId, meglerGpuFrame): the surface has an id the shell
-// keeps them under, as a TextureView's texture has, and onDraw draws the newest from there (Canvas.meglerDrawTexture),
+// keeps them under, as a TextureView's texture has, and meglerDrawSurface draws the newest from there (Canvas.meglerDrawTexture),
 // scaled to the view or cropped to it as the codec's scaling mode says, where the shell lays it under the views as it
 // does a TextureView's. The codec drew each picture read back into a bitmap into this surface's canvas, and the window
 // drew that canvas's bitmap, read back and sent up again: three 1920x1080 copies through the memory a picture, and
@@ -241,10 +241,7 @@ public class SurfaceView extends View {
     }
     /** Whether the window has drawn the last frame posted as a bitmap (true when none waits). */
     public boolean meglerFrameDrawn() { synchronized (mLock) { return mDrawn || !mCreated; } }
-    @Override public void draw(Canvas c) {
-        super.draw(c);
-    }
-    @Override protected void onDraw(Canvas c) {
+    @Override final void meglerDrawSurface(Canvas c) {
         int gpu = mGpuId;
         if (gpu != 0 && mGpuAt != 0 && !mGL) {
             int w = getWidth(), h = getHeight(), vw = mGpuW, vh = mGpuH;

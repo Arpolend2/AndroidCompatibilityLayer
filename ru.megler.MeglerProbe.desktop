@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+X-Nemo-Application-Type=silica-qt5
+Icon=ru.megler.MeglerProbe
+Exec=/usr/bin/ru.megler.MeglerProbe %u
+MimeType=application/vnd.android.package-archive;application/x-apks;application/x-xapk;application/zip;
+Name=Android App Manager
+Name[ru]=Менеджер приложений Android
+
+[X-Application]
+Permissions=Internet;UserDirs;Camera;Sensors;Audio;Bluetooth;Location
+OrganizationName=ru.megler
+ApplicationName=MeglerProbe
+ExecDBus=/usr/bin/ru.megler.MeglerProbe
+ExportDBusInterfaces=ru.megler.MeglerProbe
+Intents=OpenURI

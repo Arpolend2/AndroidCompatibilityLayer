@@ -5,7 +5,8 @@
  *
  * - Pictures (H.264, H.265). MediaCodec is fed access units with start codes, and the parameter sets either in the
  *   stream or apart from it, as csd-0 and csd-1 or in a buffer flagged as codec-specific data. Some apps hand over the
- *   length-prefixed units of an MP4 instead, or its avcC or hvcC record as csd-0. Every unit becomes Annex-B, access
+ *   length-prefixed units of an MP4 instead, or its avcC or hvcC record as csd-0. The record supplies the length size
+ *   (one, two or four bytes; four when not specified). Every unit becomes Annex-B, access
  *   unit delimiters are left out (a parameter set put in front of one would end the unit before it), the parameter
  *   sets are kept, and the first unit after a start or a flush gets them in front of its slices when it does not
  *   carry them itself: a decoder that starts afresh needs them before its first slice.
@@ -130,6 +131,7 @@ struct mg_mcodec {
     i64 gone;
     bool any_gone;
     blob unit;                         /* the unit being put together for the decoder */
+    int nal_length_size;               /* MP4 length prefix, from avcC/hvcC; 4 without a record */
     i64 pushed, pictures, blocks, failed;
 };
 
@@ -231,6 +233,7 @@ static bool each_record_nal(mg_mcodec *c, const u8 *d, size_t n, nal_fn fn, void
     if (n < 7 || d[0] != 1) return false;
     if (c->kind == MEGLER_CODEC_H264) {
         int sps = d[5] & 0x1f;
+        int length_size = (d[4] & 3) + 1;
         for (i = 6, k = 0; k < sps; k++) {
             size_t len;
             if (i + 2 > n || (len = (size_t)d[i] << 8 | d[i + 1]) > n - i - 2) return true;
@@ -244,6 +247,8 @@ static bool each_record_nal(mg_mcodec *c, const u8 *d, size_t n, nal_fn fn, void
             fn(c, d + i + 2, len, arg);
             i += 2 + len;
         }
+        if (length_size != 3) c->nal_length_size = length_size;
+        else mg_warn("media codec: invalid avcC NAL length size");
         return true;
     }
     if (n < 23) return false;
@@ -258,21 +263,43 @@ static bool each_record_nal(mg_mcodec *c, const u8 *d, size_t n, nal_fn fn, void
             i += 2 + len;
         }
     }
+    if ((d[21] & 3) != 2) c->nal_length_size = (d[21] & 3) + 1;
+    else mg_warn("media codec: invalid hvcC NAL length size");
     return true;
 }
 
-/* Each NAL unit of `d` to fn: Annex-B (start codes) or the length-prefixed form, four bytes of length before each. */
+/* Validate the whole length-prefixed sample before delivering any of its NALs. */
+static bool prefixed_nals(mg_mcodec *c, const u8 *d, size_t n, nal_fn fn, void *arg)
+{
+    size_t i = 0;
+    int width = c->nal_length_size ? c->nal_length_size : 4;
+    while (i < n) {
+        u32 len = 0;
+        int j;
+        if (n - i < (size_t)width) return false;
+        for (j = 0; j < width; j++) len = len << 8 | d[i++];
+        if (!len || len > n - i) return false;
+        i += len;
+    }
+    if (!n) return false;
+    i = 0;
+    while (i < n) {
+        u32 len = 0;
+        int j;
+        for (j = 0; j < width; j++) len = len << 8 | d[i++];
+        fn(c, d + i, len, arg);
+        i += len;
+    }
+    return true;
+}
+
+/* Each NAL unit of `d`: Annex-B or the length-prefixed form specified by the configuration record. */
 static void each_nal(mg_mcodec *c, const u8 *d, size_t n, nal_fn fn, void *arg)
 {
     size_t i = 0, start = (size_t)-1;
+    if (prefixed_nals(c, d, n, fn, arg)) return;
     if (!starts_with_code(d, n)) {
-        while (i + 4 <= n) {
-            u32 len = (u32)d[i] << 24 | (u32)d[i + 1] << 16 | (u32)d[i + 2] << 8 | d[i + 3];
-            i += 4;
-            if (len == 0 || len > n - i) break;
-            fn(c, d + i, len, arg);
-            i += len;
-        }
+        mg_warn("media codec: invalid length-prefixed video sample");
         return;
     }
     while (i + 3 <= n) {

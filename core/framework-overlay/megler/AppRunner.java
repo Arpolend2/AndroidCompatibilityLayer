@@ -486,8 +486,7 @@ public final class AppRunner {
             startActivity(caller, new Intent(i).setFlags(i.getFlags() & ~Intent.FLAG_ACTIVITY_FORWARD_RESULT), forwarded, opts);
             return;
         }
-        // An APK to install (a file manager's, a browser's download, an app store's): Megler's installer has it, as Android's
-        // package installer would (megler.Installs). Asked for a result, the caller hears RESULT_OK: the APK went.
+        // An APK to install (a file manager's, a browser's download, an app store's).
         // An app to uninstall (ACTION_DELETE of package:<name>), likewise: Megler asks the user.
         if (megler.Installs.isUninstall(i)) {
             android.util.Log.d("Megler", "startActivity " + i + " -> Megler's uninstaller");
@@ -498,9 +497,16 @@ public final class AppRunner {
         }
         if (megler.Installs.isInstall(i)) {
             android.util.Log.d("Megler", "startActivity " + i + " -> Megler's installer");
-            megler.Installs.install(from, i);
             final Activity caller = from instanceof Activity ? (Activity) from : top();
-            if (request >= 0 && caller != null) sHandler.post(() -> caller.meglerActivityResult(request, Activity.RESULT_OK, null));
+            if (megler.Installs.hasInstallStatusProtocol()) {
+                megler.Installs.installWithOutcome(from, i, (code, message) -> {
+                    if (request >= 0 && caller != null)
+                        sHandler.post(() -> caller.meglerActivityResult(request, code == 0 ? Activity.RESULT_OK : Activity.RESULT_CANCELED, null));
+                });
+            } else {
+                megler.Installs.install(from, i);
+                if (request >= 0 && caller != null) sHandler.post(() -> caller.meglerActivityResult(request, Activity.RESULT_OK, null));
+            }
             return;
         }
         // Android's documents UI, gallery, photo picker and camera app (megler.Pickers): Windows' picker and camera, the result to

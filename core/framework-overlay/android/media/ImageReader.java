@@ -13,7 +13,9 @@
 // acquireLatestImage then throw IllegalStateException, as Android's do); a picture that comes while every buffer is taken
 // takes the oldest queued one's place, as a camera that keeps streaming does. Closed images' buffers are used again.
 //
-// Not done: formats other than YUV_420_888 and NV21 (an image of another format has no planes), hardware buffers, images
+// JPEG (256): the camera queues a finished file (meglerQueueJpeg), an image of one plane holding its bytes.
+//
+// Not done: formats other than YUV_420_888, NV21 and JPEG (an image of another format has no planes), hardware buffers, images
 // detached or attached, and multi-resolution readers' parents.
 package android.media;
 
@@ -110,7 +112,10 @@ public class ImageReader implements java.lang.AutoCloseable {
     /** The newest image, the older queued ones dropped (their buffers used again). */
     public android.media.Image acquireLatestImage() {
         synchronized (mLock) {
-            while (mQueued.size() > 1) mFree.add(mQueued.poll().mData);
+            while (mQueued.size() > 1) {
+                byte[] d = mQueued.poll().mData;
+                if (mFormat != 256) mFree.add(d);
+            }
         }
         return acquireNextImage();
     }
@@ -178,10 +183,28 @@ public class ImageReader implements java.lang.AutoCloseable {
         if (l != null && e != null) e.execute(() -> l.onImageAvailable(this));
     }
 
+    /**
+     * A JPEG picture (format 256) the camera wrote: queued as an image of one plane holding the file's bytes, and the listener told.
+     * False, the picture dropped, when the reader is closed, is not a JPEG reader's or has every image acquired.
+     */
+    public boolean meglerQueueJpeg(byte[] jpeg, long timestamp) {
+        OnImageAvailableListener l;
+        Executor e;
+        synchronized (mLock) {
+            if (mClosed || mFormat != 256) return false;
+            if (mAcquired + mQueued.size() >= mMaxImages && (mAcquired >= mMaxImages || mQueued.poll() == null)) return false;
+            mQueued.add(new MeglerImage(this, jpeg, timestamp));
+            l = mListener;
+            e = mListenerExecutor;
+        }
+        if (l != null && e != null) e.execute(() -> l.onImageAvailable(this));
+        return true;
+    }
+
     private void released(MeglerImage image) {
         synchronized (mLock) {
             mAcquired--;
-            if (!mClosed) mFree.add(image.mData);
+            if (!mClosed && mFormat != 256) mFree.add(image.mData);
         }
     }
 
@@ -208,11 +231,14 @@ public class ImageReader implements java.lang.AutoCloseable {
         @Override public long getTimestamp() { valid(); return mTimestamp; }
         @Override public int getTransform() { return 0; }
         @Override public int getScalingMode() { return 0; }
-        @Override public int getPlaneCount() { return 3; }
+        @Override public int getPlaneCount() { return mReader.mFormat == 256 ? 1 : 3; }
 
         @Override public Plane[] getPlanes() {
             valid();
-            if (mPlanes == null) {
+            if (mPlanes == null && mReader.mFormat == 256) {
+                // A JPEG's one plane is the file, with no strides, as Android's.
+                mPlanes = new Plane[] { new MeglerPlane(ByteBuffer.wrap(mData).slice(), 0, 0) };
+            } else if (mPlanes == null) {
                 int w = mReader.mWidth, h = mReader.mHeight, luma = w * h, chroma = luma / 2;
                 mPlanes = new Plane[] {
                     new MeglerPlane(ByteBuffer.wrap(mData, 0, luma).slice(), w, 1),

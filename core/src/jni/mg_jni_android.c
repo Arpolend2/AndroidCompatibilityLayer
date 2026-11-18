@@ -9,6 +9,7 @@
 
 #include "../bionic/mg_bionic.h"
 #include "../bionic/mg_fd.h"
+#include "../dvm/mg_dvm.h"
 #include "../ld/mg_ld_internal.h"
 #include "../ndk/mg_ndk.h"
 #include "../run/mg_run.h"
@@ -104,6 +105,21 @@ static void ret_null(mg_jcall *c) { c->ret.l = NULL; }
 static void ret_false(mg_jcall *c) { c->ret.z = 0; }
 static void ret_void(mg_jcall *c) { (void)c; }
 static void ret_zero(mg_jcall *c) { c->ret.j = 0; }
+
+static void system_load(mg_jcall *c)
+{
+    const char *path = mg_jni_string(c->args[0].l);
+    if (!path) {
+        mg_jni_throw("java/lang/NullPointerException", "System.load: null path");
+    } else if (path[0] != '/') {
+        mg_jni_throw("java/lang/UnsatisfiedLinkError", "System.load requires an absolute path");
+    } else if (!mg_dvm_load_library(path)) {
+        mg_jni_exception_clear();
+        mg_jni_throw("java/lang/UnsatisfiedLinkError", path);
+    } else {
+        mg_info("jni: System.load(%s) completed", path);
+    }
+}
 
 /* ------------------------------------------------------------------ files */
 
@@ -476,6 +492,7 @@ static const mg_jhle g_android[] = {
     { "java/lang/System", "currentTimeMillis", NULL, system_currentTimeMillis },
     { "java/lang/System", "nanoTime", NULL, system_nanoTime },
     { "java/lang/System", "getProperty", NULL, system_getProperty },
+    { "java/lang/System", "load", "(Ljava/lang/String;)V", system_load },
     { "java/lang/System", "loadLibrary", NULL, ret_void },
     { "java/lang/String", "length", NULL, string_length },
     { "java/lang/String", "getBytes", NULL, string_getBytes },

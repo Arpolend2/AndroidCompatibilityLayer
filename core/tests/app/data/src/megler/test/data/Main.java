@@ -1842,7 +1842,7 @@ public class Main extends Activity {
         // there, where it was never told either.
         step("cell-info-update", () -> {
             android.telephony.TelephonyManager phone = (android.telephony.TelephonyManager) getSystemService(TELEPHONY_SERVICE);
-            final java.util.concurrent.CountDownLatch told = new java.util.concurrent.CountDownLatch(2);
+            final java.util.concurrent.CountDownLatch told = new java.util.concurrent.CountDownLatch(3);
             final Object[] cells = new Object[1];
             final java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newSingleThreadExecutor();
             phone.requestCellInfoUpdate(executor, new android.telephony.TelephonyManager.CellInfoCallback() {
@@ -1853,9 +1853,14 @@ public class Main extends Activity {
             });
             android.net.ConnectivityManager connectivity = (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
             final boolean[] available = new boolean[1];
+            final boolean[] unblocked = new boolean[1];
             android.net.ConnectivityManager.NetworkCallback callback = new android.net.ConnectivityManager.NetworkCallback() {
                 @Override public void onAvailable(android.net.Network n) {
                     available[0] = true;
+                    told.countDown();
+                }
+                @Override public void onBlockedStatusChanged(android.net.Network n, boolean blocked) {
+                    unblocked[0] = !blocked;
                     told.countDown();
                 }
             };
@@ -1869,8 +1874,8 @@ public class Main extends Activity {
             connectivity.unregisterNetworkCallback(callback);
             thread.quitSafely();
             executor.shutdown();
-            detail = "told=" + all + " cells=" + cells[0] + " available=" + available[0];
-            return all && cells[0] instanceof java.util.List && ((java.util.List<?>) cells[0]).isEmpty() && available[0];
+            detail = "told=" + all + " cells=" + cells[0] + " available=" + available[0] + " unblocked=" + unblocked[0];
+            return all && cells[0] instanceof java.util.List && ((java.util.List<?>) cells[0]).isEmpty() && available[0] && unblocked[0];
         });
         // A Messenger reaches a binder of another's that passes transactions on to a Messenger's, as Google Play services' task
         // services hand theirs to its scheduler, and the message received says the sender's uid (Forward says so).

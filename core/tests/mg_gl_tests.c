@@ -21,6 +21,7 @@
 #include "../src/bionic/mg_bionic.h"
 #include "../src/host/mg_host.h"
 #include "../src/ndk/mg_egl.h"
+#include "../src/run/mg_run.h"
 #include "mg_gfx_tests.h"
 #include "mg_gl_standin.h"
 
@@ -971,6 +972,82 @@ static i32 triangle_program(void)
     return program;
 }
 
+static struct {
+    u8 pixels[4 * 4 * 4];
+    int calls;
+} native_frame;
+
+static void MEGLER_CB native_present(void *user, const void *pixels, int width, int height, int stride)
+{
+    (void)user;
+    if (width == 4 && height == 4 && stride == 16) {
+        memcpy(native_frame.pixels, pixels, sizeof(native_frame.pixels));
+        native_frame.calls++;
+    }
+}
+
+static void test_native_frame(void)
+{
+    void *(*get_display)(void *) = (void *(*)(void *))mg_egl_host("eglGetDisplay");
+    u32 (*choose)(void *, const int *, void **, int, int *) = (u32 (*)(void *, const int *, void **, int, int *))mg_egl_host("eglChooseConfig");
+    void *(*create_ctx)(void *, void *, void *, const int *) = (void *(*)(void *, void *, void *, const int *))mg_egl_host("eglCreateContext");
+    void *(*create_surface)(void *, void *, const int *) = (void *(*)(void *, void *, const int *))mg_egl_host("eglCreatePbufferSurface");
+    u32 (*make_current)(void *, void *, void *, void *) = (u32 (*)(void *, void *, void *, void *))mg_egl_host("eglMakeCurrent");
+    u32 (*destroy_ctx)(void *, void *) = (u32 (*)(void *, void *))mg_egl_host("eglDestroyContext");
+    u32 (*destroy_surface)(void *, void *) = (u32 (*)(void *, void *))mg_egl_host("eglDestroySurface");
+    void (*clear_color)(float, float, float, float) = (void (*)(float, float, float, float))mg_egl_host("glClearColor");
+    void (*clear)(u32) = (void (*)(u32))mg_egl_host("glClear");
+    void (*viewport)(int, int, int, int) = (void (*)(int, int, int, int))mg_egl_host("glViewport");
+    void (*pointer)(u32, i32, u32, u8, i32, const void *) =
+        (void (*)(u32, i32, u32, u8, i32, const void *))mg_egl_host("glVertexAttribPointer");
+    void (*enable)(u32) = (void (*)(u32))mg_egl_host("glEnableVertexAttribArray");
+    void (*draw)(u32, i32, i32) = (void (*)(u32, i32, i32))mg_egl_host("glDrawArrays");
+    void (*store)(u32, i32) = (void (*)(u32, i32))mg_egl_host("glPixelStorei");
+    void (*get)(u32, i32 *) = (void (*)(u32, i32 *))mg_egl_host("glGetIntegerv");
+    void (*gen_fbos)(i32, u32 *) = (void (*)(i32, u32 *))mg_egl_host("glGenFramebuffers");
+    void (*bind_fbo)(u32, u32) = (void (*)(u32, u32))mg_egl_host("glBindFramebuffer");
+    static const float triangle[] = { -1, 1, 1, 1, -1, -1 };
+    static const int attrs[] = { 0x3033, 1, 0x3040, 4, 0x3038 };
+    static const int dims[] = { 0x3057, 4, 0x3056, 4, 0x3038 };
+    static const int es2[] = { 0x3098, 2, 0x3038 };
+    void *d = get_display(NULL), *config = NULL, *ctx, *surface;
+    int count = 0, alignment = 0, bound = 0;
+    u32 fbo = 0;
+    say("Native EGL frame: read back and present top-down BGRA");
+    memset(&native_frame, 0, sizeof(native_frame));
+    CHECK(d && choose(d, attrs, &config, 1, &count) && count == 1);
+    if (!d || !config) return;
+    ctx = create_ctx(d, config, NULL, es2);
+    surface = create_surface(d, config, dims);
+    CHECK(ctx && surface && make_current(d, surface, surface, ctx));
+    if (!ctx || !surface) return;
+    viewport(0, 0, 4, 4);
+    clear_color(1, 0, 0, 1);
+    clear(0x4000);
+    pointer(0, 2, 0x1406, 0, 0, triangle);
+    enable(0);
+    draw(4, 0, 3);
+    store(0x0D05, 8);
+    gen_fbos(1, &fbo);
+    bind_fbo(0x8D40, fbo);
+    CHECK(mg_java_gl_present_native(d, surface, 4, 4, native_present, NULL));
+    get(0x0D05, &alignment);
+    get(0x8CA6, &bound);
+    CHECK(alignment == 8);
+    CHECK((u32)bound == fbo);
+    CHECK(native_frame.calls == 1);
+    CHECK(native_frame.pixels[0] == 255 && native_frame.pixels[1] == 255 && native_frame.pixels[2] == 255);
+    CHECK(native_frame.pixels[60] == 0 && native_frame.pixels[61] == 0 && native_frame.pixels[62] == 255);
+    CHECK(!mg_java_gl_present_native(d, surface, 0, 4, native_present, NULL));
+    CHECK(!mg_java_gl_present_native(d, surface, 4, 4, NULL, NULL));
+    bind_fbo(0x8D40, 0);
+    make_current(d, NULL, NULL, NULL);
+    CHECK(!mg_java_gl_present_native(d, surface, 4, 4, native_present, NULL));
+    CHECK(native_frame.calls == 1);
+    destroy_surface(d, surface);
+    destroy_ctx(d, ctx);
+}
+
 /*
  * The window: a views' picture of 64 x 48, opaque grey with a hole at (10, 8) 40 x 20 and, in the hole, row 20 black at half
  * alpha (a dimmed dialog's kind); a window surface of the hole's size under it.
@@ -1130,6 +1207,97 @@ static MG_HOSTCB void swapping(void *arg)
     }
     EGL("makeCurrent", "(JJ)Z", 2, J(0), J(0));
     mg_atomic_xchg(&G.done, 1);
+}
+
+static struct {
+    int frames, pictures, places, hidden, result, flags;
+    bool accept_views;
+} experimental_shell;
+
+static bool MEGLER_CB experimental_views(void *user, const void *pixels, int width, int height, int stride)
+{
+    (void)user;
+    if (!pixels || width != 64 || height != 48 || stride != 64 * 4) return false;
+    experimental_shell.pictures++;
+    return experimental_shell.accept_views;
+}
+
+static int MEGLER_CB experimental_frame(void *user, int layer, void *display, void *surface, int width, int height)
+{
+    (void)user;
+    if (layer != 0 || !display || !surface || width != 40 || height != 20) return 0;
+    experimental_shell.frames++;
+    return experimental_shell.result;
+}
+
+static void MEGLER_CB experimental_place(void *user, int layer, int x, int y, int width, int height, int flags)
+{
+    (void)user; (void)x; (void)y;
+    if (layer != 0) return;
+    experimental_shell.places++;
+    if (!width || !height) experimental_shell.hidden++;
+    experimental_shell.flags = flags;
+}
+
+static void test_experimental_shell(void)
+{
+    megler_run_config *run = (megler_run_config *)mg_run_config();
+    mg_jobj *view;
+    u8 *views;
+    i64 x, surf;
+    say("Experimental EGL layers: frame and placement callbacks, then CPU fallback");
+    memset(&experimental_shell, 0, sizeof(experimental_shell));
+    experimental_shell.result = 1;
+    experimental_shell.accept_views = true;
+    run->present_egl_views = experimental_views;
+    run->present_egl_layer = experimental_frame;
+    run->place_egl_layer = experimental_place;
+    memset(&W, 0, sizeof(W));
+    mg_java_gl_start(64, 48, shown);
+    view = mg_dvm_new("java/lang/Object", "()V", NULL);
+    x = EGL("createContext", "(IJ)J", 2, I(2), J(0)).j;
+    surf = EGL("createWindowSurface", "(Ljava/lang/Object;II)J", 3, L(view), I(40), I(20)).j;
+    CHECK(x && surf && EGL("makeCurrent", "(JJ)Z", 2, J(surf), J(x)).z);
+    draw_frame(0, NULL, 1, 0, 0);
+    CHECK(EGL("swap", "(JJIIII)Z", 6, J(surf), J(x), I(0), I(0), I(0), I(0)).z);
+    CHECK(experimental_shell.frames == 1 && W.pictures == 0);
+    views = views_picture(64, 48, 10, 8, 40, 20, -1);
+    EGL("place", "(Ljava/lang/Object;IIIII)V", 6, L(view), I(10), I(8), I(40), I(20), I(MEGLER_GL_ABOVE | MEGLER_GL_TRANSLUCENT));
+    CHECK(mg_java_gl_views(views, 64, 48, 64 * 4, k_all));
+    CHECK(experimental_shell.pictures == 1 && experimental_shell.places > 0 &&
+          experimental_shell.flags == (MEGLER_GL_ABOVE | MEGLER_GL_TRANSLUCENT));
+    experimental_shell.result = 0;
+    draw_frame(0, NULL, 0, 1, 0);
+    CHECK(EGL("swap", "(JJIIII)Z", 6, J(surf), J(x), I(10), I(8), I(40), I(20)).z);
+    CHECK(experimental_shell.frames == 2 && experimental_shell.hidden > 0);
+    CHECK(mg_java_gl_views(views, 64, 48, 64 * 4, k_all));
+    CHECK(W.pictures > 0 && window_pixel(20, 10) == 0x00FF00);
+    EGL("makeCurrent", "(JJ)Z", 2, J(0), J(0));
+    EGL("destroySurface", "(J)V", 1, J(surf));
+    EGL("destroyContext", "(J)V", 1, J(x));
+    free(views);
+
+    mg_java_gl_reset();
+    memset(&W, 0, sizeof(W));
+    experimental_shell.accept_views = false;
+    mg_java_gl_start(64, 48, shown);
+    view = mg_dvm_new("java/lang/Object", "()V", NULL);
+    x = EGL("createContext", "(IJ)J", 2, I(2), J(0)).j;
+    surf = EGL("createWindowSurface", "(Ljava/lang/Object;II)J", 3, L(view), I(40), I(20)).j;
+    CHECK(x && surf && EGL("makeCurrent", "(JJ)Z", 2, J(surf), J(x)).z);
+    views = views_picture(64, 48, 10, 8, 40, 20, -1);
+    EGL("place", "(Ljava/lang/Object;IIIII)V", 6, L(view), I(10), I(8), I(40), I(20), I(0));
+    CHECK(mg_java_gl_views(views, 64, 48, 64 * 4, k_all) && W.pictures > 0);
+    draw_frame(0, NULL, 0, 1, 0);
+    CHECK(EGL("swap", "(JJIIII)Z", 6, J(surf), J(x), I(10), I(8), I(40), I(20)).z);
+    CHECK(window_pixel(20, 10) == 0x00FF00);
+    EGL("makeCurrent", "(JJ)Z", 2, J(0), J(0));
+    EGL("destroySurface", "(J)V", 1, J(surf));
+    EGL("destroyContext", "(J)V", 1, J(x));
+    free(views);
+    run->present_egl_views = NULL;
+    run->present_egl_layer = NULL;
+    run->place_egl_layer = NULL;
 }
 
 static void test_two_threads(void)
@@ -1723,6 +1891,7 @@ int mg_gl_natives_tests_run(mg_test_sink sink, void *user, int *checks)
     test_version();
     test_context_versions();
     test_context_es1();
+    test_native_frame();
     test_hardware_buffers();
     test_webview_display();
     mg_egl_webview_own_display(false);
@@ -1737,6 +1906,9 @@ int mg_gl_natives_tests_run(mg_test_sink sink, void *user, int *checks)
     mg_gl_standin_reset(true, false);
     mg_java_gl_reset();
     test_window();
+    mg_gl_standin_reset(true, false);
+    mg_java_gl_reset();
+    test_experimental_shell();
     mg_gl_standin_reset(true, false);
     mg_java_gl_reset();
     test_two_threads();

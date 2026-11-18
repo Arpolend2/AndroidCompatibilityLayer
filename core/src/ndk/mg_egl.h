@@ -1,9 +1,8 @@
 /*
- * EGL and OpenGL ES for guest code, over ANGLE.
+ * EGL and OpenGL ES for guest code, over ANGLE or the POSIX system EGL.
  *
- * Android's EGL and GLES are C APIs like any other and ANGLE implements them
- * over Direct3D 11, so most calls go straight through: a guest import of
- * glDrawArrays is bound to ANGLE's glDrawArrays. What this layer adds:
+ * Android's EGL and GLES are C APIs like any other, so most calls go straight
+ * through to the host implementation. The Windows backend adds:
  *
  *   - the display is made as an ANGLE/Direct3D 11 display, whatever the guest
  *     asked for, falling back to what a feature-level-9_3 phone needs;
@@ -20,6 +19,12 @@
  *   - on x86_64 and x86 (desktop Windows) every function of EGL's and GLES's
  *     does: ANGLE's are of Windows' calling convention, the guest's and the
  *     core's of Android's (mg_gl_adapters.c).
+ *
+ * The experimental POSIX system EGL/GLES backend is enabled only by defining
+ * MG_EXPERIMENTAL_NATIVE_EGL when compiling. It uses Qt's EGL display when
+ * supplied before initialization, otherwise the system default. Experimental
+ * GPU composition can import frames as EGLImages; CPU readback remains the
+ * fallback when the display or driver cannot support that path.
  */
 #ifndef MG_EGL_H
 #define MG_EGL_H
@@ -48,7 +53,7 @@ void *mg_gl_adapter(const char *name, void *host);
 /* How many bytes that function's arguments take on x86's stack, -1 for a name with no adapter (the tests' stand-in for ANGLE). */
 int mg_gl_adapter_arg_bytes(const char *name);
 
-/* The address to bind a guest import of an EGL or GLES function to (an adapter, or ANGLE's own), or NULL. Loads ANGLE on first use. */
+/* The address to bind a guest EGL or GLES import to, or NULL. Loads the host libraries on first use. */
 void *mg_egl_resolve(const char *name);
 /* Whether a name is one this module answers for, without loading anything (for reports). */
 bool mg_egl_is_gl_name(const char *name);
@@ -63,11 +68,18 @@ bool mg_egl_is_gl_name(const char *name);
 void *mg_egl_host(const char *name);
 
 /*
- * Where EGL and GLES come from. By default ANGLE's two DLLs in the package;
+ * Where EGL and GLES come from. By default ANGLE's two DLLs; an experimental
+ * POSIX build uses the system EGL, GLESv2 and optional GLESv1_CM libraries;
  * tests give a function that returns their own stand-ins. NULL from it means
  * "no such function".
  */
 void mg_egl_set_provider(void *(*resolve)(const char *name));
+/*
+ * For the experimental native EGL backend: reuse Qt's initialized display so
+ * the preview scene graph can import guest EGLImages. Must be called before
+ * the guest first asks for an EGL display; false if it is too late or unused.
+ */
+bool mg_egl_set_native_display(void *display);
 /*
  * For the tests: a display made as the app's is made (mg_egl.c, make_display: its attempts, WARP's on a graphics processor
  * below 9_3 among them), apart from the app's own and anew at each call; which attempt made it, in `how`. False when none.

@@ -54,6 +54,18 @@ static u32 mix_voice(mg_voice *v, float *mix, int frames)
         const queued *q = &v->queue[v->head];
         const u8 *frame = q->data + (size_t)v->pos * v->frame_bytes;
         float l = sample_at(v, frame, 0), r = v->channels > 1 ? sample_at(v, frame, 1) : l;
+        if (v->frac) {
+            const u8 *next = NULL;
+            if (v->pos + 1 < q->frames)
+                next = frame + v->frame_bytes;
+            else if (v->count > 1)
+                next = v->queue[(v->head + 1) % MAX_QUEUE].data;
+            if (next) {
+                float fraction = (float)v->frac / 65536.0f;
+                l += (sample_at(v, next, 0) - l) * fraction;
+                r += ((v->channels > 1 ? sample_at(v, next, 1) : sample_at(v, next, 0)) - r) * fraction;
+            }
+        }
         mix[i * 2] += l * v->gain * v->gain_l;
         mix[i * 2 + 1] += r * v->gain * v->gain_r;
         v->frac += v->step;

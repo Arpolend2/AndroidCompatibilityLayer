@@ -9,12 +9,29 @@ public class NetworkRequest implements android.os.Parcelable {
     public int[] getCapabilities() { return arr(mCaps); }
     public int[] getForbiddenCapabilities() { return arr(mForbidden); }
     public int[] getTransportTypes() { return arr(mTransports); }
+    private static final java.util.HashSet<String> sReportedMismatches = new java.util.HashSet<>();
+    private void reportMismatch(NetworkCapabilities nc) {
+        if (!mCaps.contains(NetworkCapabilities.NET_CAPABILITY_INTERNET) ||
+            !mCaps.contains(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return;
+        java.util.TreeSet<Integer> missing = new java.util.TreeSet<>();
+        java.util.TreeSet<Integer> forbidden = new java.util.TreeSet<>();
+        for (int c : mCaps) if (!nc.hasCapability(c)) missing.add(c);
+        for (int c : mForbidden) if (!nc.isCapabilityKnownAbsent(c)) forbidden.add(c);
+        String message = "network request unmatched: missing=" + missing +
+                " forbiddenNotKnownAbsent=" + forbidden + " requestedTransports=" + mTransports +
+                " actualTransports=" + java.util.Arrays.toString(nc.getTransportTypes());
+        synchronized (sReportedMismatches) {
+            if (sReportedMismatches.size() >= 32 || !sReportedMismatches.add(message)) return;
+        }
+        android.util.Log.i("MeglerNetwork", message);
+    }
     public boolean canBeSatisfiedBy(NetworkCapabilities nc) {
         if (nc == null) return false;
-        for (int c : mCaps) if (!nc.hasCapability(c)) return false;
-        for (int c : mForbidden) if (nc.hasCapability(c)) return false;
+        for (int c : mCaps) if (!nc.hasCapability(c)) { reportMismatch(nc); return false; }
+        for (int c : mForbidden) if (!nc.isCapabilityKnownAbsent(c)) { reportMismatch(nc); return false; }
         if (mTransports.isEmpty()) return true;
         for (int t : mTransports) if (nc.hasTransport(t)) return true;
+        reportMismatch(nc);
         return false;
     }
     @Override public String toString() { return "NetworkRequest [ caps " + mCaps + " transports " + mTransports + " ]"; }

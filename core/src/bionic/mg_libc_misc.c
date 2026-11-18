@@ -1074,13 +1074,39 @@ typedef struct g_rlimit {
     gulong cur, max;
 } g_rlimit;
 
+static int rlimit_copy(void *dst, const void *src, size_t size)
+{
+    if (!dst) {
+        mg_set_errno(GE_FAULT);
+        return -1;
+    }
+#if !MG_HOST_WINDOWS
+    {
+        int err = mg_mem_copy_to_guest(dst, src, size);
+        if (err) {
+            if (err != GE_FAULT) mg_warn("getrlimit: unable to copy result to guest memory (errno %d)", err);
+            mg_set_errno(err);
+            return -1;
+        }
+    }
+#else
+    memcpy(dst, src, size);
+#endif
+    return 0;
+}
+
+static gulong rlimit_value(int resource)
+{
+    if (resource == 3) return 8u * 1024 * 1024;
+    if (resource == 7) return 1024;
+    return (gulong)-1;
+}
+
 static int g_getrlimit(int resource, g_rlimit *r)
 {
-    /* RLIMIT_STACK 3, RLIMIT_NOFILE 7; everything else unlimited */
-    if (resource == 3) r->cur = r->max = 8u * 1024 * 1024;
-    else if (resource == 7) r->cur = r->max = 1024;
-    else r->cur = r->max = (gulong)-1;
-    return 0;
+    g_rlimit limit;
+    limit.cur = limit.max = rlimit_value(resource);
+    return rlimit_copy(r, &limit, sizeof(limit));
 }
 static int g_setrlimit(int resource, const g_rlimit *r) { (void)resource; (void)r; return 0; }
 /*
@@ -1094,11 +1120,10 @@ typedef struct g_rlimit64 {
 
 static int g_getrlimit64(int resource, g_rlimit64 *r)
 {
-    g_rlimit small;
-    g_getrlimit(resource, &small);
-    r->cur = small.cur == (gulong)-1 ? ~(u64)0 : small.cur;
-    r->max = small.max == (gulong)-1 ? ~(u64)0 : small.max;
-    return 0;
+    gulong value = rlimit_value(resource);
+    g_rlimit64 limit;
+    limit.cur = limit.max = value == (gulong)-1 ? ~(u64)0 : value;
+    return rlimit_copy(r, &limit, sizeof(limit));
 }
 static int g_setrlimit64(int resource, const g_rlimit64 *r) { (void)resource; (void)r; return 0; }
 static int g_prlimit(int pid, int resource, const g_rlimit *nl, g_rlimit *old) { (void)pid; (void)nl; return old ? g_getrlimit(resource, old) : 0; }

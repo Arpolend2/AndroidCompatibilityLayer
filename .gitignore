@@ -1,4 +1,6 @@
 /build/
+/aurora/android-runtime/
+/aurora/sqlite/
 /app/Megler/AppPackages/
 /app/Megler/*.cer
 *.pfx

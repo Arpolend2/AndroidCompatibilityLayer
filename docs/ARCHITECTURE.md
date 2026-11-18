@@ -451,6 +451,14 @@ hold their locks) sends the thread back there with the stubs' `longjmp`. The
 call then ends with a `RuntimeException` that says so, and the app runs on. The
 report is in the log all the same, with `fault: contained` after it.
 
+On Linux ARM64 the report also says `ARM64 syndrome access: read`, `write`,
+`execute`, or `unknown`, decoded from the kernel's ESR signal record. A missing
+or unrecognized record is unknown; this diagnostic does not change fault
+recovery or memory permissions. To match a report to the executable, record
+the SHA-256 and, if available, ELF build ID of the running process's
+`/proc/<pid>/exe`, and retain that exact binary and its matching debug symbols.
+Do not assume a later build with the same filename is the one that crashed.
+
 Such code is that of a service's class scope, a dex whose loader's parents
 include a service's loader (DroidGuard's VM, a `DexClassLoader` of Google Play
 services'), or the platform's own on a thread a service's code started. What a

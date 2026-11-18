@@ -28,6 +28,7 @@ static void append_line(const char *path, const char *text)
     mg_file_close(f);
 }
 
+#ifndef MEGLER_NO_EMBEDDED_TESTS
 typedef struct selftest_out {
     megler_line_fn out;
     void *user;
@@ -94,6 +95,7 @@ int megler_net_check(megler_line_fn out, void *user, int *checks, int *refused)
     if (out) out("the network as an app finds it", user);
     return mg_net_check_run("connectivitycheck.gstatic.com", "/generate_204", out, user, checks, refused);
 }
+#endif
 
 static megler_line_fn g_out;
 static void *g_out_user;

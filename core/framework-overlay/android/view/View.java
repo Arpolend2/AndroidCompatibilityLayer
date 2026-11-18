@@ -1364,6 +1364,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
     public void postInvalidateOnAnimation() { postInvalidate(); }
     public void postInvalidateOnAnimation(int l, int t, int r, int b) { postInvalidate(l, t, r, b); }
     public void invalidateDrawableMegler() { invalidate(); }
+    void meglerDrawSurface(Canvas c) {}
     protected void onDraw(Canvas c) {}
     protected void dispatchDraw(Canvas c) {}
     public void onDrawForeground(Canvas c) {
@@ -1381,6 +1382,7 @@ public class View implements Drawable.Callback, KeyEvent.Callback {
     public void draw(Canvas c) {
         mPrivateFlags &= ~PFLAG_DIRTY;
         drawBackground(c);
+        meglerDrawSurface(c);
         if ((mPrivateFlags & PFLAG_WILL_NOT_DRAW) == 0 || !(this instanceof ViewGroup)) onDraw(c);
         dispatchDraw(c);
         onDrawForeground(c);

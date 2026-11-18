@@ -18,7 +18,10 @@
 // (setPreviewTexture) as Android shows it: a front camera's picture mirrored, then turned by setDisplayOrientation, then
 // scaled to the surface. A thread of the camera's own ("Camera preview N") takes the pictures, shows them and copies them.
 //
-// Not done: takePicture (refused with a RuntimeException, said in the log), zoom, exposure compensation, focus and metering
+// takePicture: the preview's next frame at the preview's size (not the sensor's), turned by the "rotation" parameter, a JPEG of
+// "jpeg-quality" with no Exif or thumbnail, from the shutter and jpeg callbacks only (no raw or postview); the preview goes on.
+//
+// Not done: zoom, exposure compensation, focus and metering
 // areas (none offered, which Android allows), face detection (refused as Android refuses it where there is none), the
 // AutoFocusMoveCallback (never called), RenderScript allocations as preview targets, and a SurfaceTexture drawn by
 // OpenGL ES (updateTexImage gives no pixels here: the framework's SurfaceTexture has none for GL; a TextureView shows them).
@@ -55,6 +58,7 @@ public class Camera {
     private static final int CAMERA_MSG_FOCUS = 0x004;
     private static final int CAMERA_MSG_ZOOM = 0x008;
     private static final int CAMERA_MSG_PREVIEW_FRAME = 0x010;
+    private static final int CAMERA_MSG_COMPRESSED_IMAGE = 0x100;
     private static final int CAMERA_MSG_FOCUS_MOVE = 0x800;
 
     public static final String ACTION_NEW_PICTURE = "android.hardware.action.NEW_PICTURE";
@@ -87,8 +91,7 @@ public class Camera {
     private OnZoomChangeListener mZoomListener;
     private FaceDetectionListener mFaceListener;
     private boolean mFaceDetectionRunning;
-    private ShutterCallback mShutterCallback;
-    private PictureCallback mRawImageCallback, mPostviewCallback, mJpegCallback;
+    private Shot mShot;                       // a takePicture waiting for the preview thread's next frame (guarded by mLock)
     private volatile int mDisplayOrientation;
     private SurfaceHolder mHolder;
     private Surface mSurface;
@@ -260,10 +263,7 @@ public class Camera {
             mTorch = false;
         }
         mFaceDetectionRunning = false;
-        mShutterCallback = null;
-        mRawImageCallback = null;
-        mPostviewCallback = null;
-        mJpegCallback = null;
+        synchronized (mLock) { mShot = null; }
         synchronized (mAutoFocusCallbackLock) {
             mAutoFocusCallback = null;
             mFocusAsked = false;
@@ -346,8 +346,75 @@ public class Camera {
     public final void takePicture(ShutterCallback shutter, PictureCallback raw, PictureCallback jpeg) { takePicture(shutter, raw, null, jpeg); }
     public final void takePicture(ShutterCallback shutter, PictureCallback raw, PictureCallback postview, PictureCallback jpeg) {
         handle();
-        Log.w(TAG, "takePicture: pictures are not taken here (Megler has the preview and its frames only)");
-        throw new RuntimeException("takePicture failed");
+        // The shell has the preview's frames only, so the picture is the preview's next frame at its size (not the sensor's full
+        // size, whatever picture-size says), turned by the "rotation" parameter and written as a JPEG of "jpeg-quality" with no
+        // Exif and no thumbnail. The preview goes on running (Android stops it; startPreview then is a no-op here).
+        if (mPreview == null || jpeg == null && raw == null && postview == null && shutter == null) throw new RuntimeException("takePicture failed");
+        int rotation = 0, quality = 95;
+        try {
+            rotation = Integer.parseInt(mParams.get("rotation"));
+        } catch (RuntimeException e) {
+            // none set: upright as the sensor has it
+        }
+        try {
+            quality = Integer.parseInt(mParams.get("jpeg-quality"));
+        } catch (RuntimeException e) {
+            // the default
+        }
+        synchronized (mLock) {
+            if (mShot != null) throw new RuntimeException("takePicture failed");
+            mShot = new Shot(shutter, jpeg, ((rotation % 360) + 360) % 360 / 90 * 90, Math.max(1, Math.min(100, quality)));
+        }
+    }
+
+    /** A picture asked for: its callbacks, how far to turn it, and the JPEG's quality. */
+    private static final class Shot {
+        final ShutterCallback shutter;
+        final PictureCallback jpeg;
+        final int rotation, quality;
+
+        Shot(ShutterCallback shutter, PictureCallback jpeg, int rotation, int quality) {
+            this.shutter = shutter;
+            this.jpeg = jpeg;
+            this.rotation = rotation;
+            this.quality = quality;
+        }
+    }
+
+    /** The preview thread's, with a frame just held: the asked picture turned, then written as a JPEG on a thread of its own. */
+    private void shoot(long h) {
+        final Shot s;
+        synchronized (mLock) {
+            s = mShot;
+            mShot = null;
+        }
+        if (s == null) return;
+        int size = megler.CameraNative.frameSize(h), fw = size >>> 16, fh = size & 0xffff;
+        boolean turned = s.rotation % 180 != 0;
+        final Bitmap b = fw > 0 && fh > 0 ? Bitmap.createBitmap(turned ? fh : fw, turned ? fw : fh, Bitmap.Config.ARGB_8888) : null;
+        if (b == null || !megler.CameraNative.render(h, b, s.rotation, false)) {
+            Log.e(TAG, "takePicture: the frame could not be taken");
+            if (mEventHandler != null) mEventHandler.obtainMessage(CAMERA_MSG_ERROR, CAMERA_ERROR_UNKNOWN, 0).sendToTarget();
+            return;
+        }
+        if (mEventHandler != null) mEventHandler.obtainMessage(CAMERA_MSG_SHUTTER, s).sendToTarget();
+        Thread t = new Thread("Camera picture") {
+            @Override public void run() {
+                java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(256 * 1024);
+                boolean ok;
+                try {
+                    ok = b.compress(Bitmap.CompressFormat.JPEG, s.quality, out);
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "takePicture: the JPEG could not be written", e);
+                    ok = false;
+                }
+                if (mEventHandler == null) return;
+                if (ok) mEventHandler.obtainMessage(CAMERA_MSG_COMPRESSED_IMAGE, new Object[] { s, out.toByteArray() }).sendToTarget();
+                else mEventHandler.obtainMessage(CAMERA_MSG_ERROR, CAMERA_ERROR_UNKNOWN, 0).sendToTarget();
+            }
+        };
+        t.setDaemon(true);
+        t.start();
     }
 
     public final void startSmoothZoom(int value) { handle(); throw new RuntimeException("start smooth zoom failed"); }
@@ -614,6 +681,7 @@ public class Camera {
                         Log.e(TAG, "the preview could not be shown", e);
                     }
                     deliver();
+                    shoot(h);
                 }
                 if ((news & megler.CameraNative.NEWS_GONE) != 0) {
                     Log.e(TAG, "camera " + mCameraId + " stopped: it was taken away or is gone");
@@ -720,6 +788,17 @@ public class Camera {
                     }
                 }
                 if (pCb != null) pCb.onPreviewFrame((byte[]) msg.obj, mCamera);
+                return;
+            }
+            case CAMERA_MSG_SHUTTER: {
+                Shot s = (Shot) msg.obj;
+                if (s.shutter != null) s.shutter.onShutter();
+                return;
+            }
+            case CAMERA_MSG_COMPRESSED_IMAGE: {
+                Object[] r = (Object[]) msg.obj;
+                PictureCallback cb = ((Shot) r[0]).jpeg;
+                if (cb != null && mNative != 0) cb.onPictureTaken((byte[]) r[1], mCamera);
                 return;
             }
             case CAMERA_MSG_FOCUS: {

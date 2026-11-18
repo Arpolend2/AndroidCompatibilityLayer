@@ -45,7 +45,10 @@ import java.util.concurrent.Executor;
  * the last of a capture's requests onCaptureSequenceCompleted. Focus follows CONTROL_AF_MODE and CONTROL_AF_TRIGGER and is
  * said in CONTROL_AF_STATE; exposure and white balance are the camera's, always CONVERGED; FLASH_MODE TORCH lights the torch.
  *
- * Not here: reprocessing, constrained high-speed and custom sessions (refused, onConfigureFailed), JPEG pictures, manual
+ * JPEG: a JPEG ImageReader gets, for a request that is not repeating, the stream's frame at the stream's size (not the reader's
+ * or the sensor's), turned by JPEG_ORIENTATION, of JPEG_QUALITY, with no Exif or thumbnail.
+ *
+ * Not here: reprocessing, constrained high-speed and custom sessions (refused, onConfigureFailed), manual
  * sensor control, regions, zoom (the crop region is said back, the picture is the whole).
  */
 public final class MeglerCameraDevice extends CameraDevice {
@@ -254,7 +257,8 @@ public final class MeglerCameraDevice extends CameraDevice {
         Size want = null;
         for (Surface o : s.outputs) {
             ImageReader r = o.meglerImageReader;
-            if (r == null) continue;
+            // A JPEG reader's size is the picture's, not the stream's: its pictures are made of the stream's frames.
+            if (r == null || r.getImageFormat() == ImageFormat.JPEG) continue;
             if (want == null || (long) r.getWidth() * r.getHeight() > (long) want.getWidth() * want.getHeight()) want = new Size(r.getWidth(), r.getHeight());
         }
         if (want != null) return want;
@@ -388,7 +392,7 @@ public final class MeglerCameraDevice extends CameraDevice {
         int size = megler.CameraNative.frameSize(h), fw = size >>> 16, fh = size & 0xffff;
         for (Surface target : p.request.meglerTargets()) {
             try {
-                give(h, target, fw, fh, timestamp);
+                give(h, target, fw, fh, timestamp, p.request, p != s.repeating);
             } catch (RuntimeException e) {
                 Log.e(TAG, "camera " + mId + ": a picture could not be given to a surface", e);
             }
@@ -408,8 +412,12 @@ public final class MeglerCameraDevice extends CameraDevice {
     }
 
     /** One picture to one surface: an ImageReader's as NV21's bytes; any other as a picture turned upright. */
-    private void give(long h, Surface target, int fw, int fh, long timestamp) {
+    private void give(long h, Surface target, int fw, int fh, long timestamp, CaptureRequest request, boolean still) {
         ImageReader reader = target.meglerImageReader;
+        if (reader != null && reader.getImageFormat() == ImageFormat.JPEG) {
+            if (still) jpeg(h, reader, fw, fh, timestamp, request);
+            return;
+        }
         if (reader != null) {
             if (reader.getWidth() != fw || reader.getHeight() != fh) {
                 if (!mSaidSize) Log.w(TAG, "camera " + mId + " streams at " + fw + "x" + fh + "; an ImageReader of " + reader.getWidth() + "x" + reader.getHeight() + " gets no pictures");
@@ -452,6 +460,37 @@ public final class MeglerCameraDevice extends CameraDevice {
             }
         }
         if (posted) mNext ^= 1;
+    }
+
+    /**
+     * A still picture to a JPEG reader: the stream's frame at its size (not the reader's), turned by JPEG_ORIENTATION clockwise,
+     * written as a JPEG of JPEG_QUALITY with no Exif or thumbnail, on a thread of its own so that the stream goes on.
+     * Only a request that is not repeating gets one (a JPEG on every frame of a preview would be a slow stream).
+     */
+    private void jpeg(long h, ImageReader reader, int fw, int fh, long timestamp, CaptureRequest request) {
+        Object o = request.get(CaptureRequest.JPEG_ORIENTATION), q = request.get(CaptureRequest.JPEG_QUALITY);
+        int rot = o instanceof Integer ? (((Integer) o % 360) + 360) % 360 / 90 * 90 : 0;
+        int quality = q instanceof Byte ? Math.max(1, Math.min(100, ((Byte) q) & 0xff)) : 95;
+        if (fw <= 0 || fh <= 0) return;
+        final Bitmap b = Bitmap.createBitmap(rot % 180 == 0 ? fw : fh, rot % 180 == 0 ? fh : fw, Bitmap.Config.ARGB_8888);
+        if (!megler.CameraNative.render(h, b, rot, false)) {
+            Log.e(TAG, "camera " + mId + ": the still picture could not be taken from the frame");
+            return;
+        }
+        final int jq = quality;
+        Thread t = new Thread("Camera2 JPEG") {
+            @Override public void run() {
+                java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(256 * 1024);
+                try {
+                    if (b.compress(Bitmap.CompressFormat.JPEG, jq, out) && !reader.meglerQueueJpeg(out.toByteArray(), timestamp))
+                        Log.w(TAG, "camera " + mId + ": a JPEG picture was dropped (the reader is closed or has every image acquired)");
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "camera " + mId + ": the JPEG could not be written", e);
+                }
+            }
+        };
+        t.setDaemon(true);
+        t.start();
     }
 
     /** The result of a picture: the request's values said back, and the picture's own. */

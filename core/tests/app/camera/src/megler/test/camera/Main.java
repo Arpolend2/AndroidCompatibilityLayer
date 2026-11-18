@@ -70,7 +70,13 @@ public class Main extends Activity {
         Log.i(T, "onCreate");
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        surfaceView = new SurfaceView(this);
+        surfaceView = new SurfaceView(this) {
+            private final Paint marker = new Paint();
+            @Override protected void onDraw(Canvas canvas) {
+                marker.setColor(0xFFFF00FF);
+                canvas.drawRect(0, 0, 12, 12, marker);
+            }
+        };
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
             public void surfaceCreated(SurfaceHolder h) { surfaceReady.countDown(); }
             public void surfaceChanged(SurfaceHolder h, int format, int w, int ht) {}

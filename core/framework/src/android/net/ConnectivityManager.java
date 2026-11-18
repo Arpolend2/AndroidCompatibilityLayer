@@ -1,5 +1,5 @@
 package android.net;
-/** The network as the app sees it: always connected, over Wi-Fi (the phone's network is not watched). */
+/** The current host network, or no known network when the host cannot determine it. */
 public class ConnectivityManager {
     public static final int TYPE_NONE = -1, TYPE_MOBILE = 0, TYPE_WIFI = 1, TYPE_ETHERNET = 9, TYPE_VPN = 17, RESTRICT_BACKGROUND_STATUS_DISABLED = 1;
     public static final String CONNECTIVITY_ACTION = "android.net.conn.CONNECTIVITY_CHANGE", EXTRA_NO_CONNECTIVITY = "noConnectivity", EXTRA_NETWORK_INFO = "networkInfo";
@@ -22,16 +22,24 @@ public class ConnectivityManager {
     }
     public interface OnNetworkActiveListener { void onNetworkActive(); }
     private static final Network sNet = new Network();
-    public NetworkInfo getActiveNetworkInfo() { return new NetworkInfo(); }
-    public NetworkInfo getNetworkInfo(int type) { return type == TYPE_WIFI ? new NetworkInfo() : null; }
-    public NetworkInfo getNetworkInfo(Network n) { return new NetworkInfo(); }
-    public NetworkInfo[] getAllNetworkInfo() { return new NetworkInfo[] { new NetworkInfo() }; }
-    public Network getActiveNetwork() { return sNet; }
-    public Network[] getAllNetworks() { return new Network[] { sNet }; }
-    public NetworkCapabilities getNetworkCapabilities(Network n) { return new NetworkCapabilities(); }
-    public LinkProperties getLinkProperties(Network n) { return new LinkProperties(); }
-    public boolean isActiveNetworkMetered() { return false; }
-    public boolean isDefaultNetworkActive() { return true; }
+    private static boolean connected(int s) { return (s & 3) == 2 || (s & 3) == 3; }
+    private static int type(int s) {
+        if ((s & 3) == 3 || (s & 28) == 4) return TYPE_WIFI;
+        if ((s & 28) == 8) return TYPE_MOBILE;
+        if ((s & 28) == 12) return TYPE_ETHERNET;
+        if ((s & 28) == 16) return TYPE_BLUETOOTH;
+        return TYPE_NONE;
+    }
+    public NetworkInfo getActiveNetworkInfo() { int s = megler.NetworkNative.state(); return connected(s) ? new NetworkInfo(type(s), true) : null; }
+    public NetworkInfo getNetworkInfo(int type) { int s = megler.NetworkNative.state(); return connected(s) && type(s) == type ? new NetworkInfo(type, true) : null; }
+    public NetworkInfo getNetworkInfo(Network n) { int s = megler.NetworkNative.state(); return (s & 3) == 3 ? new NetworkInfo() : n == sNet && connected(s) ? new NetworkInfo(type(s), true) : null; }
+    public NetworkInfo[] getAllNetworkInfo() { NetworkInfo n = getActiveNetworkInfo(); return n == null ? new NetworkInfo[0] : new NetworkInfo[] { n }; }
+    public Network getActiveNetwork() { return connected(megler.NetworkNative.state()) ? sNet : null; }
+    public Network[] getAllNetworks() { return getActiveNetwork() == null ? new Network[0] : new Network[] { sNet }; }
+    public NetworkCapabilities getNetworkCapabilities(Network n) { int s = megler.NetworkNative.state(); return ((s & 3) == 3 || (n == sNet && connected(s))) ? new NetworkCapabilities(s) : null; }
+    public LinkProperties getLinkProperties(Network n) { int s = megler.NetworkNative.state(); return ((s & 3) == 3 || (n == sNet && connected(s))) ? new LinkProperties() : null; }
+    public boolean isActiveNetworkMetered() { return (megler.NetworkNative.state() & 3) != 3; }
+    public boolean isDefaultNetworkActive() { return connected(megler.NetworkNative.state()); }
     public int getRestrictBackgroundStatus() { return RESTRICT_BACKGROUND_STATUS_DISABLED; }
     public boolean bindProcessToNetwork(Network n) { return true; }
     public Network getBoundNetworkForProcess() { return null; }
@@ -42,9 +50,61 @@ public class ConnectivityManager {
         if (sThread == null) { android.os.HandlerThread t = new android.os.HandlerThread("ConnectivityThread"); t.start(); sThread = new android.os.Handler(t.getLooper()); }
         return sThread;
     }
+    private static final java.util.HashMap<NetworkCallback, Registration> sCallbacks = new java.util.HashMap<>();
+    private static final class Registration {
+        final NetworkRequest request;
+        final NetworkCallback callback;
+        final android.os.Handler handler;
+        boolean available;
+        int snapshot;
+        Registration(NetworkRequest request, NetworkCallback callback, android.os.Handler handler) {
+            this.request = request; this.callback = callback; this.handler = handler;
+        }
+        void post(Runnable action) {
+            handler.post(() -> { synchronized (sCallbacks) { if (sCallbacks.get(callback) != this) return; } action.run(); });
+        }
+        void update(int s) {
+            if ((s & 3) == 0) return;
+            NetworkCapabilities caps = new NetworkCapabilities(s);
+            boolean match = connected(s) && (request == null || request.canBeSatisfiedBy(caps));
+            if (available && (!match || (snapshot & 28) != (s & 28))) {
+                available = false;
+                post(() -> callback.onLost(sNet));
+            }
+            if (match && !available) {
+                available = true;
+                post(() -> { callback.onAvailable(sNet); callback.onCapabilitiesChanged(sNet, caps); callback.onLinkPropertiesChanged(sNet, new LinkProperties()); callback.onBlockedStatusChanged(sNet, false); });
+            } else if (match && snapshot != s) {
+                post(() -> callback.onCapabilitiesChanged(sNet, caps));
+            }
+            snapshot = s;
+        }
+    }
+    private static final Runnable sPoll = new Runnable() {
+        public void run() {
+            synchronized (sCallbacks) {
+                if (sCallbacks.isEmpty()) return;
+                int s = megler.NetworkNative.state();
+                for (Registration r : sCallbacks.values()) r.update(s);
+                connectivityThread().postDelayed(this, 500);
+            }
+        }
+    };
     private void announce(NetworkRequest r, NetworkCallback cb, android.os.Handler h) {
-        if (r != null && !r.canBeSatisfiedBy(new NetworkCapabilities())) { (h != null ? h : connectivityThread()).post(cb::onUnavailable); return; }
-        (h != null ? h : connectivityThread()).post(() -> { cb.onAvailable(sNet); cb.onCapabilitiesChanged(sNet, new NetworkCapabilities()); cb.onLinkPropertiesChanged(sNet, new LinkProperties()); cb.onBlockedStatusChanged(sNet, false); });
+        if (cb == null) throw new IllegalArgumentException("null network callback");
+        if ((megler.NetworkNative.state() & 3) == 3) {
+            android.os.Handler handler = h != null ? h : connectivityThread();
+            if (r != null && !r.canBeSatisfiedBy(new NetworkCapabilities())) { handler.post(cb::onUnavailable); return; }
+            handler.post(() -> { cb.onAvailable(sNet); cb.onCapabilitiesChanged(sNet, new NetworkCapabilities()); cb.onLinkPropertiesChanged(sNet, new LinkProperties()); cb.onBlockedStatusChanged(sNet, false); });
+            return;
+        }
+        synchronized (sCallbacks) {
+            if (sCallbacks.containsKey(cb)) throw new IllegalArgumentException("callback already registered");
+            boolean first = sCallbacks.isEmpty();
+            sCallbacks.put(cb, new Registration(r, cb, h != null ? h : connectivityThread()));
+            if (first) connectivityThread().post(sPoll);
+            else connectivityThread().post(() -> { synchronized (sCallbacks) { Registration x = sCallbacks.get(cb); if (x != null) x.update(megler.NetworkNative.state()); } });
+        }
     }
     private void announce(NetworkCallback cb) { announce(null, cb, null); }
     public void registerNetworkCallback(NetworkRequest r, NetworkCallback cb) { announce(r, cb, null); }
@@ -52,10 +112,16 @@ public class ConnectivityManager {
     public void registerDefaultNetworkCallback(NetworkCallback cb) { announce(null, cb, null); }
     public void registerDefaultNetworkCallback(NetworkCallback cb, android.os.Handler h) { announce(null, cb, h); }
     public void requestNetwork(NetworkRequest r, NetworkCallback cb) { announce(r, cb, null); }
-    public void requestNetwork(NetworkRequest r, NetworkCallback cb, int timeout) { announce(r, cb, null); }
+    public void requestNetwork(NetworkRequest r, NetworkCallback cb, int timeout) { requestNetwork(r, cb, null, timeout); }
     /* Android 12's, which Google Play services' network location follows the network by (NetworkConnectionMonitor): as the others, where it did nothing. */
     public void registerBestMatchingNetworkCallback(NetworkRequest r, NetworkCallback cb, android.os.Handler h) { announce(r, cb, h); }
-    public void unregisterNetworkCallback(NetworkCallback cb) {}
+    public void unregisterNetworkCallback(NetworkCallback cb) {
+        if ((megler.NetworkNative.state() & 3) == 3) return;
+        synchronized (sCallbacks) {
+            if (sCallbacks.remove(cb) == null) throw new IllegalArgumentException("callback not registered");
+            if (sCallbacks.isEmpty()) connectivityThread().removeCallbacks(sPoll);
+        }
+    }
     public void addDefaultNetworkActiveListener(OnNetworkActiveListener l) {}
     public void removeDefaultNetworkActiveListener(OnNetworkActiveListener l) {}
     public static boolean isNetworkTypeValid(int t) { return t >= 0; }
@@ -268,7 +334,26 @@ public class ConnectivityManager {
     public void requestNetwork(android.net.NetworkRequest p0, int p1, int p2, android.os.Handler p3, android.net.ConnectivityManager.NetworkCallback p4) { announce(p0, p4, p3); }
     public void requestNetwork(android.net.NetworkRequest p0, android.app.PendingIntent p1) {}
     public void requestNetwork(android.net.NetworkRequest p0, android.net.ConnectivityManager.NetworkCallback p1, android.os.Handler p2) { announce(p0, p1, p2); }
-    public void requestNetwork(android.net.NetworkRequest p0, android.net.ConnectivityManager.NetworkCallback p1, android.os.Handler p2, int p3) { announce(p0, p1, p2); }
+    public void requestNetwork(android.net.NetworkRequest p0, android.net.ConnectivityManager.NetworkCallback p1, android.os.Handler p2, int p3) {
+        if ((megler.NetworkNative.state() & 3) == 3) { announce(p0, p1, p2); return; }
+        if (p3 <= 0) throw new IllegalArgumentException("invalid timeout");
+        announce(p0, p1, p2);
+        final Registration r;
+        synchronized (sCallbacks) { r = sCallbacks.get(p1); }
+        connectivityThread().postDelayed(() -> {
+            synchronized (sCallbacks) {
+                if (sCallbacks.get(p1) != r || r.available) return;
+                r.handler.post(() -> {
+                    synchronized (sCallbacks) {
+                        if (sCallbacks.get(p1) != r || r.available) return;
+                        sCallbacks.remove(p1);
+                        if (sCallbacks.isEmpty()) connectivityThread().removeCallbacks(sPoll);
+                    }
+                    p1.onUnavailable();
+                });
+            }
+        }, p3);
+    }
     public boolean requestRouteToHost(int p0, int p1) { return false; }
     public boolean requestRouteToHostAddress(int p0, java.net.InetAddress p1) { return false; }
     public void reserveNetwork(android.net.NetworkRequest p0, android.os.Handler p1, android.net.ConnectivityManager.NetworkCallback p2) {}

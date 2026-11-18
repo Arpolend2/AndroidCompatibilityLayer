@@ -9,6 +9,7 @@
  * many and what they found, so that a phone's log shows whether the Wi-Fi is heard without a line for every scan.
  */
 #include "mg_java.h"
+#include "../../include/megler_network.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +26,21 @@
 static megler_wifi_host g_host;
 static mg_lock g_lock = MG_LOCK_INIT;
 static int g_said_state = -1;
+static volatile i32 g_network = MEGLER_NETWORK_LEGACY;
+
+void megler_network_publish(int snapshot)
+{
+    int state = snapshot & MEGLER_NETWORK_STATE_MASK;
+    int transport = snapshot & MEGLER_NETWORK_TRANSPORT_MASK;
+    if (state > MEGLER_NETWORK_CONNECTED ||
+        transport > MEGLER_NETWORK_TRANSPORT_BLUETOOTH ||
+        (snapshot & ~(MEGLER_NETWORK_STATE_MASK | MEGLER_NETWORK_TRANSPORT_MASK |
+                      MEGLER_NETWORK_INTERNET | MEGLER_NETWORK_VALIDATED | MEGLER_NETWORK_TRUSTED)))
+        snapshot = MEGLER_NETWORK_UNKNOWN;
+    if ((snapshot & MEGLER_NETWORK_STATE_MASK) != MEGLER_NETWORK_CONNECTED)
+        snapshot &= MEGLER_NETWORK_STATE_MASK;
+    mg_atomic_xchg(&g_network, snapshot);
+}
 /* The scans said one by one, and the minute's summary after them. */
 static int g_scans;
 static u64 g_minute_from;
@@ -155,6 +171,7 @@ static mg_jobj *networks_of(const megler_wifi_network *v, int n)
 
 /* state(boolean ask): MEGLER_WIFI_* */
 N(Wifi_state) { c->ret.i = mg_jwifi_state(c->args[0].z != 0); }
+N(Network_state) { c->ret.i = mg_atomic_cas(&g_network, 0, 0); }
 
 /*
  * scan(long[] meta): a scan, waited for; meta[M_COUNT] the networks' number (-1 for no scan), meta[M_TIME] when Windows' report
@@ -193,6 +210,7 @@ N(Wifi_connection)
 }
 
 static const mg_jhle k_wifi[] = {
+    { "megler/NetworkNative", "state", NULL, Network_state },
     { "megler/WifiNative", "state", NULL, Wifi_state },
     { "megler/WifiNative", "scan", NULL, Wifi_scan },
     { "megler/WifiNative", "connection", NULL, Wifi_connection },

@@ -46,6 +46,112 @@ public final class Installs {
     static final String APK_TYPE = "application/vnd.android.package-archive";
     private Installs() {}
 
+    public static boolean hasInstallStatusProtocol() {
+        String apps = Native.appsList();
+        return apps != null && apps.startsWith("MEGLER_INSTALL_STATUS_V1\n");
+    }
+
+    private static String requestName(String pkg, long version) {
+        return "request_" + java.util.UUID.randomUUID().toString().replace("-", "") +
+            (pkg == null ? "" : "_" + version + "_" + pkg) + ".apk";
+    }
+
+    public interface Installed { void done(int status, String message); }
+    private static boolean sIntentActive;
+
+    /** The Aurora status protocol returns only an actual install result, not a handoff. */
+    public static void installWithOutcome(final Context from, Intent i, Installed done) {
+        final Uri uri = i.getData();
+        if (from == null) {
+            done.done(1, "The requesting app is unavailable");
+            return;
+        }
+        final String displayName = nameOf(uri).toLowerCase(java.util.Locale.ROOT);
+        if (displayName.endsWith(".apks") || displayName.endsWith(".xapk") || displayName.endsWith(".apkm")) {
+            done.done(7, "Split APK bundles are not supported");
+            return;
+        }
+        synchronized (Installs.class) {
+            if (sIntentActive) {
+                done.done(1, "Another installation is in progress");
+                return;
+            }
+            sIntentActive = true;
+        }
+        new Thread(() -> {
+            File copy = null;
+            try {
+                String path;
+                if ("file".equals(uri.getScheme())) {
+                    path = uri.getPath();
+                } else {
+                    File dir = new File(from.getCacheDir(), "megler-install");
+                    if (!dir.isDirectory() && !dir.mkdirs()) throw new java.io.IOException("cannot create cache");
+                    copy = File.createTempFile("request-", ".apk", dir);
+                    try (InputStream in = from.getContentResolver().openInputStream(uri);
+                         OutputStream out = new FileOutputStream(copy)) {
+                        if (in == null) throw new java.io.IOException("cannot open content");
+                        byte[] buffer = new byte[65536];
+                        long total = 0;
+                        for (int n; (n = in.read(buffer)) != -1;) {
+                            if (n == 0) throw new java.io.IOException("content stream made no progress");
+                            total += n;
+                            if (total > 512L * 1024 * 1024) throw new java.io.IOException("APK is too large");
+                            out.write(buffer, 0, n);
+                        }
+                    }
+                    path = copy.getPath();
+                }
+                String name = requestName(null, 0);
+                if (!Native.installApk(path, name)) {
+                    done.done(1, "Megler could not take the request");
+                    return;
+                }
+                awaitStatus(name, null, 0, done);
+            } catch (java.io.IOException | SecurityException e) {
+                android.util.Log.w("Megler", "install: could not read requested APK: " + e);
+                done.done(1, "Could not read the requested APK");
+            } finally {
+                if (copy != null && !copy.delete()) android.util.Log.w("Megler", "install: could not remove temporary APK");
+                synchronized (Installs.class) { sIntentActive = false; }
+            }
+        }, "Megler install intent").start();
+    }
+
+    private static void awaitStatus(String name, String pkg, long version, Installed done) {
+        long until = android.os.SystemClock.uptimeMillis() + AWAIT_MS;
+        boolean installed = false;
+        while (android.os.SystemClock.uptimeMillis() < until) {
+            if (installed) {
+                PhoneApps.App app = PhoneApps.find(pkg);
+                if (app != null && (app.versionCode & 0xffffffffL) == version) {
+                    done.done(0, "Megler installed it");
+                    return;
+                }
+            }
+            String now = outcome(name);
+            if (!installed && now != null) {
+                String[] fields = now.split("\t", 3);
+                String what = fields.length > 1 ? fields[1] : "failed";
+                String why = fields.length > 2 ? fields[2] : what;
+                int code = "installed".equals(what) ? 0 : "declined".equals(what) ? 3 :
+                           "incompatible".equals(what) ? 7 : 1;
+                if (code != 0 || pkg == null) {
+                    done.done(code, why);
+                    return;
+                }
+                installed = true;
+            }
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        done.done(1, "Megler did not return an installation result");
+    }
+
     /** Whether `i` asks to uninstall an app (package:<name>), and no activity of the app's own is named for it. */
     public static boolean isUninstall(Intent i) {
         if (i == null || i.getComponent() != null || i.getData() == null || !"package".equals(i.getData().getScheme())) return false;
@@ -96,7 +202,7 @@ public final class Installs {
         if (last == null || last.isEmpty()) last = "app";
         last = last.replace('/', '_').replace('\\', '_');
         String lower = last.toLowerCase(java.util.Locale.ROOT);
-        return lower.endsWith(".apk") || lower.endsWith(".apks") || lower.endsWith(".xapk") ? last : last + ".apk";
+        return lower.endsWith(".apk") || lower.endsWith(".apks") || lower.endsWith(".xapk") || lower.endsWith(".apkm") ? last : last + ".apk";
     }
 
     // ---- PackageInstaller's sessions
@@ -171,14 +277,34 @@ public final class Installs {
     /** The session's files to Megler: one APK, or the folder of one app's; then, once it has an outcome, that to `status`. */
     public static void commit(int id, android.content.IntentSender status) {
         Session s = session(id);
-        if (s == null || s.committed) return;
-        s.committed = true;
+        if (s == null) return;
+        synchronized (s) {
+            if (s.committed) return;
+            s.committed = true;
+        }
         File[] files = s.dir.listFiles((d, n) -> n.toLowerCase(java.util.Locale.ROOT).endsWith(".apk"));
         if (files == null) files = new File[0];
         File base = files.length > 0 ? files[0] : null;
         for (File f : files) if (f.getName().equalsIgnoreCase("base.apk")) base = f;
         android.content.pm.PackageInfo apk = base != null ? ArchiveInfo.read(base.getPath()) : null;
         String pkg = s.packageName != null ? s.packageName : apk != null ? apk.packageName : null;
+        if (hasInstallStatusProtocol()) {
+            if (files.length != 1 || apk == null || apk.packageName == null ||
+                (s.packageName != null && !s.packageName.equals(apk.packageName))) {
+                finish(s, status, pkg, 7, "Only one APK with a matching package is supported");
+                return;
+            }
+            long version = apk.versionCode & 0xffffffffL;
+            String requestName = requestName(apk.packageName, version);
+            if (!Native.installApk(files[0].getPath(), requestName)) {
+                finish(s, status, pkg, 1, "Megler could not take the request");
+                return;
+            }
+            new Thread(() -> awaitStatus(requestName, apk.packageName, version,
+                                        (code, message) -> finish(s, status, pkg, code, message)),
+                       "Megler install " + id).start();
+            return;
+        }
         // A phone maker's list of apps to install at setup (Play Store's restore of "android.autoinstalls.config.google.nexus"):
         // nothing an app on this phone needs, and the user is not asked about it; Play Store goes on without it.
         if (pkg != null && pkg.startsWith("android.autoinstalls.config.")) {

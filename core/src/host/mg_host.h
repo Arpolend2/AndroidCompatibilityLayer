@@ -78,6 +78,10 @@ MG_HOSTAPI size_t mg_mem_discard(void *p, size_t size, void (MG_HOSTCB *fn)(u8 *
 MG_HOSTAPI void mg_mem_set_before_system_write(void (MG_HOSTCB *fn)(void *p, size_t size));
 /* Whether the page at `p` is committed, and its access (MG_PROT_*, -1 for any other): false where the host cannot say (POSIX). */
 MG_HOSTAPI bool mg_mem_page_state(const void *p, bool *committed, int *prot);
+#if !MG_HOST_WINDOWS
+/* Write up to 16 bytes through the kernel; inaccessible guest memory returns a Linux errno. */
+int mg_mem_copy_to_guest(void *dst, const void *src, size_t size);
+#endif
 MG_HOSTAPI void mg_mem_release(void *p, size_t size);
 /* After writing code and before running it. */
 MG_HOSTAPI void mg_icache_flush(void *p, size_t size);
@@ -413,6 +417,7 @@ typedef struct mg_fault {
     u32 code;              /* the OS's own number: an NTSTATUS, or a signal */
     mg_addr address;       /* for MG_FAULT_ACCESS: what was touched */
     bool write, exec;
+    int diagnostic_access; /* independent of the access used for fault recovery */
     mg_addr *regs;         /* MG_REG_COUNT of them, writable; NULL where the host cannot say */
     u32 *cpsr;             /* the flags (CPSR, EFLAGS, PSTATE), writable */
 } mg_fault;

@@ -3778,6 +3778,39 @@ static void test_libc_odds(void)
         u64 lim[2] = { 7, 7 };
         CHECK(get64 && get64(7, lim) == 0 && lim[0] == 1024 && lim[1] == 1024);
         CHECK(get64 && get64(9, lim) == 0 && lim[0] == ~(u64)0 && lim[1] == ~(u64)0);
+        if (get64) {
+            *mg_errno_ptr() = 0;
+            CHECK(get64(7, NULL) == -1 && *mg_errno_ptr() == GE_FAULT);
+        }
+#if !MG_HOST_WINDOWS
+        {
+            typedef int (*rlimit_fn)(int, gulong *);
+            typedef int (*prlimit64_fn)(int, int, const u64 *, u64 *);
+            rlimit_fn get = (rlimit_fn)mg_bionic_find("getrlimit");
+            prlimit64_fn prlimit64 = (prlimit64_fn)mg_bionic_find("prlimit64");
+            u8 *pages = (u8 *)mg_mem_alloc(2 * MG_PAGE);
+            gulong native_lim[2] = { 0, 0 };
+            CHECK(get && get64 && prlimit64 && pages);
+            if (get && get64 && prlimit64 && pages) {
+                CHECK(get(7, native_lim) == 0 && native_lim[0] == 1024 && native_lim[1] == 1024);
+                *mg_errno_ptr() = 0;
+                CHECK(get(7, NULL) == -1 && *mg_errno_ptr() == GE_FAULT);
+                CHECK(mg_mem_protect(pages + MG_PAGE, MG_PAGE, MG_PROT_R));
+                *mg_errno_ptr() = 0;
+                CHECK(get(0, (gulong *)(pages + MG_PAGE)) == -1 && *mg_errno_ptr() == GE_FAULT);
+                *mg_errno_ptr() = 0;
+                CHECK(get64(0, (u64 *)(pages + MG_PAGE)) == -1 && *mg_errno_ptr() == GE_FAULT);
+                *mg_errno_ptr() = 0;
+                CHECK(prlimit64(0, 7, NULL, (u64 *)(pages + MG_PAGE)) == -1 && *mg_errno_ptr() == GE_FAULT);
+                *mg_errno_ptr() = 0;
+                CHECK(get64(7, (u64 *)(pages + MG_PAGE - sizeof(u64))) == -1 && *mg_errno_ptr() == GE_FAULT);
+                CHECK(mg_mem_protect(pages + MG_PAGE, MG_PAGE, MG_PROT_NONE));
+                *mg_errno_ptr() = 0;
+                CHECK(get(0, (gulong *)(pages + MG_PAGE)) == -1 && *mg_errno_ptr() == GE_FAULT);
+            }
+            if (pages) mg_mem_release(pages, 2 * MG_PAGE);
+        }
+#endif
     }
     /*
      * getauxval: what every Linux process's vector has -- AT_EXECFN, the path it was started from, an app's its zygote's (it was

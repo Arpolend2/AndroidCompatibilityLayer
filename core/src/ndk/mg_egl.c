@@ -4,6 +4,7 @@
 
 #include "../bionic/mg_bionic.h"
 #include "../bionic/mg_fd.h"
+#include "../drivers/mg_java_gl.h"
 #include "../mg_core.h"
 #include "../host/mg_host.h"
 #include "../ld/mg_ld.h"
@@ -24,6 +25,10 @@
 
 static void *(*g_provider)(const char *name);
 static void *g_lib_egl, *g_lib_gles;
+static void *g_native_display_hint;
+#if !MG_HOST_WINDOWS
+static void *g_lib_gles1;
+#endif
 static bool g_angle_tried;
 static mg_lock g_egl_lock = MG_LOCK_INIT;      /* the display */
 static mg_lock g_angle_lock = MG_LOCK_INIT;    /* loading ANGLE: taken while the display's lock is held */
@@ -36,6 +41,7 @@ static const u8 *(*h_get_string)(u32 name);
 void mg_egl_set_provider(void *(*resolve)(const char *name))
 {
     g_provider = resolve;
+    g_native_display_hint = NULL;
     g_no_config = -1;
     h_get_string = NULL;
 }
@@ -47,6 +53,15 @@ void mg_egl_set_provider(void *(*resolve)(const char *name))
 #define ADAPTED(name, p) (p)
 #endif
 
+static bool native_egl(void)
+{
+#if !MG_HOST_WINDOWS && defined(MG_EXPERIMENTAL_NATIVE_EGL)
+    return g_provider == NULL;
+#else
+    return false;
+#endif
+}
+
 /* ANGLE's own function by name, or its adapter: everything here, and everything given to guest code, calls ANGLE through this. */
 static void *angle(const char *name)
 {
@@ -55,17 +70,38 @@ static void *angle(const char *name)
     if (!g_angle_tried) {
         mg_lock_acquire(&g_angle_lock);
         if (!g_angle_tried) {
-            g_lib_gles = mg_dl_open("libGLESv2.dll");
-            g_lib_egl = mg_dl_open("libEGL.dll");
-            if (!g_lib_egl || !g_lib_gles)
-                mg_err("egl: ANGLE did not load (libEGL.dll %s, libGLESv2.dll %s): the host's lines before say why",
-                       g_lib_egl ? "loaded" : "not loaded", g_lib_gles ? "loaded" : "not loaded");
+#if !MG_HOST_WINDOWS
+            if (native_egl()) {
+                g_lib_egl = mg_dl_open("libEGL.so.1");
+                g_lib_gles = mg_dl_open("libGLESv2.so.2");
+                g_lib_gles1 = mg_dl_open("libGLESv1_CM.so.1");
+                if (!g_lib_egl || !g_lib_gles)
+                    mg_err("egl: system libraries did not load (libEGL.so.1 %s, libGLESv2.so.2 %s)",
+                           g_lib_egl ? "loaded" : "not loaded", g_lib_gles ? "loaded" : "not loaded");
+                if (!g_lib_gles1) mg_warn("egl: libGLESv1_CM.so.1 did not load; OpenGL ES 1 functions may be unavailable");
+            } else
+#endif
+            {
+                g_lib_gles = mg_dl_open("libGLESv2.dll");
+                g_lib_egl = mg_dl_open("libEGL.dll");
+                if (!g_lib_egl || !g_lib_gles)
+                    mg_err("egl: ANGLE did not load (libEGL.dll %s, libGLESv2.dll %s): the host's lines before say why",
+                           g_lib_egl ? "loaded" : "not loaded", g_lib_gles ? "loaded" : "not loaded");
+            }
             g_angle_tried = true;
         }
         mg_lock_release(&g_angle_lock);
     }
     p = g_lib_egl ? mg_dl_sym(g_lib_egl, name) : NULL;
     if (!p && g_lib_gles) p = mg_dl_sym(g_lib_gles, name);
+#if !MG_HOST_WINDOWS
+    if (native_egl() && !p && g_lib_gles1) p = mg_dl_sym(g_lib_gles1, name);
+    if (native_egl() && !p && g_lib_egl) {
+        typedef void *(*fn_get_proc)(const char *);
+        fn_get_proc get_proc = (fn_get_proc)mg_dl_sym(g_lib_egl, "eglGetProcAddress");
+        if (get_proc) p = get_proc(name);
+    }
+#endif
     return ADAPTED(name, p);
 }
 
@@ -80,6 +116,7 @@ typedef unsigned EGLBoolean, EGLenum;
 #define EGL_BAD_ALLOC 0x3003
 #define EGL_BAD_ATTRIBUTE 0x3004
 #define EGL_BAD_DISPLAY 0x3008
+#define EGL_BAD_CONTEXT 0x3006
 #define EGL_BAD_MATCH 0x3009
 #define EGL_BAD_NATIVE_WINDOW 0x300B
 #define EGL_BAD_SURFACE 0x300D
@@ -164,6 +201,19 @@ static bool g_initialized, g_device_attached;
 static EGLint g_major, g_minor;
 static EGLint g_told_minor;            /* the version the guest is told is 1.<this>: see tell_version */
 static char g_told_version[96];        /* and its EGL_VERSION string, where that is not ANGLE's own */
+
+bool mg_egl_set_native_display(void *display)
+{
+    bool accepted = false;
+    if (!native_egl() || !display) return false;
+    mg_lock_acquire(&g_egl_lock);
+    if (!g_initialized) {
+        g_native_display_hint = display;
+        accepted = true;
+    }
+    mg_lock_release(&g_egl_lock);
+    return accepted;
+}
 static int g_d3d_level;                /* 0x9300, 0xA000, 0xB100...; 0 when unknown */
 static void *g_d3d_device;
 static char g_how[48];                 /* which attempt made the display */
@@ -207,6 +257,37 @@ static bool g_said_software;
 
 static void make_display(made_display *m)
 {
+    if (native_egl()) {
+        typedef EGLDisplay (*fn_get_display)(void *);
+        fn_get_display get = A(fn_get_display, "eglGetDisplay");
+        fn_initialize init = A(fn_initialize, "eglInitialize");
+        EGLDisplay d;
+        if (m->whose) return;
+        if (!get || !init) {
+            mg_err("egl: the system EGL lacks eglGetDisplay or eglInitialize");
+            return;
+        }
+        if (g_native_display_hint) {
+            EGLint major = 0, minor = 0;
+            d = (EGLDisplay)g_native_display_hint;
+            if (init(d, &major, &minor)) {
+                m->d = d;
+                m->major = major;
+                m->minor = minor;
+                mg_strlcpy(m->how, "Qt's EGL display", sizeof(m->how));
+                return;
+            }
+            mg_warn("egl: Qt's EGL display could not be initialized; trying the system default display");
+        }
+        d = get(NULL);
+        if (!d || !init(d, &m->major, &m->minor)) {
+            mg_err("egl: the system EGL could not initialize its default display");
+            return;
+        }
+        m->d = d;
+        mg_strlcpy(m->how, "system EGL", sizeof(m->how));
+        return;
+    }
     /*
      * What a feature-level-10+ GPU takes, then what a 9_3 phone needs. Software rendering is not worth trying on a phone: WARP,
      * Direct3D in software, is the third attempt, made only once those two have failed on a graphics processor below 9_3
@@ -602,16 +683,18 @@ static EGLDisplay display(void)
         g_minor = m.minor;
         mg_strlcpy(g_how, m.how, sizeof(g_how));
         if (g_display) {
-            fn_query_display_attrib qd = A(fn_query_display_attrib, "eglQueryDisplayAttribEXT");
-            fn_query_device_attrib qv = A(fn_query_device_attrib, "eglQueryDeviceAttribEXT");
-            intptr_t device = 0, d3d = 0;
-            if (qd && qv && qd(g_display, EGL_DEVICE_EXT, &device) && device && qv((void *)device, EGL_D3D11_DEVICE_ANGLE, &d3d)) {
-                g_d3d_device = (void *)d3d;
-                g_d3d_level = mg_host_d3d11_feature_level(g_d3d_device);
-            }
-            mg_info("egl: ANGLE display as %s, EGL %d.%d, Direct3D feature level %d_%d", g_how, g_major, g_minor, g_d3d_level >> 12, (g_d3d_level >> 8) & 15);
-            {
+            if (native_egl()) {
+                mg_info("egl: %s initialized, EGL %d.%d", g_how, g_major, g_minor);
+            } else {
+                fn_query_display_attrib qd = A(fn_query_display_attrib, "eglQueryDisplayAttribEXT");
+                fn_query_device_attrib qv = A(fn_query_device_attrib, "eglQueryDeviceAttribEXT");
+                intptr_t device = 0, d3d = 0;
                 bool offsets = false, partial = false;
+                if (qd && qv && qd(g_display, EGL_DEVICE_EXT, &device) && device && qv((void *)device, EGL_D3D11_DEVICE_ANGLE, &d3d)) {
+                    g_d3d_device = (void *)d3d;
+                    g_d3d_level = mg_host_d3d11_feature_level(g_d3d_device);
+                }
+                mg_info("egl: ANGLE display as %s, EGL %d.%d, Direct3D feature level %d_%d", g_how, g_major, g_minor, g_d3d_level >> 12, (g_d3d_level >> 8) & 15);
                 if (mg_host_d3d11_options(g_d3d_device, &offsets, &partial))
                     mg_info("egl: the driver's Direct3D 11.1: constant buffers at an offset %s, updated in part %s%s", offsets ? "yes" : "no", partial ? "yes" : "no",
                             offsets ? "" : " (ANGLE makes a buffer of its own for each range of a uniform buffer bound)");
@@ -628,7 +711,7 @@ static EGLDisplay display(void)
                 tell_version(ext, qs ? qs(g_display, EGL_VERSION) : NULL);
             }
         } else {
-            mg_err("egl: ANGLE could not make a display");
+            mg_err("egl: %s could not make a display", native_egl() ? "system EGL" : "ANGLE");
         }
         g_initialized = true;
     }
@@ -807,7 +890,7 @@ static void context_asked(const EGLint *attribs, int *major, int *minor, char *r
  * The highest OpenGL ES version ANGLE's display makes: 3.0 on Direct3D 11 from feature level 10_1 on (3.1 it does not do on
  * Direct3D 11 at all: renderer11_utils.cpp, GetMaximumClientVersion), 2.0 below; 3.0 where the level is not known.
  */
-static int display_es_version(void) { return !g_d3d_level || g_d3d_level >= 0xA100 ? 30 : 20; }
+static int display_es_version(void) { return native_egl() ? 0 : !g_d3d_level || g_d3d_level >= 0xA100 ? 30 : 20; }
 
 /*
  * eglCreateContext refused. Asked for a version of OpenGL ES above what the display makes, EGL refuses with EGL_BAD_MATCH,
@@ -828,7 +911,7 @@ static void context_refused(EGLContext share, const EGLint *attribs, volatile i3
     i32 n;
     if (e && e != EGL_SUCCESS) g_error = e;
     context_asked(attribs, &major, &minor, rest, sizeof(rest));
-    if (e == EGL_BAD_MATCH && major >= 2 && major * 10 + minor > has) {
+    if (has && e == EGL_BAD_MATCH && major >= 2 && major * 10 + minor > has) {
         i32 bit = (i32)1 << ((major & 3) * 4 + (minor & 3)), was = versions_said;
         while (!(was & bit) && mg_atomic_cas(&versions_said, was, was | bit) != was) was = versions_said;
         if (!(was & bit))
@@ -967,6 +1050,10 @@ static int surface_configs(EGLDisplay d, EGLConfig wanted, EGLConfig *out, int m
     EGLint attribs[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RED_SIZE, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 0, 0x3026, 0, EGL_RENDERABLE_TYPE, 0, EGL_NONE };
     EGLConfig found[64];
     int count = 0;
+    if (native_egl()) {
+        out[0] = wanted;
+        return 1;
+    }
     if (!get || !choose) {
         out[0] = wanted;
         return 1;
@@ -1039,7 +1126,7 @@ static EGLSurface g_eglCreatePbufferSurface(EGLDisplay d, EGLConfig config, cons
         refused("eglCreatePbufferSurface", &refused_made);
         return NULL;
     }
-    mutex = mg_egl_surface_mutex(d, h);
+    mutex = native_egl() ? NULL : mg_egl_surface_mutex(d, h);
     if (!mutex) return h;
     if (!mg_atomic_xchg(&said, 1))
         mg_info("egl: ANGLE shares its pbuffers' textures with a keyed mutex: each is held by ANGLE's device from its making, else what is drawn in it is dropped");
@@ -1140,6 +1227,7 @@ static EGLConfig context_config(EGLDisplay d, EGLConfig config, const EGLint *at
 {
     EGLConfig candidates[8];
     EGLint major = 1;
+    if (native_egl()) return config;
     for (; attribs && attribs[0] != EGL_NONE; attribs += 2)
         if (attribs[0] == EGL_CONTEXT_CLIENT_VERSION) major = attribs[1];
     if (major != 1) return no_config ? NULL : config;
@@ -1172,6 +1260,7 @@ static const EGLint *es1_on_es2(EGLDisplay d, const EGLint *attribs, EGLint *out
     int major, minor, draws;
     char rest[8];
     size_t k = 0;
+    if (native_egl()) return attribs;
     context_asked(attribs, &major, &minor, rest, sizeof(rest));
     if (major != 1 || display_es_version() >= 30) return attribs;
     mg_lock_acquire(&g_es1_lock);
@@ -1212,7 +1301,7 @@ static EGLContext g_eglCreateContext(EGLDisplay d, EGLConfig config, EGLContext 
     attribs = es1_on_es2(d, attribs, es2, MG_COUNT(es2));
     with = context_config(d, config, attribs, g_no_config != 0);
     made = real(d, with, share, attribs);
-    if (made && with && g_no_config)
+    if (made && with && g_no_config && !native_egl())
         mg_note_once("egl: OpenGL ES 1: its contexts are made with the configuration of their window surface, as ANGLE makes version 1 only "
                      "with one (every other version without)");
     if (!made) context_refused(share, attribs, &said);
@@ -1291,6 +1380,15 @@ static EGLSurface g_eglCreateWindowSurface(EGLDisplay d, EGLConfig config, mg_nw
         g_error = EGL_BAD_NATIVE_WINDOW;
         return NULL;
     }
+    if (native_egl()) {
+        fn_get_config_attrib get = A(fn_get_config_attrib, "eglGetConfigAttrib");
+        EGLint sample_buffers = 0;
+        if (!get || !get(d, config, 0x3032, &sample_buffers) || sample_buffers) {
+            mg_warn("egl: native window readback cannot use a multisampled or unqueryable configuration");
+            g_error = EGL_BAD_MATCH;
+            return NULL;
+        }
+    }
     if (window->ops && window->ops->egl_create) return window_surface_create(d, config, window);
     s = take_entry();
     if (!s) {
@@ -1347,7 +1445,8 @@ static EGLSurface g_eglCreateWindowSurface(EGLDisplay d, EGLConfig config, mg_nw
         s->from_host = from_host;
         s->handle = h;
         mg_lock_release(&g_surfaces_lock);
-        mg_info("egl: window surface %dx%d%s", width, height, from_host ? "" : " (off-screen)");
+        mg_info("egl: window surface %dx%d%s", width, height, from_host ? "" :
+                native_egl() && run->window.present_pixels ? " (CPU readback)" : " (off-screen)");
         return h;
     }
 }
@@ -2453,6 +2552,20 @@ static EGLBoolean g_eglSwapBuffers(EGLDisplay d, EGLSurface handle)
         fn_gl_void flush = A(fn_gl_void, "glFlush");
         if (flush) flush();
         if (run->window.present) run->window.present(run->window.user);
+    } else if (native_egl() && s->window) {
+        const megler_run_config *run = mg_run_config();
+        int accepted = run->present_egl_window ?
+            run->present_egl_window(run->window.user, d, handle, s->width, s->height) : 0;
+        if (accepted < 0) {
+            mg_err("egl: native window context could not be restored after presentation");
+            g_error = EGL_BAD_CONTEXT;
+            return 0;
+        }
+        if (!accepted && !mg_java_gl_present_native(d, handle, s->width, s->height, run->window.present_pixels, run->window.user)) {
+            mg_err("egl: native window frame could not be read back and presented");
+            g_error = EGL_BAD_SURFACE;
+            return 0;
+        }
     }
     mg_run_count_frame();
     return 1;
@@ -2518,7 +2631,7 @@ static const char *layer_extensions(const char *angle)
     if (g_ext_from != angle || !g_ext) {
         char *ext = (char *)mg_alloc(strlen(angle) + sizeof(fences) + sizeof(buffers));
         strcpy(ext, angle);
-        if (!has_ext(angle, "EGL_KHR_fence_sync")) strcat(ext, fences);
+        if (!native_egl() && !has_ext(angle, "EGL_KHR_fence_sync")) strcat(ext, fences);
         if (images) strcat(ext, buffers);
         /* (One made before may still be read by whoever asked for it then: it is kept.) */
         g_ext = ext;
@@ -3113,6 +3226,18 @@ static const mg_sym g_egl_overrides[] = {
     MG_END
 };
 
+static bool native_sync_name(const char *name)
+{
+    static const char *const names[] = {
+        "eglCreateSyncKHR", "eglDestroySyncKHR", "eglClientWaitSyncKHR",
+        "eglGetSyncAttribKHR", "eglWaitSyncKHR", "eglDupNativeFenceFDANDROID"
+    };
+    size_t i;
+    for (i = 0; i < MG_COUNT(names); i++)
+        if (!strcmp(name, names[i])) return true;
+    return false;
+}
+
 bool mg_egl_is_gl_name(const char *name)
 {
     return (name[0] == 'g' && name[1] == 'l' && name[2] >= 'A' && name[2] <= 'Z') || (name[0] == 'e' && name[1] == 'g' && name[2] == 'l' && name[3] >= 'A' && name[3] <= 'Z');
@@ -3128,6 +3253,7 @@ static void *resolve(const char *name)
         mg_gltex_set_host(angle);
     }
     if (name[0] == 'e') {
+        if (native_egl() && native_sync_name(name)) return angle(name);
         for (i = 0; g_egl_overrides[i].name; i++)
             if (!strcmp(g_egl_overrides[i].name, name)) return g_egl_overrides[i].addr;
         return angle(name);
@@ -3471,7 +3597,8 @@ bool mg_egl_external_upload(u32 external, u32 *helper, void **image, int *helper
 
 void mg_egl_probe(void (*line)(const char *fmt, ...))
 {
-    EGLDisplay d = (line("angle: trying (if this is the last line, ANGLE ended the process while making its display)"), display());
+    EGLDisplay d = (line("%s", native_egl() ? "egl: trying" :
+                        "angle: trying (if this is the last line, ANGLE ended the process while making its display)"), display());
     fn_query_string qs = A(fn_query_string, "eglQueryString");
     fn_choose_config choose = A(fn_choose_config, "eglChooseConfig");
     fn_create_context create = A(fn_create_context, "eglCreateContext");
@@ -3483,16 +3610,20 @@ void mg_egl_probe(void (*line)(const char *fmt, ...))
     fn_gl_get_integerv gi = A(fn_gl_get_integerv, "glGetIntegerv");
     int version;
     if (!d || !qs || !choose || !create || !pbuffer || !current || !gs) {
-        line("angle: NOT AVAILABLE (%s)", g_lib_egl || g_provider ? "no display could be made" : "its DLLs did not load");
+        line("%s: NOT AVAILABLE (%s)", native_egl() ? "egl" : "angle",
+             g_lib_egl || g_provider ? "no display could be made" : native_egl() ? "its libraries did not load" : "its DLLs did not load");
         return;
     }
-    line("angle: %s, EGL %d.%d, vendor %s", g_how, g_major, g_minor, qs(d, EGL_VENDOR));
-    if (g_d3d_level) line("d3d-feature-level: %d_%d", g_d3d_level >> 12, (g_d3d_level >> 8) & 15);
-    else line("d3d-feature-level: unknown");
+    line("%s: %s, EGL %d.%d, vendor %s", native_egl() ? "egl" : "angle", g_how, g_major, g_minor, qs(d, EGL_VENDOR));
+    if (!native_egl()) {
+        if (g_d3d_level) line("d3d-feature-level: %d_%d", g_d3d_level >> 12, (g_d3d_level >> 8) & 15);
+        else line("d3d-feature-level: unknown");
+    }
     {
         /* What the window surface rests on: a surface over a texture of the shell's, and a context that goes with any configuration. */
         const char *egl_ext = qs(d, EGL_EXTENSIONS);
-        line("egl-texture-surface: %s", egl_ext && strstr(egl_ext, "EGL_ANGLE_d3d_texture_client_buffer") ? "yes" : "NO (EGL_ANGLE_d3d_texture_client_buffer is missing)");
+        if (!native_egl())
+            line("egl-texture-surface: %s", egl_ext && strstr(egl_ext, "EGL_ANGLE_d3d_texture_client_buffer") ? "yes" : "NO (EGL_ANGLE_d3d_texture_client_buffer is missing)");
         line("egl-no-config-context: %s", egl_ext && strstr(egl_ext, "EGL_KHR_no_config_context") ? "yes" : "no");
     }
     /* The newest OpenGL ES the device gives a context for. */

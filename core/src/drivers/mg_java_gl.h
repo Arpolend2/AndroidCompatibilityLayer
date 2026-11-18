@@ -90,6 +90,9 @@ void mg_java_gl_share_gone(int id);
 /* On no view: the frame the last swap read back, R, G, B, A, rows bottom first, and its size; NULL before the first. */
 const void *mg_java_gl_window_pixels(void *surface, int *width, int *height);
 void mg_java_gl_window_destroy(void *surface);
+/* Present the current native activity pbuffer through the shell's pixel callback. */
+bool mg_java_gl_present_native(void *display, void *surface, int width, int height,
+                               void (MEGLER_CB *present)(void *, const void *, int, int, int), void *user);
 /*
  * The flag trace-surfaces, where the shell shows the views from its own picture (megler_gfx_host.present): whether the views'
  * picture is due to be looked at over the OpenGL layers (every three seconds), and then the picture, brought up to date in

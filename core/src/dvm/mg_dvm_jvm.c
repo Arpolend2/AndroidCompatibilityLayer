@@ -179,24 +179,51 @@ static const mg_sym k_jvm[] = {
  * Android's android_dlopen_ext does -- and its JNI_OnLoad then runs at the first
  * System.loadLibrary of it, as ART's does.
  */
-static mg_lib *g_java_loaded[64];
-static int g_njava_loaded;
+typedef struct java_library {
+    mg_lib *lib;
+    u32 owner;
+    int state;                         /* 0 loading, 1 loaded, -1 failed */
+    char why[700];
+    struct java_library *next;
+} java_library;
+static java_library *g_java_loaded;
 static mg_lock g_java_loaded_lock = MG_LOCK_INIT;
+static mg_cond g_java_loaded_cond = MG_COND_INIT;
 
-static bool java_loaded(const mg_lib *lib)
+/* 1: this thread must run JNI_OnLoad; 0: already loaded; -1: failed. */
+static int java_load_begin(mg_lib *lib, char *why, size_t why_size)
 {
-    int i;
-    bool there = false;
+    java_library *entry;
+    int result;
+    u32 self = mg_thread_self_id();
     mg_lock_acquire(&g_java_loaded_lock);
-    for (i = 0; i < g_njava_loaded && !there; i++) there = g_java_loaded[i] == lib;
+    for (entry = g_java_loaded; entry && entry->lib != lib; entry = entry->next) {}
+    if (!entry) {
+        entry = (java_library *)mg_alloc(sizeof(*entry));
+        entry->lib = lib;
+        entry->owner = self;
+        entry->next = g_java_loaded;
+        g_java_loaded = entry;
+        result = 1;
+    } else {
+        while (entry->state == 0 && entry->owner != self)
+            mg_cond_wait(&g_java_loaded_cond, &g_java_loaded_lock);
+        result = entry->state < 0 ? -1 : 0;
+        if (result < 0) mg_strlcpy(why, entry->why, why_size);
+    }
     mg_lock_release(&g_java_loaded_lock);
-    return there;
+    return result;
 }
 
-static void set_java_loaded(mg_lib *lib)
+static void java_load_end(mg_lib *lib, bool success, const char *why)
 {
+    java_library *entry;
     mg_lock_acquire(&g_java_loaded_lock);
-    if (g_njava_loaded < (int)MG_COUNT(g_java_loaded)) g_java_loaded[g_njava_loaded++] = lib;
+    for (entry = g_java_loaded; entry && entry->lib != lib; entry = entry->next) {}
+    if (!entry) mg_fatal("dvm: Java library load was not registered");
+    entry->state = success ? 1 : -1;
+    if (!success) mg_strlcpy(entry->why, why, sizeof(entry->why));
+    mg_cond_broadcast(&g_java_loaded_cond);
     mg_lock_release(&g_java_loaded_lock);
 }
 
@@ -252,9 +279,9 @@ static bool load_native(const char *name_or_path, bool runtime, char *why, size_
     i32 version;
     char *own;
     bool other = false;
+    int load_state;
     why[0] = 0;
     if (!runtime && mg_bionic_is_system_lib(base)) return true;
-    if (lib && java_loaded(lib)) return true;
     if (lib) {
         /* in the process already, not yet by Java: its JNI_OnLoad is run now, once (see above) */
     } else if (runtime) {
@@ -278,19 +305,29 @@ static bool load_native(const char *name_or_path, bool runtime, char *why, size_
         }
         free(host);
     }
-    if (!lib || !mg_ld_init(lib)) {
+    if (!lib) {
         snprintf(why, why_size, "dlopen failed: \"%s\" could not be loaded (the layer's log says what its linker made of it)", name_or_path);
         return false;
     }
-    set_java_loaded(lib);
+    load_state = java_load_begin(lib, why, why_size);
+    if (load_state <= 0) return load_state == 0;
+    if (!mg_ld_init(lib)) {
+        snprintf(why, why_size, "dlopen failed: \"%s\" could not be initialized", name_or_path);
+        java_load_end(lib, false, why);
+        return false;
+    }
     onload = mg_ld_sym(lib, "JNI_OnLoad");
-    if (!onload || mg_ld_lib_of(onload) != lib) return true;    /* a library need not have one */
+    if (!onload || mg_ld_lib_of(onload) != lib) {
+        java_load_end(lib, true, why);
+        return true;                                            /* a library need not have one */
+    }
     if (!runtime) {
         void *hook0 = mg_ld_sym(lib, "Java_de_robv_android_xposed_XposedBridge_hook0");
         if (hook0 && mg_ld_lib_of(hook0) == lib) {
             mg_info("dvm: %s is an Xposed bridge over LSPlant, which needs ART: its JNI_OnLoad is not run, and XposedBridge's natives are the "
                     "runtime's own (mg_dvm_hook.c)",
                     name_or_path);
+            java_load_end(lib, true, why);
             return true;
         }
     }
@@ -309,12 +346,15 @@ static bool load_native(const char *name_or_path, bool runtime, char *why, size_
     t->onload_scope = was_scope;
     if (version == -1) {
         snprintf(why, why_size, "JNI_ERR returned from JNI_OnLoad in \"%s\"", name_or_path);
+        java_load_end(lib, false, why);
         return false;
     }
     if (version != 0x10002 && version != 0x10004 && version != 0x10006) {
         snprintf(why, why_size, "Bad JNI version returned from JNI_OnLoad in \"%s\": %d", name_or_path, (int)version);
+        java_load_end(lib, false, why);
         return false;
     }
+    java_load_end(lib, true, why);
     return true;
 #else
     (void)runtime;

@@ -2145,6 +2145,19 @@ typedef struct megler_run_config {
     /* The app has ended: by its own exit (status), by a crash (reason names it), or by megler_stop. Called once, from any thread. */
     void (MEGLER_CB *on_exit)(void *user, int status, const char *reason);
     void *user;
+    /* Experimental whole native EGL window presentation, opaque like
+       present_pixels: ignore the source alpha without changing RGB. Called
+       with the app's context and pbuffer current; 1 accepts, 0 requests pixel
+       fallback, -1 means safe context restoration/synchronization failed.
+       SurfaceView layers have a separate, potentially translucent contract. */
+    int (MEGLER_CB *present_egl_window)(void *user, void *display, void *surface, int width, int height);
+    /* Experimental Java window compositor. Views are premultiplied BGRA,
+       top row first, and must be copied before returning. Layer frames use
+       the current EGL context/surface; return values match present_egl_window.
+       place is called without waiting for the UI, width/height zero hides it. */
+    bool (MEGLER_CB *present_egl_views)(void *user, const void *pixels, int width, int height, int stride);
+    int (MEGLER_CB *present_egl_layer)(void *user, int layer, void *display, void *surface, int width, int height);
+    void (MEGLER_CB *place_egl_layer)(void *user, int layer, int x, int y, int width, int height, int flags);
 } megler_run_config;
 
 /*

@@ -641,7 +641,7 @@ static struct {
     mg_java_show_fn show;
     i32 width, height;
     bool used;                         /* a window surface has been made: the views' picture is kept from then on */
-    int shell;                         /* 1: the shell composes the window (megler_gfx_host.gl_frame); -1: it is composed here */
+    int shell;                         /* 1: shared-handle shell, 2: EGL-image shell, -1: composed here */
     u8 *views, *out;                   /* the views' last picture and the window as composed: width x height, rows top first */
     bool have_views, shown_whole;
     layer layers[MAX_LAYERS];
@@ -694,11 +694,16 @@ static void compose_here(void)
  */
 static void use_window(void)
 {
+    const megler_run_config *run = mg_run_config();
     if (C.used || C.width <= 0 || C.height <= 0) return;
     C.used = true;
     /* (The flag gl-compose-here: the core composes, as where the shell cannot -- to tell the shell's composing from the rest on a phone.) */
     if (mg_flag("gl-compose-here")) mg_warn("java: the flag gl-compose-here: the window with OpenGL ES views is composed here, the frames read back");
-    else if (g_shell && g_shell->gl_frame && g_shell->gl_place && g_shell->present && E.share) {
+    else if (run->present_egl_views && run->present_egl_layer && run->place_egl_layer) {
+        C.shell = 2;
+        mg_info("java: experimental EGL image compositor enabled for SurfaceView layers");
+        return;
+    } else if (g_shell && g_shell->gl_frame && g_shell->gl_place && g_shell->present && E.share) {
         C.shell = 1;
         mg_info("java: the app draws with EGL on a view: from now on its window is composed by the shell, the views over OpenGL's frames, "
                 "on the graphics processor (the surfaces' textures shared, nothing read back)");
@@ -719,12 +724,17 @@ static void tell_place(struct layer *l, bool shown);
 static void stop_shell(void)
 {
     int i;
+    int shell = C.shell;
+    const megler_run_config *run = mg_run_config();
     if (C.shell <= 0) return;
     C.shell = -1;
     compose_here();
     C.have_views = C.shown_whole = false;
-    for (i = 0; i < MAX_LAYERS; i++)
-        if (C.layers[i].view) g_shell->gl_place(g_shell->user, i, 0, 0, 0, 0, 0);
+    for (i = 0; i < MAX_LAYERS; i++) {
+        if (!C.layers[i].view) continue;
+        if (shell == 2) run->place_egl_layer(run->window.user, i, 0, 0, 0, 0, 0);
+        else g_shell->gl_place(g_shell->user, i, 0, 0, 0, 0, 0);
+    }
     mg_warn("java: the shell did not take an OpenGL ES frame: from now on the window is composed here, the frames read back");
 }
 
@@ -748,7 +758,15 @@ static int layer_index(const struct layer *l) { return (int)(l - C.layers); }
 
 static void tell_place(struct layer *l, bool shown)
 {
+    const megler_run_config *run = mg_run_config();
     if (C.shell <= 0) return;
+    if (C.shell == 2) {
+        run->place_egl_layer(run->window.user, layer_index(l),
+                             shown && l->placed ? l->x : 0, shown && l->placed ? l->y : 0,
+                             shown && l->placed ? l->w : 0, shown && l->placed ? l->h : 0,
+                             shown && l->placed ? l->flags : 0);
+        return;
+    }
     if (shown && l->placed) g_shell->gl_place(g_shell->user, layer_index(l), l->x, l->y, l->w, l->h, l->flags);
     else g_shell->gl_place(g_shell->user, layer_index(l), 0, 0, 0, 0, 0);
 }
@@ -1164,6 +1182,16 @@ bool mg_java_gl_views(const void *pixels, int width, int height, int stride, con
         return false;
     }
     if (width != C.width || height != C.height) window_resized(width, height);
+    if (C.shell == 2) {
+        const megler_run_config *run = mg_run_config();
+        for (i = 0; i < MAX_LAYERS; i++)
+            if (C.layers[i].view && C.layers[i].pending) take_place(&C.layers[i], &x0, &y0, &x1, &y1);
+        if (run->present_egl_views(run->window.user, pixels, width, height, stride)) {
+            C.have_views = true;
+            mg_lock_release(&g_window_lock);
+            return true;
+        }
+    }
     /* The views come here while the shell composes the window only when it could not show them: it is composed here from now on. */
     if (C.shell > 0) stop_shell();
     if (C.have_views && part && part[2] > part[0] && part[3] > part[1]) {
@@ -1336,7 +1364,7 @@ static bool read_back(gl_surf *s, gl_ctx *x)
     i32 fb = 0, pack = 4, pack_buffer = 0, row_length = 0, skip_rows = 0, skip_pixels = 0;
     u32 fb_target = x->version >= 3 ? GL_READ_FRAMEBUFFER : GL_FRAMEBUFFER;
     size_t need = (size_t)s->width * (size_t)s->height * 4;
-    if (!get || !store || !read) return false;
+    if (!get || !store || !read || (x->version >= 2 && !bind_fb) || (x->version >= 3 && !bind_buffer)) return false;
     if (x->bgra < 0) {
         fn_get_string string = FN(fn_get_string, F_GET_STRING, "glGetString");
         const u8 *ext = string ? string(GL_EXTENSIONS) : NULL;
@@ -1375,6 +1403,53 @@ static bool read_back(gl_surf *s, gl_ctx *x)
     return true;
 }
 
+bool mg_java_gl_present_native(void *display, void *surface, int width, int height,
+                               void (MEGLER_CB *present)(void *, const void *, int, int, int), void *user)
+{
+    EGLContext (*current_context)(void) = (EGLContext(*)(void))mg_egl_host("eglGetCurrentContext");
+    EGLSurface (*current_surface)(EGLint) = (EGLSurface(*)(EGLint))mg_egl_host("eglGetCurrentSurface");
+    u32 (*query_context)(EGLDisplay, EGLContext, EGLint, EGLint *) =
+        (u32(*)(EGLDisplay, EGLContext, EGLint, EGLint *))mg_egl_host("eglQueryContext");
+    gl_surf s;
+    gl_ctx ctx;
+    EGLint version = 0;
+    size_t stride, bytes;
+    u8 *out;
+    int x, y;
+    if (!present || width <= 0 || height <= 0 || width > 0x7fffffff / 4 ||
+        (size_t)height > SIZE_MAX / ((size_t)width * 4)) return false;
+    memset(&s, 0, sizeof(s));
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.handle = current_context ? current_context() : NULL;
+    if (!ctx.handle || !current_surface || current_surface(0x3059) != surface || current_surface(0x305A) != surface || !query_context ||
+        !query_context(display, ctx.handle, EGL_CONTEXT_CLIENT_VERSION, &version) || version < 1) return false;
+    ctx.version = version;
+    ctx.bgra = 0;
+    s.width = width;
+    s.height = height;
+    if (!read_back(&s, &ctx)) {
+        free(s.pixels);
+        return false;
+    }
+    stride = (size_t)width * 4;
+    bytes = stride * (size_t)height;
+    out = (u8 *)mg_alloc(bytes);
+    for (y = 0; y < height; y++) {
+        const u8 *src = s.pixels + (size_t)(height - 1 - y) * stride;
+        u8 *dst = out + (size_t)y * stride;
+        for (x = 0; x < width; x++, src += 4, dst += 4) {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = src[3];
+        }
+    }
+    present(user, out, width, height, (int)stride);
+    free(out);
+    free(s.pixels);
+    return true;
+}
+
 /*
  * A swap returns no sooner than a sixtieth of a second after the one before was due, as a swap interval of 1 has it. The
  * display's turn the swapping thread holds is let go of while it waits (mg_egl_turn_pause): the display's other threads
@@ -1405,7 +1480,7 @@ static void pace(gl_surf *s)
  * UI thread never do), and the shell waits for its copy. False: the shell cannot take frames, and the window is composed
  * here from now on.
  */
-static bool shell_frame(gl_surf *s, layer *l, bool *shown, u64 *finished)
+static int shell_frame(gl_surf *s, layer *l, bool *shown, u64 *finished)
 {
     typedef void (*fn_finish)(void);
     fn_finish finish = FN(fn_finish, F_FINISH, "glFinish"), flush = FN(fn_finish, F_FLUSH, "glFlush");
@@ -1413,6 +1488,18 @@ static bool shell_frame(gl_surf *s, layer *l, bool *shown, u64 *finished)
     void *paused;
     *shown = false;
     *finished = mg_time_monotonic_ns();
+    if (C.shell == 2) {
+        const megler_run_config *run = mg_run_config();
+        int result;
+        mg_lock_acquire(&g_window_lock);
+        active = l->active && C.shell == 2;
+        mg_lock_release(&g_window_lock);
+        if (!active) return 1;
+        result = run->present_egl_layer(run->window.user, layer_index(l), E.display, s->handle, s->width, s->height);
+        *shown = result > 0;
+        *finished = mg_time_monotonic_ns();
+        return result;
+    }
     if (!s->share_asked) {
         void *handle = NULL;
         s->share_asked = true;
@@ -1462,7 +1549,9 @@ static bool swap(gl_surf *s, gl_ctx *x)
     }
     if (C.shell > 0) {
         u64 finished;
-        if (shell_frame(s, l, &shown, &finished)) {
+        int taken = shell_frame(s, l, &shown, &finished);
+        if (taken < 0) return false;
+        if (taken > 0) {
             t1 = mg_time_monotonic_ns();
             mg_lock_acquire(&g_window_lock);
             C.stats.swaps++;

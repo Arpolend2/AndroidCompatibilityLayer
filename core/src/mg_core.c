@@ -7,6 +7,7 @@
 #include "arm/mg_stubs.h"
 #include "bionic/mg_bionic.h"
 #include "host/mg_host.h"
+#include "host/mg_fault_aarch64.h"
 #include "ld/mg_ld.h"
 
 void mg_ctype_init(void);
@@ -417,6 +418,13 @@ static MG_HOSTCB bool on_fault(mg_fault *f)
                  f->kind == MG_FAULT_ILLEGAL ? "illegal instruction" : f->kind == MG_FAULT_ACCESS ? "access violation" : fault_name(f->code), f->code,
                  f->write ? " writing" : "", f->exec ? " executing" : "", (int)(sizeof(mg_addr) * 2), (unsigned long long)pc, lib ? " in " : "",
                  lib ? lib : "", sym ? " " : "", sym ? sym : "", (int)(sizeof(mg_addr) * 2), (unsigned long long)f->address, regs);
+        if (f->kind == MG_FAULT_ACCESS && f->diagnostic_access != MG_FAULT_DIAG_NONE) {
+            const char *access = f->diagnostic_access == MG_FAULT_DIAG_READ ? "read" :
+                                 f->diagnostic_access == MG_FAULT_DIAG_WRITE ? "write" :
+                                 f->diagnostic_access == MG_FAULT_DIAG_EXEC ? "execute" : "unknown";
+            size_t n = strlen(report);
+            snprintf(report + n, sizeof(report) - n, "\n  ARM64 syndrome access: %s", access);
+        }
         if (lib && base) {
             size_t n = strlen(report);
             snprintf(report + n, sizeof(report) - n, "\n  %s+0x%x", lib, (unsigned)(pc - (mg_addr)base));

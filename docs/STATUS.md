@@ -112,6 +112,12 @@ What it has answered is in the table above. What is left:
 
 ## Unity
 
+The native-only JNI bridge implements `System.load` using the shared native
+library loader, including `JNI_OnLoad` and its `JavaVM`. Concurrent loads wait
+for initialization, and a failed `JNI_OnLoad` is reported as an error. This
+addresses a possible cause of Crossy Road's Firebase crash; it has not yet
+been verified in the game on a device.
+
 Begun, on a real game: an unofficial Android build of Hollow Knight (Unity 2020.2,
 IL2CPP, with armeabi-v7a libraries). Under qemu, with the stand-in for OpenGL ES:
 

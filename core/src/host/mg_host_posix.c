@@ -9,6 +9,7 @@
 #endif
 #define _FILE_OFFSET_BITS 64
 #include "mg_host.h"
+#include "mg_fault_aarch64.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -181,6 +182,30 @@ bool mg_mem_page_state(const void *p, bool *committed, int *prot)
     return false;
 }
 #define BEFORE_SYSTEM_WRITE(p, n) do { if (g_before_system_write && (n)) g_before_system_write((p), (n)); } while (0)
+
+int mg_mem_copy_to_guest(void *dst, const void *src, size_t size)
+{
+    int fds[2], err = 0;
+    ssize_t n;
+    if (size > 16) return EINVAL;
+    if (pipe2(fds, O_CLOEXEC) != 0) return errno;
+    do {
+        n = write(fds[1], src, size);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) err = errno;
+    else if ((size_t)n != size) err = EIO;
+    if (!err) {
+        BEFORE_SYSTEM_WRITE(dst, size);
+        do {
+            n = read(fds[0], dst, size);
+        } while (n < 0 && errno == EINTR);
+        if (n < 0) err = errno;
+        else if ((size_t)n != size) err = EFAULT;
+    }
+    close(fds[0]);
+    close(fds[1]);
+    return err;
+}
 
 void mg_mem_release(void *p, size_t size) { munmap(p, size); }
 
@@ -827,6 +852,11 @@ static void on_signal(int sig, siginfo_t *si, void *ctx)
         f.regs = (mg_addr *)uc->uc_mcontext.regs;
         f.cpsr = &flags;
         f.exec = sig == SIGSEGV && f.address == (mg_addr)uc->uc_mcontext.pc;
+        if (f.kind == MG_FAULT_ACCESS) {
+            f.diagnostic_access = si->si_code > 0
+                ? mg_aarch64_fault_access(uc->uc_mcontext.__reserved, sizeof(uc->uc_mcontext.__reserved))
+                : MG_FAULT_DIAG_UNKNOWN;
+        }
         if (g_fault_handler && g_fault_handler(&f)) {
             uc->uc_mcontext.pstate = (uc->uc_mcontext.pstate & ~(u64)0xffffffffu) | flags;
             return;

@@ -4572,11 +4572,20 @@ static int run_camera(void)
     expect_line("I/CameraTest: preview running", &at, 120);
     /* The back camera's preview in the SurfaceView: the sensor's picture turned 90 degrees and scaled to the view. */
     CHECK(camera_shown(sv, back, 60));
+    CHECK(pixel(sv[0] + 4, sv[1] + 4) == 0xFF00FF);
     write_picture("camera-back");
     tap(sv[0] + sv[2] / 2, sv[1] + sv[3] / 2);
     for (i = 0; i < (int)MG_COUNT(after); i++) {
         snprintf(text, sizeof(text), "I/CameraTest: %s ok", after[i]);
         expect_line(text, &at, 120);
+    }
+    line = find_line("D/Camera: camera 0's preview ended:", 0);
+    if (line >= 0) {
+        int frames = 0, shown = 0;
+        const char *entry = strstr(line_at(line), "camera 0's preview ended:");
+        CHECK(entry && sscanf(entry, "camera 0's preview ended: %d pictures, %d shown", &frames, &shown) == 2 && shown > 1);
+    } else {
+        CHECK(line >= 0);
     }
     /* The torch went on through the parameters while the camera streamed, and off again. */
     CHECK(find_line("camera stand-in: the torch is on", 0) >= 0 && find_line("camera stand-in: the torch is off", 0) >= 0);
