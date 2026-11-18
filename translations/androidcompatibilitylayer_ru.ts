@@ -386,7 +386,7 @@
     </message>
 </context>
 <context>
-    <name>MeglerProbe</name>
+    <name>AndroidCompatibilityLayer</name>
     <message>
         <source>microG</source>
         <translation>microG</translation>
@@ -942,7 +942,7 @@ Pick an Android app&apos;s APK to add it to the library.</source>
         <translation>Запуск Android-приложения...</translation>
     </message>
     <message>
-        <source>Megler initialization failed.</source>
+        <source>Android runtime initialization failed.</source>
         <translation>Не удалось инициализировать Megler.</translation>
     </message>
     <message>

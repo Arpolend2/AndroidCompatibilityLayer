@@ -36,7 +36,7 @@ void *MEGLER_CB openCodec(void *, int kind, const megler_codec_format *format)
 {
     if (!supports(nullptr, kind) || !format || format->sample_rate <= 0 ||
         format->sample_rate > 192000 || format->channels < 1 || format->channels > 2) {
-        std::fprintf(stderr, "Megler MP3 codec: unsupported format\n");
+        std::fprintf(stderr, "AndroidCompatibilityLayer MP3 codec: unsupported format\n");
         return nullptr;
     }
     return new Decoder;
@@ -64,7 +64,7 @@ bool MEGLER_CB push(void *, void *handle, const uint8_t *data, size_t size, int6
 {
     Decoder *d = static_cast<Decoder *>(handle);
     if (!d || d->failed || !data || !size || size > 1048576) {
-        std::fprintf(stderr, "Megler MP3 codec: invalid packet or decoder state\n");
+        std::fprintf(stderr, "AndroidCompatibilityLayer MP3 codec: invalid packet or decoder state\n");
         return false;
     }
     while (size) {
@@ -96,7 +96,7 @@ bool MEGLER_CB push(void *, void *handle, const uint8_t *data, size_t size, int6
     }
     if (!size) return true;
     d->failed = true;
-    std::fprintf(stderr, "Megler MP3 codec: invalid frame, timestamp or output queue full\n");
+    std::fprintf(stderr, "AndroidCompatibilityLayer MP3 codec: invalid frame, timestamp or output queue full\n");
     return false;
 }
 

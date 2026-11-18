@@ -51,7 +51,7 @@ static void MEGLER_CB bundleLog(int, const char *line, void *)
 static void loadTranslations(QCoreApplication *app, QTranslator *translator)
 {
     if (QLocale::system().language() != QLocale::Russian) return;
-    const QString path = Aurora::Application::pathTo(QStringLiteral("qml/megler_ru.qm")).toLocalFile();
+    const QString path = Aurora::Application::pathTo(QStringLiteral("qml/androidcompatibilitylayer_ru.qm")).toLocalFile();
     if (!translator->load(path))
         qWarning().noquote() << "Could not load Russian translations:" << path;
     else
@@ -142,7 +142,7 @@ static int unpackBundle(int argc, char *argv[])
 
 static int buildStandaloneRpm(const QString &package)
 {
-    std::fputs("MEGLER_RPM_STAGE:inspect\n", stderr);
+    std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:inspect\n", stderr);
     std::fflush(stderr);
     const QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     const QString storeRoot = QDir(base).filePath(QStringLiteral("apps"));
@@ -162,12 +162,12 @@ static int buildStandaloneRpm(const QString &package)
     const QString iconData = selected.value(QStringLiteral("icon")).toString();
     const int comma = iconData.indexOf(QLatin1Char(','));
     if (comma >= 0) icon.loadFromData(QByteArray::fromBase64(iconData.mid(comma + 1).toLatin1()));
-    if (icon.isNull()) icon.load(QStringLiteral("/usr/share/icons/hicolor/172x172/apps/ru.megler.MeglerProbe.png"));
+    if (icon.isNull()) icon.load(QStringLiteral("/usr/share/icons/hicolor/172x172/apps/ru.androidcompatibilitylayer.AndroidCompatibilityLayer.png"));
     bool ok = !base.isEmpty() && !selected.isEmpty();
     if (!ok) {
         error = QCoreApplication::translate("RpmBuilder", "The app or RPM output directory is unavailable.");
     } else {
-        std::fputs("MEGLER_RPM_STAGE:build\n", stderr);
+        std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:build\n", stderr);
         std::fflush(stderr);
         ok = RpmStandalone::createUnsigned(
             package, selected.value(QStringLiteral("label")).toString(), icon,
@@ -177,7 +177,7 @@ static int buildStandaloneRpm(const QString &package)
             QDir(base).filePath(QStringLiteral("standalone-rpm-staging")), &output, &error);
     }
     if (ok) {
-        std::fputs("MEGLER_RPM_STAGE:sign\n", stderr);
+        std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:sign\n", stderr);
         std::fflush(stderr);
         std::string signingLog;
         ok = RpmSigners::signWithLibrary(output.toUtf8().toStdString(), kTestKeyPem, kTestCertPem, signingLog);
@@ -189,7 +189,7 @@ static int buildStandaloneRpm(const QString &package)
         }
     }
     if (ok) {
-        std::fputs("MEGLER_RPM_STAGE:save\n", stderr);
+        std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:save\n", stderr);
         std::fflush(stderr);
         const ApkStore store(storeRoot);
         const QString apkPath = store.apkPath(package);
@@ -258,10 +258,11 @@ int main(int argc, char *argv[])
     QTranslator translator;
     loadTranslations(app.data(), &translator);
     if (!child && diagnosticLog.available()) diagnosticLog.startNotifications();
-    app->setOrganizationName(QStringLiteral("ru.megler"));
+    app->setOrganizationName(QStringLiteral("ru.androidcompatibilitylayer"));
     const QString standaloneId = QString::fromLocal8Bit(qgetenv("AURORA_APP_ID"));
-    app->setApplicationName(standalone && standaloneId.startsWith(QLatin1String("ru.megler."))
-        ? standaloneId.mid(10) : QStringLiteral("MeglerProbe"));
+    const QString standalonePrefix = QStringLiteral("ru.androidcompatibilitylayer.");
+    app->setApplicationName(standalone && standaloneId.startsWith(standalonePrefix)
+        ? standaloneId.mid(standalonePrefix.size()) : QStringLiteral("AndroidCompatibilityLayer"));
     if (mode != "--build-standalone") {
         QString errorLogError;
         const QString label = standalone ? app->applicationName()
@@ -350,7 +351,7 @@ int main(int argc, char *argv[])
                                           standalonePathsValue.location);
             preview.setDeniedPermissions(standalonePathsValue.deniedPermissions);
         }
-        qmlRegisterType<PreviewSurface>("Megler.Preview", 1, 0, "PreviewSurface");
+        qmlRegisterType<PreviewSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
         QScopedPointer<QQuickView> view(Aurora::Application::createView());
         if (standalone) {
             view->setTitle(standalonePathsValue.displayName);
@@ -413,13 +414,13 @@ int main(int argc, char *argv[])
         return result;
     }
 
-    qmlRegisterType<SideMouseButtons>("Megler.Navigation", 1, 0, "SideMouseButtons");
+    qmlRegisterType<SideMouseButtons>("AndroidCompatibilityLayer.Navigation", 1, 0, "SideMouseButtons");
     Probe probe(Aurora::Application::pathTo(QStringLiteral("android-runtime")).toLocalFile(),
                 nullptr, &diagnosticLog);
     QScopedPointer<QQuickView> view(Aurora::Application::createView());
     probe.setConfirmationWindow(view.data());
     view->rootContext()->setContextProperty(QStringLiteral("probe"), &probe);
-    view->setSource(Aurora::Application::pathTo(QStringLiteral("qml/MeglerProbe.qml")));
+    view->setSource(Aurora::Application::pathTo(QStringLiteral("qml/AndroidCompatibilityLayer.qml")));
     if (view->status() == QQuickView::Error) return 1;
     ExternalApkReceiver fileReceiver;
     QObject::connect(&fileReceiver, &ExternalApkReceiver::requested, &probe, &Probe::requestExternalInstall);

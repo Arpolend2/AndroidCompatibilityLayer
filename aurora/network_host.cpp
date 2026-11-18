@@ -12,9 +12,9 @@ namespace {
 int transport(QNetworkConfiguration::BearerType bearer)
 {
     switch (bearer) {
-    case QNetworkConfiguration::BearerWLAN: return MEGLER_NETWORK_TRANSPORT_WIFI;
-    case QNetworkConfiguration::BearerEthernet: return MEGLER_NETWORK_TRANSPORT_ETHERNET;
-    case QNetworkConfiguration::BearerBluetooth: return MEGLER_NETWORK_TRANSPORT_BLUETOOTH;
+    case QNetworkConfiguration::BearerWLAN: return ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_WIFI;
+    case QNetworkConfiguration::BearerEthernet: return ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_ETHERNET;
+    case QNetworkConfiguration::BearerBluetooth: return ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_BLUETOOTH;
     case QNetworkConfiguration::Bearer2G:
     case QNetworkConfiguration::BearerCDMA2000:
     case QNetworkConfiguration::BearerWCDMA:
@@ -22,17 +22,17 @@ int transport(QNetworkConfiguration::BearerType bearer)
     case QNetworkConfiguration::BearerEVDO:
     case QNetworkConfiguration::BearerLTE:
     case QNetworkConfiguration::Bearer3G:
-    case QNetworkConfiguration::Bearer4G: return MEGLER_NETWORK_TRANSPORT_CELLULAR;
+    case QNetworkConfiguration::Bearer4G: return ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_CELLULAR;
     default: return 0;
     }
 }
 
 int connmanTransport(const QString &type)
 {
-    if (type == QLatin1String("wifi")) return MEGLER_NETWORK_TRANSPORT_WIFI;
-    if (type == QLatin1String("cellular")) return MEGLER_NETWORK_TRANSPORT_CELLULAR;
-    if (type == QLatin1String("ethernet")) return MEGLER_NETWORK_TRANSPORT_ETHERNET;
-    if (type == QLatin1String("bluetooth")) return MEGLER_NETWORK_TRANSPORT_BLUETOOTH;
+    if (type == QLatin1String("wifi")) return ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_WIFI;
+    if (type == QLatin1String("cellular")) return ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_CELLULAR;
+    if (type == QLatin1String("ethernet")) return ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_ETHERNET;
+    if (type == QLatin1String("bluetooth")) return ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_BLUETOOTH;
     return 0;
 }
 }
@@ -64,7 +64,7 @@ void AuroraNetworkHost::shutdown()
     if (m_stopped) return;
     m_stopped = true;
     m_routeTimer.stop();
-    megler_network_publish(MEGLER_NETWORK_UNKNOWN);
+    android_compatibility_layer_network_publish(ANDROID_COMPATIBILITY_LAYER_NETWORK_UNKNOWN);
 }
 
 void AuroraNetworkHost::invalidateRoute()
@@ -99,12 +99,12 @@ void AuroraNetworkHost::requestRoute()
         if (reply.isError()) {
             const QString error = reply.error().name();
             if (m_routeError != error)
-                qWarning() << "Megler network: ConnMan GetServices failed:" << error;
+                qWarning() << "AndroidCompatibilityLayer network: ConnMan GetServices failed:" << error;
             m_routeError = error;
             m_route = ConnmanRoute();
         } else {
             if (!m_routeError.isEmpty())
-                qInfo() << "Megler network: ConnMan GetServices recovered";
+                qInfo() << "AndroidCompatibilityLayer network: ConnMan GetServices recovered";
             m_routeError.clear();
             m_route = connmanRoute(reply.value());
         }
@@ -132,9 +132,9 @@ void AuroraNetworkHost::refresh()
         m_route.valid, m_route.valid, connmanTransport(m_route.type),
         m_route.online, m_route.favorite);
     if (snapshot != m_lastSnapshot) {
-        qInfo() << "Megler network: snapshot" << snapshot << "active configurations" << active
+        qInfo() << "AndroidCompatibilityLayer network: snapshot" << snapshot << "active configurations" << active
                 << "online probe" << online << "ConnMan unique connected route valid" << m_route.valid;
         m_lastSnapshot = snapshot;
     }
-    megler_network_publish(snapshot);
+    android_compatibility_layer_network_publish(snapshot);
 }

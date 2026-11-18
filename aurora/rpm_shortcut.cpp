@@ -18,8 +18,8 @@
 
 namespace {
 
-const char kMainBinary[] = "/usr/bin/ru.megler.MeglerProbe";
-const char kMainIcon[] = "/usr/share/icons/hicolor/172x172/apps/ru.megler.MeglerProbe.png";
+const char kMainBinary[] = "/usr/bin/ru.androidcompatibilitylayer.AndroidCompatibilityLayer";
+const char kMainIcon[] = "/usr/share/icons/hicolor/172x172/apps/ru.androidcompatibilitylayer.AndroidCompatibilityLayer.png";
 
 QImage iconImage(const QString &dataUri)
 {
@@ -50,14 +50,14 @@ QString RpmShortcut::create(const QString &package, const QString &label, const 
         return fail(QCoreApplication::translate("RpmShortcut", "Unsupported package name."));
 
     const QByteArray hash = QCryptographicHash::hash(package.toUtf8(), QCryptographicHash::Md5).toHex().left(8);
-    const std::string name = "ru.megler.Shortcut" + std::string(hash.constData());
+    const std::string name = "ru.androidcompatibilitylayer.Shortcut" + std::string(hash.constData());
     const qint64 now = QDateTime::currentMSecsSinceEpoch() / 1000;
 
     RpmWriter::Package pkg;
     pkg.name = name;
     pkg.version = "1.0.0";
     pkg.release = std::to_string(now);
-    pkg.summary = "Megler app shortcut";
+    pkg.summary = "AndroidCompatibilityLayer app shortcut";
     pkg.description = "App grid shortcut for " + package.toStdString();
     pkg.buildTime = uint32_t(now);
 
@@ -66,7 +66,7 @@ QString RpmShortcut::create(const QString &package, const QString &label, const 
     desktop.path = "/usr/share/applications/" + name + ".desktop";
     desktop.content = "[Desktop Entry]\nType=Application\nX-Nemo-Application-Type=silica-qt5\nIcon=" + name
         + "\nExec=" + kMainBinary + " --run-package " + package.toStdString()
-        + "\nName=" + title + "\n\n[X-Application]\nOrganizationName=ru.megler\nApplicationName=MeglerProbe\n";
+        + "\nName=" + title + "\n\n[X-Application]\nOrganizationName=ru.androidcompatibilitylayer\nApplicationName=AndroidCompatibilityLayer\n";
     pkg.files.push_back(desktop);
 
     const QImage image = iconImage(iconDataUri);

@@ -26,7 +26,7 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "Initialization failed: %s\n", qPrintable(error));
         return 1;
     }
-    const QDir folder(QDir(documents).filePath(QStringLiteral("Megler-Error-Logs")));
+    const QDir folder(QDir(documents).filePath(QStringLiteral("AndroidCompatibilityLayer-Error-Logs")));
     ErrorLog::record(QStringLiteral("test"), QStringLiteral("previous context"), false);
     if (!folder.entryList(QStringList() << "*.txt", QDir::Files).isEmpty()) return 1;
     ErrorLog::setApplicationName(QString::fromUtf8("Моё приложение/unsafe"));
@@ -63,6 +63,9 @@ int main(int argc, char **argv)
     DiagnosticLog::installChildQtMessageHandler();
     qWarning("qt failure");
     if (folder.entryList(QStringList() << "*.txt", QDir::Files).size() != 4) return 1;
+    ErrorLog::setApplicationName(QString());
+    if (!ErrorLog::saveText(QStringLiteral("fallback"), &savedPath, &error) ||
+        !QFileInfo(savedPath).fileName().startsWith(QStringLiteral("AndroidCompatibilityLayer-"))) return 1;
     std::fprintf(stderr, "Error logging OK\n");
     return 0;
 }

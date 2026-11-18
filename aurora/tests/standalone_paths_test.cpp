@@ -31,7 +31,7 @@ int main(int argc, char **argv)
     if (!apk.open(QIODevice::WriteOnly) || apk.write("test") != 4) return 1;
     apk.close();
     const QString package = QStringLiteral("org.example.app");
-    const QString appId = QStringLiteral("ru.megler.Android") + QString::fromLatin1(
+    const QString appId = QStringLiteral("ru.androidcompatibilitylayer.Android") + QString::fromLatin1(
         QCryptographicHash::hash(package.toUtf8(), QCryptographicHash::Sha256).toHex().left(24));
     const QString metadataPath = QDir(root).filePath(QStringLiteral("standalone.json"));
     auto metadata = [&](const QString &id, const QString &pkg, const QString &locale = QString(),
@@ -80,7 +80,7 @@ int main(int argc, char **argv)
     if (!metadata(appId, package, QString(), QString(), QStringLiteral("91,0")) ||
         standalonePaths(appId, appId, root, storage, &paths, &error) || error.isEmpty()) return 1;
     if (standalonePaths(appId, QStringLiteral("wrong"), root, storage, &paths, &error) || error.isEmpty()) return 1;
-    if (!metadata(QStringLiteral("ru.megler.Android000000000000000000000000"), QStringLiteral("org.example.other")) ||
+    if (!metadata(QStringLiteral("ru.androidcompatibilitylayer.Android000000000000000000000000"), QStringLiteral("org.example.other")) ||
         standalonePaths(appId, appId, root, storage, &paths, &error) || error.isEmpty()) return 1;
     if (!metadata(appId, QStringLiteral("../escape")) ||
         standalonePaths(appId, appId, root, storage, &paths, &error) || error.isEmpty()) return 1;

@@ -1,7 +1,7 @@
 #ifndef AURORA_NETWORK_HOST_H
 #define AURORA_NETWORK_HOST_H
 
-#include "../core/include/megler_network.h"
+#include "../core/include/android_compatibility_layer_network.h"
 #include "network_connman.h"
 
 #include <QObject>

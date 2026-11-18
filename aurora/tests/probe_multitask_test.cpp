@@ -79,14 +79,14 @@ int main(int argc, char **argv)
     app.setOrganizationName(QStringLiteral("org.test"));
     app.setApplicationName(QStringLiteral("multitask"));
     if (argc == 3 && QByteArray(argv[1]) == "--build-standalone") {
-        std::fputs("MEGLER_RPM_STAGE:in", stderr);
+        std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:in", stderr);
         std::fflush(stderr);
         QThread::msleep(40);
         std::fputs("spect\n", stderr);
         std::fflush(stderr);
         for (const char *stage : {"build", "sign", "save"}) {
             QThread::msleep(40);
-            std::fprintf(stderr, "MEGLER_RPM_STAGE:%s\n", stage);
+            std::fprintf(stderr, "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:%s\n", stage);
             std::fflush(stderr);
         }
         QThread::msleep(40);

@@ -41,7 +41,7 @@ QString safeName(const QString &name)
         result += ch.isLetterOrNumber() || ch == QLatin1Char('-') || ch == QLatin1Char('_')
             ? ch : QLatin1Char('_');
     }
-    return result.isEmpty() ? QStringLiteral("Megler") : result;
+    return result.isEmpty() ? QStringLiteral("AndroidCompatibilityLayer") : result;
 }
 
 bool writeText(const QString &text, QString *path, QString *error)
@@ -86,7 +86,7 @@ bool ErrorLog::initialize(const QString &application, QString *error)
         if (error) *error = QStringLiteral("Documents directory is unavailable.");
         return false;
     }
-    const QString target = QDir(documentsInfo.canonicalFilePath()).filePath(QStringLiteral("Megler-Error-Logs"));
+    const QString target = QDir(documentsInfo.canonicalFilePath()).filePath(QStringLiteral("AndroidCompatibilityLayer-Error-Logs"));
     if (QFileInfo(target).isSymLink() || !QDir().mkpath(target) || !QFileInfo(target).isDir()) {
         if (error) *error = QStringLiteral("Cannot create the error log directory.");
         return false;

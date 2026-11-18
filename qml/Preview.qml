@@ -1,6 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
-import Megler.Preview 1.0
+import AndroidCompatibilityLayer.Preview 1.0
 import "PreviewNavigation.js" as Navigation
 
 ApplicationWindow {

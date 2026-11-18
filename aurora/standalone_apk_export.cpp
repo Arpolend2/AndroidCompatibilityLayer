@@ -40,7 +40,7 @@ public:
         QString id = QUuid::createUuid().toString();
         id.remove(QLatin1Char('{'));
         id.remove(QLatin1Char('}'));
-        output = QDir(folder.canonicalFilePath()).filePath(QStringLiteral("Megler-") + id + QStringLiteral(".apk"));
+        output = QDir(folder.canonicalFilePath()).filePath(QStringLiteral("AndroidCompatibilityLayer-") + id + QStringLiteral(".apk"));
         QFile input(QString::fromStdString(snapshot.path()));
         QSaveFile file(output);
         if (!input.open(QIODevice::ReadOnly) || !file.open(QIODevice::WriteOnly)) {

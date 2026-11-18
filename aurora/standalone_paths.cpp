@@ -20,7 +20,7 @@ bool standalonePaths(const QString &appId, const QString &executableName,
         if (error) *error = message;
         return false;
     };
-    static const QRegularExpression identity(QStringLiteral("^ru\\.megler\\.Android[0-9a-f]{24}$"));
+    static const QRegularExpression identity(QStringLiteral("^ru\\.androidcompatibilitylayer\\.Android[0-9a-f]{24}$"));
     if (!paths || !identity.match(appId).hasMatch() || executableName != appId ||
         resourceRoot.isEmpty() || privateRoot.isEmpty())
         return fail(QStringLiteral("Invalid standalone application identity or storage."));

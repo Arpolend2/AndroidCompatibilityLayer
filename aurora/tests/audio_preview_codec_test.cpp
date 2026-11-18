@@ -85,7 +85,7 @@ void PreviewKeyboard::setSurface(QQuickItem *, const QSize &) {}
 int main(int argc, char **argv)
 {
     QGuiApplication app(argc, argv);
-    QCoreApplication::setOrganizationName(QStringLiteral("MeglerTest"));
+    QCoreApplication::setOrganizationName(QStringLiteral("AndroidCompatibilityLayerTest"));
     QCoreApplication::setApplicationName(QStringLiteral("PreviewRuntime"));
     QTemporaryDir directory;
     if (!directory.isValid()) return 1;
@@ -96,7 +96,7 @@ int main(int argc, char **argv)
         !RuntimeSettings::save(QStringLiteral("library/apps/org.example.app/edgeOnlyBack"), false)) return 1;
     LogChannel log;
     if (!log.available()) return 1;
-    qputenv("MEGLER_CORE_LOG_SOCKET", log.path().toLocal8Bit());
+    qputenv("ANDROID_COMPATIBILITY_LAYER_CORE_LOG_SOCKET", log.path().toLocal8Bit());
     {
         PreviewPlayer systemPlayer(QStringLiteral("."), QStringLiteral("."));
         systemPlayer.setSystemTheme(true, QColor(0x12, 0x34, 0x56));

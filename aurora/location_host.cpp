@@ -15,13 +15,13 @@
 #include <limits>
 #include <mutex>
 
-#ifdef MEGLER_LOCATION_HOST_TESTING
+#ifdef ANDROID_COMPATIBILITY_LAYER_LOCATION_HOST_TESTING
 #include "location_host_test_support.h"
 #endif
 
 namespace {
 
-#ifdef MEGLER_LOCATION_HOST_TESTING
+#ifdef ANDROID_COMPATIBILITY_LAYER_LOCATION_HOST_TESTING
 AuroraLocationTestSourceFactory g_testSourceFactory = nullptr;
 #endif
 
@@ -108,7 +108,7 @@ public:
 public slots:
     void initialize()
     {
-#ifdef MEGLER_LOCATION_HOST_TESTING
+#ifdef ANDROID_COMPATIBILITY_LAYER_LOCATION_HOST_TESTING
         if (g_testSourceFactory) {
             m_source = g_testSourceFactory();
             if (m_source) m_source->setParent(this);
@@ -402,7 +402,7 @@ bool MEGLER_CB lastThunk(void *user, megler_location *fix)
 
 }
 
-#ifdef MEGLER_LOCATION_HOST_TESTING
+#ifdef ANDROID_COMPATIBILITY_LAYER_LOCATION_HOST_TESTING
 void auroraLocationSetTestSourceFactory(AuroraLocationTestSourceFactory factory)
 {
     g_testSourceFactory = factory;

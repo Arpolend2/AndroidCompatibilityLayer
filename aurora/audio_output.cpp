@@ -32,10 +32,10 @@ protected:
         bool queued, nonzero;
         m_converter.read(data, static_cast<std::size_t>(size), queued, nonzero);
         if (queued && !m_reportedData.exchange(true)) {
-            qInfo() << "Megler audio: Qt backend read queued PCM";
+            qInfo() << "AndroidCompatibilityLayer audio: Qt backend read queued PCM";
         }
         if (nonzero && !m_reportedSound.exchange(true))
-            qInfo() << "Megler audio: Qt backend consumed nonzero source PCM";
+            qInfo() << "AndroidCompatibilityLayer audio: Qt backend consumed nonzero source PCM";
         return size;
     }
     qint64 writeData(const char *, qint64) override { return -1; }
@@ -61,7 +61,7 @@ protected:
     {
         const QAudioDeviceInfo device = QAudioDeviceInfo::defaultOutputDevice();
         if (device.isNull()) {
-            qWarning() << "Megler audio: no default Qt output device";
+            qWarning() << "AndroidCompatibilityLayer audio: no default Qt output device";
             return;
         }
         const QAudioFormat input = audioInputFormat(m_rate);
@@ -72,32 +72,32 @@ protected:
             return device.isFormatSupported(candidate);
         });
         if (!format.isValid()) {
-            qWarning() << "Megler audio: no supported convertible PCM format; nearest" << nearest
+            qWarning() << "AndroidCompatibilityLayer audio: no supported convertible PCM format; nearest" << nearest
                        << "preferred" << preferred << "sample rates" << device.supportedSampleRates()
                        << "channels" << device.supportedChannelCounts() << "sizes" << device.supportedSampleSizes()
                        << "types" << device.supportedSampleTypes() << "byte orders" << device.supportedByteOrders()
                        << "codecs" << device.supportedCodecs();
             return;
         }
-        qInfo() << "Megler audio: selected Qt output format" << format;
+        qInfo() << "AndroidCompatibilityLayer audio: selected Qt output format" << format;
         AudioSource source(m_queue, m_rate, format);
         QAudioOutput output(device, format);
         output.setBufferSize(format.sampleRate() * format.bytesPerFrame() / 10);
         QObject::connect(&output, &QAudioOutput::stateChanged, &output,
                          [this, &output](QAudio::State state) {
             if (state == QAudio::StoppedState && output.error() != QAudio::NoError) {
-                qWarning() << "Megler audio: output failed:" << output.error();
+                qWarning() << "AndroidCompatibilityLayer audio: output failed:" << output.error();
                 m_queue.setAvailable(false);
             }
         });
         m_queue.setAvailable(true);
         output.start(&source);
         if (output.error() != QAudio::NoError || output.state() == QAudio::StoppedState) {
-            qWarning() << "Megler audio: could not start output:" << output.error();
+            qWarning() << "AndroidCompatibilityLayer audio: could not start output:" << output.error();
             m_queue.setAvailable(false);
             return;
         }
-        qInfo() << "Megler audio: Qt output started at" << format.sampleRate() << "Hz";
+        qInfo() << "AndroidCompatibilityLayer audio: Qt output started at" << format.sampleRate() << "Hz";
         QTimer stopTimer;
         QObject::connect(&stopTimer, &QTimer::timeout, &output, [this] {
             if (m_stopping.load()) quit();
@@ -162,21 +162,21 @@ megler_audio_host AuroraAudioOutput::callbacks()
 bool MEGLER_CB AuroraAudioOutput::openCallback(void *user, int rate)
 {
     if (!user || rate < 4000 || rate > 192000) {
-        qWarning() << "Megler audio: invalid output rate:" << rate;
+        qWarning() << "AndroidCompatibilityLayer audio: invalid output rate:" << rate;
         return false;
     }
     Impl *impl = static_cast<AuroraAudioOutput *>(user)->m_impl;
     std::lock_guard<std::mutex> lock(impl->mutex);
     if (impl->shutdown) {
-        qWarning() << "Megler audio: output has shut down";
+        qWarning() << "AndroidCompatibilityLayer audio: output has shut down";
         return false;
     }
     if (impl->queue) {
-        qWarning() << "Megler audio: output already opened";
+        qWarning() << "AndroidCompatibilityLayer audio: output already opened";
         return false;
     }
     impl->queue.reset(new AudioQueue(rate));
-    qInfo() << "Megler audio: mixer opened output at" << rate << "Hz";
+    qInfo() << "AndroidCompatibilityLayer audio: mixer opened output at" << rate << "Hz";
     impl->thread.reset(new AudioThread(*impl->queue, rate));
     impl->thread->start();
     return true;
@@ -186,7 +186,7 @@ void MEGLER_CB AuroraAudioOutput::writeCallback(void *user, const int16_t *sampl
 {
     if (!user || !samples || frames <= 0 ||
         static_cast<unsigned long long>(frames) > std::numeric_limits<std::size_t>::max() / 4) {
-        qWarning() << "Megler audio: invalid write";
+        qWarning() << "AndroidCompatibilityLayer audio: invalid write";
         return;
     }
     Impl *impl = static_cast<AuroraAudioOutput *>(user)->m_impl;
@@ -196,20 +196,20 @@ void MEGLER_CB AuroraAudioOutput::writeCallback(void *user, const int16_t *sampl
         queue = impl->queue.get();
     }
     if (!queue) {
-        qWarning() << "Megler audio: write before open";
+        qWarning() << "AndroidCompatibilityLayer audio: write before open";
         return;
     }
     if (!impl->reportedWrite.exchange(true))
-        qInfo() << "Megler audio: mixer wrote PCM";
+        qInfo() << "AndroidCompatibilityLayer audio: mixer wrote PCM";
     if (!impl->reportedSound.load()) {
         for (std::size_t i = 0; i < static_cast<std::size_t>(frames) * 2; ++i) {
             if (samples[i] != 0) {
                 if (!impl->reportedSound.exchange(true))
-                    qInfo() << "Megler audio: mixer wrote nonzero PCM";
+                    qInfo() << "AndroidCompatibilityLayer audio: mixer wrote nonzero PCM";
                 break;
             }
         }
     }
     if (!queue->write(reinterpret_cast<const char *>(samples), static_cast<std::size_t>(frames) * 4))
-        qWarning() << "Megler audio: output stalled; switching to paced silence";
+        qWarning() << "AndroidCompatibilityLayer audio: output stalled; switching to paced silence";
 }

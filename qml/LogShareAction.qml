@@ -7,7 +7,7 @@ ShareAction {
     mimeType: "text/plain"
 
     function share(text) {
-        resources = [{ "name": "megler-log.txt", "data": text,
+        resources = [{ "name": "android-compatibility-layer-log.txt", "data": text,
                        "type": "text/plain", "status": text }]
         trigger()
     }

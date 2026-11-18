@@ -1,5 +1,5 @@
-#ifndef MEGLER_AURORA_PROBE_H
-#define MEGLER_AURORA_PROBE_H
+#ifndef ANDROID_COMPATIBILITY_LAYER_AURORA_PROBE_H
+#define ANDROID_COMPATIBILITY_LAYER_AURORA_PROBE_H
 
 #include <QObject>
 #include <QString>
@@ -755,10 +755,10 @@ private:
             m_standaloneErrorBuffer = newline < 0 ? QByteArray()
                                                  : m_standaloneErrorBuffer.mid(newline + 1);
             QString stage;
-            if (line == "MEGLER_RPM_STAGE:inspect") stage = tr("Inspecting the app and preparing the package...");
-            else if (line == "MEGLER_RPM_STAGE:build") stage = tr("Building the RPM with the app and runtime...");
-            else if (line == "MEGLER_RPM_STAGE:sign") stage = tr("Signing the RPM...");
-            else if (line == "MEGLER_RPM_STAGE:save") stage = tr("Saving the RPM in the library...");
+            if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:inspect") stage = tr("Inspecting the app and preparing the package...");
+            else if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:build") stage = tr("Building the RPM with the app and runtime...");
+            else if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:sign") stage = tr("Signing the RPM...");
+            else if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:save") stage = tr("Saving the RPM in the library...");
             if (!stage.isEmpty()) {
                 m_standaloneRpmStatus = stage;
                 emit standaloneRpmChanged();

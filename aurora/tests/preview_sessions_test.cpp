@@ -61,7 +61,7 @@ int main(int argc, char **argv)
         const QString data = QString::fromLocal8Bit(argv[3]);
         const QByteArray tag = QFile::encodeName(QFileInfo(data).fileName());
         std::fprintf(stderr, "preview output %s\n", tag.constData());
-        const QByteArray logPath = qgetenv("MEGLER_CORE_LOG_SOCKET");
+        const QByteArray logPath = qgetenv("ANDROID_COMPATIBILITY_LAYER_CORE_LOG_SOCKET");
         if (!logPath.isEmpty()) {
             int socket = LogChannel::openSender(QString::fromLocal8Bit(logPath));
             check(socket >= 0, "child log socket");

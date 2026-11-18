@@ -111,9 +111,9 @@ bool PreviewSessions::start(const QString &key, const QString &androidRoot, cons
     });
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
     if ((!m_diagnosticLog || !m_diagnosticLog->available()) && session->log.available())
-        environment.insert(QStringLiteral("MEGLER_CORE_LOG_SOCKET"), session->log.path());
+        environment.insert(QStringLiteral("ANDROID_COMPATIBILITY_LAYER_CORE_LOG_SOCKET"), session->log.path());
     else
-        environment.remove(QStringLiteral("MEGLER_CORE_LOG_SOCKET"));
+        environment.remove(QStringLiteral("ANDROID_COMPATIBILITY_LAYER_CORE_LOG_SOCKET"));
     session->process.setProcessEnvironment(environment);
     session->process.start(QCoreApplication::applicationFilePath(),
                            QStringList() << QStringLiteral("--preview") << androidRoot << data << apk

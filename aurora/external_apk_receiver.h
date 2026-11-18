@@ -1,5 +1,5 @@
-#ifndef MEGLER_AURORA_EXTERNAL_APK_RECEIVER_H
-#define MEGLER_AURORA_EXTERNAL_APK_RECEIVER_H
+#ifndef ANDROID_COMPATIBILITY_LAYER_AURORA_EXTERNAL_APK_RECEIVER_H
+#define ANDROID_COMPATIBILITY_LAYER_AURORA_EXTERNAL_APK_RECEIVER_H
 
 #include <QObject>
 #include <QStringList>
@@ -8,7 +8,7 @@
 class ExternalApkReceiver : public QObject
 {
     Q_OBJECT
-    Q_CLASSINFO("D-Bus Interface", "ru.megler.MeglerProbe")
+    Q_CLASSINFO("D-Bus Interface", "ru.androidcompatibilitylayer.AndroidCompatibilityLayer")
 public:
     explicit ExternalApkReceiver(QObject *parent = nullptr);
     ~ExternalApkReceiver() override;

@@ -1,5 +1,5 @@
 import QtQuick 2.0
-import Megler.Navigation 1.0
+import AndroidCompatibilityLayer.Navigation 1.0
 
 Item {
     id: sideNavigation

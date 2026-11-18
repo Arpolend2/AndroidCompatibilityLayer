@@ -111,7 +111,7 @@ bool InstallRequestSnapshot::capture(const std::string &root, const std::string 
         return fail(error, "The APK is not an allowed regular file or is too large.");
 
 #if defined(SYS_memfd_create)
-    Fd output(static_cast<int>(syscall(SYS_memfd_create, "megler-install-request", MFD_CLOEXEC | MFD_ALLOW_SEALING)));
+    Fd output(static_cast<int>(syscall(SYS_memfd_create, "android-compatibility-layer-install-request", MFD_CLOEXEC | MFD_ALLOW_SEALING)));
 #else
     Fd output;
 #endif

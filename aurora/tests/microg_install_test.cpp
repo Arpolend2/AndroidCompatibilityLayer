@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <cstring>
 
-#ifndef MEGLER_MICROG_REAL
+#ifndef ANDROID_COMPATIBILITY_LAYER_MICROG_REAL
 extern "C" bool mg_apk_read_info(const char *path, mg_apk_info *info)
 {
     QFile file(QString::fromUtf8(path));
@@ -53,7 +53,7 @@ int main(int argc, char **argv)
 
     QTemporaryDir directory;
     check(directory.isValid(), "temporary directory");
-    QCoreApplication::setOrganizationName(QStringLiteral("MeglerTest"));
+    QCoreApplication::setOrganizationName(QStringLiteral("AndroidCompatibilityLayerTest"));
     QCoreApplication::setApplicationName(QStringLiteral("MicrogInstall"));
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, directory.path());

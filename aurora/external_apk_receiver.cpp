@@ -8,8 +8,8 @@
 #include <RuntimeManager/RuntimeDispatcher>
 
 namespace {
-const char ServiceName[] = "ru.megler.MeglerProbe";
-const char ObjectPath[] = "/ru/megler/MeglerProbe";
+const char ServiceName[] = "ru.androidcompatibilitylayer.AndroidCompatibilityLayer";
+const char ObjectPath[] = "/ru/androidcompatibilitylayer/AndroidCompatibilityLayer";
 }
 
 ExternalApkReceiver::ExternalApkReceiver(QObject *parent)

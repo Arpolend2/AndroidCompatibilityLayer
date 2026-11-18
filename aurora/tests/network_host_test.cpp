@@ -3,7 +3,7 @@
 #include <cassert>
 
 static int snapshot = -1;
-extern "C" void megler_network_publish(int value) { snapshot = value; }
+extern "C" void android_compatibility_layer_network_publish(int value) { snapshot = value; }
 
 int main(int argc, char **argv)
 {
@@ -28,8 +28,8 @@ int main(int argc, char **argv)
     AuroraNetworkHost host;
     assert(snapshot >= 0);
     host.shutdown();
-    assert(snapshot == MEGLER_NETWORK_UNKNOWN);
+    assert(snapshot == ANDROID_COMPATIBILITY_LAYER_NETWORK_UNKNOWN);
     host.shutdown();
     QCoreApplication::processEvents();
-    assert(snapshot == MEGLER_NETWORK_UNKNOWN);
+    assert(snapshot == ANDROID_COMPATIBILITY_LAYER_NETWORK_UNKNOWN);
 }

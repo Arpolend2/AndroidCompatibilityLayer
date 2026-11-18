@@ -41,7 +41,7 @@ static std::string readFile(const std::string &path)
 
 int main()
 {
-    char temp[] = "/tmp/megler-install-request-test-XXXXXX";
+    char temp[] = "/tmp/android-compatibility-layer-install-request-test-XXXXXX";
     check(mkdtemp(temp) != nullptr, "create test directory");
     const std::string root = std::string(temp) + "/data";
     const std::string sub = root + "/cache";

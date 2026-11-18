@@ -36,7 +36,7 @@ static int descriptor(void *handle)
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
-    QCoreApplication::setOrganizationName(QStringLiteral("MeglerTest"));
+    QCoreApplication::setOrganizationName(QStringLiteral("AndroidCompatibilityLayerTest"));
     QCoreApplication::setApplicationName(QStringLiteral("SharedFolders"));
     QTemporaryDir temporary;
     check(temporary.isValid(), "temporary root");

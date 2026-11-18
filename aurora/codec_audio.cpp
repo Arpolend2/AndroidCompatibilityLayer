@@ -68,7 +68,7 @@ struct AvApi {
         ready = version && (version() >> 16) == 61 && find && alloc && open && freeContext &&
                 send && receive && flush && packetAlloc && packetFree && newPacket &&
                 packetUnref && frameAlloc && frameFree && frameUnref && mallocz;
-        if (!ready) qWarning() << "Megler audio codec: FFmpeg 7 libraries or required symbols unavailable";
+        if (!ready) qWarning() << "AndroidCompatibilityLayer audio codec: FFmpeg 7 libraries or required symbols unavailable";
     }
 };
 
@@ -116,14 +116,14 @@ void *MEGLER_CB openCodec(void *, int kind, const megler_codec_format *format)
 {
     if (!format || !supports(nullptr, kind) || format->sample_rate <= 0 ||
         format->sample_rate > 192000 || format->channels < 1 || format->channels > 2) {
-        qWarning() << "Megler audio codec: unsupported format or decoder";
+        qWarning() << "AndroidCompatibilityLayer audio codec: unsupported format or decoder";
         return nullptr;
     }
     std::unique_ptr<Decoder> d(new Decoder(api()));
     d->kind = kind;
     if (kind == MEGLER_CODEC_AAC) {
         if (!format->config || format->config_size < 2 || format->config_size > 1024) {
-            qWarning() << "Megler audio codec: unsupported AAC configuration size";
+            qWarning() << "AndroidCompatibilityLayer audio codec: unsupported AAC configuration size";
             return nullptr;
         }
     }
@@ -132,20 +132,20 @@ void *MEGLER_CB openCodec(void *, int kind, const megler_codec_format *format)
     d->packet = d->av.packetAlloc();
     d->frame = d->av.frameAlloc();
     if (!d->context || !d->packet || !d->frame) {
-        qWarning() << "Megler audio codec: allocation failed";
+        qWarning() << "AndroidCompatibilityLayer audio codec: allocation failed";
         return nullptr;
     }
     if (kind == MEGLER_CODEC_AAC) {
         d->context->extradata = static_cast<uint8_t *>(d->av.mallocz(format->config_size + AV_INPUT_BUFFER_PADDING_SIZE));
         if (!d->context->extradata) {
-            qWarning() << "Megler audio codec: configuration allocation failed";
+            qWarning() << "AndroidCompatibilityLayer audio codec: configuration allocation failed";
             return nullptr;
         }
         std::memcpy(d->context->extradata, format->config, format->config_size);
         d->context->extradata_size = static_cast<int>(format->config_size);
     }
     if (d->av.open(d->context, codec, nullptr) < 0) {
-        qWarning() << "Megler audio codec: decoder initialization failed";
+        qWarning() << "AndroidCompatibilityLayer audio codec: decoder initialization failed";
         return nullptr;
     }
     return d.release();
@@ -164,7 +164,7 @@ bool collect(Decoder &d)
         const int result = d.av.receive(d.context, d.frame);
         if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) return true;
         if (result < 0) {
-            qWarning() << "Megler audio codec: receive failed:" << result;
+            qWarning() << "AndroidCompatibilityLayer audio codec: receive failed:" << result;
             return false;
         }
         AVFrame *f = d.frame;
@@ -179,7 +179,7 @@ bool collect(Decoder &d)
             (format != AV_SAMPLE_FMT_S16 && format != AV_SAMPLE_FMT_S16P &&
              format != AV_SAMPLE_FMT_FLT && format != AV_SAMPLE_FMT_FLTP) ||
             d.queuedSamples + static_cast<std::size_t>(count) * channels > 2097152) {
-            qWarning() << "Megler audio codec: unsupported PCM format or output queue full";
+            qWarning() << "AndroidCompatibilityLayer audio codec: unsupported PCM format or output queue full";
             d.av.frameUnref(f);
             return false;
         }
@@ -209,7 +209,7 @@ bool sendPacket(Decoder &d, const uint8_t *data, std::size_t size, int64_t time)
 {
     if (size > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
         d.av.newPacket(d.packet, static_cast<int>(size)) < 0) {
-        qWarning() << "Megler audio codec: packet allocation failed";
+        qWarning() << "AndroidCompatibilityLayer audio codec: packet allocation failed";
         return false;
     }
     std::memcpy(d.packet->data, data, size);
@@ -218,7 +218,7 @@ bool sendPacket(Decoder &d, const uint8_t *data, std::size_t size, int64_t time)
     const int result = d.av.send(d.context, d.packet);
     d.av.packetUnref(d.packet);
     if (result < 0) {
-        qWarning() << "Megler audio codec: packet rejected:" << result;
+        qWarning() << "AndroidCompatibilityLayer audio codec: packet rejected:" << result;
         return false;
     }
     return collect(d);
@@ -246,7 +246,7 @@ bool MEGLER_CB push(void *, void *handle, const uint8_t *data, size_t size, int6
 {
     Decoder *d = static_cast<Decoder *>(handle);
     if (!d || d->failed || !data || !size || size > 1048576 || time == AV_NOPTS_VALUE) {
-        qWarning() << "Megler audio codec: invalid packet";
+        qWarning() << "AndroidCompatibilityLayer audio codec: invalid packet";
         return false;
     }
     bool ok = true;
@@ -257,7 +257,7 @@ bool MEGLER_CB push(void *, void *handle, const uint8_t *data, size_t size, int6
             std::size_t n;
             int rate, samples;
             if (!mp3Frame(data, size, n, rate, samples)) {
-                qWarning() << "Megler audio codec: invalid MP3 frame";
+                qWarning() << "AndroidCompatibilityLayer audio codec: invalid MP3 frame";
                 ok = false;
                 break;
             }
@@ -266,7 +266,7 @@ bool MEGLER_CB push(void *, void *handle, const uint8_t *data, size_t size, int6
             size -= n;
             const int64_t delta = static_cast<int64_t>(samples) * 1000000 / rate;
             if (time > std::numeric_limits<int64_t>::max() - delta) {
-                qWarning() << "Megler audio codec: timestamp overflow";
+                qWarning() << "AndroidCompatibilityLayer audio codec: timestamp overflow";
                 ok = false;
                 break;
             }
@@ -283,7 +283,7 @@ void MEGLER_CB drain(void *, void *handle)
     if (!d || d->failed) return;
     const int result = d->av.send(d->context, nullptr);
     if ((result < 0 && result != AVERROR_EOF) || !collect(*d)) {
-        qWarning() << "Megler audio codec: drain failed:" << result;
+        qWarning() << "AndroidCompatibilityLayer audio codec: drain failed:" << result;
         d->failed = true;
     }
     d->av.flush(d->context);

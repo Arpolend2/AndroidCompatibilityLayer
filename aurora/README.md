@@ -1,16 +1,20 @@
 # AndroidCompatibilityLayer for Aurora
 
 The app is displayed as Android App Manager (Менеджер приложений Android in Russian).
-The installed application ID and runtime interfaces still use their legacy
-Megler names to preserve existing data and compatibility; their migration is
-not yet implemented.
+The installed application ID is `ru.androidcompatibilitylayer.AndroidCompatibilityLayer`.
+It differs from earlier builds, so existing private data is not automatically
+migrated and previously created shortcut RPMs may no longer work.
+
+The inherited Megler core API and bundled runtime keep their original names.
+The installation-status marker `MEGLER_INSTALL_STATUS_V1` also remains unchanged
+because it is consumed by the bundled framework DEX.
 
 The manager and standalone app interface use Russian when the device language
 is Russian and otherwise use English. Android apps choose their own language;
 the Android language setting is independent of the manager interface.
 
 Native EGL/GLES rendering is experimental and disabled by default. In the
-Aurora IDE, set the CMake option `MEGLER_EXPERIMENTAL_NATIVE_EGL=ON` to try it.
+Aurora IDE, set the CMake option `ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL=ON` to try it.
 Android GL frames use system EGL pbuffers and CPU readback for preview; this
 is not the Windows GPU compositor or zero-copy presentation. The default EGL
 display, device drivers and actual Android apps still need device validation.
@@ -19,14 +23,14 @@ multisampled window configurations are refused, and composition with
 native-activity Java overlays is not implemented.
 If EGL initialization fails, GL contexts are unavailable; non-GL CPU drawing
 continues to use the existing preview path.
-The optional `megler_native_egl_system_test` target exercises pbuffer rendering
+The optional `android_compatibility_layer_native_egl_system_test` target exercises pbuffer rendering
 and native-window frame delivery against the system EGL; it requires an EGL
 display and GLES driver. On a headless Mesa system, run it with
 `EGL_PLATFORM=surfaceless`. This software-renderer test does not verify a
 device GPU.
 
-For experiments only, setting both `MEGLER_EXPERIMENTAL_NATIVE_EGL=ON` and
-`MEGLER_EXPERIMENTAL_GPU_COMPOSITION=ON` enables an EGLImage-to-Qt scenegraph
+For experiments only, setting both `ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL=ON` and
+`ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION=ON` enables an EGLImage-to-Qt scenegraph
 path for native-activity window frames and Java SurfaceView layers. It copies
 EGL frames on the GPU; the premultiplied Java views image is uploaded from CPU
 memory. It falls back
@@ -46,7 +50,7 @@ existing timeout may be used instead.
 `tools/native-egl-image-test.c` tests the transport for copying
 a pbuffer into an EGL image and importing it in an independent GLES context,
 using an EGL fence without CPU pixel transfer. It reads pixels only to verify
-the result. Build the optional `megler_native_egl_image_test` target in the
+the result. Build the optional `android_compatibility_layer_native_egl_image_test` target in the
 SDK and run it with a working EGL display.
 The test requires EGL image and fence extensions and `GL_OES_EGL_image`; an
 unsupported or unavailable display is reported as a failure. Passing does
@@ -55,17 +59,17 @@ composition.
 
 Open the repository's `CMakeLists.txt` in Aurora IDE and select an aarch64
 Aurora SDK kit matching the device's OS version. Build and deploy the
-`ru.megler.MeglerProbe` application and launch it on the device.
+`ru.androidcompatibilitylayer.AndroidCompatibilityLayer` application and launch it on the device.
 
 The RPM build disables optional test targets to speed up IDE configuration.
-For tests, configure CMake separately with `MEGLER_BUILD_TEST_TARGETS=ON`
+For tests, configure CMake separately with `ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS=ON`
 (the default for direct CMake builds), then build the desired test target.
 Debug builds use reduced debug information for the bundled SQLite amalgamation
 to limit build time and object size; other sources keep their normal debug info.
 
 The manager and standalone Android apps save observed Qt warnings and errors,
 Android runtime error messages and reported startup failures as text files in the
-shared `Documents/Megler-Error-Logs` directory. Each filename contains the app
+shared `Documents/AndroidCompatibilityLayer-Error-Logs` directory. Each filename contains the app
 name and a timestamp. Reports include recent diagnostic context, which may
 contain private data or credentials; review them before sharing. They remain
 until deleted by the user. An inaccessible Documents directory or a failed
@@ -187,7 +191,7 @@ implemented and report failure. Test adapter access and scan behavior on a
 device; the local test covers only address and advertising-data conversion.
 If an Android app does not stop within five seconds, its isolated process exits
 with an error; the controller reports the failure.
-The optional `megler_preview_text_test` CMake target exercises glyph outlines
+The optional `android_compatibility_layer_preview_text_test` CMake target exercises glyph outlines
 and text measurements; run it in a Qt GUI environment with real system fonts.
 Pass one or more TrueType or OpenType file paths as arguments to test embedded
 font loading, source-byte lifetime, derivation and concurrent registration.

@@ -64,7 +64,7 @@ static void setProvider(const QString &provider, const QString &gms)
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
-    QCoreApplication::setOrganizationName(QStringLiteral("MeglerTest"));
+    QCoreApplication::setOrganizationName(QStringLiteral("AndroidCompatibilityLayerTest"));
     QCoreApplication::setApplicationName(QStringLiteral("GoogleServicesRuntime"));
     QTemporaryDir directory;
     if (!directory.isValid()) return 1;

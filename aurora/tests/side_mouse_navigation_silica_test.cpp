@@ -17,7 +17,7 @@ int main(int argc, char **argv)
     });
     QGuiApplication app(argc, argv);
     if (argc != 2) return 2;
-    qmlRegisterType<SideMouseButtons>("Megler.Navigation", 1, 0, "SideMouseButtons");
+    qmlRegisterType<SideMouseButtons>("AndroidCompatibilityLayer.Navigation", 1, 0, "SideMouseButtons");
     QQuickView view;
     view.rootContext()->setContextProperty(QStringLiteral("testWindow"), &view);
     view.resize(540, 960);

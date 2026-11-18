@@ -66,7 +66,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    qmlRegisterType<TestSurface>("Megler.Preview", 1, 0, "PreviewSurface");
+    qmlRegisterType<TestSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
     TestPlayer player;
     TestPicker picker;
     QQuickView view;

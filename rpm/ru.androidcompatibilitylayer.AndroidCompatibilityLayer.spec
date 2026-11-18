@@ -1,9 +1,9 @@
-Name:       ru.megler.MeglerProbe
-Summary:    Megler core diagnostic for Aurora OS
+Name:       ru.androidcompatibilitylayer.AndroidCompatibilityLayer
+Summary:    AndroidCompatibilityLayer for Aurora OS
 Version:    0.1.0
 Release:    1
 License:    GPL-3.0-only
-URL:        https://github.com/Computershik73/megler-w10m
+URL:        https://github.com/Arpolend2/AndroidCompatibilityLayer
 Source0:    %{name}-%{version}.tar.bz2
 
 %global __provides_exclude_from ^%{_datadir}/%{name}/(fixtures|android-runtime)/.*$
@@ -33,7 +33,7 @@ standalone Android APKs, but Android application isolation is not implemented.
 %autosetup
 
 %build
-%cmake -DMEGLER_BUILD_TEST_TARGETS=OFF
+%cmake -DANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS=OFF
 # apptool --configure overrides these macros to /bin/true.
 if [ -f build.ninja ]; then
     %{__ninja}

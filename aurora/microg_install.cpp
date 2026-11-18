@@ -123,7 +123,7 @@ void MicrogInstall::request(const QUrl &url)
     }
     QNetworkRequest request(url);
     request.setRawHeader("Accept", m_stage == Metadata ? "application/vnd.github+json" : "application/octet-stream");
-    request.setRawHeader("User-Agent", "Megler-Aurora");
+    request.setRawHeader("User-Agent", "AndroidCompatibilityLayer-Aurora");
     m_reply = m_network.get(request);
     connect(m_reply, &QNetworkReply::readyRead, this, &MicrogInstall::readReply);
     connect(m_reply, &QNetworkReply::finished, this, &MicrogInstall::replyFinished);

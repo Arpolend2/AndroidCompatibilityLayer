@@ -9,7 +9,7 @@
  * many and what they found, so that a phone's log shows whether the Wi-Fi is heard without a line for every scan.
  */
 #include "mg_java.h"
-#include "../../include/megler_network.h"
+#include "../../include/android_compatibility_layer_network.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -26,19 +26,19 @@
 static megler_wifi_host g_host;
 static mg_lock g_lock = MG_LOCK_INIT;
 static int g_said_state = -1;
-static volatile i32 g_network = MEGLER_NETWORK_LEGACY;
+static volatile i32 g_network = ANDROID_COMPATIBILITY_LAYER_NETWORK_LEGACY;
 
-void megler_network_publish(int snapshot)
+void android_compatibility_layer_network_publish(int snapshot)
 {
-    int state = snapshot & MEGLER_NETWORK_STATE_MASK;
-    int transport = snapshot & MEGLER_NETWORK_TRANSPORT_MASK;
-    if (state > MEGLER_NETWORK_CONNECTED ||
-        transport > MEGLER_NETWORK_TRANSPORT_BLUETOOTH ||
-        (snapshot & ~(MEGLER_NETWORK_STATE_MASK | MEGLER_NETWORK_TRANSPORT_MASK |
-                      MEGLER_NETWORK_INTERNET | MEGLER_NETWORK_VALIDATED | MEGLER_NETWORK_TRUSTED)))
-        snapshot = MEGLER_NETWORK_UNKNOWN;
-    if ((snapshot & MEGLER_NETWORK_STATE_MASK) != MEGLER_NETWORK_CONNECTED)
-        snapshot &= MEGLER_NETWORK_STATE_MASK;
+    int state = snapshot & ANDROID_COMPATIBILITY_LAYER_NETWORK_STATE_MASK;
+    int transport = snapshot & ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_MASK;
+    if (state > ANDROID_COMPATIBILITY_LAYER_NETWORK_CONNECTED ||
+        transport > ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_BLUETOOTH ||
+        (snapshot & ~(ANDROID_COMPATIBILITY_LAYER_NETWORK_STATE_MASK | ANDROID_COMPATIBILITY_LAYER_NETWORK_TRANSPORT_MASK |
+                      ANDROID_COMPATIBILITY_LAYER_NETWORK_INTERNET | ANDROID_COMPATIBILITY_LAYER_NETWORK_VALIDATED | ANDROID_COMPATIBILITY_LAYER_NETWORK_TRUSTED)))
+        snapshot = ANDROID_COMPATIBILITY_LAYER_NETWORK_UNKNOWN;
+    if ((snapshot & ANDROID_COMPATIBILITY_LAYER_NETWORK_STATE_MASK) != ANDROID_COMPATIBILITY_LAYER_NETWORK_CONNECTED)
+        snapshot &= ANDROID_COMPATIBILITY_LAYER_NETWORK_STATE_MASK;
     mg_atomic_xchg(&g_network, snapshot);
 }
 /* The scans said one by one, and the minute's summary after them. */

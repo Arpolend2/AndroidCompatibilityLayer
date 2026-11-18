@@ -29,7 +29,7 @@ int main(int argc, char **argv)
     });
     QGuiApplication app(argc, argv);
     if (argc != 2) return 2;
-    qmlRegisterType<SideMouseButtons>("Megler.Navigation", 1, 0, "SideMouseButtons");
+    qmlRegisterType<SideMouseButtons>("AndroidCompatibilityLayer.Navigation", 1, 0, "SideMouseButtons");
     TestView view;
     view.rootContext()->setContextProperty(QStringLiteral("testWindow"), &view);
     view.setSource(QUrl::fromLocalFile(QString::fromLocal8Bit(argv[1])));

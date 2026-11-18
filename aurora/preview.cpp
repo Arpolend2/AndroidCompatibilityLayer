@@ -104,17 +104,17 @@ void PreviewPlayer::start()
     megler_config config = {};
     config.data_dir = data.constData();
     config.package_dir = m_rootUtf8.constData();
-    static int logSocket = LogChannel::openSender(QString::fromLocal8Bit(qgetenv("MEGLER_CORE_LOG_SOCKET")));
+    static int logSocket = LogChannel::openSender(QString::fromLocal8Bit(qgetenv("ANDROID_COMPATIBILITY_LAYER_CORE_LOG_SOCKET")));
     QString logError;
     if (!ErrorLog::startCoreChannel(&logError))
         qWarning().noquote() << "Android error log channel unavailable:" << logError;
     config.log = &coreLog;
     config.log_user = &logSocket;
-    if (logSocket < 0 && !qgetenv("MEGLER_CORE_LOG_SOCKET").isEmpty()) {
+    if (logSocket < 0 && !qgetenv("ANDROID_COMPATIBILITY_LAYER_CORE_LOG_SOCKET").isEmpty()) {
         qWarning() << "Core log display unavailable; application output remains in the IDE";
     }
     if (!megler_init(&config)) {
-        setStatus(tr("Megler initialization failed."));
+        setStatus(tr("Android runtime initialization failed."));
         ErrorLog::record(QStringLiteral("Android"), m_status, true);
         return;
     }

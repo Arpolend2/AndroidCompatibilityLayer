@@ -18,9 +18,9 @@ static std::atomic<int> opened{0}, wrote{0}, sound{0};
 
 static void capture(QtMsgType, const QMessageLogContext &, const QString &message)
 {
-    if (message.startsWith(QLatin1String("Megler audio: mixer opened output"))) ++opened;
-    if (message == QLatin1String("Megler audio: mixer wrote PCM")) ++wrote;
-    if (message == QLatin1String("Megler audio: mixer wrote nonzero PCM")) ++sound;
+    if (message.startsWith(QLatin1String("AndroidCompatibilityLayer audio: mixer opened output"))) ++opened;
+    if (message == QLatin1String("AndroidCompatibilityLayer audio: mixer wrote PCM")) ++wrote;
+    if (message == QLatin1String("AndroidCompatibilityLayer audio: mixer wrote nonzero PCM")) ++sound;
 }
 
 static int testFormats()

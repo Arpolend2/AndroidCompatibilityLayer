@@ -31,13 +31,13 @@ int main(int argc, char **argv)
     qDBusRegisterMetaType<ConnmanServices>();
     QDBusConnection bus = QDBusConnection::sessionBus();
     assert(bus.isConnected());
-    const bool registeredService = bus.registerService(QStringLiteral("ru.megler.NetworkTest"));
+    const bool registeredService = bus.registerService(QStringLiteral("ru.androidcompatibilitylayer.NetworkTest"));
     assert(registeredService);
     ConnmanTestService service;
     const bool registeredObject = bus.registerObject(QStringLiteral("/"), &service, QDBusConnection::ExportAllSlots);
     assert(registeredObject);
     QDBusMessage message = QDBusMessage::createMethodCall(
-        QStringLiteral("ru.megler.NetworkTest"), QStringLiteral("/"),
+        QStringLiteral("ru.androidcompatibilitylayer.NetworkTest"), QStringLiteral("/"),
         QStringLiteral("net.connman.Manager"), QStringLiteral("GetServices"));
     QDBusPendingCallWatcher watcher(bus.asyncCall(message, 3000));
     QEventLoop loop;

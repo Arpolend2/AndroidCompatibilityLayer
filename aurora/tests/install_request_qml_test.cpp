@@ -225,14 +225,14 @@ static bool click(QQuickItem *button)
 int main(int argc, char **argv)
 {
     QGuiApplication app(argc, argv);
-    qmlRegisterType<SideMouseButtons>("Megler.Navigation", 1, 0, "SideMouseButtons");
+    qmlRegisterType<SideMouseButtons>("AndroidCompatibilityLayer.Navigation", 1, 0, "SideMouseButtons");
     if (argc != 2 && !(argc == 3 && (QByteArray(argv[2]) == "--permissions-only" ||
                                      QByteArray(argv[2]) == "--rpm-menu-only" ||
                                      QByteArray(argv[2]) == "--gesture-setting-only" ||
                                      QByteArray(argv[2]) == "--translation-only"))) return 2;
     QTranslator translator;
     if (argc == 3 && QByteArray(argv[2]) == "--translation-only" &&
-        (!translator.load(QString::fromLocal8Bit(qgetenv("MEGLER_TRANSLATION_QM"))) ||
+        (!translator.load(QString::fromLocal8Bit(qgetenv("ANDROID_COMPATIBILITY_LAYER_TRANSLATION_QM"))) ||
          !app.installTranslator(&translator))) return 1;
     FakeProbe probe;
     {

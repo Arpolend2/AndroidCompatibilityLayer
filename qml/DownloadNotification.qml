@@ -54,12 +54,12 @@ Item {
     Notification {
         id: notification
         appName: qsTr("Android App Manager")
-        appIcon: "ru.megler.MeglerProbe"
+        appIcon: "ru.androidcompatibilitylayer.AndroidCompatibilityLayer"
     }
     Notification {
         id: previewNotification
         appName: qsTr("Android App Manager")
-        appIcon: "ru.megler.MeglerProbe"
+        appIcon: "ru.androidcompatibilitylayer.AndroidCompatibilityLayer"
     }
     Timer {
         id: updateTimer

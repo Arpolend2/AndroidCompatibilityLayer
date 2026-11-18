@@ -34,7 +34,7 @@ public slots:
     {
         startDecoder();
         if (nextBuffer() != 1) {
-            qWarning() << "Megler media: MP3 produced no initial audio";
+            qWarning() << "AndroidCompatibilityLayer media: MP3 produced no initial audio";
             return;
         }
         const QAudioFormat fmt = buffer.format();
@@ -42,7 +42,7 @@ public slots:
             fmt.sampleSize() != 16 || fmt.byteOrder() != QAudioFormat::LittleEndian ||
             fmt.sampleRate() <= 0 || fmt.sampleRate() > 192000 ||
             fmt.channelCount() < 1 || fmt.channelCount() > 2) {
-            qWarning() << "Megler media: unsupported decoded MP3 format" << fmt;
+            qWarning() << "AndroidCompatibilityLayer media: unsupported decoded MP3 format" << fmt;
             return;
         }
         info.sample_rate = fmt.sampleRate();
@@ -57,7 +57,7 @@ public slots:
     {
         result = -1;
         if (!output || maxFrames <= 0) {
-            qWarning() << "Megler media: invalid audio read";
+            qWarning() << "AndroidCompatibilityLayer media: invalid audio read";
             return;
         }
         if (offset >= buffer.frameCount()) {
@@ -81,7 +81,7 @@ public slots:
     {
         result = -1;
         if (requestedTime < 0 || requestedTime > std::numeric_limits<int64_t>::max() / info.sample_rate) {
-            qWarning() << "Megler media: invalid seek position";
+            qWarning() << "AndroidCompatibilityLayer media: invalid seek position";
             return;
         }
         const int64_t target = requestedTime * info.sample_rate / 1000000;
@@ -93,7 +93,7 @@ public slots:
         timer.start();
         while (framePosition < target) {
             if (timer.elapsed() > 15000) {
-                qWarning() << "Megler media: MP3 seek timed out";
+                qWarning() << "AndroidCompatibilityLayer media: MP3 seek timed out";
                 return;
             }
             if (offset >= buffer.frameCount()) {
@@ -141,11 +141,11 @@ private:
         }
         if (!decoder->bufferAvailable()) {
             if (decoder->error() != QAudioDecoder::NoError) {
-                qWarning() << "Megler media: MP3 decoding failed:" << decoder->errorString();
+                qWarning() << "AndroidCompatibilityLayer media: MP3 decoding failed:" << decoder->errorString();
                 return -1;
             }
             if (ended) return 0;
-            qWarning() << "Megler media: MP3 decoder timed out";
+            qWarning() << "AndroidCompatibilityLayer media: MP3 decoder timed out";
             return -1;
         }
         buffer = decoder->read();
@@ -158,7 +158,7 @@ private:
              fmt.channelCount() != info.channels || fmt.sampleType() != QAudioFormat::SignedInt ||
              fmt.sampleSize() != 16 || fmt.byteOrder() != QAudioFormat::LittleEndian ||
              fmt.codec() != QLatin1String("audio/pcm")))) {
-            qWarning() << "Megler media: invalid or changed MP3 output format";
+            qWarning() << "AndroidCompatibilityLayer media: invalid or changed MP3 output format";
             return -1;
         }
         return 1;
@@ -203,14 +203,14 @@ bool looksLikeMp3(const QString &path)
 void *MEGLER_CB openMedia(void *, const char *path, megler_media_info *info)
 {
     if (!path || !info || !looksLikeMp3(QString::fromUtf8(path))) {
-        qWarning() << "Megler media: file is not a supported MP3";
+        qWarning() << "AndroidCompatibilityLayer media: file is not a supported MP3";
         return nullptr;
     }
     Mp3Media *media = new Mp3Media;
     media->worker->path = QString::fromUtf8(path);
     if (!QMetaObject::invokeMethod(media->worker, "open", Qt::BlockingQueuedConnection) ||
         media->worker->result != 1) {
-        qWarning() << "Megler media: could not open MP3";
+        qWarning() << "AndroidCompatibilityLayer media: could not open MP3";
         delete media;
         return nullptr;
     }
@@ -225,7 +225,7 @@ int MEGLER_CB readAudio(void *, void *handle, int16_t *samples, int maxFrames, i
     worker->output = samples;
     worker->maxFrames = maxFrames;
     if (!QMetaObject::invokeMethod(worker, "read", Qt::BlockingQueuedConnection)) {
-        qWarning() << "Megler media: could not dispatch audio read";
+        qWarning() << "AndroidCompatibilityLayer media: could not dispatch audio read";
         return -1;
     }
     if (worker->result > 0) *time = worker->outputTime;
@@ -238,7 +238,7 @@ bool MEGLER_CB seekMedia(void *, void *handle, int64_t time)
     Mp3Worker *worker = static_cast<Mp3Media *>(handle)->worker;
     worker->requestedTime = time;
     if (!QMetaObject::invokeMethod(worker, "seek", Qt::BlockingQueuedConnection)) {
-        qWarning() << "Megler media: could not dispatch MP3 seek";
+        qWarning() << "AndroidCompatibilityLayer media: could not dispatch MP3 seek";
         return false;
     }
     return worker->result == 1;

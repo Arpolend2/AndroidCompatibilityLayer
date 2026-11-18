@@ -133,7 +133,8 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     random.remove(QLatin1Char('{'));
     random.remove(QLatin1Char('}'));
     random.remove(QLatin1Char('-'));
-    const QString appId = QStringLiteral("ru.megler.Android") + random.left(24);
+    const QString organization = QStringLiteral("ru.androidcompatibilitylayer");
+    const QString appId = organization + QStringLiteral(".Android") + random.left(24);
     const QString dataRoot = QStringLiteral("/usr/share/") + appId;
     const QString binaryPath = QStringLiteral("/usr/bin/") + appId;
     std::vector<RpmWriter::StreamFile> files;
@@ -206,8 +207,9 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
         "[Desktop Entry]\nType=Application\nX-Nemo-Application-Type=silica-qt5\n"
         "Icon=%1\nExec=%2 --standalone\nName=%3\n\n[X-Application]\n"
         "Permissions=%4\n"
-        "OrganizationName=ru.megler\nApplicationName=%5\n")
-        .arg(appId, binaryPath, title, osPermissions.join(QLatin1Char(';')), appId.mid(10));
+        "OrganizationName=%5\nApplicationName=%6\n")
+        .arg(appId, binaryPath, title, osPermissions.join(QLatin1Char(';')),
+             organization, appId.mid(organization.size() + 1));
     addBytes(&files, QStringLiteral("/usr/share/applications/") + appId + QStringLiteral(".desktop"),
              desktop.toUtf8());
     const int sizes[] = {86, 108, 128, 172};

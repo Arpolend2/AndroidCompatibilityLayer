@@ -39,7 +39,7 @@ int main(int argc, char **argv)
     QCoreApplication app(argc, argv);
     if (argc != 2) return 2;
     const QDir root(QString::fromLocal8Bit(argv[1]));
-    QCoreApplication::setOrganizationName(QStringLiteral("MeglerTest"));
+    QCoreApplication::setOrganizationName(QStringLiteral("AndroidCompatibilityLayerTest"));
     QCoreApplication::setApplicationName(QStringLiteral("StandaloneRpm"));
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, root.path());
@@ -59,7 +59,7 @@ int main(int argc, char **argv)
         !write(appDir + QStringLiteral("/splits/config.apk"), "split content") ||
         !write(appDir + QStringLiteral("/data/secret"), "private data must stay private") ||
         !write(runtime + QStringLiteral("/runtime.dex"), "runtime content") ||
-        !write(qml + QStringLiteral("/megler_ru.qm"), "translation catalog content") ||
+        !write(qml + QStringLiteral("/androidcompatibilitylayer_ru.qm"), "translation catalog content") ||
         !write(root.filePath(QStringLiteral("qml-source.qml")), "linked qml content") ||
         !write(root.filePath(QStringLiteral("binary-source")), "binary content") ||
         !QFile::link(root.filePath(QStringLiteral("binary-source")), root.filePath(QStringLiteral("binary")))) return 1;
@@ -101,6 +101,7 @@ int main(int argc, char **argv)
     const QByteArray contents = rpm.readAll();
     if (contents.contains("private data must stay private") ||
         !contents.contains("translation catalog content") ||
+        !contents.contains("OrganizationName=ru.androidcompatibilitylayer\nApplicationName=Android") ||
         !contents.contains("\"deniedPermissions\":[\"camera\",\"location\"]") ||
         !contents.contains("Permissions=Internet;Audio;Bluetooth\n")) return 1;
     const QString first = output;
