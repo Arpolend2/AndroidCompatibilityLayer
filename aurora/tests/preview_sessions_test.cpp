@@ -2,6 +2,7 @@
 #include "../install_request_host.h"
 #include "../log_channel.h"
 #include "../diagnostic_log.h"
+#include "../error_log.h"
 #include "../preview_activation_channel.h"
 #include "../../core/src/apk/mg_apk.h"
 
@@ -13,6 +14,7 @@
 #include <QMap>
 #include <QLocalSocket>
 #include <QScopedPointer>
+#include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTimer>
 
@@ -21,6 +23,7 @@
 #include <cstring>
 #include <cerrno>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -55,11 +58,19 @@ static void writeFile(const QString &path, const QByteArray &contents)
 
 int main(int argc, char **argv)
 {
+    QTemporaryDir home;
+    check(home.isValid(), "temporary home");
+    if (argc == 1) qputenv("HOME", QFile::encodeName(home.path()));
     QCoreApplication app(argc, argv);
     const QByteArray request("request_0123456789abcdef0123456789abcdef.apk");
     if (argc == 8 && QByteArray(argv[1]) == "--preview") {
         const QString data = QString::fromLocal8Bit(argv[3]);
         const QByteArray tag = QFile::encodeName(QFileInfo(data).fileName());
+        if (tag == "crash") {
+            ::raise(SIGKILL);
+            return 1;
+        }
+        if (tag == "nonzero") return 23;
         std::fprintf(stderr, "preview output %s\n", tag.constData());
         const QByteArray logPath = qgetenv("ANDROID_COMPATIBILITY_LAYER_CORE_LOG_SOCKET");
         if (!logPath.isEmpty()) {
@@ -115,6 +126,10 @@ int main(int argc, char **argv)
 
     QTemporaryDir directory;
     check(directory.isValid(), "temporary root");
+    check(QDir().mkpath(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)),
+          "create documents directory");
+    QString logError;
+    check(ErrorLog::initialize(QStringLiteral("Android App Manager"), &logError), "initialize safe log");
     const QString first = directory.path() + QStringLiteral("/first");
     const QString second = directory.path() + QStringLiteral("/second");
     const QString cancel = directory.path() + QStringLiteral("/cancel");
@@ -277,6 +292,35 @@ int main(int argc, char **argv)
         check(killedCount == 2 && killed.count() == 0, "killed processes finished independently");
         check(!killed.kill(QStringLiteral("kill-later")), "finished process cannot be killed");
     }
+    {
+        PreviewSessions crashing;
+        QEventLoop crashLoop;
+        bool crashed = false;
+        bool nonzero = false;
+        QObject::connect(&crashing, &PreviewSessions::finished, &app,
+                         [&](const QString &, const QString &key, int code, bool wasCrash, const QString &) {
+            if (key == QLatin1String("private-app-name")) crashed = wasCrash;
+            if (key == QLatin1String("private-second-app")) nonzero = !wasCrash && code == 23;
+            if (crashed && nonzero) crashLoop.quit();
+        });
+        check(crashing.start(QStringLiteral("private-app-name"), directory.path(),
+                             directory.path() + QStringLiteral("/crash"), QStringLiteral("private-apk"),
+                             store, &error), "start crashing process");
+        check(crashing.start(QStringLiteral("private-second-app"), directory.path(),
+                             directory.path() + QStringLiteral("/nonzero"), QStringLiteral("private-apk"),
+                             store, &error), "start failing process");
+        QTimer::singleShot(5000, &crashLoop, &QEventLoop::quit);
+        crashLoop.exec();
+        check(crashed && nonzero, "unexpected crash and nonzero exit detected");
+    }
+    const QString report = ErrorLog::report().section(QStringLiteral("Current process context:\n"), 0, 0);
+    check(report.count(QStringLiteral(" result=completed")) == 3 &&
+          report.count(QStringLiteral(" result=stopped")) == 2 &&
+          report.count(QStringLiteral(" result=crashed")) == 1 &&
+          report.count(QStringLiteral(" result=nonzero")) == 1 &&
+          !report.contains(QStringLiteral("private-app-name")) &&
+          !report.contains(QStringLiteral("private-apk")) &&
+          !report.contains(directory.path()), "safe lifecycle categories distinguish exits");
     std::puts("Preview sessions OK");
     return 0;
 }

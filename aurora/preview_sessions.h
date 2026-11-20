@@ -8,6 +8,16 @@
 
 class PreviewSession;
 class DiagnosticLog;
+class QProcess;
+
+class EmbeddedEndpoint
+{
+public:
+    virtual ~EmbeddedEndpoint() {}
+    virtual bool listen(QProcess *process, QString *error) = 0;
+    virtual QString endpoint() const = 0;
+    virtual bool stopping() const = 0;
+};
 
 // The owner must remain alive until all children have exited.
 class PreviewSessions : public QObject
@@ -19,7 +29,8 @@ public:
 
     void setDiagnosticLog(DiagnosticLog *log);
     bool start(const QString &key, const QString &androidRoot, const QString &data,
-               const QString &apk, const QString &storeRoot, QString *error);
+               const QString &apk, const QString &storeRoot, QString *error,
+               EmbeddedEndpoint *embedded = nullptr);
     bool activate(const QString &key, int timeoutMs, QString *error);
     bool running(const QString &key) const;
     bool kill(const QString &key);
@@ -32,7 +43,7 @@ signals:
     void started(const QString &key);
     void finished(const QString &instance, const QString &key, int exitCode, bool crashed, const QString &error);
     void activationFinished(const QString &instance, const QString &key, bool activated, const QString &error);
-    void installed();
+    void installed(const QString &package);
     void logChanged(const QString &instance, const QString &key, const QString &text);
     void logUnavailable(const QString &key);
     void confirmationRequested(const QString &token, const QString &label,

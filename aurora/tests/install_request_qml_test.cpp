@@ -15,6 +15,36 @@
 
 #include <cstdio>
 
+class FakeSurface : public QQuickItem
+{
+    Q_OBJECT
+    Q_PROPERTY(QObject *player MEMBER player)
+    Q_PROPERTY(qreal edgeZoneWidth MEMBER edgeZoneWidth)
+public:
+    QObject *player = nullptr;
+    qreal edgeZoneWidth = 0;
+};
+
+class FakeMicrog : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(bool showStatus READ showStatus CONSTANT)
+    Q_PROPERTY(QString status READ status CONSTANT)
+    Q_PROPERTY(int backGestureEdgeDp READ edge CONSTANT)
+public:
+    bool showStatus() const { return false; }
+    QString status() const { return QString(); }
+    int edge() const { return 32; }
+    Q_INVOKABLE void stop() { ++stops; }
+    Q_INVOKABLE void setUiReady(bool) {}
+    Q_INVOKABLE void canceled(const QString &) {}
+    Q_INVOKABLE void selected(const QString &, const QString &) {}
+    Q_INVOKABLE void showFailed(const QString &) {}
+    int stops = 0;
+signals:
+    void showPicker(const QString &, const QStringList &);
+};
+
 class FakeProbe : public QObject
 {
     Q_OBJECT
@@ -37,6 +67,7 @@ class FakeProbe : public QObject
     Q_PROPERTY(QString standaloneRpmStatus READ rpmStatus NOTIFY rpmChanged)
     Q_PROPERTY(bool standaloneRpmOpened READ rpmOpened NOTIFY rpmChanged)
     Q_PROPERTY(QString standaloneRpmPackage READ rpmTarget NOTIFY rpmChanged)
+    Q_PROPERTY(bool autoInstallRpm READ autoInstallRpm NOTIFY runtimeSettingsChanged)
     Q_PROPERTY(QString androidLocale READ androidLocale NOTIFY runtimeSettingsChanged)
     Q_PROPERTY(QString systemAndroidLocale READ systemAndroidLocale CONSTANT)
     Q_PROPERTY(QString androidTheme READ androidTheme NOTIFY runtimeSettingsChanged)
@@ -55,6 +86,8 @@ class FakeProbe : public QObject
     Q_PROPERTY(QString runtimeSettingsError READ empty CONSTANT)
     Q_PROPERTY(QString coreLog READ coreLog NOTIFY coreLogChanged)
     Q_PROPERTY(bool coreLogAvailable READ yes CONSTANT)
+    Q_PROPERTY(bool detailedLogEnabled READ detailedLogEnabled NOTIFY detailedLogChanged)
+    Q_PROPERTY(QString detailedLogError READ empty CONSTANT)
 public:
     bool previewRunning() const { return m_previewRunning; }
     void setPreviewRunning(bool running) { m_previewRunning = running; emit previewRunningChanged(); }
@@ -64,6 +97,8 @@ public:
     bool yes() const { return true; }
     bool disabled() const { return false; }
     bool rpmBusy() const { return m_rpmBusy; }
+    bool autoInstallRpm() const { return m_autoInstallRpm; }
+    Q_INVOKABLE void setAutoInstallRpm(bool enabled) { m_autoInstallRpm = enabled; emit runtimeSettingsChanged(); }
     QString rpmStatus() const { return m_rpmStatus; }
     bool rpmOpened() const { return m_rpmOpened; }
     QString rpmTarget() const { return rpmPackage; }
@@ -83,6 +118,9 @@ public:
     QString googleServicesGmsApkPath() const { return m_googleServicesGmsApkPath; }
     QString empty() const { return QString(); }
     QString coreLog() const { return m_coreLog; }
+    bool detailedLogEnabled() const { return m_detailedLogEnabled; }
+    Q_INVOKABLE void setDetailedLogEnabled(bool enabled) { m_detailedLogEnabled = enabled; emit detailedLogChanged(); }
+    Q_INVOKABLE QString diagnosticReport() const { return QStringLiteral("Safe test report"); }
     Q_INVOKABLE QString saveCoreLog() { ++saveLogCount; return saveLogResult; }
     int saveLogCount = 0;
     QString saveLogResult = QStringLiteral("Saved for test");
@@ -96,7 +134,7 @@ public:
                             {QStringLiteral("permissionMaxSdk"), QVariantList{0}},
                             {QStringLiteral("icon"), QStringLiteral("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAIklEQVR42mNgoAb438DwHxdmWOCAG48aMGrAqAFUNoASAAC0gKuqwY9yQwAAAABJRU5ErkJggg==")},
                             {QStringLiteral("launchCount"), 1}},
-                QVariantMap{{QStringLiteral("label"), QStringLiteral("example Two")},
+                QVariantMap{{QStringLiteral("label"), QStringLiteral("A very long application name that should fade instead of overflowing its cover column")},
                             {QStringLiteral("package"), QStringLiteral("org.example.second")},
                             {QStringLiteral("launchCount"), 4}},
                 QVariantMap{{QStringLiteral("label"), QString::fromUtf8("Три")},
@@ -150,7 +188,8 @@ public:
     Q_INVOKABLE void setGoogleServicesGmsApkPath(const QString &value) { m_googleServicesGmsApkPath = value; emit runtimeSettingsChanged(); }
     Q_INVOKABLE void openMicrog() { ++microgOpenCount; setGoogleServicesProvider(QStringLiteral("microg")); }
     Q_INVOKABLE void updateMicrog(const QString &path) { updatePath = path; updateCalled = true; }
-    Q_INVOKABLE void openOfficialStore() {}
+    Q_INVOKABLE void openOfficialStore() { ++storeOpenCount; }
+    Q_INVOKABLE void activateManager() { ++activationCount; }
     Q_INVOKABLE void updateOfficialStore() {}
     Q_INVOKABLE void updateOfficialStoreFromLocal(const QString &) {}
     Q_INVOKABLE bool removeApp(const QString &package) { removedPackage = package; return true; }
@@ -169,24 +208,33 @@ public:
     QString updatePath;
     bool updateCalled = false;
     int microgOpenCount = 0;
+    int storeOpenCount = 0;
+    int activationCount = 0;
 signals:
     void standaloneRpmError(const QString &appPackage, const QString &message);
+    void standaloneInstallOffered(const QString &appPackage, const QString &message);
+    void libraryAppAddedNotice(const QString &appPackage);
     void signatureReminder();
     void visibilityChanged();
     void externalInstallNotice();
     void controllerCloseBlocked();
     void busyChanged();
     void coreLogChanged();
+    void detailedLogChanged();
     void runtimeSettingsChanged();
     void previewRunningChanged();
     void rpmChanged();
     void microgDownloadNotification(const QString &message, int percent, bool complete);
+    void microgPreviewRequested();
     void officialStoreDownloadNotification(const QString &message, int percent, bool complete);
+    void officialStoreLaunchFailed(const QString &message);
 private:
     bool m_visible = true;
     bool m_busy = false;
     bool m_previewRunning = false;
+    bool m_detailedLogEnabled = false;
     bool m_rpmBusy = false;
+    bool m_autoInstallRpm = false;
     bool m_rpmOpened = false;
     QString m_rpmStatus;
     int m_renderSizeCap = 0;
@@ -222,23 +270,72 @@ static bool click(QQuickItem *button)
     return false;
 }
 
+static void coverItemsNamed(QQuickItem *parent, const QString &name, QList<QQuickItem *> *items)
+{
+    for (QQuickItem *child : parent->childItems()) {
+        if (child->objectName() == name) items->append(child);
+        coverItemsNamed(child, name, items);
+    }
+}
+
+static bool checkDetailedLog(QObject *root, FakeProbe &probe)
+{
+    QObject *toggle = root->findChild<QObject *>(QStringLiteral("toggleDetailedLog"));
+    if (!toggle || !QMetaObject::invokeMethod(toggle, "clicked")) return false;
+    QTest::qWait(100);
+    QObject *dialog = root->findChild<QObject *>(QStringLiteral("detailedLogDialog"));
+    QObject *warning = root->findChild<QObject *>(QStringLiteral("detailedLogWarning"));
+    if (!dialog || !warning || probe.detailedLogEnabled() ||
+        !warning->property("text").toString().contains(QStringLiteral("passwords")) ||
+        !warning->property("text").toString().contains(QStringLiteral("Documents")) ||
+        !warning->property("text").toString().contains(QStringLiteral("keep recording"))) {
+        std::fprintf(stderr, "Detailed logging did not require a privacy warning\n");
+        return false;
+    }
+    QQmlExpression cancelDialog(qmlContext(root), root,
+        QStringLiteral("pageStack.pop(null, PageStackAction.Immediate)"));
+    cancelDialog.evaluate();
+    if (cancelDialog.hasError() || probe.detailedLogEnabled()) return false;
+    QTest::qWait(100);
+    if (!QMetaObject::invokeMethod(toggle, "clicked")) return false;
+    QTest::qWait(100);
+    dialog = root->findChild<QObject *>(QStringLiteral("detailedLogDialog"));
+    if (!dialog) return false;
+    if (!QMetaObject::invokeMethod(dialog, "accepted") || !probe.detailedLogEnabled()) return false;
+    QQmlExpression popDialog(qmlContext(root), root,
+        QStringLiteral("pageStack.pop(null, PageStackAction.Immediate)"));
+    popDialog.evaluate();
+    if (popDialog.hasError()) return false;
+    QTest::qWait(100);
+    return toggle->property("text").toString() == QStringLiteral("Use short log") &&
+           QMetaObject::invokeMethod(toggle, "clicked") && !probe.detailedLogEnabled();
+}
+
 int main(int argc, char **argv)
 {
     QGuiApplication app(argc, argv);
     qmlRegisterType<SideMouseButtons>("AndroidCompatibilityLayer.Navigation", 1, 0, "SideMouseButtons");
+    qmlRegisterType<FakeSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
     if (argc != 2 && !(argc == 3 && (QByteArray(argv[2]) == "--permissions-only" ||
                                      QByteArray(argv[2]) == "--rpm-menu-only" ||
                                      QByteArray(argv[2]) == "--gesture-setting-only" ||
+                                     QByteArray(argv[2]) == "--detailed-log-only" ||
+                                     QByteArray(argv[2]) == "--auto-rpm-only" ||
+                                     QByteArray(argv[2]) == "--launch-install-only" ||
+                                     QByteArray(argv[2]) == "--cover-only" ||
+                                     QByteArray(argv[2]) == "--microg-only" ||
                                      QByteArray(argv[2]) == "--translation-only"))) return 2;
     QTranslator translator;
     if (argc == 3 && QByteArray(argv[2]) == "--translation-only" &&
         (!translator.load(QString::fromLocal8Bit(qgetenv("ANDROID_COMPATIBILITY_LAYER_TRANSLATION_QM"))) ||
          !app.installTranslator(&translator))) return 1;
     FakeProbe probe;
+    FakeMicrog microg;
     {
         QQuickView view;
         view.setResizeMode(QQuickView::SizeRootObjectToView);
         view.rootContext()->setContextProperty(QStringLiteral("probe"), &probe);
+        view.rootContext()->setContextProperty(QStringLiteral("microgPreview"), &microg);
         view.resize(480, 854);
         view.setSource(QUrl::fromLocalFile(QString::fromLocal8Bit(argv[1])));
         if (view.status() != QQuickView::Ready) {
@@ -249,6 +346,193 @@ int main(int argc, char **argv)
         QTest::qWait(100);
 
         QObject *root = view.rootObject();
+        if (argc == 3 && QByteArray(argv[2]) == "--cover-only") {
+            probe.setVisible(false);
+            QQmlExpression createCover(qmlContext(root), root,
+                QStringLiteral("cover.createObject(contentItem)"));
+            QObject *cover = createCover.evaluate().value<QObject *>();
+            if (createCover.hasError() || !cover) {
+                std::fprintf(stderr, "Cannot create cover: %s\n", qPrintable(createCover.error().toString()));
+                return 1;
+            }
+            auto coverItem = qobject_cast<QQuickItem *>(cover);
+            if (!coverItem) return 1;
+            QObject *apps = cover->findChild<QObject *>(QStringLiteral("coverAppsRepeater"));
+            QObject *install = cover->findChild<QObject *>(QStringLiteral("coverInstallApk"));
+            QObject *save = cover->findChild<QObject *>(QStringLiteral("coverSaveLog"));
+            QObject *store = cover->findChild<QObject *>(QStringLiteral("coverOpenOfficialStore"));
+            QObject *banner = root->findChild<QObject *>(QStringLiteral("coverActionBanner"));
+            QObject *storeMenu = root->findChild<QObject *>(QStringLiteral("openOfficialStore"));
+            if (!apps || apps->property("count").toInt() != 7 || !install || !save || !store || !banner ||
+                !store->property("iconSource").toUrl().toString().contains(QStringLiteral("cover-aurora-store-")) ||
+                save->property("iconSource").toUrl().toString() != QStringLiteral("image://theme/icon-s-export") ||
+                !storeMenu || !QMetaObject::invokeMethod(storeMenu, "clicked") || probe.storeOpenCount != 1)
+                return 1;
+            auto grid = qobject_cast<QQuickItem *>(apps);
+            if (!grid) return 1;
+            coverItem->setWidth(480);
+            coverItem->setHeight(854);
+            QCoreApplication::processEvents();
+            if (apps->property("columnCount").toInt() != 1) {
+                std::fprintf(stderr, "Portrait cover did not use one column\n");
+                return 1;
+            }
+            QList<QQuickItem *> coverNames;
+            coverItemsNamed(grid, QStringLiteral("coverAppName"), &coverNames);
+            QQuickItem *firstName = nullptr;
+            for (QQuickItem *name : coverNames) {
+                if (name->property("text").toString() == QStringLiteral("Example")) firstName = name;
+            }
+            QQuickItem *firstRow = firstName ? firstName->parentItem() : nullptr;
+            QQuickItem *firstIcon = firstRow ? firstRow->findChild<QQuickItem *>(QStringLiteral("coverAppIcon")) : nullptr;
+            if (!firstRow || !firstIcon ||
+                firstIcon->property("source").toString() !=
+                    QStringLiteral("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAIklEQVR42mNgoAb438DwHxdmWOCAG48aMGrAqAFUNoASAAC0gKuqwY9yQwAAAABJRU5ErkJggg==")) {
+                std::fprintf(stderr, "Cover did not show an app icon\n");
+                return 1;
+            }
+            coverItem->setWidth(854);
+            coverItem->setHeight(480);
+            QTest::qWait(100);
+            if (apps->property("columnCount").toInt() != 2) {
+                std::fprintf(stderr, "Landscape cover did not use two columns\n");
+                return 1;
+            }
+            apps->setProperty("contentY", grid->property("cellHeight"));
+            QTest::qWait(100);
+            coverNames.clear();
+            coverItemsNamed(grid, QStringLiteral("coverAppName"), &coverNames);
+            QQuickItem *secondName = nullptr;
+            for (QQuickItem *name : coverNames) {
+                if (name->property("text").toString().startsWith(QStringLiteral("A very long"))) secondName = name;
+            }
+            QQuickItem *secondRow = secondName ? secondName->parentItem() : nullptr;
+            QQuickItem *secondIcon = secondRow ? secondRow->findChild<QQuickItem *>(QStringLiteral("coverAppIcon")) : nullptr;
+            if (!secondIcon || !secondName || secondName->width() <= 0 ||
+                secondIcon->property("source").toString() != QStringLiteral("image://theme/icon-m-file-apk")) {
+                std::fprintf(stderr, "Long name or missing-icon fallback was not handled (name=%s icon=%s width=%.1f names=%d)\n",
+                             secondName ? qPrintable(secondName->property("text").toString()) : "",
+                             secondIcon ? qPrintable(secondIcon->property("source").toString()) : "",
+                             secondName ? secondName->width() : 0, coverNames.size());
+                return 1;
+            }
+            if (qAbs(grid->property("cellWidth").toReal() * 2 - grid->width()) > 1 ||
+                apps->property("count").toInt() != 7) {
+                std::fprintf(stderr, "Landscape columns or odd app count is incorrect\n");
+                return 1;
+            }
+            if (!QMetaObject::invokeMethod(save, "triggered") || probe.saveLogCount != 0 ||
+                banner->property("previewBody").toString().isEmpty()) return 1;
+            probe.setCoreLog(QStringLiteral("log"));
+            if (!QMetaObject::invokeMethod(save, "triggered") || probe.saveLogCount != 1 ||
+                banner->property("previewBody").toString() != probe.saveLogResult) return 1;
+            if (!QMetaObject::invokeMethod(store, "triggered") || probe.storeOpenCount != 2) return 1;
+            if (!QMetaObject::invokeMethod(install, "triggered") || probe.activationCount != 1) return 1;
+            QQmlExpression picker(qmlContext(root), root,
+                                  QStringLiteral("pageStack.currentPage.title"));
+            if (picker.evaluate().toString() != QStringLiteral("Select APK or bundle") || picker.hasError()) return 1;
+            delete cover;
+            return 0;
+        }
+        if (argc == 3 && QByteArray(argv[2]) == "--launch-install-only") {
+            probe.setVisible(false);
+            QObject *banner = root->findChild<QObject *>(QStringLiteral("launchInstallBanner"));
+            QQuickItem *install = root->findChild<QQuickItem *>(QStringLiteral("confirmLaunchInstall"));
+            QQuickItem *dismiss = root->findChild<QQuickItem *>(QStringLiteral("dismissLaunchInstall"));
+            if (!banner || !install || !dismiss || banner->property("visible").toBool()) {
+                std::fprintf(stderr, "Initial banner state: banner=%d install=%d dismiss=%d visible=%d\n",
+                             bool(banner), bool(install), bool(dismiss),
+                             banner && banner->property("visible").toBool());
+                return 1;
+            }
+            emit probe.standaloneInstallOffered(QStringLiteral("org.example.second"), QStringLiteral("Launch failed"));
+            if (!banner->property("visible").toBool() ||
+                banner->property("appPackage").toString() != QStringLiteral("org.example.second") ||
+                banner->property("errorMessage").toString() != QStringLiteral("Launch failed")) {
+                std::fprintf(stderr, "Offer banner not shown\n");
+                return 1;
+            }
+            probe.setRpmState(true, QString());
+            if (install->property("enabled").toBool()) {
+                std::fprintf(stderr, "Install enabled during RPM operation\n");
+                return 1;
+            }
+            probe.setRpmState(false, QString());
+            if (!install->property("enabled").toBool() || !click(install) ||
+                probe.rpmPackage != QStringLiteral("org.example.second") ||
+                banner->property("visible").toBool()) {
+                std::fprintf(stderr, "Install action failed\n");
+                return 1;
+            }
+            emit probe.standaloneInstallOffered(QStringLiteral("org.example.other"), QString());
+            if (!banner->property("visible").toBool() || !click(dismiss) ||
+                banner->property("visible").toBool() ||
+                probe.rpmPackage != QStringLiteral("org.example.second")) {
+                std::fprintf(stderr, "Dismiss action failed\n");
+                return 1;
+            }
+            return 0;
+        }
+        if (argc == 3 && QByteArray(argv[2]) == "--auto-rpm-only") {
+            probe.setVisible(false);
+            QObject *page = root->findChild<QObject *>(QStringLiteral("launcherPage"));
+            QQuickItem *toggle = root->findChild<QQuickItem *>(QStringLiteral("autoInstallRpm"));
+            QObject *banner = root->findChild<QObject *>(QStringLiteral("libraryAddedBanner"));
+            if (!page || !toggle || !banner) {
+                std::fprintf(stderr, "Automatic RPM controls unavailable: page=%d toggle=%d banner=%d\n",
+                             bool(page), bool(toggle), bool(banner));
+                return 1;
+            }
+            const bool sectionSet = page->setProperty("section", 3);
+            const bool initiallyChecked = toggle->property("checked").toBool();
+            const bool invoked = click(toggle);
+            if (!sectionSet || initiallyChecked || !invoked || !probe.autoInstallRpm() ||
+                !toggle->property("checked").toBool()) {
+                std::fprintf(stderr, "Automatic RPM toggle failed: section=%d initial=%d invoked=%d setting=%d checked=%d\n",
+                             sectionSet, initiallyChecked, invoked, probe.autoInstallRpm(), toggle->property("checked").toBool());
+                return 1;
+            }
+            emit probe.libraryAppAddedNotice(QStringLiteral("org.example.new"));
+            if (banner->property("previewBody").toString() != QStringLiteral("Added org.example.new to the library.")) {
+                std::fprintf(stderr, "Library banner missing\n");
+                return 1;
+            }
+            QQmlExpression visible(qmlContext(root), root,
+                                  QStringLiteral("libraryIsVisible(pageStack.currentPage, true)"));
+            if (visible.evaluate().toBool() || visible.hasError() || !page->setProperty("section", 0) ||
+                !visible.evaluate().toBool() || visible.hasError()) {
+                std::fprintf(stderr, "Library visibility detection failed: %s\n", qPrintable(visible.error().toString()));
+                return 1;
+            }
+            QQmlExpression background(qmlContext(root), root,
+                                     QStringLiteral("libraryIsVisible(pageStack.currentPage, false)"));
+            if (background.evaluate().toBool() || background.hasError()) return 1;
+            probe.setVisible(true);
+            if (visible.evaluate().toBool() || visible.hasError()) return 1;
+            return 0;
+        }
+        if (argc == 3 && QByteArray(argv[2]) == "--microg-only") {
+            probe.setVisible(false);
+            emit probe.microgPreviewRequested();
+            QTest::qWait(700);
+            QQmlExpression check(qmlContext(root), root,
+                                 QStringLiteral("microgPage && pageStack.currentPage === microgPage && pageStack.depth === 2"));
+            if (!check.evaluate().toBool() || check.hasError()) return 1;
+            QQmlExpression back(qmlContext(root), root, QStringLiteral("pageStack.navigateBack(PageStackAction.Animated)"));
+            back.evaluate();
+            if (back.hasError() || microg.stops) return 1;
+            QTest::qWait(800);
+            QQmlExpression returned(qmlContext(root), root, QStringLiteral("!microgPage && pageStack.depth === 1"));
+            if (!returned.evaluate().toBool() || returned.hasError() || microg.stops != 1) return 1;
+            return 0;
+        }
+        if (argc == 3 && QByteArray(argv[2]) == "--detailed-log-only") {
+            auto prompt = root->findChild<QQuickItem *>(QStringLiteral("installConfirmation"));
+            if (!prompt || !prompt->parentItem()) return 1;
+            probe.setVisible(false);
+            if (!prompt->parentItem()->setProperty("section", 2)) return 1;
+            return checkDetailedLog(root, probe) ? 0 : 1;
+        }
         if (argc == 3 && QByteArray(argv[2]) == "--translation-only") {
             QObject *button = root->findChild<QObject *>(QStringLiteral("installApk"));
             if (!button || button->property("text").toString() !=
@@ -355,9 +639,10 @@ int main(int argc, char **argv)
                          appsRepeater != nullptr, appsRepeater ? appsRepeater->property("count").toInt() : -1);
             return 1;
         }
-        if (page->property("apps").toList().size() != 8 ||
-            appsRepeater->property("count").toInt() != 8 ||
-            root->findChild<QObject *>(QStringLiteral("openOfficialStore"))) {
+        QObject *storeMenu = root->findChild<QObject *>(QStringLiteral("openOfficialStore"));
+        if (page->property("apps").toList().size() != 7 ||
+            appsRepeater->property("count").toInt() != 7 || !storeMenu ||
+            !QMetaObject::invokeMethod(storeMenu, "clicked") || probe.storeOpenCount != 1) {
             std::fprintf(stderr, "Library list is incorrect\n");
             return 1;
         }
@@ -527,6 +812,12 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "Page menu visibility is incorrect\n");
             return 1;
         }
+        QQuickItem *autoRpm = root->findChild<QQuickItem *>(QStringLiteral("autoInstallRpm"));
+        QObject *addedBanner = root->findChild<QObject *>(QStringLiteral("libraryAddedBanner"));
+        if (!autoRpm || !addedBanner || autoRpm->property("checked").toBool()) return 1;
+        if (!click(autoRpm) || !probe.autoInstallRpm()) return 1;
+        emit probe.libraryAppAddedNotice(QStringLiteral("org.example.new"));
+        if (addedBanner->property("previewBody").toString() != QStringLiteral("Added org.example.new to the library.")) return 1;
         QObject *cap = root->findChild<QObject *>(QStringLiteral("renderSize960"));
         QObject *resolution = root->findChild<QObject *>(QStringLiteral("renderSize"));
         QObject *localeCombo = root->findChild<QObject *>(QStringLiteral("androidLocale"));
@@ -750,7 +1041,7 @@ int main(int argc, char **argv)
         if (!QMetaObject::invokeMethod(saveLog, "clicked") || probe.saveLogCount != 2 ||
             logActionMessage->property("text").toString() != probe.saveLogResult) return 1;
         QQmlExpression clipboard(qmlContext(root), root, QStringLiteral("Clipboard.text"));
-        if (clipboard.evaluate().toString() != QStringLiteral("first line\nsecond line\n") || clipboard.hasError()) {
+        if (clipboard.evaluate().toString() != QStringLiteral("Safe test report") || clipboard.hasError()) {
             std::fprintf(stderr, "Log pulley copy did not copy the log\n");
             return 1;
         }
@@ -771,6 +1062,7 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "Log following did not return to the newest entries at the top\n");
             return 1;
         }
+        if (!checkDetailedLog(root, probe)) return 1;
     }
     if (probe.uiReady) return 1;
     std::puts("Install confirmation QML OK");

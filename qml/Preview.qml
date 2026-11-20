@@ -79,6 +79,7 @@ ApplicationWindow {
         Page {
             id: guestPage
             allowedOrientations: Orientation.All
+            property string diagnosticFileError: ""
             onStatusChanged: navigationTimer.restart()
             PreviewSurface {
                 anchors.fill: parent
@@ -93,6 +94,29 @@ ApplicationWindow {
                 wrapMode: Text.Wrap
                 visible: preview.showStatus
                 text: preview.status
+            }
+            Rectangle {
+                objectName: "standaloneDiagnosticError"
+                anchors.top: parent.top
+                width: parent.width
+                height: diagnosticErrorLabel.height + 2 * Theme.paddingSmall
+                color: Theme.rgba(Theme.errorColor, 0.9)
+                visible: guestPage.diagnosticFileError.length > 0
+                Label {
+                    id: diagnosticErrorLabel
+                    x: Theme.horizontalPageMargin
+                    y: Theme.paddingSmall
+                    width: parent.width - 2 * x
+                    wrapMode: Text.Wrap
+                    text: qsTr("Diagnostic file could not be saved: %1").arg(guestPage.diagnosticFileError)
+                }
+            }
+            Timer {
+                interval: 1000
+                running: typeof standaloneFileDiagnostics !== "undefined" && standaloneFileDiagnostics
+                repeat: true
+                triggeredOnStart: true
+                onTriggered: guestPage.diagnosticFileError = diagnosticLog.standaloneDiagnosticFileError()
             }
         }
     }

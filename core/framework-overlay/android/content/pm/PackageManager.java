@@ -390,14 +390,23 @@ public class PackageManager {
     public List<ResolveInfo> queryBroadcastReceivers(Intent i, ResolveInfoFlags flags) { return queryBroadcastReceivers(i, (int) flags.getValue()); }
     public List<ResolveInfo> queryIntentContentProviders(Intent i, int flags) { return new ArrayList<>(); }
     public List<ResolveInfo> queryIntentContentProviders(Intent i, ResolveInfoFlags flags) { return queryIntentContentProviders(i, (int) flags.getValue()); }
+    private Intent launchIntentForPackage(String pkg, String category) {
+        if (pkg == null) return null;
+        Intent intent = new Intent(Intent.ACTION_MAIN).addCategory(category).setPackage(pkg);
+        ResolveInfo result = resolveActivity(intent, 0);
+        if (result == null || result.activityInfo == null) return null;
+        return intent.setClassName(pkg, result.activityInfo.name).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+    }
     public Intent getLaunchIntentForPackage(String pkg) {
-        if (!mine(pkg)) {
-            megler.PhoneApps.App other = megler.PhoneApps.find(pkg);
-            return other == null || other.activity == null ? null
-                : new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setClassName(pkg, other.activity).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        }
-        megler.Manifest.Component c = megler.Manifest.launcher();
-        return c == null ? null : new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setClassName(pkg, c.name);
+        Intent intent = launchIntentForPackage(pkg, Intent.CATEGORY_INFO);
+        return intent != null ? intent : launchIntentForPackage(pkg, Intent.CATEGORY_LAUNCHER);
+    }
+    public android.content.IntentSender getLaunchIntentSenderForPackage(String pkg) {
+        Intent intent = getLaunchIntentForPackage(pkg);
+        if (intent == null) return null;
+        android.app.PendingIntent pending = android.app.PendingIntent.getActivity(
+            megler.ContextImpl.app(), 0, intent, android.app.PendingIntent.FLAG_IMMUTABLE);
+        return pending.getIntentSender();
     }
     public Intent getLeanbackLaunchIntentForPackage(String pkg) { return null; }
     public List<PackageInfo> getInstalledPackages(int flags) {
@@ -1057,7 +1066,6 @@ public class PackageManager {
     public java.util.List getIntentFilterVerifications(java.lang.String p0) { return new java.util.ArrayList(); }
     public int getIntentVerificationStatusAsUser(java.lang.String p0, int p1) { return 0; }
     public android.content.Intent getLaunchIntentForPackage(java.lang.String p0, boolean p1) { return null; }
-    public android.content.IntentSender getLaunchIntentSenderForPackage(java.lang.String p0) { return null; }
     public java.util.Set getMimeGroup(java.lang.String p0) { return new java.util.HashSet(); }
     public int getMoveStatus(int p0) { return 0; }
     public java.lang.String[] getNamesForUids(int[] p0) { return null; }

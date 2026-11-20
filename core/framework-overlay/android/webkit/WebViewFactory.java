@@ -400,6 +400,11 @@ public final class WebViewFactory {
      * getProviderClass adds it on Android, so that its manifest is read through it.
      */
     private static PackageInfo readPackageInfo(AssetManager assets) throws MissingWebViewPackageException {
+        if (!new File(WEBVIEW_APK).isFile()) {
+            throw new MissingWebViewPackageException("Android System WebView provider is missing: " + WEBVIEW_APK
+                    + "; runtime ABI=" + WEBVIEW_ABI + ". Supply a verified standalone provider in the active "
+                    + "Android runtime root at app/webview/webview.apk; no Aurora/WKWebView fallback is used.");
+        }
         int cookie = assets.addAssetPathAsSharedLibrary(WEBVIEW_APK);
         if (cookie == 0) {
             throw new MissingWebViewPackageException("the WebView package cannot be read: " + WEBVIEW_APK);
@@ -450,7 +455,9 @@ public final class WebViewFactory {
         ai.packageName = pi.packageName;
         ai.processName = AppGlobals.getInitialPackage();
         ai.sourceDir = ai.publicSourceDir = WEBVIEW_APK;
-        ai.nativeLibraryDir = new File(WEBVIEW_APK).getParent() + "/lib/arm";
+        String instructionSet = WEBVIEW_ABI.equals("arm64-v8a") ? "arm64"
+                : WEBVIEW_ABI.equals("armeabi-v7a") ? "arm" : WEBVIEW_ABI;
+        ai.nativeLibraryDir = new File(WEBVIEW_APK).getParent() + "/lib/" + instructionSet;
         ai.flags = ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_INSTALLED | ApplicationInfo.FLAG_HAS_CODE;
         ai.enabled = true;
         pi.applicationInfo = ai;
@@ -483,13 +490,24 @@ public final class WebViewFactory {
             Log.i(LOGTAG, "Loading " + sPackageInfo.packageName + " version " +
                     sPackageInfo.versionName + " (code " + sPackageInfo.getLongVersionCode() + "), for " + meglerAsker());
             if (!WebViewFactoryProvider.isCompatibleImplementationPackage(sPackageInfo)) {
-                throw new MissingWebViewPackageException("the WebView package is too old for this framework: "
+                throw new MissingWebViewPackageException("the WebView package " + sPackageInfo.packageName
+                        + " targets SDK " + sPackageInfo.applicationInfo.targetSdkVersion
+                        + " and is too old for this framework: "
                         + WebViewFactoryProvider.describeCompatibleImplementationPackage());
             }
             if (getWebViewLibrary(sPackageInfo.applicationInfo) == null) {
                 throw new MissingWebViewPackageException("Tried to load an invalid WebView provider: "
                         + sPackageInfo.packageName);
             }
+            try {
+                WebViewProviderCheck.check(new File(WEBVIEW_APK), WEBVIEW_ABI,
+                        getWebViewLibrary(sPackageInfo.applicationInfo));
+            } catch (java.io.IOException e) {
+                throw new MissingWebViewPackageException("Android System WebView preflight failed for "
+                        + WEBVIEW_APK + ", ABI=" + WEBVIEW_ABI + ": " + e.getMessage());
+            }
+            Log.i(LOGTAG, "Provider preflight passed, native path=" + getWebViewNativeLibraryPath()
+                    + "; Chromium startup and renderer sandbox are not verified by this check");
 
             Trace.traceBegin(Trace.TRACE_TAG_WEBVIEW, "WebViewFactory.getChromiumProviderClass()");
             try {
@@ -521,7 +539,7 @@ public final class WebViewFactory {
                 Trace.traceEnd(Trace.TRACE_TAG_WEBVIEW);
             }
         } catch (MissingWebViewPackageException e) {
-            Log.e(LOGTAG, "Chromium WebView package does not exist", e);
+            Log.e(LOGTAG, "Android System WebView provider is missing, incompatible or failed to load", e);
             throw new AndroidRuntimeException(e);
         }
     }

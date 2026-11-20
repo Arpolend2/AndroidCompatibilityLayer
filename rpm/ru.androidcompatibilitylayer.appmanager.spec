@@ -1,6 +1,6 @@
 Name:       ru.androidcompatibilitylayer.appmanager
 Summary:    AndroidCompatibilityLayer for Aurora OS
-Version:    0.1.0
+Version:    0.2.10
 Release:    1
 License:    GPL-3.0-only
 URL:        https://github.com/Arpolend2/AndroidCompatibilityLayer
@@ -33,7 +33,10 @@ standalone Android APKs, but Android application isolation is not implemented.
 %autosetup
 
 %build
-%cmake -DANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS=OFF
+%cmake -DANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS=OFF \
+    -DANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL=ON \
+    -DANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION=ON \
+    -DANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS=ON
 # apptool --configure overrides these macros to /bin/true.
 if [ -f build.ninja ]; then
     %{__ninja}

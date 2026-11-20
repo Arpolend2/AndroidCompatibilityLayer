@@ -40,12 +40,18 @@ input, then a convertible nearest/preferred format, and finally other
 supported PCM combinations. Output conversion supports mono or stereo,
 8/16/24/32-bit signed or unsigned integer and 32/64-bit floating point,
 either byte order, from 4000 to 384000 Hz. Mono averages the channels; rate
-conversion uses nearest-sample hold without anti-alias filtering, so quality
+conversion uses linear interpolation without anti-alias filtering, so quality
 can be reduced, especially when downsampling. Unsupported combinations are
 not advertised as working. The input queue holds up to 30 ms, and the bridge
 requests a 20 ms Qt buffer; the backend may choose a different buffer size.
 A stalled or unavailable output is logged and audio is discarded at its
-original pace. There is no automatic device recovery.
+original pace. If the default output is absent, unsupported, fails to start,
+or stops unexpectedly, the bridge retries device selection and startup with exponential
+backoff from 1 second to 30 seconds. A successful output must remain up for
+30 seconds before the backoff resets. Queued PCM is discarded when output
+becomes unavailable, and writes during the retry period continue to be paced
+and discarded. Recovery is best effort and does not guarantee that the
+device emits audible sound.
 The bridge deliberately leaves the optional `route` callback unset: default
 system routing is used, and Android earpiece/speaker requests are not
 implemented. Background media policy and capture are not implemented.
@@ -55,8 +61,8 @@ threads, and run it on a host or target with a C++11 compiler. It checks FIFO,
 silence on underrun, backpressure, stalled-output fallback, and paced drops.
 `aurora/tests/audio_output_test.cpp` can also be linked with
 `aurora/audio_output.cpp`, Qt5::Multimedia and threads to check the callback
-contract, format selection and conversion, resampling, diagnostic milestones
-and worker startup/shutdown.
+contract, format selection and conversion, resampling, diagnostic milestones,
+retry backoff, and worker startup/shutdown.
 `aurora/tests/audio_mixer_path_test.cpp` exercises the native MediaCodec path,
 standalone MP3 decoder, `mg_pcm` stream and mixer through the Qt host
 callback, with a stub run config. It does not execute Java AudioTrack or

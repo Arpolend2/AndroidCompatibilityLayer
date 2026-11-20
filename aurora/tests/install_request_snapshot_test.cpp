@@ -87,6 +87,8 @@ int main()
     check(!first.capture(root, apk, "../app.apk", 100, &error), "untrusted name");
     check(!first.capture(root, apk, "app\033.apk", 100, &error), "control characters in name");
     check(!first.capture(root, apk, "bundle.APKS", 100, &error), "bundle name");
+    check(first.capture(root, apk, "bundle.APKS", 100, &error, true) &&
+          readFile(first.path()) == "abcdef", "explicitly allowed bundle snapshot");
     check(!first.capture(root, sub + "/bundle.xapk", "app.apk", 100, &error), "bundle path");
     check(!first.capture(root, sub, "app.apk", 100, &error), "directory rejected");
     check(readFile(second.path()) == "first", "other request unaffected");

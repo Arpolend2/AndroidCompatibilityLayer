@@ -13,7 +13,9 @@ int JNI_OnLoad(void *vm, void *reserved)
     __atomic_add_fetch(&calls, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&entered, 1, __ATOMIC_SEQ_CST);
 #ifndef JNI_LOAD_FAILURE
+#ifndef JNI_LOAD_NO_WAIT
     while (!__atomic_load_n(&release, __ATOMIC_SEQ_CST)) {}
+#endif
     return 0x10006;
 #else
     return -1;

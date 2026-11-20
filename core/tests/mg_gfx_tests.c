@@ -304,7 +304,7 @@ static void test_matrix_and_clip(void)
     CHECK_HEX(at(&b, 3, 3), 0x80800000u);
     H->draw_rect(H->user, b.cv, 0, 0, 16, 16, &red, NULL);
     CHECK_INT(count_of(&b, 0xFFFF0000u), 256);
-    /* The stand-in clips to a path's box. */
+    /* A path clip keeps only the pixels inside its fill rule. */
     erase(&b);
     {
         float tri[] = { MEGLER_GFX_PATH_MOVE, 2, 2, MEGLER_GFX_PATH_LINE, 10, 2, MEGLER_GFX_PATH_LINE, 2, 6, MEGLER_GFX_PATH_CLOSE };
@@ -313,7 +313,12 @@ static void test_matrix_and_clip(void)
         H->draw_color(H->user, b.cv, 0xFFFF0000u, MEGLER_GFX_BLEND_SRC);
         H->restore(H->user, b.cv);
     }
-    CHECK(exactly(&b, 2, 2, 10, 6));
+    CHECK_INT(covered(&b), 16);
+    CHECK_HEX(at(&b, 2, 2), 0xFFFF0000u);
+    CHECK_HEX(at(&b, 8, 2), 0xFFFF0000u);
+    CHECK_HEX(at(&b, 9, 2), 0u);
+    CHECK_HEX(at(&b, 4, 4), 0xFFFF0000u);
+    CHECK_HEX(at(&b, 5, 4), 0u);
     bitmap_done(&b);
 }
 

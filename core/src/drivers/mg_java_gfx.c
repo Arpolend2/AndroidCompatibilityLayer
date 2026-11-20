@@ -4711,6 +4711,7 @@ static mg_cond g_rt_wake = MG_COND_INIT, g_rt_idle = MG_COND_INIT;
 static struct {
     i32 started;                       /* 0 not yet, 1 it runs, 2 none: frames are drawn and shown on the main thread */
     bool busy;                         /* a frame has been handed over and is not shown yet */
+    bool release;                      /* release this thread's host resources before reporting app exit */
     gcanvas *cv;                       /* the frame handed over: the screen's canvas and bitmap, the list, the part it changes */
     gbitmap *bm;
     gdlist *list;
@@ -4826,7 +4827,15 @@ static MG_HOSTCB void rt_main(void *arg)
         i32 part[4];
         u32 cull;
         u64 now;
-        while (!R.busy || !R.list) mg_cond_wait(&g_rt_wake, &g_rt_lock);
+        while ((!R.busy || !R.list) && !R.release) mg_cond_wait(&g_rt_wake, &g_rt_lock);
+        if (R.release) {
+            mg_lock_release(&g_rt_lock);
+            G.release_thread(G.user);
+            mg_lock_acquire(&g_rt_lock);
+            R.release = false;
+            mg_cond_broadcast(&g_rt_idle);
+            continue;
+        }
         v = R.cv;
         b = R.bm;
         l = R.list;
@@ -4884,7 +4893,19 @@ static void rt_wait(void)
     mg_lock_release(&g_rt_lock);
 }
 
-void mg_java_gfx_frames_wait(void) { rt_wait(); }
+void mg_java_gfx_frames_finish(void)
+{
+    rt_wait();
+    if (!G.release_thread) return;
+    mg_lock_acquire(&g_rt_lock);
+    if (R.started == 1) {
+        R.release = true;
+        mg_cond_signal(&g_rt_wake);
+        while (R.release) mg_cond_wait(&g_rt_idle, &g_rt_lock);
+    }
+    mg_lock_release(&g_rt_lock);
+    G.release_thread(G.user);
+}
 
 /*
  * (long screen canvas, long screen bitmap, long recording canvas, int left, int top, int right, int bottom): Gfx.frame. What the

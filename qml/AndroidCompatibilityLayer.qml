@@ -8,14 +8,114 @@ ApplicationWindow {
     palette.colorScheme: probe.androidTheme === "light" ? Theme.DarkOnLight
                          : probe.androidTheme === "dark" ? Theme.LightOnDark : Theme.colorScheme
     readonly property color pageBackground: probe.androidTheme === "" ? "transparent" : palette.overlayBackgroundColor
+    readonly property bool systemDark: Theme.colorScheme === Theme.LightOnDark
+    readonly property color systemAccent: Theme.highlightColor
+    property var microgPage: null
+    property var launcherPage: null
+    readonly property var libraryApps: {
+        var result = []
+        var apps = probe.installedApps
+        for (var i = 0; i < apps.length; ++i)
+            if (apps[i].package !== "com.aurora.store") result.push(apps[i])
+        return result
+    }
+    function libraryIsVisible(current, applicationActive) {
+        return applicationActive && current && current.objectName === "launcherPage" &&
+                current.section === 0 && !probe.installConfirmationVisible
+    }
     allowedOrientations: probe.installConfirmationVisible ? Orientation.All : defaultAllowedOrientations
     Component.onCompleted: probe.setInstallUiReady(true)
     Component.onDestruction: probe.setInstallUiReady(false)
+    cover: Component {
+        CoverBackground {
+            id: managerCover
+            objectName: "managerCover"
+            Item {
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: managerCover.coverActionArea.top
+                anchors.margins: Theme.paddingMedium
+                Label {
+                    anchors.centerIn: parent
+                    width: parent.width - 2 * Theme.paddingSmall
+                    visible: window.libraryApps.length === 0
+                    text: qsTr("No Apps Yet")
+                    font.pixelSize: Theme.fontSizeExtraSmall
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.Wrap
+                }
+                GridView {
+                    id: coverAppsGrid
+                    objectName: "coverAppsRepeater"
+                    anchors.fill: parent
+                    clip: true
+                    model: window.libraryApps
+                    property int columnCount: managerCover.width > managerCover.height ? 2 : 1
+                    cellWidth: width / columnCount
+                    cellHeight: Theme.itemSizeSmall
+                    delegate: Item {
+                        width: coverAppsGrid.cellWidth
+                        height: coverAppsGrid.cellHeight
+                        Image {
+                            id: coverAppIcon
+                            objectName: "coverAppIcon"
+                            x: Theme.paddingSmall
+                            width: Theme.iconSizeSmall
+                            height: width
+                            anchors.verticalCenter: parent.verticalCenter
+                            fillMode: Image.PreserveAspectFit
+                            source: modelData.icon || "image://theme/icon-m-file-apk"
+                            onStatusChanged: {
+                                if (status === Image.Error && source.toString() !== "image://theme/icon-m-file-apk")
+                                    source = "image://theme/icon-m-file-apk"
+                            }
+                        }
+                        Label {
+                            objectName: "coverAppName"
+                            x: coverAppIcon.x + coverAppIcon.width + Theme.paddingSmall
+                            width: parent.width - x - Theme.paddingSmall
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData.label || modelData.package
+                            textFormat: Text.PlainText
+                            truncationMode: TruncationMode.Fade
+                            font.pixelSize: Theme.fontSizeExtraSmall
+                        }
+                    }
+                }
+            }
+            CoverActionList {
+                CoverAction {
+                    objectName: "coverInstallApk"
+                    iconSource: "image://theme/icon-cover-new"
+                    onTriggered: if (window.launcherPage) window.launcherPage.openApkPicker()
+                }
+                CoverAction {
+                    objectName: "coverSaveLog"
+                    iconSource: "image://theme/icon-s-export"
+                    onTriggered: if (window.launcherPage) window.launcherPage.saveLogFromCover()
+                }
+                CoverAction {
+                    objectName: "coverOpenOfficialStore"
+                    iconSource: Qt.resolvedUrl(window.systemDark ? "icons/cover-aurora-store-light.svg"
+                                                                  : "icons/cover-aurora-store-dark.svg")
+                    onTriggered: if (!probe.officialStoreBusy) probe.openOfficialStore()
+                }
+            }
+        }
+    }
     DownloadNotification { id: microgDownloadNotification; title: qsTr("microG") }
     DownloadNotification { id: storeDownloadNotification; title: qsTr("Aurora Store") }
     Notification {
         id: rpmErrorBanner
         objectName: "rpmErrorBanner"
+        appName: qsTr("Android App Manager")
+        appIcon: "ru.androidcompatibilitylayer.appmanager"
+        previewSummary: qsTr("Android App Manager")
+    }
+    Notification {
+        id: libraryAddedBanner
+        objectName: "libraryAddedBanner"
         appName: qsTr("Android App Manager")
         appIcon: "ru.androidcompatibilitylayer.appmanager"
         previewSummary: qsTr("Android App Manager")
@@ -28,13 +128,43 @@ ApplicationWindow {
         previewSummary: qsTr("Android App Manager")
         previewBody: qsTr("Only add apps you trust. APK signatures are not verified.")
     }
+    Notification {
+        id: coverActionBanner
+        objectName: "coverActionBanner"
+        appName: qsTr("Android App Manager")
+        appIcon: "ru.androidcompatibilitylayer.appmanager"
+        previewSummary: qsTr("Android App Manager")
+    }
     Connections {
         target: probe
         onMicrogDownloadNotification: microgDownloadNotification.publishUpdate(message, percent, complete)
+        onMicrogPreviewRequested: {
+            if (!window.microgPage) {
+                window.microgPage = pageStack.push(microgPageComponent,
+                                                  { "player": microgPreview, "stack": pageStack })
+                if (!window.microgPage) {
+                    console.error("Could not open microG settings")
+                    microgPreview.stop()
+                }
+            }
+        }
         onOfficialStoreDownloadNotification: storeDownloadNotification.publishUpdate(message, percent, complete)
+        onOfficialStoreLaunchFailed: {
+            coverActionBanner.previewBody = message
+            coverActionBanner.replacesId = 0
+            coverActionBanner.publish()
+        }
         onSignatureReminder: {
             signatureBanner.replacesId = 0
             signatureBanner.publish()
+        }
+        onLibraryAppAddedNotice: {
+            var current = pageStack.currentPage
+            if (window.libraryIsVisible(current, Qt.application.state === Qt.ApplicationActive))
+                return
+            libraryAddedBanner.previewBody = qsTr("Added %1 to the library.").arg(appPackage)
+            libraryAddedBanner.replacesId = 0
+            libraryAddedBanner.publish()
         }
         onStandaloneRpmError: {
             var current = pageStack.currentPage
@@ -44,6 +174,73 @@ ApplicationWindow {
             rpmErrorBanner.replacesId = 0
             rpmErrorBanner.publish()
         }
+        onStandaloneInstallOffered: {
+            launchInstallBanner.appPackage = appPackage
+            launchInstallBanner.errorMessage = message
+            launchInstallBanner.visible = true
+        }
+    }
+    Rectangle {
+        id: launchInstallBanner
+        objectName: "launchInstallBanner"
+        parent: window.contentItem
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        z: 9000
+        visible: false
+        color: window.palette.overlayBackgroundColor
+        height: launchInstallContent.height + 2 * Theme.paddingMedium
+        property string appPackage: ""
+        property string errorMessage: ""
+        Column {
+            id: launchInstallContent
+            x: Theme.horizontalPageMargin
+            y: Theme.paddingMedium
+            width: parent.width - 2 * x
+            spacing: Theme.paddingSmall
+            Label {
+                width: parent.width
+                text: qsTr("Could not launch %1. Install it as an RPM?").arg(launchInstallBanner.appPackage)
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+            }
+            Label {
+                width: parent.width
+                visible: text.length > 0
+                text: launchInstallBanner.errorMessage
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                maximumLineCount: 3
+                elide: Text.ElideRight
+                font.pixelSize: Theme.fontSizeExtraSmall
+            }
+            Row {
+                width: parent.width
+                spacing: Theme.paddingMedium
+                Button {
+                    objectName: "dismissLaunchInstall"
+                    width: (parent.width - parent.spacing) / 2
+                    text: qsTr("Cancel")
+                    onClicked: launchInstallBanner.visible = false
+                }
+                Button {
+                    objectName: "confirmLaunchInstall"
+                    width: (parent.width - parent.spacing) / 2
+                    text: qsTr("Install as RPM")
+                    enabled: !probe.standaloneRpmBusy
+                    onClicked: {
+                        var appPackage = launchInstallBanner.appPackage
+                        launchInstallBanner.visible = false
+                        probe.installStandaloneRpm(appPackage)
+                    }
+                }
+            }
+        }
+    }
+    Component {
+        id: microgPageComponent
+        EmbeddedMicrogPage { onClosed: window.microgPage = null }
     }
     Rectangle {
         objectName: "installConfirmation"
@@ -109,11 +306,28 @@ ApplicationWindow {
     initialPage: Component {
         Page {
             id: launcher
+            objectName: "launcherPage"
             backgroundColor: window.pageBackground
             allowedOrientations: Orientation.All
             property bool busy: probe.externalInstallBusy
             property int section: 0
-            property var apps: probe.installedApps
+            property var apps: window.libraryApps
+            Component.onCompleted: window.launcherPage = launcher
+            Component.onDestruction: window.launcherPage = null
+            function openApkPicker() {
+                if (busy || probe.installConfirmationVisible) return
+                probe.activateManager()
+                section = 0
+                if (pageStack.currentPage !== launcher)
+                    pageStack.pop(launcher, PageStackAction.Immediate)
+                pageStack.push(apkPicker)
+            }
+            function saveLogFromCover() {
+                if (logActions.canAct) logActions.saveLog()
+                coverActionBanner.previewBody = logActions.canAct ? logActions.message : qsTr("No log available to save.")
+                coverActionBanner.replacesId = 0
+                coverActionBanner.publish()
+            }
 
             SideMouseNavigation {
                 stack: pageStack
@@ -152,6 +366,33 @@ ApplicationWindow {
                     onSelectedContentPropertiesChanged: {
                         if (selectedContentProperties && selectedContentProperties.filePath)
                             probe.installApk(selectedContentProperties.filePath)
+                    }
+                }
+            }
+
+            Component {
+                id: detailedLogDialog
+                Dialog {
+                    objectName: "detailedLogDialog"
+                    backgroundColor: window.pageBackground
+                    allowedOrientations: Orientation.All
+                    onAccepted: probe.setDetailedLogEnabled(true)
+                    SilicaFlickable {
+                        anchors.fill: parent
+                        contentHeight: detailedWarningContent.height + Theme.paddingLarge
+                        Column {
+                            id: detailedWarningContent
+                            width: parent.width
+                            DialogHeader { title: qsTr("Detailed log"); acceptText: qsTr("Enable") }
+                            Label {
+                                objectName: "detailedLogWarning"
+                                x: Theme.horizontalPageMargin
+                                width: parent.width - 2 * x
+                                text: qsTr("Detailed logs may contain passwords, tokens, app data, paths, network addresses and D-Bus executable/signing-key identifiers. The manager saves them in private storage. While enabled, newly created standalone RPMs also save test logs in Documents, accessible to other apps with Documents access. Those RPMs keep recording after detailed logging is turned off: remove them and create new RPMs to stop it. Saved files remain. If saving the cleared manager history fails, old logs may reappear. Remote events are untrusted. Review logs before sharing.")
+                                wrapMode: Text.Wrap
+                            }
+                        }
+                        VerticalScrollDecorator {}
                     }
                 }
             }
@@ -490,11 +731,29 @@ ApplicationWindow {
                     objectName: "mainPulleyMenu"
                     visible: launcher.section === 0 || launcher.section === 2
                     MenuItem {
+                        objectName: "openOfficialStore"
+                        visible: launcher.section === 0
+                        enabled: !probe.officialStoreBusy
+                        text: qsTr("Open Aurora Store")
+                        onClicked: probe.openOfficialStore()
+                    }
+                    MenuItem {
                         objectName: "installApk"
                         visible: launcher.section === 0
                         enabled: !launcher.busy
                         text: qsTr("Add APK or bundle")
-                        onClicked: pageStack.push(apkPicker)
+                        onClicked: launcher.openApkPicker()
+                    }
+                    MenuItem {
+                        objectName: "toggleDetailedLog"
+                        visible: launcher.section === 2
+                        text: probe.detailedLogEnabled ? qsTr("Use short log") : qsTr("Enable detailed log")
+                        onClicked: {
+                            if (probe.detailedLogEnabled)
+                                probe.setDetailedLogEnabled(false)
+                            else
+                                pageStack.push(detailedLogDialog)
+                        }
                     }
                     MenuItem {
                         objectName: "logFollow"
@@ -585,6 +844,44 @@ ApplicationWindow {
                             return lines.reverse().join("\n")
                         }
                         Item { width: parent.width; height: Theme.paddingMedium }
+                        Label {
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            text: qsTr("Logs are saved automatically in the manager's private storage. Recent events may be lost before they are saved or delivered. Events may be dropped; remote sources are untrusted. Older standalone apps need rebuilding for this log service.")
+                            wrapMode: Text.Wrap
+                        }
+                        Label {
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            text: qsTr("Test RPMs created while detailed logging is enabled save their own logs in Documents/AndroidCompatibilityLayer-Error-Logs. They keep recording after this setting is turned off; remove them and create new RPMs to stop it. Logs may contain private data.")
+                            wrapMode: Text.Wrap
+                            color: palette.secondaryColor
+                        }
+                        Label {
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            visible: probe.logStorageError.length > 0
+                            text: qsTr("Automatic log storage failed: %1").arg(probe.logStorageError)
+                            wrapMode: Text.Wrap
+                            color: palette.highlightColor
+                        }
+                        Label {
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            visible: probe.detailedLogEnabled
+                            text: qsTr("Detailed logging is on. The log may contain private data.")
+                            wrapMode: Text.Wrap
+                            color: palette.highlightColor
+                        }
+                        Label {
+                            objectName: "detailedLogError"
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            visible: probe.detailedLogError.length > 0
+                            text: probe.detailedLogError
+                            wrapMode: Text.Wrap
+                            color: palette.highlightColor
+                        }
                         LogActions {
                             id: logActions
                             width: parent.width
@@ -626,6 +923,14 @@ ApplicationWindow {
                         width: parent.width
                         visible: launcher.section === 3
                         Item { width: parent.width; height: Theme.paddingMedium }
+                        TextSwitch {
+                            objectName: "autoInstallRpm"
+                            text: qsTr("Automatically install apps as RPM")
+                            description: qsTr("Create an RPM when an app is added to the library. The system installer may ask for confirmation.")
+                            checked: probe.autoInstallRpm
+                            automaticCheck: false
+                            onClicked: probe.setAutoInstallRpm(!checked)
+                        }
                         ComboBox {
                             objectName: "renderSize"
                             label: qsTr("Resolution")

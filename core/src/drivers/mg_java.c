@@ -39,6 +39,7 @@
 #include "mg_driver.h"
 #include "../apk/mg_arsc.h"
 #include "mg_java.h"
+#include "mg_store_restart.h"
 #include "mg_java_gfx.h"
 #include "mg_java_gl.h"
 
@@ -1455,6 +1456,11 @@ N(Native_threadNice) { mg_gthread_set_nice(mg_gthread_self(), c->args[0].i); }
 
 static void back_wake(void);
 
+N(Native_storeRestart)
+{
+    c->ret.i = mg_store_restart_request(J.package);
+}
+
 N(Native_exit)
 {
     mg_jvalue looper;
@@ -1607,6 +1613,7 @@ static const mg_jhle k_native[] = {
     { "megler/Native", "dnsServers", NULL, Native_dnsServers },
     { "megler/Native", "vibrate", NULL, Native_nothing },
     { "megler/Native", "openUrl", NULL, Native_openUrl },
+    { "megler/Native", "storeRestart", NULL, Native_storeRestart },
     { "megler/Native", "exit", NULL, Native_exit },
     { "megler/Native", "backDone", NULL, Native_backDone },
     { "megler/Native", "toBack", NULL, Native_toBack },
@@ -2773,8 +2780,7 @@ static MG_HOSTCB void main_thread(void *arg)
             shorten(what);
             snprintf(why, sizeof(why), "the app stopped because nothing caught %s%s%s%s, which ends an app on Android too", what, where[0] ? " (in " : "", where, where[0] ? ")" : "");
         }
-        /* The last frame handed to the render thread shown before the app is said to have ended. */
-        mg_java_gfx_frames_wait();
+        mg_java_gfx_frames_finish();
         meter_end();
     }
     free(framework);

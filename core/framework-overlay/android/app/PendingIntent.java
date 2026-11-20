@@ -19,11 +19,19 @@ public final class PendingIntent implements android.os.Parcelable {
         FLAG_IMMUTABLE = 0x04000000, FLAG_MUTABLE = 0x02000000, FLAG_ALLOW_UNSAFE_IMPLICIT_INTENT = 0x01000000;
     public static class CanceledException extends android.util.AndroidException { public CanceledException() {} public CanceledException(String s) { super(s); } public CanceledException(Exception e) { super(e); } }
     public interface OnFinished { void onSendFinished(PendingIntent p, Intent i, int resultCode, String resultData, android.os.Bundle resultExtras); }
-    private final Context mContext; private final Intent mIntent; private final int mKind;   /* 0 activity, 1 broadcast, 2 service */
+    private final Context mContext; private final Intent mIntent; private final Intent[] mIntents; private final android.os.Bundle mOptions;
+    private final int mKind;   /* 0 activity, 1 broadcast, 2 service */
     private final int mRequest, mFlags; private final String mCreator;
     private volatile boolean mCanceled;
-    private PendingIntent(Context c, Intent i, int kind, int req, int flags, String creator) {
+    private PendingIntent(Context c, Intent i, int kind, int req, int flags, String creator, Intent[] activities, android.os.Bundle options) {
         mContext = c; mIntent = new Intent(i); mKind = kind; mRequest = req; mFlags = flags; mCreator = creator;
+        mOptions = options == null ? null : new android.os.Bundle(options);
+        if (activities == null) mIntents = null;
+        else {
+            mIntents = new Intent[activities.length];
+            for (int n = 0; n < activities.length - 1; n++) mIntents[n] = new Intent(activities[n]);
+            mIntents[activities.length - 1] = mIntent;
+        }
     }
     /*
      * The PendingIntents of this process, found again as Android's activity manager finds its: by what they start (the kind,
@@ -35,6 +43,9 @@ public final class PendingIntent implements android.os.Parcelable {
      */
     private static final java.util.HashMap<Integer, java.util.ArrayList<java.lang.ref.WeakReference<PendingIntent>>> sLive = new java.util.HashMap<>();
     private static PendingIntent get(Context c, int req, Intent i, int flags, int kind) {
+        return get(c, req, i, flags, kind, null, null);
+    }
+    private static PendingIntent get(Context c, int req, Intent i, int flags, int kind, Intent[] activities, android.os.Bundle options) {
         String creator = c != null && c.getPackageName() != null ? c.getPackageName() : megler.Native.packageName();
         Integer key = java.util.Objects.hash(kind, req, creator, i.filterHashCode());
         synchronized (sLive) {
@@ -52,14 +63,19 @@ public final class PendingIntent implements android.os.Parcelable {
                 return had;
             }
             if ((flags & FLAG_NO_CREATE) != 0) { if (same.isEmpty()) sLive.remove(key); return null; }
-            PendingIntent p = new PendingIntent(c, i, kind, req, flags, creator);
+            PendingIntent p = new PendingIntent(c, i, kind, req, flags, creator, activities, options);
             same.add(new java.lang.ref.WeakReference<>(p));
             return p;
         }
     }
     public static PendingIntent getActivity(Context c, int req, Intent i, int flags) { return get(c, req, i, flags, 0); }
-    public static PendingIntent getActivity(Context c, int req, Intent i, int flags, android.os.Bundle o) { return get(c, req, i, flags, 0); }
-    public static PendingIntent getActivities(Context c, int req, Intent[] i, int flags) { return get(c, req, i[i.length - 1], flags, 0); }
+    public static PendingIntent getActivity(Context c, int req, Intent i, int flags, android.os.Bundle o) { return get(c, req, i, flags, 0, null, o); }
+    private static Intent lastActivity(Intent[] intents) {
+        if (intents == null || intents.length == 0) throw new IllegalArgumentException("intents must not be null or empty");
+        for (Intent intent : intents) if (intent == null) throw new NullPointerException("intents contains null");
+        return intents[intents.length - 1];
+    }
+    public static PendingIntent getActivities(Context c, int req, Intent[] i, int flags) { return get(c, req, lastActivity(i), flags, 0, i, null); }
     public static PendingIntent getBroadcast(Context c, int req, Intent i, int flags) { return get(c, req, i, flags, 1); }
     public static PendingIntent getService(Context c, int req, Intent i, int flags) { return get(c, req, i, flags, 2); }
     public static PendingIntent getForegroundService(Context c, int req, Intent i, int flags) { return get(c, req, i, flags, 2); }
@@ -92,7 +108,16 @@ public final class PendingIntent implements android.os.Parcelable {
         if ((mFlags & FLAG_ONE_SHOT) != 0) cancel();
         // (A fix of Google Play services' network location on its way to its fused provider: seen by megler.LocationService.)
         megler.LocationService.sent(this, i);
-        if (mKind == 0) mContext.startActivity(i);
+        android.os.Bundle launchOptions = options != null ? options : mOptions;
+        if (mKind == 0) {
+            if (mIntents == null) mContext.startActivity(i, launchOptions);
+            else {
+                Intent[] activities = new Intent[mIntents.length];
+                for (int n = 0; n < activities.length - 1; n++) activities[n] = new Intent(mIntents[n]);
+                activities[activities.length - 1] = i;
+                mContext.startActivities(activities, launchOptions);
+            }
+        }
         else if (mKind == 1) { if (requiredPermission != null) mContext.sendBroadcast(i, requiredPermission); else mContext.sendBroadcast(i); }
         else mContext.startService(i);
         if (f != null) {
@@ -142,7 +167,9 @@ public final class PendingIntent implements android.os.Parcelable {
     public static final long BLOCK_MUTABLE_IMPLICIT_PENDING_INTENT = 236704164L;
     public static final int FLAG_MUTABLE_UNAUDITED = 33554432;
     public static final long PENDING_INTENT_OPTIONS_CHECK = 320664730L;
-    public static android.app.PendingIntent getActivities(android.content.Context p0, int p1, android.content.Intent[] p2, int p3, android.os.Bundle p4) { return null; }
+    public static android.app.PendingIntent getActivities(android.content.Context p0, int p1, android.content.Intent[] p2, int p3, android.os.Bundle p4) {
+        return get(p0, p1, lastActivity(p2), p3, 0, p2, p4);
+    }
     public static android.app.PendingIntent getActivitiesAsUser(android.content.Context p0, int p1, android.content.Intent[] p2, int p3, android.os.Bundle p4, android.os.UserHandle p5) { return null; }
     public static android.app.PendingIntent getActivityAsUser(android.content.Context p0, int p1, android.content.Intent p2, int p3, android.os.Bundle p4, android.os.UserHandle p5) { return null; }
     public static android.app.PendingIntent getBroadcastAsUser(android.content.Context p0, int p1, android.content.Intent p2, int p3, android.os.UserHandle p4) { return null; }

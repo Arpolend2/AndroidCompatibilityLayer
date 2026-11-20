@@ -3,6 +3,8 @@
 #include "../core/src/apk/mg_apk.h"
 
 #include <QObject>
+#include <QCryptographicHash>
+#include <QFile>
 #include <QRegularExpression>
 
 namespace {
@@ -31,10 +33,11 @@ void InstallRequestCandidate::clear()
     m_package.clear();
     m_label.clear();
     m_version = 0;
+    m_fingerprint.clear();
 }
 
 bool InstallRequestCandidate::prepare(const QString &senderRoot, const QString &source,
-                                      const QString &name, quint64 maxBytes, QString *error)
+                                      const QString &name, quint64 maxBytes, QString *error, bool fingerprint)
 {
     clear();
     if (error) error->clear();
@@ -47,6 +50,16 @@ bool InstallRequestCandidate::prepare(const QString &senderRoot, const QString &
 
     mg_apk_info info;
     const std::string snapshotPath = m_snapshot.path();
+    if (fingerprint) {
+        QFile snapshot(QString::fromStdString(snapshotPath));
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        if (!snapshot.open(QIODevice::ReadOnly) || !hash.addData(&snapshot)) {
+            if (error) *error = QObject::tr("Cannot verify the APK snapshot.");
+            clear();
+            return false;
+        }
+        m_fingerprint = hash.result().toHex();
+    }
     if (!mg_apk_read_info(snapshotPath.c_str(), &info)) {
         if (error) *error = QObject::tr("Cannot inspect the requested APK.");
         clear();

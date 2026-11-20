@@ -1,6 +1,7 @@
 #include "audio_output.h"
 #include "audio_queue.h"
 #include "audio_format.h"
+#include "audio_output_retry.h"
 
 #include <QAudioDeviceInfo>
 #include <QAudioFormat>
@@ -59,53 +60,98 @@ public:
 protected:
     void run() override
     {
-        const QAudioDeviceInfo device = QAudioDeviceInfo::defaultOutputDevice();
-        if (device.isNull()) {
-            qWarning() << "AndroidCompatibilityLayer audio: no default Qt output device";
-            return;
-        }
-        const QAudioFormat input = audioInputFormat(m_rate);
-        const QAudioFormat nearest = device.nearestFormat(input);
-        const QAudioFormat preferred = device.preferredFormat();
-        const QAudioFormat format = audioChooseFormat(input, nearest, preferred, device.supportedSampleRates(),
-                                                       [&device](const QAudioFormat &candidate) {
-            return device.isFormatSupported(candidate);
-        });
-        if (!format.isValid()) {
-            qWarning() << "AndroidCompatibilityLayer audio: no supported convertible PCM format; nearest" << nearest
-                       << "preferred" << preferred << "sample rates" << device.supportedSampleRates()
-                       << "channels" << device.supportedChannelCounts() << "sizes" << device.supportedSampleSizes()
-                       << "types" << device.supportedSampleTypes() << "byte orders" << device.supportedByteOrders()
-                       << "codecs" << device.supportedCodecs();
-            return;
-        }
-        qInfo() << "AndroidCompatibilityLayer audio: selected Qt output format" << format;
-        AudioSource source(m_queue, m_rate, format);
-        QAudioOutput output(device, format);
-        output.setBufferSize(format.sampleRate() * format.bytesPerFrame() / 10);
-        QObject::connect(&output, &QAudioOutput::stateChanged, &output,
-                         [this, &output](QAudio::State state) {
-            if (state == QAudio::StoppedState && output.error() != QAudio::NoError) {
-                qWarning() << "AndroidCompatibilityLayer audio: output failed:" << output.error();
-                m_queue.setAvailable(false);
-            }
-        });
-        m_queue.setAvailable(true);
-        output.start(&source);
-        if (output.error() != QAudio::NoError || output.state() == QAudio::StoppedState) {
-            qWarning() << "AndroidCompatibilityLayer audio: could not start output:" << output.error();
+        QTimer retryTimer, stableTimer, stopTimer;
+        retryTimer.setSingleShot(true);
+        stableTimer.setSingleShot(true);
+        aurora_audio_detail::RetryBackoff backoff;
+        std::unique_ptr<AudioSource> source;
+        std::unique_ptr<QAudioOutput> output;
+        bool replacingOutput = false;
+        const auto scheduleRetry = [this, &retryTimer, &stableTimer, &backoff] {
             m_queue.setAvailable(false);
-            return;
-        }
-        qInfo() << "AndroidCompatibilityLayer audio: Qt output started at" << format.sampleRate() << "Hz";
-        QTimer stopTimer;
-        QObject::connect(&stopTimer, &QTimer::timeout, &output, [this] {
+            stableTimer.stop();
+            if (m_stopping.load() || retryTimer.isActive()) return;
+            const int delay = backoff.nextDelay();
+            qWarning() << "AndroidCompatibilityLayer audio: retrying output in" << delay << "ms";
+            retryTimer.start(delay);
+        };
+        const auto startOutput = [this, &source, &output, &replacingOutput, &scheduleRetry,
+                                  &retryTimer, &stableTimer, &backoff] {
+            if (m_stopping.load()) return;
+            m_queue.setAvailable(false);
+            if (output) {
+                replacingOutput = true;
+                output->stop();
+                output.reset();
+                source.reset();
+                replacingOutput = false;
+            }
+            const QAudioDeviceInfo device = QAudioDeviceInfo::defaultOutputDevice();
+            if (device.isNull()) {
+                qWarning() << "AndroidCompatibilityLayer audio: no default Qt output device";
+                scheduleRetry();
+                return;
+            }
+            const QAudioFormat input = audioInputFormat(m_rate);
+            const QAudioFormat nearest = device.nearestFormat(input);
+            const QAudioFormat preferred = device.preferredFormat();
+            const QAudioFormat format = audioChooseFormat(input, nearest, preferred, device.supportedSampleRates(),
+                                                           [&device](const QAudioFormat &candidate) {
+                return device.isFormatSupported(candidate);
+            });
+            if (!format.isValid()) {
+                qWarning() << "AndroidCompatibilityLayer audio: no supported convertible PCM format; nearest" << nearest
+                           << "preferred" << preferred << "sample rates" << device.supportedSampleRates()
+                           << "channels" << device.supportedChannelCounts() << "sizes" << device.supportedSampleSizes()
+                           << "types" << device.supportedSampleTypes() << "byte orders" << device.supportedByteOrders()
+                           << "codecs" << device.supportedCodecs();
+                scheduleRetry();
+                return;
+            }
+            qInfo() << "AndroidCompatibilityLayer audio: selected Qt output format" << format;
+            source.reset(new AudioSource(m_queue, m_rate, format));
+            output.reset(new QAudioOutput(device, format));
+            output->setBufferSize(format.sampleRate() * format.bytesPerFrame() / 10);
+            QAudioOutput *startedOutput = output.get();
+            QObject::connect(startedOutput, &QAudioOutput::stateChanged, startedOutput,
+                             [this, startedOutput, &output, &replacingOutput, &scheduleRetry](QAudio::State state) {
+                if (output.get() == startedOutput && !replacingOutput && state == QAudio::StoppedState &&
+                    !m_stopping.load()) {
+                    qWarning() << "AndroidCompatibilityLayer audio: output stopped:" << startedOutput->error();
+                    scheduleRetry();
+                }
+            });
+            m_queue.setAvailable(true);
+            output->start(source.get());
+            if (output->error() != QAudio::NoError || output->state() == QAudio::StoppedState ||
+                retryTimer.isActive()) {
+                qWarning() << "AndroidCompatibilityLayer audio: could not start output:" << output->error();
+                scheduleRetry();
+                return;
+            }
+            retryTimer.stop();
+            stableTimer.start(30000);
+            m_queue.setAvailable(true);
+            qInfo() << "AndroidCompatibilityLayer audio: Qt output started at" << format.sampleRate() << "Hz";
+        };
+        QObject::connect(&retryTimer, &QTimer::timeout, &retryTimer, startOutput);
+        QObject::connect(&stableTimer, &QTimer::timeout, &stableTimer, [&backoff] { backoff.reset(); });
+        startOutput();
+        QObject::connect(&stopTimer, &QTimer::timeout, &stopTimer, [this] {
             if (m_stopping.load()) quit();
         });
         stopTimer.start(20);
         if (!m_stopping.load()) exec();
         m_queue.setAvailable(false);
-        output.stop();
+        retryTimer.stop();
+        stableTimer.stop();
+        stopTimer.stop();
+        if (output) {
+            replacingOutput = true;
+            output->stop();
+            output.reset();
+            source.reset();
+        }
     }
 
 private:

@@ -2049,6 +2049,49 @@ static bool walk_frame(i64 screen_cv, i64 screen, i64 whole, bool compare, i32 *
     return any;
 }
 
+static u32 teardown_present_thread, teardown_release_threads[2];
+static unsigned teardown_releases;
+
+static void capture_teardown_frame(void *user, const void *pixels, int width, int height, int stride)
+{
+    (void)user; (void)pixels; (void)width; (void)height; (void)stride;
+    teardown_present_thread = mg_thread_self_id();
+}
+
+static void MEGLER_CB capture_thread_release(void *user)
+{
+    (void)user;
+    if (teardown_releases < 2)
+        teardown_release_threads[teardown_releases] = mg_thread_self_id();
+    teardown_releases++;
+}
+
+static void test_frame_teardown(void)
+{
+    megler_gfx_host host = *mg_gfx_standin();
+    const u32 main_thread = mg_thread_self_id();
+    const i64 bitmap = call("bmNew", 2, I(8), I(8)).j;
+    const i64 canvas = call("cvNew", 1, J(bitmap)).j;
+    const i64 recording = call("cvRecord", 2, I(8), I(8)).j;
+    teardown_present_thread = 0;
+    teardown_releases = 0;
+    host.release_thread = capture_thread_release;
+    mg_java_gfx_set_host(&host);
+    mg_java_gfx_set_present(capture_teardown_frame, NULL);
+    call("cvDrawColor", 3, J(recording), I((i32)0xffffffffu), I(3));
+    call("frame", 7, J(canvas), J(bitmap), J(recording), I(0), I(0), I(0), I(0));
+    mg_java_gfx_frames_finish();
+    CHECK(teardown_present_thread != 0);
+    CHECK_INT(teardown_releases, teardown_present_thread == main_thread ? 1 : 2);
+    CHECK_INT(teardown_release_threads[0], teardown_present_thread);
+    if (teardown_present_thread != main_thread) CHECK_INT(teardown_release_threads[1], main_thread);
+    mg_java_gfx_set_present(NULL, NULL);
+    mg_java_gfx_set_host(mg_gfx_standin());
+    call("cvFree", 1, J(recording));
+    call("cvFree", 1, J(canvas));
+    call("bmFree", 1, J(bitmap));
+}
+
 static bool box_is(const i32 *out, int l, int t, int r, int b) { return out[0] == l && out[1] == t && out[2] == r && out[3] == b; }
 
 static void test_walk(void)
@@ -2362,11 +2405,17 @@ static void test_lists(void)
         erase(a);
         call("cvDrawNode", 2, J(ca), J(parent));
         CHECK(exactly(a, 4, 4, 9, 9));
-        /* With round corners it is a path, which the stand-in clips to as its box. */
+        /* The rounded outline clips its corners, not just its bounding box. */
         node_set(child, 4, 4, 14, 14, NULL, 1, RN_CLIP_OUTLINE, 255, NULL, 1, outline, 2);
         erase(a);
         call("cvDrawNode", 2, J(ca), J(parent));
-        CHECK(exactly(a, 4, 4, 9, 9));
+        CHECK_INT(covered(a), 21);
+        CHECK_HEX(word(a, 4, 4), 0u);
+        CHECK_HEX(word(a, 8, 4), 0u);
+        CHECK_HEX(word(a, 4, 8), 0u);
+        CHECK_HEX(word(a, 8, 8), 0u);
+        CHECK_HEX(word(a, 5, 5), 0xFFFF0000u);
+        CHECK_HEX(word(a, 6, 4), 0xFFFF0000u);
         /* An outline to clip to that is empty, or no alpha: nothing at all, as on Android. */
         node_set(child, 4, 4, 14, 14, NULL, 1, RN_CLIP_OUTLINE, 255, NULL, 0, NULL, 0);
         erase(a);
@@ -2659,6 +2708,7 @@ int mg_gfx_natives_tests_run(mg_test_sink sink, void *user, int *checks)
     test_paths();
     test_lists();
     test_walk();
+    test_frame_teardown();
     test_inverse("over the stand-in");
 #ifdef MG_GFX_WINDOWS
     test_lists_on_shell();

@@ -27,6 +27,7 @@ class TestPlayer : public QObject {
     Q_PROPERTY(bool showStatus READ showStatus CONSTANT)
     Q_PROPERTY(QString status READ status CONSTANT)
     Q_PROPERTY(int backGestureEdgeDp READ backGestureEdgeDp CONSTANT)
+    Q_PROPERTY(bool closeOnBackGesture MEMBER closeOnBackGesture CONSTANT)
 public:
     bool showStatus() const { return false; }
     QString status() const { return QString(); }
@@ -36,10 +37,12 @@ public:
     Q_INVOKABLE bool hasFrameAfterGestureBack() const { return newFrame; }
     Q_INVOKABLE void endGestureFrameWait() {}
     Q_INVOKABLE void close() { ++closes; }
+    Q_INVOKABLE void closeToManager() { ++closes; }
     void frame(bool fresh) { newFrame = fresh; emit frameChanged(); }
     int backs = 0;
     int closes = 0;
     bool newFrame = false;
+    bool closeOnBackGesture = false;
 signals:
     void frameChanged();
 };
@@ -58,20 +61,32 @@ signals:
     void showPicker(const QString &token, const QStringList &filters);
 };
 
+class TestDiagnostics : public QObject {
+    Q_OBJECT
+public:
+    QString error = QStringLiteral("test write failure");
+    Q_INVOKABLE QString standaloneDiagnosticFileError() const { return error; }
+};
+
 int main(int argc, char **argv)
 {
     QGuiApplication app(argc, argv);
-    if (argc != 2) {
+    const bool diagnosticTest = argc == 3 && QByteArray(argv[2]) == "--diagnostic";
+    if (argc != 2 && !(argc == 3 && QByteArray(argv[2]) == "--microg") && !diagnosticTest) {
         std::fprintf(stderr, "Expected the absolute path to Preview.qml\n");
         return 1;
     }
 
     qmlRegisterType<TestSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
     TestPlayer player;
+    player.closeOnBackGesture = argc == 3 && !diagnosticTest;
     TestPicker picker;
+    TestDiagnostics diagnostics;
     QQuickView view;
     view.rootContext()->setContextProperty("preview", &player);
     view.rootContext()->setContextProperty("pickerHost", &picker);
+    view.rootContext()->setContextProperty("standaloneFileDiagnostics", diagnosticTest);
+    view.rootContext()->setContextProperty("diagnosticLog", &diagnostics);
     view.resize(540, 960);
     view.setSource(QUrl::fromLocalFile(QString::fromLocal8Bit(argv[1])));
     if (view.status() == QQuickView::Error) {
@@ -79,6 +94,22 @@ int main(int argc, char **argv)
         return 1;
     }
     if (view.rootObject()->findChild<QObject *>(QStringLiteral("backGestureHint"))) return 1;
+    if (diagnosticTest) {
+        QTimer::singleShot(800, [&]() {
+            QObject *error = view.rootObject()->findChild<QObject *>(QStringLiteral("standaloneDiagnosticError"));
+            if (!error || !error->property("visible").toBool()) {
+                std::fprintf(stderr, "standalone diagnostic error is not visible\n");
+                app.exit(1);
+                return;
+            }
+            diagnostics.error.clear();
+            QTimer::singleShot(1400, [&]() {
+                QObject *current = view.rootObject()->findChild<QObject *>(QStringLiteral("standaloneDiagnosticError"));
+                app.exit(current && !current->property("visible").toBool() ? 0 : 1);
+            });
+        });
+        return app.exec();
+    }
     bool failed = false;
     auto action = [&view, &failed](const char *code) {
         QQmlExpression expression(qmlContext(view.rootObject()), view.rootObject(),
@@ -90,6 +121,31 @@ int main(int argc, char **argv)
         }
         return result;
     };
+    if (player.closeOnBackGesture) {
+        QTimer::singleShot(700, [&]() {
+            picker.request();
+        });
+        QTimer::singleShot(2000, [&]() {
+            action("pageStack.navigateBack(PageStackAction.Immediate)");
+        });
+        QTimer::singleShot(3200, [&]() {
+            if (player.backs != 0 || player.closes != 0 || picker.cancels != 1) {
+                std::fprintf(stderr, "microG picker: backs=%d closes=%d cancels=%d failed=%d depth=%d\n",
+                             player.backs, player.closes, picker.cancels, picker.failed,
+                             action("pageStack.depth").toInt());
+                failed = true;
+            }
+            action("pageStack.navigateBack(PageStackAction.Immediate)");
+        });
+        QTimer::singleShot(4400, [&]() {
+            if (player.backs != 0 || player.closes != 1) {
+                std::fprintf(stderr, "microG gesture: backs=%d closes=%d\n", player.backs, player.closes);
+                failed = true;
+            }
+            app.exit(failed ? 1 : 0);
+        });
+        return app.exec();
+    }
     QTimer::singleShot(100, [&]() {
         action("pageStack.navigateBack(PageStackAction.Immediate)");
     });
@@ -135,7 +191,7 @@ int main(int argc, char **argv)
         }
         action("pageStack.navigateBack(PageStackAction.Immediate)");
     });
-    QTimer::singleShot(7700, [&]() {
+    QTimer::singleShot(9000, [&]() {
         if (player.backs != 4 || player.closes != 0 ||
                 action("pageStack.depth").toInt() != 2 || TestSurface::created != 1 ||
                 TestSurface::destroyed != 0) {
@@ -144,14 +200,14 @@ int main(int argc, char **argv)
         }
         action("pageStack.navigateBack(PageStackAction.Immediate)");
     });
-    QTimer::singleShot(7900, [&]() {
+    QTimer::singleShot(9600, [&]() {
         if (player.backs != 5 || action("pageStack.depth").toInt() != 1) {
             std::fprintf(stderr, "last back: backs=%d depth=%d\n", player.backs, action("pageStack.depth").toInt());
             failed = true;
         }
         player.frame(true);
     });
-    QTimer::singleShot(8100, [&]() {
+    QTimer::singleShot(10200, [&]() {
         if (player.backs != 5 || player.closes != 0 ||
                 action("pageStack.depth").toInt() != 2) {
             std::fprintf(stderr, "last restore: backs=%d closes=%d depth=%d\n", player.backs, player.closes, action("pageStack.depth").toInt());

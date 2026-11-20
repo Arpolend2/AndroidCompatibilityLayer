@@ -14,7 +14,7 @@ public:
     ~ExternalApkInstall() override;
 
     bool start(const QString &path, QString *error, const QString &expectedPackage = QString(),
-               bool allowUpdate = false);
+               bool allowUpdate = false, bool storeHandoff = false);
     bool busy() const;
     bool isUpdate() const { return m_updating; }
     void decision(bool accepted);
@@ -22,12 +22,13 @@ public:
 
 signals:
     void confirmationRequested(const QString &label, const QString &packageName, quint32 version);
-    void finished(bool installed, const QString &message);
+    void finished(bool installed, const QString &message, const QString &package, const QByteArray &fingerprint);
 
 private:
     void ready(quint64 id);
     void staged();
-    void finish(bool installed, const QString &message);
+    void finish(bool installed, const QString &message, const QString &package = QString(),
+                const QByteArray &fingerprint = QByteArray());
 
     QString m_storeRoot;
     QString m_expectedPackage;

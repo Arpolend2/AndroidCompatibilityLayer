@@ -1,0 +1,37 @@
+#ifndef TEST_RUNTIME_MANAGER_INTENTS_INVOKER
+#define TEST_RUNTIME_MANAGER_INTENTS_INVOKER
+
+#include <QJsonObject>
+#include <QObject>
+#include <QString>
+
+namespace RuntimeManager {
+class Error
+{
+public:
+    explicit Error(const QString &message = QString()) : m_message(message) {}
+    explicit operator bool() const { return !m_message.isEmpty(); }
+    QString message() const { return m_message; }
+private:
+    QString m_message;
+};
+
+class IntentsInvoker : public QObject
+{
+    Q_OBJECT
+public:
+    explicit IntentsInvoker(QObject *parent = nullptr) : QObject(parent) {}
+    void invoke(const QString &name, const QJsonObject &hints, const QJsonObject &params) {
+        intentName = name;
+        intentHints = hints;
+        intentParams = params;
+    }
+    void complete(const Error &error = Error()) { emit replyReceived(QJsonObject(), error); }
+    QString intentName;
+    QJsonObject intentHints, intentParams;
+signals:
+    void replyReceived(const QJsonObject &reply, const RuntimeManager::Error &error);
+};
+}
+
+#endif

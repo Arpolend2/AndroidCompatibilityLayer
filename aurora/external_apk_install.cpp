@@ -30,7 +30,8 @@ ExternalApkInstall::~ExternalApkInstall()
     }
 }
 
-bool ExternalApkInstall::start(const QString &path, QString *error, const QString &expectedPackage, bool allowUpdate)
+bool ExternalApkInstall::start(const QString &path, QString *error, const QString &expectedPackage, bool allowUpdate,
+                               bool storeHandoff)
 {
     if (error) error->clear();
     if (busy() || m_storeRoot.isEmpty()) {
@@ -44,7 +45,7 @@ bool ExternalApkInstall::start(const QString &path, QString *error, const QStrin
     QString local;
     if (!externalApkPath(path, &local, error)) return false;
     const QFileInfo file(local);
-    if (!m_prepare.start(RequestId, file.absolutePath(), local, QStringLiteral("external.apk"), MaxApkBytes)) {
+    if (!m_prepare.start(RequestId, file.absolutePath(), local, QStringLiteral("external.apk"), MaxApkBytes, storeHandoff)) {
         if (error) *error = tr("Installation is unavailable or busy.");
         return false;
     }
@@ -108,16 +109,20 @@ void ExternalApkInstall::staged()
 {
     InstallRequestCommit *commit = m_commit;
     m_commit = nullptr;
+    const InstallRequestCandidate *candidate = m_prepare.candidate(RequestId);
+    const QString package = candidate ? candidate->package() : QString();
+    const QByteArray fingerprint = candidate ? candidate->fingerprint() : QByteArray();
     QString error;
     const bool installed = m_active && commit->commit(&error);
     if (!installed && error.isEmpty()) error = commit->error();
     if (!installed && error.isEmpty()) error = tr("Could not add the requested APK to the library.");
     delete commit;
     finish(installed, installed ? (m_updating ? tr("APK updated. Compatibility is not guaranteed.")
-                                              : tr("APK added to the library. Compatibility is not guaranteed.")) : error);
+                                              : tr("APK added to the library. Compatibility is not guaranteed.")) : error,
+           installed ? package : QString(), installed ? fingerprint : QByteArray());
 }
 
-void ExternalApkInstall::finish(bool installed, const QString &message)
+void ExternalApkInstall::finish(bool installed, const QString &message, const QString &package, const QByteArray &fingerprint)
 {
     m_prepare.cancel(RequestId);
     m_active = false;
@@ -125,5 +130,5 @@ void ExternalApkInstall::finish(bool installed, const QString &message)
     m_expectedPackage.clear();
     m_allowUpdate = false;
     m_updating = false;
-    emit finished(installed, message);
+    emit finished(installed, message, package, fingerprint);
 }

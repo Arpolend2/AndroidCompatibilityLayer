@@ -16,7 +16,7 @@ public:
     explicit InstallRequestPrepare(QObject *parent = nullptr);
     ~InstallRequestPrepare() override;
     bool start(quint64 id, const QString &senderRoot, const QString &source,
-               const QString &name, quint64 maxBytes);
+               const QString &name, quint64 maxBytes, bool fingerprint = false);
     void cancel(quint64 id);
     const InstallRequestCandidate *candidate(quint64 id) const;
     bool busy() const;

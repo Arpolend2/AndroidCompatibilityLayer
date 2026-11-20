@@ -13,7 +13,7 @@ The manager and standalone app interface use Russian when the device language
 is Russian and otherwise use English. Android apps choose their own language;
 the Android language setting is independent of the manager interface.
 
-Native EGL/GLES rendering is experimental and disabled by default. In the
+Native EGL/GLES rendering is experimental and disabled by default in CMake. In the
 Aurora IDE, set the CMake option `ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL=ON` to try it.
 Android GL frames use system EGL pbuffers and CPU readback for preview; this
 is not the Windows GPU compositor or zero-copy presentation. The default EGL
@@ -43,9 +43,69 @@ After a fallback, other SurfaceView layers cannot recover their last GPU-only
 frames until they swap again. Qt scenegraph interoperation, concurrent layers,
 and device drivers have not been verified on an Aurora device. This is an
 experimental device test configuration, not a complete GPU implementation, and
-must not be enabled by default.
+is not suitable as a production default.
 Back-gesture frame comparison cannot detect changed GPU-only frames, so its
 existing timeout may be used instead.
+
+For the experimental Android Canvas path, also set
+`ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS=ON`. It requires both
+options above. If the shared graphics context or presentation is unavailable,
+the Canvas path falls back to CPU rendering. This path has not been validated
+on an Aurora device. All three CMake options are off by default.
+
+microG settings open as a page in the manager, where the back gesture can start
+anywhere on the page. The Android runtime remains in a separate process and
+continues to use the bounded CPU frame channel.
+
+Embedded workers (including Aurora Store and microG) attempt GPU Canvas
+presentation only when both experimental GPU options are enabled. The worker
+probes the current EGL context for DMA-BUF export support before selecting the
+GPU transport; when export is unavailable it uses the existing CPU frame
+channel. The parent verifies the actual format and modifier against its EGL
+importer, imports the file descriptors, and copies into a parent-owned GPU
+texture before acknowledging buffer release. A credential-checked local
+`SOCK_SEQPACKET` channel carries the descriptors and per-plane format, stride,
+offset, and modifier metadata; EGL handles and process pointers are never
+serialized. Only one frame may be in flight, producer and consumer GPU work is
+completed before buffer reuse, and runtime handoff/import failure falls back
+to CPU texture readback and the existing CPU frame channel. The GPU path is
+reported active only after a frame is imported and acknowledged. This
+experimental path still requires device validation; it does not establish
+DMA-BUF support on Aurora ARM64.
+Returning from the microG page stops that process after the transition;
+cancelling the gesture leaves it running.
+
+Aurora Store keeps its own window while its Android process restarts. The
+supervisor recognizes the ProcessPhoenix default-launcher restart used by
+known versions of the store; other restart intents are not replayed. It limits
+restarts to three per minute, and does not restart after a crash or user close.
+If an accepted restart's worker does not exit within 500 ms, the
+supervisor terminates it and waits for its exit before starting the replacement.
+On manual close, after the worker confirms a successful Android exit and host
+shutdown, it has 500 ms to finish teardown. Without that confirmation the
+existing seven-second stop watchdog still applies. Manual close never restarts it.
+This path still requires validation with the installed store on an Aurora device.
+Before Qt tears down the offscreen Canvas surface, the Android main and frame
+threads release their own GL contexts. This applies to both pixel and remote
+texture presentation, including fallback from remote texture to pixels.
+If the worker remains alive after
+`host shutdown complete`, its `teardown:`
+messages show which destructor boundaries it reached. If it logged `leaving main`
+but was still killed, look at process-exit cleanup rather than the Android stop
+or host shutdown. GPU builds log which threads release a Canvas context and
+how many drawing contexts remain immediately before offscreen surface destruction.
+A live owner entry gives the thread ID, OS thread name, first Canvas operation,
+and whether its context was ever bound to the surface or is being released.
+A zero count rules out a still-live Canvas drawing context at that point, not
+the Qt share context or the platform surface cleanup itself. The supervisor still
+reports the actual process exit status.
+
+For the current device experiment, the RPM spec explicitly enables all three
+options, including when its build directory has cached values from an earlier
+build. The detailed log records the GL vendor, renderer and version when the
+shared Canvas context is created. Rendering artifacts may occur.
+IDE options for a separate CMake build do not change the packaged
+configuration.
 
 `tools/native-egl-image-test.c` tests the transport for copying
 a pbuffer into an EGL image and importing it in an independent GLES context,
@@ -60,6 +120,8 @@ composition.
 Open the repository's `CMakeLists.txt` in Aurora IDE and select an aarch64
 Aurora SDK kit matching the device's OS version. Build and deploy the
 `ru.androidcompatibilitylayer.appmanager` application and launch it on the device.
+If the debug launcher passes the desktop `%u` field code as its only argument,
+the manager treats it as an ordinary launch, not an APK request.
 
 The RPM build disables optional test targets to speed up IDE configuration.
 For tests, configure CMake separately with `ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS=ON`
@@ -67,19 +129,129 @@ For tests, configure CMake separately with `ANDROID_COMPATIBILITY_LAYER_BUILD_TE
 Debug builds use reduced debug information for the bundled SQLite amalgamation
 to limit build time and object size; other sources keep their normal debug info.
 
-The manager and standalone Android apps save observed Qt warnings and errors,
-Android runtime error messages and reported startup failures as text files in the
-shared `Documents/AndroidCompatibilityLayer-Error-Logs` directory. Each filename contains the app
-name and a timestamp. Reports include recent diagnostic context, which may
-contain private data or credentials; review them before sharing. They remain
-until deleted by the user. An inaccessible Documents directory or a failed
-write is reported in the diagnostic output. Abrupt termination, unreported
-errors, and messages lost when the runtime's nonblocking log channel is full
-may not produce a report. Access on an Aurora device still needs verification.
-The Log page's pulley menu can also save its current contents to this folder as
-a separate text file; the result or a write error is shown on the page.
+The manager and standalone Android apps collect diagnostic information.
+Explicitly saved reports go under `Documents/AndroidCompatibilityLayer-Error-Logs`.
+Short reports use an allowlist of
+operation stages, error categories, selected Android exception types, system and
+build information, timestamps and process IDs. They omit raw application and
+Qt messages, application names, file paths, URLs and network names; unrecognised
+errors are recorded without their details. This limits diagnostic detail and
+does not identify which installed app corresponds to a process ID. The Log page
+displays the current process's safe context; copying, sharing or saving exports
+the combined safe report. For apps started by the manager, process IDs and
+completion, failure or forced-stop categories help correlate lifecycle events;
+standalone processes do not have a manager observing their termination. Raw
+output may still appear in the IDE. Older reports
+created before this change are not modified and may contain private data.
+
+The manager holds bounded activity and detailed histories in RAM and periodically
+atomically saves them in its private application files directory. They are
+restored when the manager restarts. The oldest output is discarded when a
+buffer fills and this is marked in the report. Snapshot write and recovery
+errors are shown in the Log page; a malformed snapshot is not overwritten.
+The snapshot and its single reusable pending file are each limited to 96 MiB.
+Standalone and preview processes send events to the manager over an append-only
+D-Bus interface; it does not offer remote log reads. The manager remains running
+when its window closes, but Aurora may suspend or terminate it. Events received
+since the most recent snapshot (normally up to five seconds, or longer if
+writes fail or the process is suspended) can be lost. Delivery is best effort:
+queue limits, unavailable services, process termination and platform background
+policies can cause loss. Known drops are reported where possible. The interface
+uses system-provided process identity for routing, not proof of authorship: remote
+events are untrusted and can be forged. Per-source quotas limit their impact.
+For log submission the manager requires a nonempty key ID of at most 256
+characters and accepts only
+its own executable (also used by the built-in Store worker) or a generated
+standalone executable, in either the legacy `/usr/bin` layout or the versioned
+`/opt/app/<app-id>/<version>/bin/<app-id>` package layout.
+Standalone packages built before this interface was added need rebuilding; device
+verification of activation and sandbox permissions is still required.
+Reports include per-manager-process counts of state and append requests,
+accepted calls and rejected or limited requests without sender identities.
+Clients also send bounded, predefined diagnostic stages and failure categories
+without log contents to the manager's public service name, before manager
+identification and when their connection status changes. These aggregate counts
+are untrusted and may be forged; they do not prove which app sent them. No
+log events are sent before manager identification. If the diagnostic request
+itself cannot reach the manager, zero requests cannot distinguish an app that
+did not start from a connection failure. Counters reset when the manager
+process restarts. Standalone processes also emit sanitized connection-failure
+stages to stderr (for example in the IDE).
+If manager identification fails, the client reports whether the executable
+matched and whether the key was empty or oversized, without printing either
+value. It also compares the unique and well-known names once for diagnosis;
+the comparison does not authorize log delivery.
+Detailed events observed after the client starts but before it learns the
+manager's detailed setting are not retained; if the setting is enabled, their
+count is reported after a connection succeeds. Earlier startup events are not
+counted.
+
+The Log page pulley can enable detailed logging after a privacy warning. While
+enabled, unfiltered Qt, Android runtime and captured stdout/stderr may include
+credentials, application data, paths and network addresses. Its state and
+history are also saved privately. Disabling it clears the detailed history and
+attempts to save the cleared state immediately; if this fails, the previous
+snapshot can reappear after restart. Saved or shared copies are not cleared.
+State propagation is
+polled, so output around mode changes may be missed or buffered; native output
+may be duplicated. No new `activity.log` or `detailed.log` files are written;
+the private snapshot has a separate name.
+Existing files and older packages are not modified; older packages may continue
+using their previous on-disk logging until rebuilt.
+
+GPU Canvas performance summaries are emitted on the next completed frame
+after each roughly three-second interval while extended logging is active in
+the rendering process. Timing samples are still taken on one in sixteen frames.
+For embedded GPU Canvas, `producer_us` includes readback but not submission;
+`readback_present` counts presentation readbacks, `readback_gl_us` and
+`readback_convert_us` split sampled readback time. On ARM64 the CPU conversion
+uses NEON to swap RGBA to BGRA while flipping the rows. `pixel_submit_*` measure
+the subsequent CPU pixel submission callback. `qt_wait_us` applies to the
+shared-texture path only. These are elapsed times, not GPU execution times.
+`readback_cache_*` counts operations satisfied by an up-to-date CPU mirror,
+separately from readback attempts. For filters, compare `readback_cache_filter`
+with `readback_filter` to see how often a readback was skipped.
+`filter_fallback_mode`, `filter_fallback_blend`, `filter_fallback_self`,
+`filter_fallback_gles` and `filter_fallback_invalid` count why a color-filter
+draw used the CPU path; `filter_draw_errors` records GLES errors after the
+filtered draw was submitted. Shared-texture presentation does not read pixels
+back; `readback_present` applies to the CPU pixel-presentation callback.
+The experimental GPU Canvas applies all declared Android color-filter blend
+modes (`CLEAR` through `LIGHTEN`) with paint `SRC_OVER` directly to a GPU
+source texture for shape and external-bitmap draws. For the outer paint blend,
+`DST` is a no-op; `SRC_OVER`, `DST_OVER`, `DST_OUT`, `SRC_ATOP`, `XOR`, `PLUS`
+and `SCREEN` use premultiplied GLES blend factors when the selected filter
+preserves source coverage (`CLEAR`, `DST`, `SRC_IN`, `DST_IN`, `DST_OUT`,
+`SRC_ATOP` or `MODULATE`). Other filter/blend combinations, invalid filter
+modes, self-bitmap filters and GLES setup failures retain the CPU fallback.
+Pixel-based embedded presentation still requires its existing CPU readback
+callback.
+
+Temporary device testing: a standalone RPM created while detailed logging is
+enabled also captures its own detailed output before starting Android and saves
+one `StandaloneDiagnostic-*.txt` file per launch in
+`Documents/AndroidCompatibilityLayer-Error-Logs`, independently of D-Bus.
+The package requests the `Documents` permission (or uses its existing
+`UserDirs` permission). The mode is fixed when RPM creation starts: disabling
+detailed logging later does not stop these installed RPMs. Remove them and
+create new RPMs with detailed logging disabled to stop autonomous recording.
+These files may contain passwords, tokens and other private data, are accessible
+to the user and potentially other apps with Documents access, and remain after
+the app closes. The RAM history is bounded and overwritten when full; the
+snapshot is updated approximately every five seconds and at normal shutdown.
+Events before capture starts or after the last successful write can be lost.
+At most eight standalone diagnostic files are allocated in this folder; the
+application reports an error instead of removing old files when the limit is
+reached. Move or remove old test files manually to resume. Saving errors are
+shown in the standalone app. The normal D-Bus collection remains active and its
+sanitized stderr diagnostics are included in the standalone file when captured.
 
 Standalone RPM generation is available on an app's library details page.
+Settings can also automatically create an RPM and open the system installer
+after a successful library import. This option is off by default. Imports
+are queued for RPM generation if another build is in progress; the system
+installer may require confirmation, and opening it does not confirm installation.
+A successful import displays a banner when the library is not currently visible.
 An indeterminate progress bar shows the current inspection, build, signing and
 save stages; it does not estimate remaining time or report installer completion.
 The SDK signer appends a CMS trailer; the SDK's generic `rpm -Kv` reports
@@ -251,12 +423,62 @@ require all running Android apps to be closed. The downloaded microG APK is
 used by subsequently opened apps. The runtime attempts to open its settings,
 but microG, Google account authentication, Play Integrity, and individual
 Google APIs have not been verified on Aurora. No Aurora Wi-Fi scan host is
-connected for Android apps.
+connected for Android apps. In microG settings, a completed Aurora back
+gesture returns to the manager and closes the settings instead of sending
+Android Back. A canceled gesture leaves the settings running.
 
-Aurora Store appears in the library after installation. Settings allow
-installing or updating it from GitLab or a local APK. Local
-updates require confirmation; signatures are not verified. Updates preserve
-app data and require the store to be closed. The Android store's operation,
+The manager also exposes an experimental D-Bus `GetProvider` method at
+`/ru/androidcompatibilitylayer/appmanager/microg` on
+`ru.androidcompatibilitylayer.appmanager.microg`. It returns only the manager's
+selected `none` or `microg` setting; it does not check whether microG is installed
+or working. The D-Bus launch command starts the manager without creating its
+window. A normal launch or an incoming APK request creates the window in that
+same process. An idle windowless process schedules exit after 60 seconds;
+system suspension or termination may change that timing. The desktop launcher,
+D-Bus activation, sandbox permissions, simultaneous clients and APK handling
+still need device verification. Closing the window exits the manager; a later
+request may activate it again.
+
+This is not a shared Android service, Binder bridge, authenticated client
+interface or shared Google login. It does not expose account credentials.
+Standalone APKs do not yet use this interface or share the manager's microG
+state. The separate `dbus-identity` test clients provide a device check without
+accounts or secrets.
+
+The experimental `InspectCaller` method resolves the actual D-Bus sender using
+Aurora's `IdentifyByBusName` and returns that sender, executable and key ID only
+to the caller. It accepts no claimed identity and limits concurrent lookups.
+Errors are returned instead of treating unidentified callers as trusted.
+Identification is not authorization: a key ID, especially the public developer
+test key, does not establish trust in an APK. Nothing in this method grants
+access to account data, and device sandbox behaviour still needs verification.
+
+Standalone APK handoffs and child log forwarding check the manager's unique
+D-Bus identity against the legacy `/usr/bin/ru.androidcompatibilitylayer.appmanager`
+path or the versioned `/opt/app/ru.androidcompatibilitylayer.appmanager/<version>/bin/ru.androidcompatibilitylayer.appmanager`
+path. Both require a nonempty key ID of at most 256 characters.
+
+For local checks, build `android_compatibility_layer_manager_lifecycle_test`
+with test targets enabled. Run the binary under `dbus-run-session`, and run
+`sh tools/manager-lifecycle-test.sh <path-to-test-binary>` for activation and
+restart on an isolated bus. The optional `--actual-manager <path-to-manager>`
+test mode uses Qt's `minimal` platform plugin and a temporary configuration.
+These checks do not reproduce the device sandbox or launcher.
+
+The manager's cover shows the library and offers actions to choose an APK,
+save the log, and open Aurora Store. The library pulley also opens the store.
+Aurora Store is hidden from the manager's library view but remains in the
+underlying library. It runs in a separate preview process and window; reopening
+it activates the existing window. Opening an installed app from this Store window
+queues the launch without waiting on the Store UI thread; the manager still
+handles launch failures, including a missing standalone installation. The
+immediate callback result indicates that the request was queued, not that the
+app started; a failed or unverified manager reply is logged.
+The desktop entry allows separate multitasking
+covers for the manager and store. Settings allow installing or updating it
+from GitLab or a local APK. These imports stay in the manager's library even
+when automatic standalone RPM installation is enabled. Signatures are not
+verified. Updates preserve app data and require the store to be closed. The Android store's operation,
 sign-in and compatibility on Aurora have not been verified.
 Online microG and Aurora Store downloads show their progress in Settings and in
 system notifications. Release checks, unknown download sizes and APK
@@ -295,6 +517,86 @@ tools, a JDK 8 and the Android NDK; see `tools/android9-*.sh`,
 `tools/build-framework.sh` and `tools/dvm-android-root.sh`. Android runtime
 files come from the Android 9 image and AOSP sources; their applicable licenses
 and notices must be considered before redistributing a package.
+
+## Android System WebView
+
+The selected backend is Android's `WebViewFactory`, not Aurora's native WebView
+and not the old WKWebView bridge. The abandoned Android-to-QML/Aurora bridge and
+its mock tests have been removed; the independent native diagnostic remains
+documented in `aurora/webview_native_probe.md`.
+
+CMake installs `aurora/android-runtime` into
+`/usr/share/ru.androidcompatibilitylayer.appmanager/android-runtime`.
+The manager resolves that resource directory with `Aurora::Application::pathTo`;
+preview passes it to `megler_run_config.android_root`. Standalone packages copy
+that runtime into their own resource directory and use that copy. Megler mounts
+the selected root at the guest path `/system`. Rebuilding
+`build/android9/root-arm64-v8a` alone does not update the IDE source runtime or
+an already installed standalone package.
+
+For Aurora aarch64 the primary ABI is `arm64-v8a` (the bundled
+`lib/libjavacore.so` is ELF64/AArch64). The required provider is a standalone
+APK at `app/webview/webview.apk` inside the selected root, visible to Android as
+`/system/app/webview/webview.apk`. It must contain `classes.dex`, its compiled
+manifest/resources, and `lib/arm64-v8a/<library>` named by manifest metadata
+`com.android.webview.WebViewLibrary`. The usual library is
+`libwebviewchromium.so`. The current framework requires target SDK >= 33 and
+the entry class
+`com.android.webview.chromium.WebViewChromiumFactoryProviderForT`.
+A split/Trichrome package with external code or library dependencies is not a
+drop-in provider for this loader. The upstream standalone package name is
+`com.android.webview`; this factory reads the name from the manifest rather
+than enforcing that name. It does not implement Android's WebViewUpdateService
+or authenticate the APK's signing certificate.
+
+At this implementation stage the prepared runtime contains no provider and
+there is no verified provider APK in this tree. `tools/webview-fetch.sh` records
+an AOSP source commit and hashes for Chromium 128.0.6613.88, including ARM64;
+this is an old historical prebuilt, not a maintained security baseline. It has
+not been fetched or installed as part of this port. The Android 9 image's
+Chromium 66 (odex/vdex-only code) is also not a suitable replacement. A provider
+must have reviewed provenance, redistribution licenses/notices and a maintained
+update source; neither an AOSP URL nor a matching ABI establishes suitability
+for real accounts. No binary has been substituted.
+
+The [pinned AOSP repository's README](https://android.googlesource.com/platform/external/chromium-webview/+/27ac2bdb9a1a4e55dc65bb6cdc752dbfdea3b9f4/)
+identifies its APKs as Chromium upstream builds and recommends newer stable
+sources. Chromium's
+[system integration guide](https://chromium.googlesource.com/chromium/src/+/HEAD/android_webview/docs/aosp-system-integration.md)
+warns that these prebuilts are not regularly updated, and documents
+`system_webview_apk` with `target_cpu="arm64"` as a source-build route.
+The [Chromium 128 license](https://chromium.googlesource.com/chromium/src/+/128.0.6613.88/LICENSE)
+permits binary redistribution with its notice and conditions; third-party
+component notices and any optional codec rights must also be reviewed for the
+specific build. This is a source/provenance lead, not approval of a particular
+binary or confirmation that a current provider runs on Megler.
+
+The factory now reports a missing provider with its guest path and primary ABI.
+Before creating its class loader or invoking native constructors it checks the
+existing manifest target-SDK requirement, DEX magic and the named library's
+little-endian ELF class, machine and shared-object type. Invalid metadata,
+missing ABI libraries, split/odex-only packages and malformed headers fail with
+explicit diagnostics. This is a structural preflight, not signature validation,
+full ELF/DEX validation, a compatibility guarantee or a sandbox test. Changed
+framework sources must be rebuilt with `tools/build-framework.sh` and copied to
+the prepared runtime by the runtime maintainer; these changes do not publish
+DEX or modify the existing generated runtime.
+
+The focused host test is `core/tests/webview-provider/WebViewProviderCheckTest.java`.
+Compile it together with
+`core/framework-overlay/android/webkit/WebViewProviderCheck.java` using a JDK
+(`javac -source 8 -target 8 -d <temporary-output> <both-source-files>`), then run
+`java -cp <temporary-output> android.webkit.WebViewProviderCheckTest`.
+It uses synthetic ZIP/DEX/ELF headers only and does not execute Chromium.
+
+Device startup remains blocked on a reviewed compatible ARM64 provider. After
+one is supplied, use Aurora IDE for an offline `loadData` page with fixed text
+and a fixed title, without accounts, network navigation or JavaScript bridges.
+Confirm native loading, page-finished callback, visible pixels and clean close;
+then investigate any actual loader/JNI/rendering failure. Renderer process
+creation, OS sandbox boundaries and engine updates remain unverified. Do not
+add `--no-sandbox`, bypass signature/trust policy or use real credentials to
+make the smoke test pass.
 
 The compatibility layer cannot run arbitrary APKs reliably. Development tests
 remain separate from the application build.

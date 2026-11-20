@@ -101,9 +101,10 @@ int main(int argc, char **argv)
     const QByteArray contents = rpm.readAll();
     if (contents.contains("private data must stay private") ||
         !contents.contains("translation catalog content") ||
+        !contents.contains("\"fileDiagnostics\":false") ||
         !contents.contains("OrganizationName=ru.androidcompatibilitylayer\nApplicationName=Android") ||
         !contents.contains("\"deniedPermissions\":[\"camera\",\"location\"]") ||
-        !contents.contains("Permissions=Internet;Audio;Bluetooth\n")) return 1;
+        !contents.contains("Permissions=Internet;Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;Bluetooth\n")) return 1;
     const QString first = output;
     apkReport = R"({"ok":true,"package":"org.example.app","permissions":["android.permission.CAMERA","android.permission.ACCESS_FINE_LOCATION","android.permission.RECORD_AUDIO","android.permission.BODY_SENSORS","android.permission.READ_MEDIA_IMAGES","android.permission.READ_MEDIA_AUDIO","android.permission.CALL_PHONE","android.permission.INTERNET"],"permissionMaxSdk":[0,0,0,0,0,0,0,28]})";
     if (!PermissionSettings::save(appDir, QStringList(), &error) ||
@@ -111,25 +112,37 @@ int main(int argc, char **argv)
             store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;
     QFile selectedRpm(output);
     if (!selectedRpm.open(QIODevice::ReadOnly) ||
-        !selectedRpm.readAll().contains("Permissions=Audio;Camera;Location;Microphone;Call;Sensors;Pictures;Music\n")) return 1;
+        !selectedRpm.readAll().contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;Camera;Location;Microphone;Call;Sensors;Pictures;Music\n")) return 1;
     apkReport = R"({"ok":true,"package":"org.example.app","permissions":[],"permissionMaxSdk":[]})";
     if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;
     QFile minimalRpm(output);
     if (!minimalRpm.open(QIODevice::ReadOnly) ||
-        !minimalRpm.readAll().contains("Permissions=Audio\n")) return 1;
+        !minimalRpm.readAll().contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager\n")) return 1;
+    if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+            store, runtimeLink, qmlLink, binary, out, &output, &error, true)) return 1;
+    QFile diagnosticRpm(output);
+    if (!diagnosticRpm.open(QIODevice::ReadOnly)) return 1;
+    const QByteArray diagnosticContents = diagnosticRpm.readAll();
+    if (!diagnosticContents.contains("\"fileDiagnostics\":true") ||
+        !diagnosticContents.contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;Documents\n")) return 1;
     apkReport = R"({"ok":true,"package":"org.example.app","permissions":["android.permission.NEARBY_WIFI_DEVICES","android.permission.UWB_RANGING"],"permissionMaxSdk":[0,0]})";
     if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;
     QFile nearbyRpm(output);
     if (!nearbyRpm.open(QIODevice::ReadOnly) ||
-        !nearbyRpm.readAll().contains("Permissions=Audio\n")) return 1;
+        !nearbyRpm.readAll().contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager\n")) return 1;
     apkReport = R"({"ok":true,"package":"org.example.app","permissions":["android.permission.READ_EXTERNAL_STORAGE","android.permission.READ_MEDIA_IMAGES","android.permission.READ_MEDIA_VIDEO","android.permission.READ_MEDIA_AUDIO"],"permissionMaxSdk":[0,0,0,0]})";
     if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;
     QFile storageRpm(output);
     if (!storageRpm.open(QIODevice::ReadOnly) ||
-        !storageRpm.readAll().contains("Permissions=Audio;UserDirs\n")) return 1;
+        !storageRpm.readAll().contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;UserDirs\n")) return 1;
+    if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+            store, runtimeLink, qmlLink, binary, out, &output, &error, true)) return 1;
+    QFile diagnosticStorageRpm(output);
+    if (!diagnosticStorageRpm.open(QIODevice::ReadOnly) ||
+        !diagnosticStorageRpm.readAll().contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;UserDirs\n")) return 1;
     apkReport = R"({"ok":true,"package":"org.example.app"})";
     if (RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error) || error.isEmpty()) return 1;

@@ -2682,6 +2682,7 @@ static bool buffer_context(int which)
 }
 
 enum { J_IMAGE, J_READ, J_UPLOAD, J_FORGET };
+enum { AHB_R8G8B8X8 = 2 };
 typedef struct buffer_job {
     mg_ahb *b;
     int what;
@@ -2691,6 +2692,20 @@ typedef struct buffer_job {
 } buffer_job;
 
 static void buffer_job_work(buffer_job *j);
+
+static bool buffer_upload_pixels(mg_ahb *b, u8 **copy, const void **pixels)
+{
+    size_t i, n = (size_t)b->width * b->height;
+    *copy = NULL;
+    *pixels = b->pixels;
+    if (b->format != AHB_R8G8B8X8 || !b->pixels) return true;
+    /* R8G8B8X8 is an opaque RGB texture; its ignored X byte is not uploaded as alpha. */
+    *copy = (u8 *)malloc(n * 3);
+    if (!*copy) return false;
+    for (i = 0; i < n; i++) memcpy(*copy + i * 3, b->pixels + i * 4, 3);
+    *pixels = *copy;
+    return true;
+}
 
 /* A job in its display's turn: the turn of the thread that asked, when that one holds it (turn_begin). */
 static void buffer_job_run(void *p)
@@ -2742,6 +2757,9 @@ static void buffer_job_work(buffer_job *j)
     case J_IMAGE:
         if (!create_image) return;
         if (!b->texture) {
+            u8 *copy;
+            const void *pixels;
+            if (!buffer_upload_pixels(b, &copy, &pixels)) return;
             gen(1, &b->texture);
             bind(TEXTURE_2D, b->texture);
             param(TEXTURE_2D, MIN_FILTER, LINEAR);
@@ -2749,12 +2767,17 @@ static void buffer_job_work(buffer_job *j)
             param(TEXTURE_2D, WRAP_S, CLAMP_TO_EDGE);
             param(TEXTURE_2D, WRAP_T, CLAMP_TO_EDGE);
             storei(UNPACK_ALIGNMENT, 1);
-            tex_image(TEXTURE_2D, 0, (i32)format, (i32)w, (i32)h, 0, format, type, b->pixels);
+            tex_image(TEXTURE_2D, 0, (i32)format, (i32)w, (i32)h, 0, format, type, pixels);
+            free(copy);
             b->cpu_newer = false;
         } else if (b->cpu_newer && b->pixels) {
+            u8 *copy;
+            const void *pixels;
+            if (!buffer_upload_pixels(b, &copy, &pixels)) return;
             bind(TEXTURE_2D, b->texture);
             storei(UNPACK_ALIGNMENT, 1);
-            sub_image(TEXTURE_2D, 0, 0, 0, (i32)w, (i32)h, format, type, b->pixels);
+            sub_image(TEXTURE_2D, 0, 0, 0, (i32)w, (i32)h, format, type, pixels);
+            free(copy);
             b->cpu_newer = false;
         }
         j->image = create_image(b->display ? g_webview_display : g_display, own->ctx, EGL_GL_TEXTURE_2D_KHR, (void *)(mg_addr)b->texture, preserved);
@@ -2773,20 +2796,27 @@ static void buffer_job_work(buffer_job *j)
             /* What every OpenGL ES reads, R, G, B, A bytes, packed into the buffer's own format. */
             u8 *rgba = (u8 *)malloc((size_t)w * h * 4);
             size_t i, n = (size_t)w * h;
-            if (rgba) {
-                read(0, 0, (i32)w, (i32)h, RGBA, UNSIGNED_BYTE, rgba);
-                for (i = 0; i < n; i++) {
-                    const u8 *s = rgba + i * 4;
-                    if (type == UNSIGNED_SHORT_5_6_5) {
-                        u16 v = (u16)(((s[0] >> 3) << 11) | ((s[1] >> 2) << 5) | (s[2] >> 3));
-                        b->pixels[i * 2] = (u8)v;
-                        b->pixels[i * 2 + 1] = (u8)(v >> 8);
-                    } else {
-                        memcpy(b->pixels + i * 3, s, 3);
-                    }
-                }
-                free(rgba);
+            if (!rgba) {
+                fbo_texture(FRAMEBUFFER, COLOR_ATTACHMENT0, TEXTURE_2D, 0, 0);
+                bind_fbo(FRAMEBUFFER, 0);
+                return;
             }
+            read(0, 0, (i32)w, (i32)h, RGBA, UNSIGNED_BYTE, rgba);
+            for (i = 0; i < n; i++) {
+                const u8 *s = rgba + i * 4;
+                u8 *out = b->pixels + i * b->bpp;
+                if (type == UNSIGNED_SHORT_5_6_5) {
+                    u16 v = (u16)(((s[0] >> 3) << 11) | ((s[1] >> 2) << 5) | (s[2] >> 3));
+                    out[0] = (u8)v;
+                    out[1] = (u8)(v >> 8);
+                } else if (b->format == AHB_R8G8B8X8) {
+                    memcpy(out, s, 3);
+                    out[3] = 255;
+                } else {
+                    memcpy(out, s, 3);
+                }
+            }
+            free(rgba);
         }
         fbo_texture(FRAMEBUFFER, COLOR_ATTACHMENT0, TEXTURE_2D, 0, 0);
         bind_fbo(FRAMEBUFFER, 0);
@@ -2794,9 +2824,15 @@ static void buffer_job_work(buffer_job *j)
         break;
     case J_UPLOAD:
         if (!b->texture || !b->pixels) return;
-        bind(TEXTURE_2D, b->texture);
-        storei(UNPACK_ALIGNMENT, 1);
-        sub_image(TEXTURE_2D, 0, 0, 0, (i32)w, (i32)h, format, type, b->pixels);
+        {
+            u8 *copy;
+            const void *pixels;
+            if (!buffer_upload_pixels(b, &copy, &pixels)) return;
+            bind(TEXTURE_2D, b->texture);
+            storei(UNPACK_ALIGNMENT, 1);
+            sub_image(TEXTURE_2D, 0, 0, 0, (i32)w, (i32)h, format, type, pixels);
+            free(copy);
+        }
         flush();
         j->ok = true;
         break;

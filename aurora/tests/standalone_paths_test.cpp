@@ -55,18 +55,25 @@ int main(int argc, char **argv)
         paths.locale != QStringLiteral("zh-Hant-TW") || paths.theme != QStringLiteral("dark") ||
         paths.location != QStringLiteral("55.5,37.5") ||
         paths.data != QDir(storage).filePath(QStringLiteral("apps/org.example.app/data")) ||
-        QFileInfo::exists(storage)) return 1;
+        paths.fileDiagnostics || QFileInfo::exists(storage)) return 1;
     {
         QFile file(metadataPath);
         if (!file.open(QIODevice::ReadOnly)) return 1;
         QJsonObject object = QJsonDocument::fromJson(file.readAll()).object();
         file.close();
+        object.insert(QStringLiteral("fileDiagnostics"), true);
         object.insert(QStringLiteral("deniedPermissions"), QJsonArray() << QStringLiteral("camera") << QStringLiteral("location"));
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
             file.write(QJsonDocument(object).toJson()) < 0) return 1;
         file.close();
-        if (!standalonePaths(appId, appId, root, storage, &paths, &error) ||
+        if (!standalonePaths(appId, appId, root, storage, &paths, &error) || !paths.fileDiagnostics ||
             paths.deniedPermissions != (QStringList() << QStringLiteral("camera") << QStringLiteral("location"))) return 1;
+        object.insert(QStringLiteral("fileDiagnostics"), QStringLiteral("yes"));
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            file.write(QJsonDocument(object).toJson()) < 0) return 1;
+        file.close();
+        if (standalonePaths(appId, appId, root, storage, &paths, &error) || error.isEmpty()) return 1;
+        object.insert(QStringLiteral("fileDiagnostics"), true);
         object.insert(QStringLiteral("deniedPermissions"), QJsonArray() << QStringLiteral("unknown"));
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
             file.write(QJsonDocument(object).toJson()) < 0) return 1;

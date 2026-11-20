@@ -52,8 +52,12 @@ public final class Installs {
     }
 
     private static String requestName(String pkg, long version) {
+        return requestName(pkg, version, false);
+    }
+
+    private static String requestName(String pkg, long version, boolean bundle) {
         return "request_" + java.util.UUID.randomUUID().toString().replace("-", "") +
-            (pkg == null ? "" : "_" + version + "_" + pkg) + ".apk";
+            (pkg == null ? "" : "_" + version + "_" + pkg) + (bundle ? ".apks" : ".apk");
     }
 
     public interface Installed { void done(int status, String message); }
@@ -125,7 +129,7 @@ public final class Installs {
             if (installed) {
                 PhoneApps.App app = PhoneApps.find(pkg);
                 if (app != null && (app.versionCode & 0xffffffffL) == version) {
-                    done.done(0, "Megler installed it");
+                    done.done(0, "The APK was added to the manager library");
                     return;
                 }
             }
@@ -289,9 +293,44 @@ public final class Installs {
         android.content.pm.PackageInfo apk = base != null ? ArchiveInfo.read(base.getPath()) : null;
         String pkg = s.packageName != null ? s.packageName : apk != null ? apk.packageName : null;
         if (hasInstallStatusProtocol()) {
+            if (files.length > 1) {
+                final File[] parts = files;
+                new Thread(() -> {
+                    if (parts.length > 11 || apk == null || apk.packageName == null ||
+                        (s.packageName != null && !s.packageName.equals(apk.packageName))) {
+                        finish(s, status, pkg, 7, "The split APK session is invalid");
+                        return;
+                    }
+                    long version = apk.versionCode & 0xffffffffL;
+                    for (File part : parts) {
+                        android.content.pm.PackageInfo info = ArchiveInfo.read(part.getPath());
+                        if (info == null || !apk.packageName.equals(info.packageName) ||
+                            (info.versionCode & 0xffffffffL) != version) {
+                            finish(s, status, pkg, 7, "The split APK packages or versions do not match");
+                            return;
+                        }
+                    }
+                    File output = new File(s.dir.getParentFile(), s.dir.getName() + ".apks");
+                    String name = requestName(apk.packageName, version, true);
+                    try {
+                        bundle(parts, output, true);
+                    } catch (java.io.IOException e) {
+                        android.util.Log.w("Megler", "install: cannot package split APK session: " + e);
+                        finish(s, status, pkg, 1, "Could not package the split APK session");
+                        return;
+                    }
+                    if (!Native.installApk(output.getPath(), name)) {
+                        finish(s, status, pkg, 1, "Megler could not take the request");
+                        return;
+                    }
+                    awaitStatus(name, apk.packageName, version,
+                                (code, message) -> finish(s, status, pkg, code, message));
+                }, "Megler split install " + id).start();
+                return;
+            }
             if (files.length != 1 || apk == null || apk.packageName == null ||
                 (s.packageName != null && !s.packageName.equals(apk.packageName))) {
-                finish(s, status, pkg, 7, "Only one APK with a matching package is supported");
+                finish(s, status, pkg, 7, "The session APK is invalid or its package does not match");
                 return;
             }
             long version = apk.versionCode & 0xffffffffL;
@@ -323,7 +362,7 @@ public final class Installs {
         else if (files.length > 1) {
             File bundle = new File(s.dir.getParentFile(), s.dir.getName() + ".apks");
             try {
-                bundle(files, bundle);
+                bundle(files, bundle, false);
                 handed = Native.installApk(bundle.getPath(), name);
             } catch (java.io.IOException e) {
                 android.util.Log.w("Megler", "install: session " + id + "'s files could not be put in one bundle: " + e);
@@ -466,22 +505,43 @@ public final class Installs {
     }
 
     /* The APKs into one .apks file: a ZIP of them, each stored as it is (an APK is compressed inside already). */
-    private static void bundle(File[] files, File into) throws java.io.IOException {
+    private static void bundle(File[] files, File into, boolean limited) throws java.io.IOException {
         byte[] chunk = new byte[1 << 16];
+        long total = 0;
+        java.util.HashSet<String> names = new java.util.HashSet<>();
         try (java.util.zip.ZipOutputStream zip = new java.util.zip.ZipOutputStream(new java.io.BufferedOutputStream(new FileOutputStream(into), 1 << 16))) {
-            for (File f : files) {
+            for (int i = 0; i < files.length; i++) {
+                File f = files[i];
+                long length = f.length();
+                if (limited && (length <= 0 || length > 511L * 1024 * 1024 - total))
+                    throw new java.io.IOException("split APK session is too large");
+                total += length;
                 java.util.zip.CRC32 crc = new java.util.zip.CRC32();
                 try (InputStream in = new java.io.FileInputStream(f)) {
-                    for (int n; (n = in.read(chunk)) > 0; ) crc.update(chunk, 0, n);
+                    long read = 0;
+                    for (int n; (n = in.read(chunk)) != -1;) {
+                        if (n == 0 || (read += n) > length) throw new java.io.IOException("split APK changed");
+                        crc.update(chunk, 0, n);
+                    }
+                    if (read != length) throw new java.io.IOException("split APK changed");
                 }
-                java.util.zip.ZipEntry e = new java.util.zip.ZipEntry(f.getName());
+                String name = f.getName();
+                if (limited && (!name.matches("[A-Za-z0-9._-]{1,200}\\.apk") || names.contains(name)))
+                    name = "part_" + i + ".apk";
+                if (!names.add(name)) throw new java.io.IOException("duplicate split APK name");
+                java.util.zip.ZipEntry e = new java.util.zip.ZipEntry(name);
                 e.setMethod(java.util.zip.ZipEntry.STORED);
-                e.setSize(f.length());
-                e.setCompressedSize(f.length());
+                e.setSize(length);
+                e.setCompressedSize(length);
                 e.setCrc(crc.getValue());
                 zip.putNextEntry(e);
                 try (InputStream in = new java.io.FileInputStream(f)) {
-                    for (int n; (n = in.read(chunk)) > 0; ) zip.write(chunk, 0, n);
+                    long read = 0;
+                    for (int n; (n = in.read(chunk)) != -1;) {
+                        if (n == 0 || (read += n) > length) throw new java.io.IOException("split APK changed");
+                        zip.write(chunk, 0, n);
+                    }
+                    if (read != length) throw new java.io.IOException("split APK changed");
                 }
                 zip.closeEntry();
             }

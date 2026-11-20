@@ -458,7 +458,7 @@ static void test_context_es1(void)
  * Android, 168 in 64-bit), written by the CPU, made an EGL image of with no context, a texture of the test's own made of
  * that image and read through a framebuffer object (the CPU's pixels, rows in the buffer's order), cleared green by the
  * graphics processor and locked for reading (green); formats refused; one sent through a socket of the process and
- * received.
+ * received; CPU lock requests bounded by allocation usage; R8G8B8X8's ignored byte treated as opaque by EGL images.
  */
 static void test_hardware_buffers(void)
 {
@@ -535,6 +535,27 @@ static void test_hardware_buffers(void)
     CHECK(supported(&want) == 1);
     CHECK(supported(&fp16) == 0);
     CHECK(allocate(&fp16, &bad) == -22 && !bad);
+    {
+        desc_t read_only = { 1, 1, 1, 1, 0x2, 0, 0, 0 }, write_only = { 1, 1, 1, 1, 0x20, 0, 0, 0 };
+        void *limited = NULL, *memory = (void *)1;
+        CHECK(allocate(&read_only, &limited) == 0 && limited);
+        if (limited) {
+            CHECK(lock(limited, 0x20, -1, NULL, &memory) == -22 && !memory);
+            CHECK(lock(limited, 0x202, -1, NULL, &memory) == -22 && !memory);
+            CHECK(lock(limited, 0x2, -1, NULL, &memory) == 0 && memory);
+            CHECK(unlock(limited, NULL) == 0);
+            release(limited);
+        }
+        limited = NULL;
+        memory = (void *)1;
+        CHECK(allocate(&write_only, &limited) == 0 && limited);
+        if (limited) {
+            CHECK(lock(limited, 0x2, -1, NULL, &memory) == -22 && !memory);
+            CHECK(lock(limited, 0x20, -1, NULL, &memory) == 0 && memory);
+            CHECK(unlock(limited, NULL) == 0);
+            release(limited);
+        }
+    }
     CHECK(allocate(&want, &b) == 0 && b);
     if (!b) return;
     describe(b, &got);
@@ -591,6 +612,48 @@ static void test_hardware_buffers(void)
     CHECK(green);
     CHECK(unlock(b, NULL) == 0);
     say("  4x2 R8G8B8A8: written %s, drawn into %s", same ? "and read through an EGL image" : "and NOT read back", green ? "and read by the CPU" : "and NOT read back");
+    {
+        desc_t x8 = { 2, 1, 1, 2, 0x333, 0, 0, 0 };
+        void *opaque = NULL, *opaque_image = NULL;
+        u8 *opaque_pixels = NULL, result[8] = { 0 };
+        bool opaque_rgb = false, opaque_alpha = false;
+        CHECK(allocate(&x8, &opaque) == 0 && opaque);
+        if (opaque) {
+            CHECK(lock(opaque, 0x30, -1, NULL, (void **)&opaque_pixels) == 0 && opaque_pixels);
+            if (opaque_pixels) {
+                opaque_pixels[0] = 24;
+                opaque_pixels[1] = 80;
+                opaque_pixels[2] = 160;
+                opaque_pixels[3] = 0;
+                opaque_pixels[4] = 200;
+                opaque_pixels[5] = 120;
+                opaque_pixels[6] = 40;
+                opaque_pixels[7] = 17;
+                CHECK(unlock(opaque, NULL) == 0);
+                opaque_image = create_image(d, NULL, 0x3140, client_of(opaque), preserved);
+                CHECK(opaque_image != NULL);
+                if (opaque_image) {
+                    bind_texture(0x0DE1, tex);
+                    target_image(0x0DE1, opaque_image);
+                    fbo_texture(0x8D40, 0x8CE0, 0x0DE1, tex, 0);
+                    read_pixels(0, 0, 2, 1, 0x1908, 0x1401, result);
+                    opaque_rgb = result[0] == 24 && result[1] == 80 && result[2] == 160 &&
+                                 result[4] == 200 && result[5] == 120 && result[6] == 40;
+                    CHECK(opaque_rgb);
+                    CHECK(result[3] == 255 && result[7] == 255);
+                    clear_color(0, 0, 1, 1);
+                    clear(0x4000);
+                    CHECK(lock(opaque, 0x3, -1, NULL, (void **)&opaque_pixels) == 0 && opaque_pixels);
+                    opaque_alpha = opaque_pixels && opaque_pixels[3] == 255 && opaque_pixels[7] == 255;
+                    CHECK(opaque_alpha);
+                    CHECK(unlock(opaque, NULL) == 0);
+                    CHECK(destroy_image(d, opaque_image));
+                }
+            }
+            release(opaque);
+        }
+        say("  2x1 R8G8B8X8: RGB %s and alpha opaque in EGL and CPU reads", opaque_rgb ? "preserved" : "not preserved");
+    }
     bind_fbo(0x8D40, 0);
     delete_textures(1, &tex);
     make_current(d, NULL, NULL, NULL);

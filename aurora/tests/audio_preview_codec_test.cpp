@@ -110,6 +110,28 @@ int main(int argc, char **argv)
         darkPlayer.start();
         if (!themeDark) return 1;
     }
+    {
+        PreviewPlayer standalone(QStringLiteral("."), QStringLiteral("."));
+        standalone.setCloseOnExit(true);
+        int finished = 0;
+        QObject::connect(&standalone, &PreviewPlayer::finished, [&]() { ++finished; });
+        standalone.start();
+        runConfig.on_exit(runConfig.user, 0, "");
+        app.processEvents();
+        if (finished != 1) {
+            std::fprintf(stderr, "Standalone guest exit did not close the preview\n");
+            return 1;
+        }
+    }
+    {
+        PreviewPlayer preview(QStringLiteral("."), QStringLiteral("."));
+        int finished = 0;
+        QObject::connect(&preview, &PreviewPlayer::finished, [&]() { ++finished; });
+        preview.start();
+        runConfig.on_exit(runConfig.user, 0, "");
+        app.processEvents();
+        if (finished != 0 || !preview.status().contains(QStringLiteral("ended"))) return 1;
+    }
     PreviewPlayer player(QStringLiteral("."), QStringLiteral("."));
     player.setStandaloneSettings(QStringLiteral("de-DE"), QStringLiteral("light"), QStringLiteral("55.5,37.5"));
     player.setSystemTheme(true, QColor(0x12, 0x34, 0x56));
@@ -207,9 +229,25 @@ int main(int argc, char **argv)
     release();
     if (press(384)) { std::fprintf(stderr, "Narrow right edge boundary failed\n"); return 1; }
     release();
+    if (!surface.setProperty("edgeZoneWidth", surface.width() / 2)) return 1;
+    for (qreal x : {0.0, 150.0, 200.0, 399.0}) {
+        if (press(x)) {
+            std::fprintf(stderr, "Full-width back gesture retained the mouse grab\n");
+            return 1;
+        }
+        release();
+    }
     bool finished = false;
     QObject::connect(&player, &PreviewPlayer::finished, [&]() { finished = true; });
-    player.close();
+    int managerRequests = 0;
+    QObject::connect(&player, &PreviewPlayer::returnToManagerRequested, [&]() { ++managerRequests; });
+    const size_t keyCount = keys.size();
+    player.closeToManager();
+    if (managerRequests || stops) return 1;
+    player.setCloseOnBackGesture(true);
+    player.closeToManager();
+    player.closeToManager();
+    if (managerRequests != 1 || keys.size() != keyCount) return 1;
     if (stops != 1 || finished) return 1;
     runConfig.on_exit(runConfig.user, 0, "");
     app.processEvents();

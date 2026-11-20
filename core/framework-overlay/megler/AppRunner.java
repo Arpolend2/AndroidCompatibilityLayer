@@ -475,6 +475,7 @@ public final class AppRunner {
     }
     /** Context.startActivity: an activity of the app's own, or something the host can open (a web page, mail, the store). */
     public static void startActivity(Context from, Intent i, int request, Bundle opts) {
+        if (request < 0 && StorePhoenix.request(i)) return;
         // FLAG_ACTIVITY_FORWARD_RESULT: the activity started takes this one's place as its caller's, as on Android -- its result
         // goes to whoever started this one, which gives its own up. GmsCore's UnpackingRedirectActivity starts the sign-in so,
         // and finishes.

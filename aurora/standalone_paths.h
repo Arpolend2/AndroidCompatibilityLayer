@@ -14,6 +14,7 @@ struct StandalonePaths {
     QString theme;
     QString location;
     QStringList deniedPermissions;
+    bool fileDiagnostics = false;
 };
 
 bool standalonePaths(const QString &appId, const QString &executableName,

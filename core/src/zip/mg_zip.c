@@ -48,7 +48,8 @@ static int by_name(const void *a, const void *b)
     return strcmp(((const mg_zip_entry *)a)->name, ((const mg_zip_entry *)b)->name);
 }
 
-bool mg_zip_open(mg_zip *z, const char *path, char *err, size_t errlen)
+bool mg_zip_open_limited(mg_zip *z, const char *path, u32 max_entries, u64 max_directory,
+                         char *err, size_t errlen)
 {
     u8 *tail = NULL, *cd = NULL;
     const u8 *d;
@@ -94,7 +95,7 @@ bool mg_zip_open(mg_zip *z, const char *path, char *err, size_t errlen)
         cd_off = rd64(rec64 + 48);
     }
     (void)eocd;
-    if (!in_file(z, cd_off, cd_size) || total > 1000000 || cd_size > (256u << 20)) {
+    if (!in_file(z, cd_off, cd_size) || total > max_entries || cd_size > max_directory) {
         fail(err, errlen, "central directory outside the file");
         goto bad;
     }
@@ -160,6 +161,11 @@ bad:
     free(cd);
     mg_zip_close(z);
     return false;
+}
+
+bool mg_zip_open(mg_zip *z, const char *path, char *err, size_t errlen)
+{
+    return mg_zip_open_limited(z, path, 1000000, 256u << 20, err, errlen);
 }
 
 void mg_zip_close(mg_zip *z)

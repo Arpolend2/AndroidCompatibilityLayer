@@ -24,16 +24,25 @@ public:
     void stop();
     bool back();
     void setSurface(QQuickItem *surface, const QSize &pixels);
+    void setRemote(bool remote) { m_remote = remote; }
 
     QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
+
+signals:
+    void textCommitted(const QString &text);
+    void textKey(int key);
+    void keyboardClosed();
+    void keyboardHeight(int height);
 
 protected:
     void inputMethodEvent(QInputMethodEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
 
-private slots:
+public slots:
     void showKeyboard(int kind, int flags, int enter);
     void hideKeyboard();
+
+private slots:
     void visibilityChanged();
     void updateHeight();
 
@@ -43,6 +52,8 @@ private:
     void dismiss(bool notifyAndroid);
     void updateInputMethod();
     void sendKey(int key);
+    void commitText(const QString &text);
+    void sendHeight(int height);
 
     QPointer<QQuickItem> m_surface;
     QSize m_surfacePixels;
@@ -50,6 +61,7 @@ private:
     Qt::InputMethodHints m_hints;
     int m_enter = MEGLER_ENTER_DONE;
     bool m_active = false;
+    bool m_remote = false;
     bool m_requested = false;
     bool m_seenVisible = false;
     int m_lastHeight = -1;

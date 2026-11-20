@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include "../bionic/mg_bionic.h"
+#include "../dvm/mg_dvm.h"
 #include "../mg_core.h"
 #include "../host/mg_host.h"
 #include "../jni/mg_jni.h"
@@ -30,6 +31,7 @@
 #include "../ndk/mg_ndk.h"
 #include "../run/mg_run.h"
 #include "mg_driver.h"
+#include "mg_unity.h"
 
 #define PLAYER "com/unity3d/player/UnityPlayer"
 
@@ -417,6 +419,27 @@ static void dialog_text(mg_jcall *c)
     c->ret.l = mg_jni_ref(c->self);
 }
 
+static void player_load_library(mg_jcall *c)
+{
+    const char *name = c->args ? mg_jni_string(c->args[0].l) : NULL;
+    char *file;
+    size_t len;
+    if (!name || !name[0]) {
+        mg_warn("unity: loadLibrary requires a non-empty library name");
+        c->ret.z = false;
+        return;
+    }
+    len = strlen(name);
+    if (strchr(name, '/') || (len >= 3 && !strcmp(name + len - 3, ".so"))) {
+        c->ret.z = mg_dvm_load_library(name);
+        return;
+    }
+    file = mg_sprintf("lib%s.so", name);
+    c->ret.z = mg_dvm_load_library(file);
+    if (c->ret.z) mg_info("unity: Java-aware library load succeeded: %s", file);
+    free(file);
+}
+
 static const mg_jhle g_unity[] = {
     /* What the engine asks the player object itself. */
     { PLAYER, "getContext", NULL, player_getContext },
@@ -447,7 +470,7 @@ static const mg_jhle g_unity[] = {
     { PLAYER, "initializeGoogleVr", NULL, ret_false },
     /* Android 13's game state hints (GameManager): none on the Android 9 the engine is told it runs on. */
     { PLAYER, "shouldSetGameState", NULL, ret_false },
-    { PLAYER, "loadLibrary", NULL, ret_true },
+    { PLAYER, "loadLibrary", "(Ljava/lang/String;)Z", player_load_library },
     { PLAYER, "getLaunchURL", NULL, ret_null },
     { PLAYER, "getClipboardText", NULL, ret_null },
     { PLAYER, "setClipboardText", NULL, ret_void },
@@ -460,6 +483,11 @@ static const mg_jhle g_unity[] = {
     { "android/app/AlertDialog$Builder", "show", NULL, ret_self },
     { NULL, NULL, NULL, NULL },
 };
+
+void mg_unity_register_jni(void)
+{
+    mg_jni_register(g_unity);
+}
 
 /* ------------------------------------------- what the engine asks of Android
  *
@@ -1240,7 +1268,7 @@ static bool un_start(const megler_run_config *config, const mg_apk_info *info)
     mg_jni_class(PLAYER, "android/widget/FrameLayout");
     mg_jni_class(k_players[1], PLAYER);
     mg_jni_class(k_players[2], PLAYER);
-    mg_jni_register(g_unity);
+    mg_unity_register_jni();
     mg_jni_class("android/view/InputEvent", "java/lang/Object");
     mg_jni_class(MOTION, "android/view/InputEvent");
     mg_jni_class(KEY, "android/view/InputEvent");

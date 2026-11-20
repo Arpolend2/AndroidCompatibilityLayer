@@ -11,10 +11,12 @@ var newFrame = false
 var canBack = true
 var failures = []
 var playerMock = {
+    closeOnBackGesture: false,
     gestureBack: function() { ++backs; newFrame = false; return canBack },
     hasFrameAfterGestureBack: function() { return newFrame },
     endGestureFrameWait: function() {},
-    close: function() { ++closes }
+    close: function() { ++closes },
+    closeToManager: function() { ++closes }
 }
 var timerMock = {
     running: false,
@@ -187,4 +189,27 @@ update()
 check(base.navigationError && failures.length === 2 && failures[1] === "startup",
       "preview creation failure must report queued picker and expose close")
 check(pick(picker, {}, proxy) === null, "failed preview must reject picker")
+
+source = fs.OpenTextFile(WScript.Arguments(0), 1)
+eval(source.ReadAll())
+source.Close()
+base.status = 1
+base.navigationError = false
+guest.status = 0
+stackMock.busy = false
+stackMock.currentPage = base
+playerMock.closeOnBackGesture = true
+var backsBeforeMicrog = backs
+initialize(stackMock, base, component, playerMock, hostMock, 2, 1, timerMock)
+update()
+guestReady()
+stackMock.busy = true
+update()
+guestReady()
+check(closes === 0 && backs === backsBeforeMicrog, "cancelled microG gesture must not close")
+backFinished()
+check(closes === 1 && backs === backsBeforeMicrog && !timerMock.running,
+      "microG gesture must close without sending Android Back")
+backFinished()
+check(closes === 1, "closing microG must happen once")
 WScript.Echo("preview navigation tests passed")

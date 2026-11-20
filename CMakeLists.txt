@@ -3,9 +3,14 @@ project(AndroidCompatibilityLayer LANGUAGES C CXX)
 
 option(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL "Enable experimental native EGL/GLES rendering" OFF)
 option(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION "Enable experimental native-window GPU presentation" OFF)
+option(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS "Enable experimental GPU rendering for Android Canvas" OFF)
 option(ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS "Generate optional test targets" ON)
+option(ANDROID_COMPATIBILITY_LAYER_BUILD_WEBVIEW_PROBE "Build the native Aurora WebView diagnostic" OFF)
 if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION AND NOT ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL)
     message(FATAL_ERROR "GPU composition requires ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL")
+endif()
+if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS AND NOT ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION)
+    message(FATAL_ERROR "GPU Canvas requires ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION")
 endif()
 
 set(APP_ID ru.androidcompatibilitylayer.appmanager)
@@ -52,12 +57,16 @@ add_executable(${APP_ID}
     aurora/diagnostic_log.h
     aurora/error_log.cpp
     aurora/error_log.h
+    aurora/memory_log_bus.cpp
+    aurora/memory_log_bus.h
     aurora/side_mouse_buttons.cpp
     aurora/side_mouse_buttons.h
     aurora/preview_activation_channel.cpp
     aurora/preview_activation_channel.h
     aurora/apk_store.cpp
     aurora/apk_store.h
+    aurora/library_app_index.cpp
+    aurora/library_app_index.h
     aurora/apk_bundle_install.cpp
     aurora/apk_bundle_install.h
     aurora/audio_output.cpp
@@ -102,6 +111,10 @@ add_executable(${APP_ID}
     aurora/install_request_host.h
     aurora/standalone_apk_export.cpp
     aurora/standalone_apk_export.h
+    aurora/standalone_start.cpp
+    aurora/standalone_start.h
+    aurora/standalone_app_mapping.cpp
+    aurora/standalone_app_mapping.h
     aurora/install_request_candidate.cpp
     aurora/install_request_candidate.h
     aurora/install_request_prepare.cpp
@@ -122,8 +135,16 @@ add_executable(${APP_ID}
     aurora/microg_install.h
     aurora/external_apk_receiver.cpp
     aurora/external_apk_receiver.h
+    aurora/manager_lifecycle.cpp
+    aurora/manager_lifecycle.h
+    aurora/shared_microg_ipc.cpp
+    aurora/shared_microg_ipc.h
     aurora/preview.cpp
     aurora/preview.h
+    aurora/embedded_preview.cpp
+    aurora/embedded_preview.h
+    aurora/store_preview_supervisor.cpp
+    aurora/store_preview_supervisor.h
     aurora/preview_viewport.h
     aurora/preview_text.cpp
     aurora/preview_text.h
@@ -159,10 +180,15 @@ endif()
 if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION)
     pkg_check_modules(EGL REQUIRED egl)
     pkg_check_modules(GLES2 REQUIRED glesv2)
-    target_sources(${APP_ID} PRIVATE aurora/egl_frame_transport.c aurora/preview_gpu.cpp aurora/preview_gpu.h)
+    target_sources(${APP_ID} PRIVATE aurora/egl_frame_transport.c aurora/preview_gpu.cpp aurora/preview_gpu.h
+        aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h)
     target_compile_definitions(${APP_ID} PRIVATE MG_EXPERIMENTAL_GPU_COMPOSITION)
     target_include_directories(${APP_ID} PRIVATE ${EGL_INCLUDE_DIRS} ${GLES2_INCLUDE_DIRS})
     target_link_libraries(${APP_ID} PRIVATE ${EGL_LDFLAGS} ${GLES2_LDFLAGS})
+endif()
+if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS)
+    target_sources(${APP_ID} PRIVATE aurora/preview_gpu_canvas.cpp aurora/preview_gpu_canvas.h)
+    target_compile_definitions(${APP_ID} PRIVATE MG_EXPERIMENTAL_GPU_CANVAS)
 endif()
 target_link_libraries(${APP_ID} PRIVATE
     Qt5::Quick Qt5::Multimedia Qt5::Sensors Qt5::Network Qt5::DBus Qt5::Positioning
@@ -170,6 +196,13 @@ target_link_libraries(${APP_ID} PRIVATE
 )
 
 if(ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS)
+if(ANDROID_COMPATIBILITY_LAYER_BUILD_WEBVIEW_PROBE)
+    pkg_check_modules(AURORA_WEBVIEW REQUIRED aurorawebview)
+    add_executable(android_compatibility_layer_webview_native_probe EXCLUDE_FROM_ALL aurora/tests/webview_native_probe.cpp)
+    set_property(TARGET android_compatibility_layer_webview_native_probe PROPERTY CXX_STANDARD 17)
+    target_include_directories(android_compatibility_layer_webview_native_probe PRIVATE ${AURORA_WEBVIEW_INCLUDE_DIRS})
+    target_link_libraries(android_compatibility_layer_webview_native_probe PRIVATE Qt5::Quick ${AURORA_WEBVIEW_LDFLAGS})
+endif()
 add_executable(android_compatibility_layer_rpm_icon_test EXCLUDE_FROM_ALL aurora/tests/rpm_icon_test.cpp aurora/rpm_icon.cpp)
 target_link_libraries(android_compatibility_layer_rpm_icon_test PRIVATE Qt5::Gui)
 add_executable(android_compatibility_layer_rpm_stream_test EXCLUDE_FROM_ALL aurora/tests/rpm_stream_test.cpp aurora/rpm_writer.cpp)
@@ -196,20 +229,56 @@ add_executable(android_compatibility_layer_native_egl_image_test EXCLUDE_FROM_AL
     tools/native-egl-image-test.c aurora/egl_frame_transport.c)
 target_link_libraries(android_compatibility_layer_native_egl_image_test PRIVATE EGL GLESv2)
 add_executable(android_compatibility_layer_preview_gpu_order_test EXCLUDE_FROM_ALL aurora/tests/preview_gpu_order_test.cpp)
+if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION)
+    add_executable(android_compatibility_layer_preview_gpu_state_test EXCLUDE_FROM_ALL
+        aurora/tests/preview_gpu_state_test.cpp aurora/preview_gpu.cpp aurora/preview_gpu.h
+        aurora/egl_frame_transport.c)
+    target_include_directories(android_compatibility_layer_preview_gpu_state_test PRIVATE ${EGL_INCLUDE_DIRS} ${GLES2_INCLUDE_DIRS})
+    target_link_libraries(android_compatibility_layer_preview_gpu_state_test PRIVATE Qt5::Quick ${EGL_LDFLAGS} ${GLES2_LDFLAGS} pthread)
+    add_executable(android_compatibility_layer_embedded_gpu_transport_test EXCLUDE_FROM_ALL
+        aurora/tests/embedded_gpu_transport_test.cpp aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h)
+    target_link_libraries(android_compatibility_layer_embedded_gpu_transport_test PRIVATE
+        Qt5::Core ${EGL_LDFLAGS} ${GLES2_LDFLAGS} pthread)
+    add_executable(android_compatibility_layer_embedded_gpu_import_test EXCLUDE_FROM_ALL
+        aurora/tests/embedded_gpu_import_test.cpp aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h)
+    target_link_libraries(android_compatibility_layer_embedded_gpu_import_test PRIVATE
+        Qt5::Core ${EGL_LDFLAGS} ${GLES2_LDFLAGS} pthread)
+endif()
 add_executable(android_compatibility_layer_gl_native_test EXCLUDE_FROM_ALL tools/gl-native-test-main.c ${CORE_SOURCES} ${TEST_SOURCES} ${ZLIB_SOURCES})
 target_include_directories(android_compatibility_layer_gl_native_test PRIVATE core/third_party/zlib)
 target_compile_definitions(android_compatibility_layer_gl_native_test PRIVATE _GNU_SOURCE)
 target_link_libraries(android_compatibility_layer_gl_native_test PRIVATE m pthread dl)
 
+add_executable(android_compatibility_layer_gfx_native_test EXCLUDE_FROM_ALL tools/gfx-native-test-main.c ${CORE_SOURCES} ${TEST_SOURCES} ${ZLIB_SOURCES})
+target_include_directories(android_compatibility_layer_gfx_native_test PRIVATE core/third_party/zlib)
+target_compile_definitions(android_compatibility_layer_gfx_native_test PRIVATE _GNU_SOURCE)
+target_link_libraries(android_compatibility_layer_gfx_native_test PRIVATE m pthread dl)
+if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS)
+    pkg_check_modules(GPU_CANVAS_TEST_GLES2 REQUIRED glesv2)
+    add_executable(android_compatibility_layer_gpu_canvas_test EXCLUDE_FROM_ALL
+        aurora/tests/preview_gpu_canvas_test.cpp
+        aurora/preview_gpu_canvas.cpp
+        core/tests/mg_gfx_standin.c
+        ${CORE_SOURCES}
+        ${ZLIB_SOURCES}
+    )
+    target_include_directories(android_compatibility_layer_gpu_canvas_test PRIVATE core/third_party/zlib)
+    target_compile_definitions(android_compatibility_layer_gpu_canvas_test PRIVATE _GNU_SOURCE MEGLER_NO_EMBEDDED_TESTS)
+    target_link_libraries(android_compatibility_layer_gpu_canvas_test PRIVATE Qt5::Gui ${GPU_CANVAS_TEST_GLES2_LDFLAGS} m pthread dl)
+endif()
+
 add_library(jni_load_fixture SHARED EXCLUDE_FROM_ALL aurora/tests/jni_load_fixture.c)
 add_library(jni_load_failure SHARED EXCLUDE_FROM_ALL aurora/tests/jni_load_fixture.c)
+add_library(jni_unity_load_fixture SHARED EXCLUDE_FROM_ALL aurora/tests/jni_load_fixture.c)
 target_compile_definitions(jni_load_failure PRIVATE JNI_LOAD_FAILURE)
-set_target_properties(jni_load_fixture jni_load_failure PROPERTIES LINK_FLAGS "-nostdlib")
+target_compile_definitions(jni_unity_load_fixture PRIVATE JNI_LOAD_NO_WAIT)
+set_target_properties(jni_unity_load_fixture PROPERTIES OUTPUT_NAME "FirebaseCppApp-13_6_0")
+set_target_properties(jni_load_fixture jni_load_failure jni_unity_load_fixture PROPERTIES LINK_FLAGS "-nostdlib")
 add_executable(android_compatibility_layer_jni_load_test EXCLUDE_FROM_ALL aurora/tests/jni_load_test.c ${CORE_SOURCES} ${ZLIB_SOURCES})
 target_include_directories(android_compatibility_layer_jni_load_test PRIVATE core/third_party/zlib)
 target_compile_definitions(android_compatibility_layer_jni_load_test PRIVATE _GNU_SOURCE MEGLER_NO_EMBEDDED_TESTS)
 target_link_libraries(android_compatibility_layer_jni_load_test PRIVATE m pthread dl)
-add_dependencies(android_compatibility_layer_jni_load_test jni_load_fixture jni_load_failure)
+add_dependencies(android_compatibility_layer_jni_load_test jni_load_fixture jni_load_failure jni_unity_load_fixture)
 
 add_executable(android_compatibility_layer_network_host_test EXCLUDE_FROM_ALL
     aurora/tests/network_host_test.cpp aurora/network_host.cpp)
@@ -289,6 +358,13 @@ add_executable(android_compatibility_layer_app_cache_clear_test EXCLUDE_FROM_ALL
 target_link_libraries(android_compatibility_layer_app_cache_clear_test PRIVATE Qt5::Core)
 
 add_executable(android_compatibility_layer_google_services_runtime_test EXCLUDE_FROM_ALL aurora/tests/google_services_runtime_test.cpp)
+add_executable(android_compatibility_layer_manager_lifecycle_test EXCLUDE_FROM_ALL
+    aurora/tests/manager_lifecycle_test.cpp
+    aurora/manager_lifecycle.cpp aurora/manager_lifecycle.h
+    aurora/external_apk_receiver.cpp aurora/external_apk_receiver.h
+    aurora/external_apk_path.cpp aurora/shared_microg_ipc.cpp)
+target_include_directories(android_compatibility_layer_manager_lifecycle_test PRIVATE ${RUNTIME_MANAGER_INCLUDE_DIRS})
+target_link_libraries(android_compatibility_layer_manager_lifecycle_test PRIVATE Qt5::Core Qt5::DBus ${RUNTIME_MANAGER_LDFLAGS})
 target_link_libraries(android_compatibility_layer_google_services_runtime_test PRIVATE Qt5::Core)
 
 add_executable(android_compatibility_layer_official_store_release_test EXCLUDE_FROM_ALL
@@ -319,9 +395,14 @@ target_link_libraries(android_compatibility_layer_log_channel_test PRIVATE Qt5::
 
 add_executable(android_compatibility_layer_error_log_test EXCLUDE_FROM_ALL
     aurora/tests/error_log_test.cpp aurora/error_log.cpp aurora/error_log.h
+    aurora/memory_log_bus.cpp aurora/memory_log_bus.h
     aurora/diagnostic_log.cpp aurora/diagnostic_log.h)
 target_compile_definitions(android_compatibility_layer_error_log_test PRIVATE _GNU_SOURCE)
-target_link_libraries(android_compatibility_layer_error_log_test PRIVATE Qt5::Core pthread)
+target_link_libraries(android_compatibility_layer_error_log_test PRIVATE Qt5::Core Qt5::DBus pthread)
+
+add_executable(android_compatibility_layer_memory_log_bus_test EXCLUDE_FROM_ALL
+    aurora/tests/memory_log_bus_test.cpp aurora/memory_log_bus.cpp aurora/memory_log_bus.h)
+target_link_libraries(android_compatibility_layer_memory_log_bus_test PRIVATE Qt5::Core Qt5::DBus)
 
 add_executable(android_compatibility_layer_preview_activation_channel_test EXCLUDE_FROM_ALL
     aurora/tests/preview_activation_channel_test.cpp
@@ -355,6 +436,7 @@ add_executable(android_compatibility_layer_audio_preview_codec_test EXCLUDE_FROM
     aurora/preview.cpp
     aurora/preview.h
     aurora/error_log.cpp aurora/error_log.h
+    aurora/memory_log_bus.cpp aurora/memory_log_bus.h
     aurora/shared_folders.cpp
     aurora/shared_folders.h
     aurora/audio_mp3_codec.cpp
@@ -363,6 +445,43 @@ add_executable(android_compatibility_layer_audio_preview_codec_test EXCLUDE_FROM
     aurora/log_channel.h
 )
 target_link_libraries(android_compatibility_layer_audio_preview_codec_test PRIVATE Qt5::Quick Qt5::Multimedia Qt5::Network Qt5::DBus pthread)
+
+set(EMBEDDED_PREVIEW_TEST_SOURCES
+    aurora/tests/embedded_preview_test.cpp
+    aurora/embedded_preview.cpp aurora/embedded_preview.h
+    aurora/preview.cpp aurora/preview.h
+    aurora/preview_keyboard.cpp aurora/preview_keyboard.h
+    aurora/picker_host.cpp aurora/picker_host.h
+    aurora/error_log.cpp aurora/error_log.h
+    aurora/memory_log_bus.cpp aurora/memory_log_bus.h
+    aurora/shared_folders.cpp aurora/shared_folders.h
+    aurora/preview_image.cpp aurora/audio_mp3_codec.cpp
+    aurora/media_mp3_host.cpp aurora/log_channel.cpp aurora/log_channel.h
+    aurora/store_preview_supervisor.cpp aurora/store_preview_supervisor.h
+    core/src/drivers/mg_store_restart.c)
+add_executable(android_compatibility_layer_embedded_preview_test EXCLUDE_FROM_ALL
+    ${EMBEDDED_PREVIEW_TEST_SOURCES})
+target_compile_definitions(android_compatibility_layer_embedded_preview_test PRIVATE _GNU_SOURCE)
+target_link_libraries(android_compatibility_layer_embedded_preview_test PRIVATE Qt5::Quick Qt5::Multimedia Qt5::Network Qt5::DBus pthread)
+
+if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS)
+    add_executable(android_compatibility_layer_embedded_preview_gpu_test EXCLUDE_FROM_ALL
+        ${EMBEDDED_PREVIEW_TEST_SOURCES}
+        aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h
+        aurora/preview_gpu.cpp aurora/preview_gpu.h
+        aurora/preview_gpu_canvas.cpp aurora/preview_gpu_canvas.h
+        aurora/egl_frame_transport.c)
+    target_compile_definitions(android_compatibility_layer_embedded_preview_gpu_test PRIVATE
+        _GNU_SOURCE MG_EXPERIMENTAL_GPU_COMPOSITION MG_EXPERIMENTAL_GPU_CANVAS)
+    target_include_directories(android_compatibility_layer_embedded_preview_gpu_test PRIVATE ${EGL_INCLUDE_DIRS} ${GLES2_INCLUDE_DIRS})
+    target_link_libraries(android_compatibility_layer_embedded_preview_gpu_test PRIVATE
+        Qt5::Quick Qt5::Multimedia Qt5::Network Qt5::DBus ${EGL_LDFLAGS} ${GLES2_LDFLAGS} pthread)
+endif()
+
+add_executable(android_compatibility_layer_embedded_preview_silica_test EXCLUDE_FROM_ALL
+    aurora/tests/embedded_preview_silica_test.cpp
+    aurora/tests/embedded_preview_silica_test.qml)
+target_link_libraries(android_compatibility_layer_embedded_preview_silica_test PRIVATE Qt5::Quick)
 
 add_executable(android_compatibility_layer_audio_mixer_path_test EXCLUDE_FROM_ALL
     aurora/tests/audio_mixer_path_test.cpp
@@ -413,17 +532,20 @@ target_link_libraries(android_compatibility_layer_install_request_host_test PRIV
 
 add_executable(android_compatibility_layer_standalone_apk_export_test EXCLUDE_FROM_ALL
     aurora/tests/standalone_apk_export_test.cpp
+    aurora/library_app_index.cpp aurora/library_app_index.h
+    aurora/standalone_app_mapping.cpp aurora/standalone_app_mapping.h
     aurora/standalone_apk_export.cpp aurora/standalone_apk_export.h
     aurora/external_apk_install.cpp aurora/external_apk_install.h aurora/external_apk_path.cpp
     aurora/install_request_candidate.cpp aurora/install_request_prepare.cpp aurora/install_request_prepare.h
     aurora/install_request_snapshot.cpp aurora/install_request_commit.cpp)
-target_link_libraries(android_compatibility_layer_standalone_apk_export_test PRIVATE Qt5::Gui)
+target_link_libraries(android_compatibility_layer_standalone_apk_export_test PRIVATE Qt5::Gui Qt5::DBus)
 
 add_executable(android_compatibility_layer_preview_sessions_test EXCLUDE_FROM_ALL
     aurora/tests/preview_sessions_test.cpp
     aurora/preview_sessions.cpp aurora/preview_sessions.h
     aurora/diagnostic_log.cpp aurora/diagnostic_log.h
     aurora/error_log.cpp aurora/error_log.h
+    aurora/memory_log_bus.cpp aurora/memory_log_bus.h
     aurora/preview_activation_channel.cpp aurora/preview_activation_channel.h
     aurora/log_channel.cpp aurora/log_channel.h
     aurora/install_request_channel.cpp aurora/install_request_channel.h
@@ -432,7 +554,7 @@ add_executable(android_compatibility_layer_preview_sessions_test EXCLUDE_FROM_AL
     aurora/install_request_snapshot.cpp aurora/install_request_commit.cpp
     aurora/install_request_coordinator.cpp aurora/install_request_coordinator.h)
 target_compile_definitions(android_compatibility_layer_preview_sessions_test PRIVATE _GNU_SOURCE)
-target_link_libraries(android_compatibility_layer_preview_sessions_test PRIVATE Qt5::Network Qt5::Gui)
+target_link_libraries(android_compatibility_layer_preview_sessions_test PRIVATE Qt5::Network Qt5::Gui Qt5::DBus)
 
 if(NOT CMAKE_CROSSCOMPILING)
     add_executable(android_compatibility_layer_probe_multitask_test EXCLUDE_FROM_ALL
@@ -445,6 +567,7 @@ if(NOT CMAKE_CROSSCOMPILING)
         aurora/external_apk_path.cpp aurora/preview_sessions.cpp aurora/preview_sessions.h
         aurora/diagnostic_log.cpp aurora/diagnostic_log.h
         aurora/error_log.cpp aurora/error_log.h
+        aurora/memory_log_bus.cpp aurora/memory_log_bus.h
         aurora/preview_activation_channel.cpp aurora/preview_activation_channel.h
         aurora/log_channel.cpp aurora/log_channel.h
         aurora/install_request_channel.cpp aurora/install_request_channel.h
@@ -454,7 +577,7 @@ if(NOT CMAKE_CROSSCOMPILING)
         aurora/install_request_coordinator.cpp aurora/install_request_coordinator.h
         aurora/rpm_writer.cpp aurora/rpm_signers.cpp aurora/rpm_icon.cpp)
     target_compile_definitions(android_compatibility_layer_probe_multitask_test PRIVATE _GNU_SOURCE)
-    target_link_libraries(android_compatibility_layer_probe_multitask_test PRIVATE Qt5::Quick Qt5::Network ${CMAKE_DL_LIBS})
+    target_link_libraries(android_compatibility_layer_probe_multitask_test PRIVATE Qt5::Quick Qt5::Network Qt5::DBus ${CMAKE_DL_LIBS})
 endif()
 
 add_executable(android_compatibility_layer_install_request_commit_test EXCLUDE_FROM_ALL

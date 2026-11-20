@@ -82,7 +82,8 @@ void addBytes(std::vector<RpmWriter::StreamFile> *files, const QString &path, co
 bool RpmStandalone::createUnsigned(const QString &package, const QString &label, const QImage &icon,
                                    const QString &storeRoot, const QString &runtimeRoot,
                                    const QString &qmlRoot, const QString &executable,
-                                   const QString &outputDirectory, QString *output, QString *error)
+                                   const QString &outputDirectory, QString *output, QString *error,
+                                   bool fileDiagnostics)
 {
     if (output) output->clear();
     if (error) error->clear();
@@ -161,6 +162,7 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     title = title.left(512);
     QJsonObject metadata;
     metadata.insert(QStringLiteral("appId"), appId);
+    metadata.insert(QStringLiteral("fileDiagnostics"), fileDiagnostics);
     metadata.insert(QStringLiteral("package"), package);
     metadata.insert(QStringLiteral("displayName"), title);
     metadata.insert(QStringLiteral("locale"), RuntimeSettings::selectedLocale());
@@ -181,6 +183,8 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     QStringList osPermissions;
     if (requests("INTERNET")) osPermissions << QStringLiteral("Internet");
     osPermissions << QStringLiteral("Audio");
+    osPermissions << QStringLiteral("ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager");
+    osPermissions << QStringLiteral("ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager");
     if (allowedGroups.contains(QStringLiteral("camera"))) osPermissions << QStringLiteral("Camera");
     if (allowedGroups.contains(QStringLiteral("nearby_devices")) &&
         (requests("BLUETOOTH") || requests("BLUETOOTH_ADMIN") || requests("BLUETOOTH_SCAN") ||
@@ -203,6 +207,8 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
         }
         if (allowedGroups.contains(QStringLiteral("read_media_aural"))) osPermissions << QStringLiteral("Music");
     }
+    if (fileDiagnostics && !osPermissions.contains(QStringLiteral("UserDirs")))
+        osPermissions << QStringLiteral("Documents");
     const QString desktop = QStringLiteral(
         "[Desktop Entry]\nType=Application\nX-Nemo-Application-Type=silica-qt5\n"
         "Icon=%1\nExec=%2 --standalone\nName=%3\n\n[X-Application]\n"

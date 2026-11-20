@@ -49,6 +49,11 @@ function update() {
             }
         } else if (armed) {
             armed = false
+            if (player.closeOnBackGesture) {
+                shutdown()
+                player.closeToManager()
+                return
+            }
             waitingForFrame = true
             frameTimer.restart()
             if (!player.gestureBack() || pendingPicker)

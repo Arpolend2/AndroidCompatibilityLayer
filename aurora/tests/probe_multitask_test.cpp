@@ -2,8 +2,12 @@
 #include "../../core/src/apk/mg_apk.h"
 
 #include <QEventLoop>
+#include <QCryptographicHash>
 #include <QFile>
 #include <QGuiApplication>
+#include <QQmlComponent>
+#include <QQmlContext>
+#include <QQmlEngine>
 #include <QSet>
 #include <QTemporaryDir>
 #include <QThread>
@@ -30,6 +34,7 @@ extern "C" bool mg_apk_read_info(const char *path, mg_apk_info *info)
                           input == "external1" ? "org.install.external1" :
                           input == "external2" ? "org.install.external2" :
                           input == "external3" ? "org.install.external3" :
+                          input == "external4" ? "org.install.external4" :
                           input == "microg" ? "com.google.android.gms" :
                           input == "store" || input == "store2" ? "com.aurora.store" : nullptr;
     if (!package) return false;
@@ -49,7 +54,22 @@ extern "C" bool mg_apk_gms_name(const char *package)
 }
 
 static int reportCalls = 0;
-extern "C" char *megler_apk_report(const char *) { ++reportCalls; return nullptr; }
+static bool libraryReportTest = false;
+extern "C" char *megler_apk_report(const char *path)
+{
+    ++reportCalls;
+    if (!libraryReportTest) return nullptr;
+    QFile file(QString::fromUtf8(path));
+    if (!file.open(QIODevice::ReadOnly)) return nullptr;
+    const QByteArray contents = file.readAll();
+    const char *package = contents == "external" ? "org.install.external" :
+                          contents == "external1" ? "org.install.external1" :
+                          contents == "external2" ? "org.install.external2" : nullptr;
+    if (!package) return nullptr;
+    const QByteArray json = QByteArray("{\"ok\":true,\"runnable\":true,\"package\":\"") + package +
+                            "\",\"label\":\"Example\"}";
+    return ::strdup(json.constData());
+}
 extern "C" bool megler_apk_icon(const char *, uint8_t **, size_t *) { return false; }
 extern "C" char *megler_apk_report_splits(const char *, const char *) { return nullptr; }
 extern "C" bool megler_apk_icon_splits(const char *, const char *, uint8_t **, size_t *) { return false; }
@@ -70,15 +90,17 @@ int main(int argc, char **argv)
     const bool rpmProgressTest = argc == 2 && QByteArray(argv[1]) == "--rpm-progress-test";
     const bool microgLifecycleTest = argc == 2 && QByteArray(argv[1]) == "--microg-lifecycle-test";
     const bool reminderTest = argc == 2 && QByteArray(argv[1]) == "--signature-reminder-test";
-    if (argc == 1 || rpmGuardTest || rpmProgressTest || microgLifecycleTest || reminderTest)
+    const bool libraryRefreshTest = argc == 2 && QByteArray(argv[1]) == "--library-refresh-test";
+    if (argc == 1 || rpmGuardTest || rpmProgressTest || microgLifecycleTest || reminderTest || libraryRefreshTest)
         qputenv("XDG_DATA_HOME", QFile::encodeName(temporary.path()));
-    if (reminderTest)
+    if (argc == 1 || reminderTest || libraryRefreshTest)
         qputenv("XDG_CONFIG_HOME", QFile::encodeName(temporary.path()));
     QGuiApplication app(argc, argv);
     app.setQuitOnLastWindowClosed(false);
     app.setOrganizationName(QStringLiteral("org.test"));
     app.setApplicationName(QStringLiteral("multitask"));
-    if (argc == 3 && QByteArray(argv[1]) == "--build-standalone") {
+    if ((argc == 3 || argc == 4) && QByteArray(argv[1]) == "--build-standalone") {
+        if (argc == 4 && QByteArray(argv[3]) != "--file-diagnostics") return 2;
         std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:in", stderr);
         std::fflush(stderr);
         QThread::msleep(40);
@@ -90,7 +112,7 @@ int main(int argc, char **argv)
             std::fflush(stderr);
         }
         QThread::msleep(40);
-        std::fputs("test build failure", stderr);
+        std::fputs(argc == 4 ? "test build failure with file diagnostics" : "test build failure", stderr);
         std::puts("{\"ok\":false}");
         return 1;
     }
@@ -100,12 +122,143 @@ int main(int argc, char **argv)
         std::puts("{\"ok\":true,\"package\":\"org.install.bundle\",\"versionCode\":42}");
         return 0;
     }
+    if (argc == 10 && QByteArray(argv[1]) == "--unpack-store-bundle") {
+        QFile input(QString::fromLocal8Bit(argv[4]));
+        check(input.open(QIODevice::ReadOnly), "open store bundle snapshot");
+        writeFile(QString::fromLocal8Bit(argv[6]), input.readAll());
+        check(QDir().mkpath(QString::fromLocal8Bit(argv[7])), "create mock store splits");
+        std::puts("{\"ok\":true,\"package\":\"org.install.storebundle\",\"versionCode\":42}");
+        return 0;
+    }
     if (argc == 8 && QByteArray(argv[1]) == "--preview") {
         const QString data = QString::fromLocal8Bit(argv[3]);
         check(QDir().mkpath(data), "create preview data directory");
         writeFile(data + QStringLiteral("/started"), QByteArray(argv[4]));
         QTimer::singleShot(300, &app, &QCoreApplication::quit);
         return app.exec();
+    }
+
+    if (libraryRefreshTest) {
+        libraryReportTest = true;
+        Probe manager(QStringLiteral("/runtime"));
+        QStringList added;
+        QStringList rpmErrors;
+        QObject::connect(&manager, &Probe::libraryAppAddedNotice, &app,
+                         [&](const QString &package) { added.append(package); });
+        QObject::connect(&manager, &Probe::standaloneRpmError, &app,
+                         [&](const QString &package, const QString &) { rpmErrors.append(package); });
+        check(!manager.autoInstallRpm(), "automatic RPM installation defaults to off");
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("probe"), &manager);
+        QQmlComponent component(&engine);
+        component.setData("import QtQuick 2.0\nQtObject { property var apps: probe.installedApps; property int count: apps.length }",
+                          QUrl());
+        QObject *binding = component.create();
+        check(binding != nullptr, "create QML library binding");
+        check(binding->property("count").toInt() == 0, "library initially empty");
+        const QString apk = temporary.path() + QStringLiteral("/library.apk");
+        writeFile(apk, "external");
+        manager.installApk(apk);
+        check(binding->property("count").toInt() == 1, "first import updates QML library");
+        check(added == QStringList{QStringLiteral("org.install.external")} && !manager.standaloneRpmBusy(),
+              "successful import emits a notice without automatic RPM by default");
+        const int firstReadCalls = reportCalls;
+        manager.installedApps();
+        manager.installedApps();
+        check(reportCalls == firstReadCalls, "library metadata is cached after refresh");
+        writeFile(apk, "external1");
+        manager.installApk(apk);
+        check(binding->property("count").toInt() == 2, "second import updates QML library");
+        manager.installApk(apk);
+        check(added.size() == 2, "failed duplicate import emits no notice");
+        check(manager.removeApp(QStringLiteral("org.install.external")), "remove first app");
+        check(binding->property("count").toInt() == 1, "removal updates QML library");
+        writeFile(apk, "external");
+        QEventLoop wait;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        QObject::connect(&timeout, &QTimer::timeout, &wait, &QEventLoop::quit);
+        QObject::connect(&manager, &Probe::externalInstallBusyChanged, &wait, [&]() {
+            if (!manager.externalInstallBusy()) wait.quit();
+        });
+        manager.requestExternalInstall(apk);
+        check(manager.externalInstallBusy(), "external import started");
+        timeout.start(10000);
+        wait.exec();
+        check(timeout.isActive(), "external import timed out");
+        check(binding->property("count").toInt() == 2, "external import updates QML library");
+        check(added.last() == QStringLiteral("org.install.external"), "external import reports its package");
+        manager.setAutoInstallRpm(true);
+        check(manager.autoInstallRpm(), "automatic RPM setting saved");
+        {
+            Probe reloaded(QStringLiteral("/runtime"));
+            check(reloaded.autoInstallRpm(), "automatic RPM setting persists across instances");
+        }
+        writeFile(apk, "external2");
+        manager.installApk(apk);
+        check(added.last() == QStringLiteral("org.install.external2"), "direct import reports its package");
+        manager.installApk(apk);
+        check(added.size() == 4, "failed direct import does not queue RPM");
+        writeFile(apk, "external3");
+        manager.requestExternalInstall(apk);
+        if (manager.externalInstallBusy()) {
+            timeout.start(10000);
+            wait.exec();
+            check(timeout.isActive(), "automatic external import timed out");
+        }
+        check(added.last() == QStringLiteral("org.install.external3"), "automatic external import reports its package");
+        const QString bundle = temporary.path() + QStringLiteral("/test.xapk");
+        writeFile(bundle, "bundle");
+        manager.installApk(bundle);
+        if (manager.externalInstallBusy()) {
+            timeout.start(10000);
+            wait.exec();
+            check(timeout.isActive(), "bundle import timed out");
+        }
+        check(added.last() == QStringLiteral("org.install.bundle"), "bundle import reports its package");
+        writeFile(apk, "external4");
+        bool handoffFinished = false;
+        {
+            QEventLoop handoffWait;
+            QTimer handoffTimeout;
+            handoffTimeout.setSingleShot(true);
+            QObject::connect(&handoffTimeout, &QTimer::timeout, &handoffWait, &QEventLoop::quit);
+            QObject::connect(&manager, &Probe::storeHandoffFinished, &handoffWait,
+                             [&](bool retry, bool installed, const QByteArray &fingerprint) {
+                check(!retry && installed &&
+                      fingerprint == QCryptographicHash::hash(QByteArray("external4"), QCryptographicHash::Sha256).toHex(),
+                      "headless store import reports the actual snapshot");
+                handoffFinished = true;
+                handoffWait.quit();
+            });
+            QString error;
+            check(manager.requestStoreHandoff(apk, &error), "start headless automatic store import");
+            handoffTimeout.start(10000);
+            handoffWait.exec();
+            check(handoffFinished && handoffTimeout.isActive(), "headless store import completed");
+        }
+        check(added.last() == QStringLiteral("org.install.external4"),
+              "headless store import queues automatic RPM");
+        if (rpmErrors.size() < 4) {
+            QEventLoop rpmWait;
+            QTimer rpmTimeout;
+            rpmTimeout.setSingleShot(true);
+            QObject::connect(&rpmTimeout, &QTimer::timeout, &rpmWait, &QEventLoop::quit);
+            QObject::connect(&manager, &Probe::standaloneRpmError, &rpmWait,
+                             [&]() { if (rpmErrors.size() >= 4) rpmWait.quit(); });
+            rpmTimeout.start(10000);
+            rpmWait.exec();
+            check(rpmTimeout.isActive(), "automatic RPM queue timed out");
+        }
+        check(rpmErrors == (QStringList() << QStringLiteral("org.install.external2")
+                                         << QStringLiteral("org.install.external3")
+                                         << QStringLiteral("org.install.bundle")
+                                         << QStringLiteral("org.install.external4")),
+              "automatic RPM queue attempts each successful import and reports builder failures");
+        manager.setAutoInstallRpm(false);
+        check(!manager.autoInstallRpm(), "automatic RPM can be disabled");
+        delete binding;
+        return 0;
     }
 
     const QString store = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/apps");
@@ -159,9 +312,6 @@ int main(int argc, char **argv)
     const int firstReadCalls = reportCalls;
     probe.installedApps();
     check(firstReadCalls > 0 && reportCalls == firstReadCalls, "library metadata is cached");
-    emit probe.installedAppsChanged();
-    probe.installedApps();
-    check(reportCalls > firstReadCalls, "library cache invalidated on change");
     const QVariantMap permissionApp{
         {QStringLiteral("package"), QStringLiteral("org.example.runner1")},
         {QStringLiteral("permissions"), QVariantList{QStringLiteral("android.permission.CAMERA")}},
@@ -181,7 +331,6 @@ int main(int argc, char **argv)
           probe.metaObject()->indexOfMethod("setAlwaysInstallRpm(bool)") < 0 &&
           probe.metaObject()->indexOfMethod("installAsRpm(QString)") < 0,
           "obsolete automatic RPM interface removed");
-    emit probe.installedAppsChanged();
     QCoreApplication::processEvents();
     check(QSettings().value(QStringLiteral("rpm/alwaysInstall")).toBool(),
           "legacy preference preserved but ignored");
@@ -220,8 +369,19 @@ int main(int argc, char **argv)
               !probe.standaloneRpmOpened(), "builder diagnostic preserved on failure");
         check(errorCount == 1 && errorPackage == QStringLiteral("org.example.runner1") &&
               errorMessage == probe.standaloneRpmStatus(), "RPM error emitted once with the package and diagnostic");
+        check(!probe.standaloneRpmStatus().contains(QStringLiteral("with file diagnostics")),
+              "disabled detailed logging does not enable file diagnostics");
+        probe.setDetailedLogEnabled(true);
+        probe.installStandaloneRpm(QStringLiteral("org.example.runner1"));
+        check(probe.standaloneRpmBusy(), "diagnostic RPM builder started");
+        timeout.start(10000);
+        wait.exec();
+        check(timeout.isActive() &&
+              probe.standaloneRpmStatus().contains(QStringLiteral("with file diagnostics")),
+              "enabled detailed logging enables file diagnostics");
+        probe.setDetailedLogEnabled(false);
         probe.installStandaloneRpm(QStringLiteral("org.example.missing"));
-        check(errorCount == 2 && errorPackage == QStringLiteral("org.example.missing") &&
+        check(errorCount == 3 && errorPackage == QStringLiteral("org.example.missing") &&
               errorMessage == probe.standaloneRpmStatus(), "missing APK emits an RPM error");
         return 0;
     }
@@ -234,21 +394,11 @@ int main(int argc, char **argv)
     view.requestActivate();
     QCoreApplication::processEvents();
     check(view.isActive(), "controller active");
-    bool acceptStore = false;
-    bool storeUpdatePrompt = false;
+    const QString storeBundle = temporary.path() + QStringLiteral("/handoff.apks");
     int promptCount = 0;
     QObject::connect(&probe, &Probe::installConfirmationChanged, &app, [&]() {
         if (!probe.installConfirmationVisible()) return;
         ++promptCount;
-        const QString package = probe.installConfirmationPackage();
-        const QString token = probe.installConfirmationToken();
-        if (package == QLatin1String("com.aurora.store")) {
-            storeUpdatePrompt = probe.installConfirmationIsUpdate();
-            QTimer::singleShot(0, &probe, [&probe, token, &acceptStore]() {
-                probe.answerInstall(token, acceptStore);
-            });
-            return;
-        }
         check(false, "unexpected library import confirmation");
     });
     probe.runInstalled(QStringLiteral("org.example.runner1"));
@@ -266,7 +416,9 @@ int main(int argc, char **argv)
     check(probe.previewRunning() && probe.isAppRunning(QStringLiteral("__microg__")),
           "microG settings launch remains available");
     view.close();
-    check(view.isVisible(), "controller stays accessible while microG runs");
+    check(!view.isVisible() && probe.previewRunning(), "controller closes without stopping microG");
+    view.show();
+    check(view.isVisible(), "controller can be reopened while microG runs");
     QEventLoop microgLoop;
     QTimer poll;
     QObject::connect(&poll, &QTimer::timeout, &microgLoop, [&]() {
@@ -330,8 +482,72 @@ int main(int argc, char **argv)
     importBundle();
     check(promptCount == 0 && QFile::exists(bundleApk),
           "duplicate bundle does not replace the library entry");
+    const QString handoffApk = store + QStringLiteral("/org.install.storebundle/base.apk");
+    auto importStoreBundle = [&](bool expectedSuccess) {
+        writeFile(storeBundle, "original bundle");
+        QEventLoop wait;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        bool completed = false;
+        QObject::connect(&timeout, &QTimer::timeout, &wait, &QEventLoop::quit);
+        QObject::connect(&probe, &Probe::storeHandoffFinished, &wait,
+                         [&](bool retry, bool installed, const QByteArray &fingerprint) {
+            check(!retry, "store bundle does not retry");
+            check(installed == expectedSuccess, "store bundle status reflects import");
+            const QByteArray expected = expectedSuccess
+                ? QCryptographicHash::hash(QByteArray("original bundle"), QCryptographicHash::Sha256).toHex()
+                : QByteArray();
+            check(fingerprint == expected, "store bundle status identifies the immutable snapshot");
+            completed = true;
+            wait.quit();
+        });
+        QString error;
+        check(probe.requestStoreHandoff(storeBundle, &error), "start store bundle import");
+        timeout.start(15000);
+        wait.exec();
+        check(completed && timeout.isActive(), "store bundle import finished");
+    };
+    probe.setInstallUiReady(false);
+    importStoreBundle(true);
+    QFile importedHandoff(handoffApk);
+    check(promptCount == 0 && importedHandoff.open(QIODevice::ReadOnly) &&
+          importedHandoff.readAll() == "original bundle", "store bundle imported without confirmation UI");
+    check(!QFile::exists(store + QStringLiteral("/org.install.storebundle/.store-source.apks")),
+          "temporary store bundle is not retained in the library");
+    importStoreBundle(false);
+    check(promptCount == 0, "duplicate store bundle fails without a confirmation");
+    const QString storeSingle = temporary.path() + QStringLiteral("/handoff.apk");
+    writeFile(storeSingle, "external3");
+    {
+        QEventLoop wait;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        bool completed = false;
+        QObject::connect(&timeout, &QTimer::timeout, &wait, &QEventLoop::quit);
+        QObject::connect(&probe, &Probe::storeHandoffFinished, &wait,
+                         [&](bool retry, bool installed, const QByteArray &fingerprint) {
+            check(!retry && installed, "store APK import succeeds without confirmation UI");
+            check(fingerprint == QCryptographicHash::hash(QByteArray("external3"), QCryptographicHash::Sha256).toHex(),
+                  "store APK result identifies the imported snapshot");
+            completed = true;
+            wait.quit();
+        });
+        QString error;
+        check(probe.requestStoreHandoff(storeSingle, &error), "start store APK import");
+        timeout.start(15000);
+        wait.exec();
+        check(completed && timeout.isActive() && promptCount == 0 &&
+              QFile::exists(store + QStringLiteral("/org.install.external3/base.apk")),
+              "store APK added without confirmation");
+    }
     const QString storeInput = temporary.path() + QStringLiteral("/store.apk");
     const QString storeApk = store + QStringLiteral("/com.aurora.store/base.apk");
+    probe.setAutoInstallRpm(true);
+    check(probe.autoInstallRpm(), "automatic RPM is enabled while updating Aurora Store");
+    bool storeRpmRequested = false;
+    QObject::connect(&probe, &Probe::standaloneRpmChanged, &app, [&]() {
+        if (probe.standaloneRpmPackage() == QLatin1String("com.aurora.store")) storeRpmRequested = true;
+    });
     writeFile(storeInput, "store");
     auto updateStore = [&]() {
         QEventLoop wait;
@@ -347,24 +563,34 @@ int main(int argc, char **argv)
             wait.exec();
             check(timeout.isActive(), "store update timed out");
         }
+        QCoreApplication::processEvents();
+        check(!storeRpmRequested, "Aurora Store settings imports do not request a standalone RPM");
     };
-    acceptStore = true;
     updateStore();
     check(QFile::exists(storeApk) && promptCount == 0, "local store added without confirmation");
     probe.openOfficialStore();
-    check(!probe.previewRunning() && probe.officialStoreStatus().contains(QStringLiteral("standalone RPM")),
-          "installed store opens only through RPM");
+    check(probe.previewRunning() && probe.isAppRunning(QStringLiteral("com.aurora.store")),
+          "installed store starts in a separate preview process");
     const QString storeData = store + QStringLiteral("/com.aurora.store/data");
+    {
+        QEventLoop wait;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        QObject::connect(&timeout, &QTimer::timeout, &wait, &QEventLoop::quit);
+        QObject::connect(&probe, &Probe::previewRunningChanged, &wait, [&]() {
+            if (!probe.previewRunning()) wait.quit();
+        });
+        timeout.start(15000);
+        wait.exec();
+        check(timeout.isActive() && QFile::exists(storeData + QStringLiteral("/started")),
+              "store preview process receives the library data directory");
+    }
     check(QDir().mkpath(storeData), "create store data");
     writeFile(storeData + QStringLiteral("/saved"), "saved");
     writeFile(storeInput, "store2");
-    acceptStore = false;
     updateStore();
-    check(promptCount == 1 && storeUpdatePrompt && QFileInfo(storeApk).size() == 5, "declined store update preserves APK");
-    acceptStore = true;
-    updateStore();
-    check(promptCount == 2 && storeUpdatePrompt && QFileInfo(storeApk).size() == 6 &&
-          QFile::exists(storeData + QStringLiteral("/saved")), "store update preserves data");
+    check(promptCount == 0 && QFileInfo(storeApk).size() == 6 &&
+          QFile::exists(storeData + QStringLiteral("/saved")), "store update preserves data without confirmation");
     writeFile(storeInput, "external");
     updateStore();
     check(QFileInfo(storeApk).size() == 6 && !probe.officialStoreStatus().isEmpty(),

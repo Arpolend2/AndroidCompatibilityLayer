@@ -11,8 +11,9 @@ Column {
 
     function copyLog() {
         if (!canAct) return
-        Clipboard.text = logText
-        message = Clipboard.text === logText
+        var report = probe.diagnosticReport()
+        Clipboard.text = report
+        message = report.length > 0 && Clipboard.text === report
                 ? qsTr("Copied to clipboard.")
                 : qsTr("Could not copy to clipboard.")
     }
@@ -21,7 +22,7 @@ Column {
         if (!canAct) return
         message = ""
         if (shareLoader.status === Loader.Ready)
-            shareLoader.item.share(logText)
+            shareLoader.item.share(probe.diagnosticReport())
         else
             shareLoader.source = "LogShareAction.qml"
     }
@@ -45,7 +46,7 @@ Column {
         id: shareLoader
         onLoaded: {
             if (root.logAvailable && root.logText.length > 0)
-                item.share(root.logText)
+                item.share(probe.diagnosticReport())
         }
         onStatusChanged: {
             if (status === Loader.Error)

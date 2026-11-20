@@ -45,8 +45,8 @@ import java.util.concurrent.Executor;
  * the last of a capture's requests onCaptureSequenceCompleted. Focus follows CONTROL_AF_MODE and CONTROL_AF_TRIGGER and is
  * said in CONTROL_AF_STATE; exposure and white balance are the camera's, always CONVERGED; FLASH_MODE TORCH lights the torch.
  *
- * JPEG: a JPEG ImageReader gets, for a request that is not repeating, the stream's frame at the stream's size (not the reader's
- * or the sensor's), turned by JPEG_ORIENTATION, of JPEG_QUALITY, with no Exif or thumbnail.
+ * JPEG: an ImageReader receives a stream frame scaled to its requested size, turned by JPEG_ORIENTATION and encoded at
+ * JPEG_QUALITY, with no Exif or thumbnail. Scaling cannot add sensor detail.
  *
  * Not here: reprocessing, constrained high-speed and custom sessions (refused, onConfigureFailed), manual
  * sensor control, regions, zoom (the crop region is said back, the picture is the whole).
@@ -252,14 +252,20 @@ public final class MeglerCameraDevice extends CameraDevice {
 
     // ---------------------------------------------------------------- the stream
 
-    /** The size to stream at: a session's ImageReader's (the largest, if more than one), else the camera's nearest to 1280 x 720. */
+    /** Prefer a YUV reader's size, then a JPEG reader's, then the camera size nearest to 1280 x 720. */
     private Size wantedSize(Session s) {
         Size want = null;
         for (Surface o : s.outputs) {
             ImageReader r = o.meglerImageReader;
-            // A JPEG reader's size is the picture's, not the stream's: its pictures are made of the stream's frames.
             if (r == null || r.getImageFormat() == ImageFormat.JPEG) continue;
             if (want == null || (long) r.getWidth() * r.getHeight() > (long) want.getWidth() * want.getHeight()) want = new Size(r.getWidth(), r.getHeight());
+        }
+        if (want != null) return want;
+        for (Surface o : s.outputs) {
+            ImageReader r = o.meglerImageReader;
+            if (r != null && r.getImageFormat() == ImageFormat.JPEG &&
+                (want == null || (long) r.getWidth() * r.getHeight() > (long) want.getWidth() * want.getHeight()))
+                want = new Size(r.getWidth(), r.getHeight());
         }
         if (want != null) return want;
         Size best = mSizes[0];
@@ -392,9 +398,11 @@ public final class MeglerCameraDevice extends CameraDevice {
         int size = megler.CameraNative.frameSize(h), fw = size >>> 16, fh = size & 0xffff;
         for (Surface target : p.request.meglerTargets()) {
             try {
-                give(h, target, fw, fh, timestamp, p.request, p != s.repeating);
+                if (!give(h, target, fw, fh, timestamp, p.request) && p.callback != null)
+                    p.executor.execute(() -> q.callback.onCaptureBufferLost(ss, q.request, target, frame));
             } catch (RuntimeException e) {
                 Log.e(TAG, "camera " + mId + ": a picture could not be given to a surface", e);
+                if (p.callback != null) p.executor.execute(() -> q.callback.onCaptureBufferLost(ss, q.request, target, frame));
             }
         }
         final TotalCaptureResult result = result(p, frame, timestamp);
@@ -411,39 +419,38 @@ public final class MeglerCameraDevice extends CameraDevice {
         }
     }
 
-    /** One picture to one surface: an ImageReader's as NV21's bytes; any other as a picture turned upright. */
-    private void give(long h, Surface target, int fw, int fh, long timestamp, CaptureRequest request, boolean still) {
+    /** Give a frame to one surface; false reports a lost output buffer to the request callback. */
+    private boolean give(long h, Surface target, int fw, int fh, long timestamp, CaptureRequest request) {
         ImageReader reader = target.meglerImageReader;
         if (reader != null && reader.getImageFormat() == ImageFormat.JPEG) {
-            if (still) jpeg(h, reader, fw, fh, timestamp, request);
-            return;
+            return jpeg(h, reader, fw, fh, timestamp, request);
         }
         if (reader != null) {
             if (reader.getWidth() != fw || reader.getHeight() != fh) {
                 if (!mSaidSize) Log.w(TAG, "camera " + mId + " streams at " + fw + "x" + fh + "; an ImageReader of " + reader.getWidth() + "x" + reader.getHeight() + " gets no pictures");
                 mSaidSize = true;
-                return;
+                return false;
             }
             byte[] data = reader.meglerDequeue();
-            if (data == null) return;
+            if (data == null) return false;
             if (megler.CameraNative.copyFrame(h, data, ImageFormat.NV21) < 0) {
                 reader.meglerCancel(data);
-                return;
+                return false;
             }
             reader.meglerQueue(data, timestamp);
-            return;
+            return true;
         }
         android.view.SurfaceView view = target.meglerView;
         SurfaceTexture texture = target.meglerTexture;
         // A SurfaceView whose window has not yet shown the last picture is not given another: the window would draw only the latest.
-        if (view != null && !view.meglerFrameDrawn()) return;
+        if (view != null && !view.meglerFrameDrawn()) return true;
         boolean front = mInfo[0] == 1;
         int orientation = ((mInfo[1] % 360) + 360) % 360, rot = front ? (360 - orientation) % 360 : orientation;
-        if (fw <= 0 || fh <= 0) return;
+        if (fw <= 0 || fh <= 0) return false;
         int bw = rot % 180 == 0 ? fw : fh, bh = rot % 180 == 0 ? fh : fw;
         Bitmap b = mShown[mNext];
         if (b == null || b.getWidth() != bw || b.getHeight() != bh) b = mShown[mNext] = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
-        if (!megler.CameraNative.render(h, b, rot, front)) return;
+        if (!megler.CameraNative.render(h, b, rot, front)) return false;
         boolean posted = false;
         if (view != null) {
             posted = view.meglerPostBitmap(b);
@@ -460,37 +467,51 @@ public final class MeglerCameraDevice extends CameraDevice {
             }
         }
         if (posted) mNext ^= 1;
+        return true;
     }
 
     /**
-     * A still picture to a JPEG reader: the stream's frame at its size (not the reader's), turned by JPEG_ORIENTATION clockwise,
-     * written as a JPEG of JPEG_QUALITY with no Exif or thumbnail, on a thread of its own so that the stream goes on.
-     * Only a request that is not repeating gets one (a JPEG on every frame of a preview would be a slow stream).
+     * Encode on the camera thread to preserve request order and bound memory even for bursts or repeating JPEG requests.
      */
-    private void jpeg(long h, ImageReader reader, int fw, int fh, long timestamp, CaptureRequest request) {
+    private boolean jpeg(long h, ImageReader reader, int fw, int fh, long timestamp, CaptureRequest request) {
         Object o = request.get(CaptureRequest.JPEG_ORIENTATION), q = request.get(CaptureRequest.JPEG_QUALITY);
         int rot = o instanceof Integer ? (((Integer) o % 360) + 360) % 360 / 90 * 90 : 0;
         int quality = q instanceof Byte ? Math.max(1, Math.min(100, ((Byte) q) & 0xff)) : 95;
-        if (fw <= 0 || fh <= 0) return;
-        final Bitmap b = Bitmap.createBitmap(rot % 180 == 0 ? fw : fh, rot % 180 == 0 ? fh : fw, Bitmap.Config.ARGB_8888);
-        if (!megler.CameraNative.render(h, b, rot, false)) {
-            Log.e(TAG, "camera " + mId + ": the still picture could not be taken from the frame");
-            return;
+        if (fw <= 0 || fh <= 0) {
+            Log.e(TAG, "camera " + mId + ": no frame for JPEG");
+            return false;
         }
-        final int jq = quality;
-        Thread t = new Thread("Camera2 JPEG") {
-            @Override public void run() {
-                java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(256 * 1024);
-                try {
-                    if (b.compress(Bitmap.CompressFormat.JPEG, jq, out) && !reader.meglerQueueJpeg(out.toByteArray(), timestamp))
-                        Log.w(TAG, "camera " + mId + ": a JPEG picture was dropped (the reader is closed or has every image acquired)");
-                } catch (RuntimeException e) {
-                    Log.e(TAG, "camera " + mId + ": the JPEG could not be written", e);
-                }
+        boolean supported = false;
+        for (Size size : mSizes)
+            if (size.getWidth() == reader.getWidth() && size.getHeight() == reader.getHeight()) supported = true;
+        if (!supported) {
+            Log.e(TAG, "camera " + mId + ": unsupported JPEG size " + reader.getWidth() + "x" + reader.getHeight());
+            return false;
+        }
+        Bitmap frame = Bitmap.createBitmap(rot % 180 == 0 ? fw : fh, rot % 180 == 0 ? fh : fw, Bitmap.Config.ARGB_8888);
+        Bitmap scaled = null;
+        try {
+            if (!megler.CameraNative.render(h, frame, rot, false)) {
+                Log.e(TAG, "camera " + mId + ": the still picture could not be taken from the frame");
+                return false;
             }
-        };
-        t.setDaemon(true);
-        t.start();
+            int width = rot % 180 == 0 ? reader.getWidth() : reader.getHeight();
+            int height = rot % 180 == 0 ? reader.getHeight() : reader.getWidth();
+            scaled = Bitmap.createScaledBitmap(frame, width, height, true);
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(256 * 1024);
+            if (!scaled.compress(Bitmap.CompressFormat.JPEG, quality, out)) {
+                Log.e(TAG, "camera " + mId + ": JPEG encoding failed");
+                return false;
+            }
+            if (!reader.meglerQueueJpeg(out.toByteArray(), timestamp)) {
+                Log.w(TAG, "camera " + mId + ": JPEG reader could not accept the picture");
+                return false;
+            }
+            return true;
+        } finally {
+            if (scaled != null && scaled != frame) scaled.recycle();
+            frame.recycle();
+        }
     }
 
     /** The result of a picture: the request's values said back, and the picture's own. */

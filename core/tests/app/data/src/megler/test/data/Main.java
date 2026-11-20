@@ -389,6 +389,7 @@ public class Main extends Activity {
         textDrawables();
         pfdDup();
         pfdParcel();
+        providerPipe();
         themeSelfRef();
         queueNext();
         storageStats();
@@ -4723,6 +4724,21 @@ public class Main extends Activity {
         });
     }
 
+    private void providerPipe() {
+        step("provider-pipe", () -> {
+            android.net.Uri uri = android.net.Uri.parse("content://megler.test.sync/pipe");
+            try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
+                byte[] bytes = new byte[8];
+                long skipped = in.skip(2);
+                int count = 0;
+                for (int n; count < bytes.length && (n = in.read(bytes, count, bytes.length - count)) != -1;) count += n;
+                int end = in.read();
+                detail = "skipped=" + skipped + " read=" + count + " end=" + end;
+                return skipped == 2 && count == 4 && "pe!!".equals(new String(bytes, 0, count, "UTF-8")) && end == -1;
+            }
+        });
+    }
+
     /**
      * A ParcelFileDescriptor through a Parcel, as an AIDL stub passes one (microG's People service hands Play Store the
      * account's picture so): written with writeToParcel and read with CREATOR, it reads the file after the writer closed its own.
@@ -5117,6 +5133,15 @@ public class Main extends Activity {
         @Override public int update(android.net.Uri u, android.content.ContentValues v, String s, String[] a) { return 0; }
         /** "content://megler.test.sync/config": the file Main's step provider-client-file wrote, read-only (as Google Play services' Chimera configuration). */
         @Override public android.os.ParcelFileDescriptor openFile(android.net.Uri u, String mode) throws java.io.FileNotFoundException {
+            if ("/pipe".equals(u.getPath())) {
+                return openPipeHelper(u, "application/octet-stream", null, "pipe!!", (out, uri, mime, options, text) -> {
+                    try (java.io.OutputStream stream = new android.os.ParcelFileDescriptor.AutoCloseOutputStream(out)) {
+                        stream.write(text.getBytes("UTF-8"));
+                    } catch (java.io.IOException e) {
+                        android.util.Log.w("DataTest", "provider pipe write failed", e);
+                    }
+                });
+            }
             if (!"/config".equals(u.getPath())) throw new java.io.FileNotFoundException(String.valueOf(u));
             return android.os.ParcelFileDescriptor.open(new java.io.File(getContext().getFilesDir(), "provider-config"), android.os.ParcelFileDescriptor.MODE_READ_ONLY);
         }

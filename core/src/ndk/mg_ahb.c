@@ -83,8 +83,8 @@ bool mg_ahb_gl_format(const mg_ahb *b, u32 *format, u32 *type)
 {
     enum { RGBA = 0x1908, RGB = 0x1907, UNSIGNED_BYTE = 0x1401, UNSIGNED_SHORT_5_6_5 = 0x8363 };
     switch (b->format) {
-    case F_R8G8B8A8: case F_R8G8B8X8: *format = RGBA; *type = UNSIGNED_BYTE; return true;
-    case F_R8G8B8: *format = RGB; *type = UNSIGNED_BYTE; return true;
+    case F_R8G8B8A8: *format = RGBA; *type = UNSIGNED_BYTE; return true;
+    case F_R8G8B8X8: case F_R8G8B8: *format = RGB; *type = UNSIGNED_BYTE; return true;
     case F_R5G6B5: *format = RGB; *type = UNSIGNED_SHORT_5_6_5; return true;
     default: return false;
     }
@@ -220,7 +220,10 @@ static int lock_common(void *buffer, u64 usage, i32 fence, void **out)
     if (out) *out = NULL;
     if (fence >= 0) mg_fd_close(fence);
     if (!b || !out) return E_BAD_VALUE;
+    if (usage & ~(U_CPU_READ_MASK | U_CPU_WRITE_MASK)) return E_BAD_VALUE;
     if (!(usage & (U_CPU_READ_MASK | U_CPU_WRITE_MASK))) return E_BAD_VALUE;
+    if ((usage & U_CPU_READ_MASK) && !(b->usage & U_CPU_READ_MASK)) return E_BAD_VALUE;
+    if ((usage & U_CPU_WRITE_MASK) && !(b->usage & U_CPU_WRITE_MASK)) return E_BAD_VALUE;
     mg_lock_acquire(&b->lock);
     if (!b->pixels) {
         b->pixels = (u8 *)calloc((size_t)b->width * b->height, b->bpp);

@@ -161,9 +161,11 @@ void PreviewKeyboard::dismiss(bool notifyAndroid)
     QGuiApplication::inputMethod()->reset();
     QGuiApplication::inputMethod()->hide();
     setFocus(false);
-    if (m_active && wasRequested && notifyAndroid) megler_keyboard_closed();
+    if (m_active && wasRequested && notifyAndroid) {
+        if (m_remote) emit keyboardClosed(); else megler_keyboard_closed();
+    }
     if (m_active && wasRequested && m_lastHeight != 0) {
-        megler_keyboard_height(0);
+        sendHeight(0);
         m_lastHeight = 0;
     }
 }
@@ -195,7 +197,7 @@ void PreviewKeyboard::updateHeight()
             height = qBound(0, qRound(overlap.height() * m_surfacePixels.height() / size.height()), m_surfacePixels.height());
     }
     if (height != m_lastHeight) {
-        megler_keyboard_height(height);
+        sendHeight(height);
         m_lastHeight = height;
     }
 }
@@ -248,12 +250,13 @@ void PreviewKeyboard::inputMethodEvent(QInputMethodEvent *event)
     if (length) {
         const int from = m_tail.size() + start;
         const int count = scalarCount(m_tail.mid(from, length));
-        for (int i = 0; i < count; ++i) megler_text_key(MEGLER_TEXT_BACKSPACE);
+        for (int i = 0; i < count; ++i) {
+            if (m_remote) emit textKey(MEGLER_TEXT_BACKSPACE); else megler_text_key(MEGLER_TEXT_BACKSPACE);
+        }
         m_tail.truncate(from);
     }
     if (!event->commitString().isEmpty()) {
-        const QByteArray utf8 = event->commitString().toUtf8();
-        megler_text_commit(utf8.constData());
+        commitText(event->commitString());
         m_tail += event->commitString();
     }
     updateInputMethod();
@@ -262,7 +265,7 @@ void PreviewKeyboard::inputMethodEvent(QInputMethodEvent *event)
 
 void PreviewKeyboard::sendKey(int key)
 {
-    megler_text_key(key);
+    if (m_remote) emit textKey(key); else megler_text_key(key);
     if (key == MEGLER_TEXT_BACKSPACE && !m_tail.isEmpty()) {
         int from = m_tail.size() - 1;
         if (m_tail.at(from).isLowSurrogate() && from > 0 && m_tail.at(from - 1).isHighSurrogate()) --from;
@@ -299,8 +302,7 @@ void PreviewKeyboard::keyPressEvent(QKeyEvent *event)
         sendKey(key);
     } else if (!(event->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier))
                && !event->text().isEmpty() && event->text().at(0).isPrint()) {
-        const QByteArray utf8 = event->text().toUtf8();
-        megler_text_commit(utf8.constData());
+        commitText(event->text());
         m_tail += event->text();
         updateInputMethod();
     } else {
@@ -308,4 +310,18 @@ void PreviewKeyboard::keyPressEvent(QKeyEvent *event)
         return;
     }
     event->accept();
+}
+
+void PreviewKeyboard::commitText(const QString &text)
+{
+    if (m_remote) emit textCommitted(text);
+    else {
+        const QByteArray utf8 = text.toUtf8();
+        megler_text_commit(utf8.constData());
+    }
+}
+
+void PreviewKeyboard::sendHeight(int height)
+{
+    if (m_remote) emit keyboardHeight(height); else megler_keyboard_height(height);
 }

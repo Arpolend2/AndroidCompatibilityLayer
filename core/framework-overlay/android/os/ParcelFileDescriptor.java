@@ -75,8 +75,20 @@ public class ParcelFileDescriptor implements Parcelable, Closeable {
     public static ParcelFileDescriptor dup(FileDescriptor fd) throws IOException { return meglerDup(fd, null); }
     public static ParcelFileDescriptor fromFd(int fd) throws IOException { return meglerDup(meglerOf(fd), null); }
     public static ParcelFileDescriptor adoptFd(int fd) { FileDescriptor f = meglerOf(fd); return new ParcelFileDescriptor(f, meglerCloser(f), null); }
-    public static ParcelFileDescriptor[] createPipe() throws IOException { throw new IOException("pipes are not supported"); }
-    public static ParcelFileDescriptor[] createReliablePipe() throws IOException { return createPipe(); }
+    public static ParcelFileDescriptor[] createPipe() throws IOException {
+        try {
+            FileDescriptor[] fds = (FileDescriptor[]) Class.forName("android.system.Os").getMethod("pipe").invoke(null);
+            return new ParcelFileDescriptor[] {
+                new ParcelFileDescriptor(fds[0], meglerCloser(fds[0]), null),
+                new ParcelFileDescriptor(fds[1], meglerCloser(fds[1]), null)
+            };
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            throw new IOException(e.getCause());
+        } catch (ReflectiveOperationException e) {
+            throw new IOException(e);
+        }
+    }
+    public static ParcelFileDescriptor[] createReliablePipe() throws IOException { throw new IOException("reliable pipes are not supported"); }
     public ParcelFileDescriptor dup() throws IOException { return meglerDup(mFd, mFile); }
     public FileDescriptor getFileDescriptor() { return mFd; }
     public int getFd() { try { java.lang.reflect.Field d = FileDescriptor.class.getDeclaredField("descriptor"); d.setAccessible(true); return d.getInt(mFd); } catch (Exception e) { return -1; } }

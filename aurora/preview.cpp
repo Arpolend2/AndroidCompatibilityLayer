@@ -8,6 +8,8 @@
 #include <QFileInfo>
 #include <QMouseEvent>
 #include <QMutexLocker>
+#include <QOffscreenSurface>
+#include <QOpenGLFunctions>
 #include <QPainter>
 #include <QQuickWindow>
 #include <QScreen>
@@ -38,6 +40,12 @@
 #include "../core/src/ndk/mg_egl.h"
 #include "preview_gpu.h"
 #endif
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+#include "preview_gpu_canvas.h"
+#endif
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+#include "embedded_gpu_transport.h"
+#endif
 
 namespace {
 void MEGLER_CB coreLog(int level, const char *line, void *user)
@@ -58,6 +66,20 @@ PreviewPlayer::PreviewPlayer(const QString &root, const QString &data, const QSt
 {
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     m_gpuState = std::make_shared<PreviewGpuState>();
+#endif
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+    if (!m_gpuCanvas.setMetricsEnabled([]() { return ErrorLog::detailedCaptureEnabled(); }))
+        qWarning("Could not configure GPU diagnostics.");
+#endif
+}
+
+void PreviewPlayer::enableStoreWorkerTeardownTrace()
+{
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+    m_gpuCanvas.enableStoreWorkerTeardownTrace();
+#endif
+#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
+    m_gpuState->enableStoreWorkerTeardownTrace();
 #endif
 }
 
@@ -88,12 +110,13 @@ void PreviewPlayer::setStatus(const QString &status)
 
 void PreviewPlayer::start()
 {
+    if (m_closing) return;
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
-    const EGLDisplay qtDisplay = m_gpuState->qtDisplay();
+    const EGLDisplay qtDisplay = m_cpuPresentationOnly ? EGL_NO_DISPLAY : m_gpuState->qtDisplay();
     if (qtDisplay != EGL_NO_DISPLAY) {
         if (!mg_egl_set_native_display(qtDisplay))
             qWarning("Could not select Qt's EGL display before Android EGL initialization");
-    } else if (m_surface && m_surface->window() && m_gpuDisplayWaits < 20) {
+    } else if (!m_cpuPresentationOnly && m_surface && m_surface->window() && m_gpuDisplayWaits < 20) {
         ++m_gpuDisplayWaits;
         m_surface->requestGpuFrame();
         QTimer::singleShot(25, this, &PreviewPlayer::start);
@@ -138,6 +161,74 @@ void PreviewPlayer::start()
     run.height = m_surfaceHeight;
     run.density_dpi = m_density;
     run.gfx = previewGraphics();
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+    bool gpuCanvasReady = false;
+    bool remoteGpuCanvasReady = false;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    if (m_cpuPresentationOnly && m_remoteGpuCanvasPresent) {
+        QOpenGLContext *context = new QOpenGLContext(this);
+        QSurfaceFormat format = QSurfaceFormat::defaultFormat();
+        format.setRenderableType(QSurfaceFormat::OpenGLES);
+        format.setVersion(2, 0);
+        context->setFormat(format);
+        QString exportError;
+        bool exportAvailable = false;
+        if (context->create() && context->isOpenGLES()) {
+            QOffscreenSurface probeSurface;
+            probeSurface.setFormat(context->format());
+            probeSurface.create();
+            if (probeSurface.isValid() && context->makeCurrent(&probeSurface)) {
+                exportAvailable = EmbeddedGpuTransport::canExportDmaBuf(&exportError);
+                context->doneCurrent();
+            } else {
+                exportError = tr("Could not make the worker EGL context current for the DMA-BUF capability probe.");
+            }
+        } else {
+            exportError = tr("Could not create the worker GLES context.");
+        }
+        if (exportAvailable) {
+            remoteGpuCanvasReady = m_gpuCanvas.prepareRemotePresentation(
+                context, presentRemoteGpuCanvas, releaseRemoteGpuCanvas, this);
+            gpuCanvasReady = remoteGpuCanvasReady;
+        }
+        if (!gpuCanvasReady && context->isValid() && context->isOpenGLES()) {
+            gpuCanvasReady = m_gpuCanvas.prepareCpuPresentation(context, presentOffscreenGpuCanvas, this);
+            if (gpuCanvasReady) {
+                if (exportError.isEmpty())
+                    exportError = tr("The DMA-BUF GPU Canvas could not be initialized.");
+                qWarning().noquote() << "Embedded GPU DMA-BUF presentation unavailable; using CPU frame transport:"
+                                     << exportError;
+            }
+        }
+        if (!gpuCanvasReady)
+            delete context;
+    } else
+#endif
+    if (m_cpuPresentationOnly && m_offscreenGpuCanvas) {
+        QOpenGLContext *context = new QOpenGLContext(this);
+        QSurfaceFormat format = QSurfaceFormat::defaultFormat();
+        format.setRenderableType(QSurfaceFormat::OpenGLES);
+        format.setVersion(2, 0);
+        context->setFormat(format);
+        gpuCanvasReady = context->create() && context->isOpenGLES() &&
+                         m_gpuCanvas.prepareCpuPresentation(context, presentOffscreenGpuCanvas, this);
+        if (!gpuCanvasReady)
+            delete context;
+    } else if (!m_cpuPresentationOnly) {
+        gpuCanvasReady = m_gpuCanvas.prepare(m_gpuState->qtContext(), presentGpuCanvas, releaseGpuCanvas, this);
+    }
+    if (gpuCanvasReady) {
+        run.gfx = previewGraphics(&m_gpuCanvas);
+        if (remoteGpuCanvasReady)
+            qInfo("Embedded GPU DMA-BUF export is available; waiting for the first imported frame");
+        else if (!m_remoteGpuCanvasPresent)
+            qInfo("Experimental GPU Canvas active; Android 2D draws into a shared GLES texture");
+        else
+            qInfo("Experimental GPU Canvas uses CPU readback for the embedded worker");
+    } else if (!m_cpuPresentationOnly || m_offscreenGpuCanvas) {
+        qWarning("Experimental GPU Canvas unavailable; using the CPU Canvas fallback");
+    }
+#endif
     if (m_audio) run.audio = m_audio->callbacks();
     run.codec = auroraMp3CodecCallbacks();
     run.media = auroraMp3MediaCallbacks();
@@ -173,14 +264,16 @@ void PreviewPlayer::start()
     if (m_keyboard) {
         m_keyboard->start();
         run.keyboard = m_keyboard->host();
-    }
+    } else if (m_hasRemoteKeyboard) run.keyboard = m_remoteKeyboard;
     run.window.user = this;
     run.window.present_pixels = presentPixels;
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
-    run.present_egl_window = presentEglWindow;
-    run.present_egl_layer = presentEglLayer;
-    run.present_egl_views = presentEglViews;
-    run.place_egl_layer = placeEglLayer;
+    if (!m_cpuPresentationOnly) {
+        run.present_egl_window = presentEglWindow;
+        run.present_egl_layer = presentEglLayer;
+        run.present_egl_views = presentEglViews;
+        run.place_egl_layer = placeEglLayer;
+    }
 #endif
     run.on_exit = appExited;
     run.user = this;
@@ -223,6 +316,12 @@ void PreviewPlayer::setKeyboard(PreviewKeyboard *keyboard)
     if (m_keyboard) m_keyboard->setSurface(m_surface, QSize(m_surfaceWidth, m_surfaceHeight));
 }
 
+void PreviewPlayer::setRemoteKeyboard(const megler_keyboard_host &keyboard)
+{
+    m_remoteKeyboard = keyboard;
+    m_hasRemoteKeyboard = true;
+}
+
 void PreviewPlayer::setSurface(PreviewSurface *surface)
 {
     m_surface = surface;
@@ -247,22 +346,141 @@ void PreviewPlayer::setViewport(qreal width, qreal height, qreal pixelRatio)
 void MEGLER_CB PreviewPlayer::presentPixels(void *user, const void *pixels, int width, int height, int stride)
 {
     PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
+    self->submitPixels(pixels, width, height, stride);
+}
+
+bool PreviewPlayer::submitPixels(const void *pixels, int width, int height, int stride)
+{
     QImage copy = previewCopyFrame(pixels, width, height, stride);
-    if (copy.isNull()) return;
+    if (copy.isNull()) return false;
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
-    self->m_gpuState->clear();
+    m_gpuState->clear();
 #endif
+    QMutexLocker lock(&m_frameMutex);
+    if (m_awaitingGestureFrame)
+        m_gestureFrameChanged = (copy != m_gestureFrame);
+    m_frame = copy;
+    if (!m_framePending) {
+        m_framePending = true;
+        QMetaObject::invokeMethod(this, "publishFrame", Qt::QueuedConnection);
+    }
+    return true;
+}
+
+#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+bool MEGLER_CB PreviewPlayer::presentOffscreenGpuCanvas(void *user, const void *pixels, int width, int height, int stride)
+{
+    return static_cast<PreviewPlayer *>(user)->submitPixels(pixels, width, height, stride);
+}
+
+bool MEGLER_CB PreviewPlayer::presentRemoteGpuCanvas(void *user, uint32_t texture, int width, int height)
+{
+    PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
+    const bool transportAccepted = !self->m_remoteGpuCanvasFailed.loadAcquire() &&
+        self->m_remoteGpuCanvasPresent &&
+        self->m_remoteGpuCanvasPresent(self->m_remoteGpuCanvasUser, texture, width, height);
+    if (!transportAccepted)
+        self->m_remoteGpuCanvasFailed.storeRelease(1);
+    if (self->m_remoteGpuCanvasFailed.loadAcquire()) {
+        if (width <= 0 || height <= 0 || width > INT_MAX / 4 ||
+            quint64(width) * quint64(height) > 8 * 1024 * 1024)
+            return false;
+        QOpenGLContext *context = QOpenGLContext::currentContext();
+        if (!context || !context->isValid()) return false;
+        QOpenGLFunctions *gl = context->functions();
+        QImage pixels(width, height, QImage::Format_RGB32);
+        if (pixels.isNull()) return false;
+        QByteArray rgba(width * height * 4, char(0));
+        for (int i = 0; i < 16 && gl->glGetError() != GL_NO_ERROR; ++i) {}
+        GLint previousFramebuffer = 0;
+        GLuint framebuffer = 0;
+        gl->glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+        gl->glGenFramebuffers(1, &framebuffer);
+        if (!framebuffer) return false;
+        gl->glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        gl->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        const bool complete = gl->glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (complete) {
+            gl->glFinish();
+            gl->glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        }
+        const GLenum glError = gl->glGetError();
+        gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
+        gl->glDeleteFramebuffers(1, &framebuffer);
+        if (!complete || glError != GL_NO_ERROR) return false;
+        for (int y = 0; y < height; ++y) {
+            const uchar *source = reinterpret_cast<const uchar *>(rgba.constData()) +
+                                  (height - 1 - y) * width * 4;
+            uchar *destination = pixels.scanLine(y);
+            for (int x = 0; x < width; ++x) {
+                destination[x * 4 + 0] = source[x * 4 + 2];
+                destination[x * 4 + 1] = source[x * 4 + 1];
+                destination[x * 4 + 2] = source[x * 4 + 0];
+                destination[x * 4 + 3] = source[x * 4 + 3];
+            }
+        }
+        return self->submitPixels(pixels.constBits(), width, height, pixels.bytesPerLine());
+    }
+    QImage placeholder(width, height, QImage::Format_RGB32);
+    if (placeholder.isNull()) return false;
+    placeholder.fill(Qt::black);
+    {
+        QMutexLocker lock(&self->m_frameMutex);
+        self->m_frame = placeholder;
+        if (self->m_awaitingGestureFrame)
+            self->m_gestureFrameChanged = true;
+        if (!self->m_framePending) {
+            self->m_framePending = true;
+            QMetaObject::invokeMethod(self, "publishFrame", Qt::QueuedConnection);
+        }
+    }
+    return true;
+}
+
+bool MEGLER_CB PreviewPlayer::releaseRemoteGpuCanvas(void *, uint32_t)
+{
+    return true;
+}
+
+bool MEGLER_CB PreviewPlayer::presentGpuCanvas(void *user, uint32_t texture, int width, int height)
+{
+    PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
+    QImage placeholder;
+    {
+        QMutexLocker lock(&self->m_frameMutex);
+        if (self->m_frame.size() != QSize(width, height)) {
+            placeholder = QImage(width, height, QImage::Format_RGB32);
+            if (placeholder.isNull())
+                return false;
+            placeholder.fill(Qt::black);
+        }
+    }
+    if (!self->m_gpuState->presentCanvas(texture, width, height, self)) {
+        static QAtomicInt warned = Q_BASIC_ATOMIC_INITIALIZER(0);
+        if (warned.testAndSetOrdered(0, 1))
+            qWarning("Experimental GPU Canvas presentation failed; using the CPU frame fallback");
+        return false;
+    }
     QMutexLocker lock(&self->m_frameMutex);
+    if (!placeholder.isNull())
+        self->m_frame = placeholder;
     if (self->m_awaitingGestureFrame)
-        self->m_gestureFrameChanged = (copy != self->m_gestureFrame);
-    self->m_frame = copy;
+        self->m_gestureFrameChanged = true;
     if (!self->m_framePending) {
         self->m_framePending = true;
         QMetaObject::invokeMethod(self, "publishFrame", Qt::QueuedConnection);
     }
+    return true;
 }
 
-#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
+bool MEGLER_CB PreviewPlayer::releaseGpuCanvas(void *user, uint32_t texture)
+{
+    PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
+    return self->m_gpuState->releaseCanvasTexture(texture, self);
+}
+#endif
+
 int MEGLER_CB PreviewPlayer::presentEglWindow(void *user, void *display, void *surface, int width, int height)
 {
     PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
@@ -357,15 +575,15 @@ void MEGLER_CB PreviewPlayer::appExited(void *user, int status, const char *reas
 void PreviewPlayer::ended(int status, const QString &reason)
 {
     m_running = false;
+    m_exitStatus = status;
     if (m_picker) m_picker->stop();
     if (m_keyboard) m_keyboard->stop();
-    if (m_closing) {
-        emit finished();
-    } else {
+    if (!m_closing) {
         setStatus(reason.isEmpty() ? tr("Android app ended (status %1).").arg(status)
                                    : tr("Android app ended: %1").arg(reason));
         if (status != 0) ErrorLog::record(QStringLiteral("Android"), m_status, true);
     }
+    if (m_closing || m_closeOnExit) emit finished();
 }
 
 bool PreviewPlayer::touch(int phase, float x, float y)
@@ -412,6 +630,13 @@ void PreviewPlayer::endGestureFrameWait()
     m_awaitingGestureFrame = false;
     m_gestureFrameChanged = false;
     m_gestureFrame = QImage();
+}
+
+void PreviewPlayer::closeToManager()
+{
+    if (!m_closeOnBackGesture || m_closing) return;
+    emit returnToManagerRequested();
+    close();
 }
 
 void PreviewPlayer::close()
@@ -476,8 +701,10 @@ void PreviewSurface::setPlayer(QObject *object)
         m_player->setSurface(this);
         connect(m_player, &PreviewPlayer::frameChanged, this, [this]() { update(); });
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
-        m_gpuItem = new PreviewGpuItem(m_player->gpuState(), this);
-        connect(m_player, &PreviewPlayer::frameChanged, m_gpuItem, &QQuickItem::update);
+        if (m_player->usesGpuSurface()) {
+            m_gpuItem = new PreviewGpuItem(m_player->gpuState(), this);
+            connect(m_player, &PreviewPlayer::frameChanged, m_gpuItem, &QQuickItem::update);
+        }
 #endif
     }
     updateViewport();

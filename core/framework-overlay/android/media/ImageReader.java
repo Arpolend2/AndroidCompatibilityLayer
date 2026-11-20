@@ -185,14 +185,13 @@ public class ImageReader implements java.lang.AutoCloseable {
 
     /**
      * A JPEG picture (format 256) the camera wrote: queued as an image of one plane holding the file's bytes, and the listener told.
-     * False, the picture dropped, when the reader is closed, is not a JPEG reader's or has every image acquired.
+     * False when the reader is closed, is not a JPEG reader, or its bounded queue is full.
      */
     public boolean meglerQueueJpeg(byte[] jpeg, long timestamp) {
         OnImageAvailableListener l;
         Executor e;
         synchronized (mLock) {
-            if (mClosed || mFormat != 256) return false;
-            if (mAcquired + mQueued.size() >= mMaxImages && (mAcquired >= mMaxImages || mQueued.poll() == null)) return false;
+            if (mClosed || mFormat != 256 || jpeg == null || mAcquired + mQueued.size() >= (long) mMaxImages + 1) return false;
             mQueued.add(new MeglerImage(this, jpeg, timestamp));
             l = mListener;
             e = mListenerExecutor;

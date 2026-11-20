@@ -39,6 +39,8 @@ public class First extends Activity {
             return;
         }
         Log.i("CrashTest", "first onCreate");
+        verifyPackageLaunchIntents();
+        verifyPendingIntentActivityStack();
         // by the system, which started it for the tap on the app's tile (megler.AppRunner.SHELL_REFERRER)
         Log.i("CrashTest", "first referrer " + getReferrer());
         /*
@@ -56,6 +58,61 @@ public class First extends Activity {
         String unlimited = row.getMeasuredWidth() + ":" + narrow.getMeasuredWidth() + "+" + wide.getMeasuredWidth();
         row.measure(android.view.View.MeasureSpec.makeMeasureSpec(200, android.view.View.MeasureSpec.EXACTLY), 0);
         Log.i("CrashTest", "row unlimited=" + unlimited + " exact=" + row.getMeasuredWidth() + ":" + narrow.getMeasuredWidth() + "+" + wide.getMeasuredWidth());
+    }
+
+    private void verifyPackageLaunchIntents() {
+        android.content.pm.PackageManager pm = getPackageManager();
+        Intent launch = pm.getLaunchIntentForPackage(getPackageName());
+        String infoActivity = Info.class.getName();
+        if (launch == null || launch.getComponent() == null || !infoActivity.equals(launch.getComponent().getClassName())
+                || !launch.hasCategory(Intent.CATEGORY_INFO) || (launch.getFlags() & Intent.FLAG_ACTIVITY_NEW_TASK) == 0) {
+            throw new IllegalStateException("getLaunchIntentForPackage did not prefer CATEGORY_INFO");
+        }
+        try {
+            Object sender = pm.getClass().getMethod("getLaunchIntentSenderForPackage", String.class).invoke(pm, getPackageName());
+            Object pending = sender == null ? null : sender.getClass().getMethod("meglerPending").invoke(sender);
+            Intent sent = pending == null ? null : (Intent) pending.getClass().getMethod("meglerIntent").invoke(pending);
+            if (sent == null || sent.getComponent() == null || !infoActivity.equals(sent.getComponent().getClassName())
+                    || !sent.hasCategory(Intent.CATEGORY_INFO)) {
+                throw new IllegalStateException("getLaunchIntentSenderForPackage targeted the wrong activity");
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("getLaunchIntentSenderForPackage is unavailable", e);
+        }
+        Log.i("CrashTest", "package launch INFO and intent sender ok");
+    }
+
+    private void verifyPendingIntentActivityStack() {
+        final Intent[][] started = new Intent[1][];
+        final Bundle[] options = new Bundle[1];
+        android.content.Context recording = new android.content.ContextWrapper(this) {
+            @Override public void startActivities(Intent[] intents, Bundle launchOptions) {
+                started[0] = intents;
+                options[0] = launchOptions;
+            }
+        };
+        Intent first = new Intent("megler.test.STACK_FIRST");
+        Intent last = new Intent("megler.test.STACK_LAST").putExtra("value", 1);
+        Bundle creationOptions = new Bundle();
+        creationOptions.putInt("launch", 7);
+        android.app.PendingIntent stack = android.app.PendingIntent.getActivities(recording, 31, new Intent[] { first, last }, 0, creationOptions);
+        first.setAction("megler.test.MUTATED");
+        android.app.PendingIntent updated = android.app.PendingIntent.getActivities(recording, 31,
+                new Intent[] { new Intent("megler.test.OTHER"), new Intent("megler.test.OTHER_LAST").putExtra("value", 2) },
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT, null);
+        try {
+            stack.send(recording, 0, new Intent().putExtra("fill", true), null, null, null, null);
+        } catch (android.app.PendingIntent.CanceledException e) {
+            throw new IllegalStateException("activity stack PendingIntent was canceled", e);
+        }
+        if (stack != updated || started[0] == null || started[0].length != 2
+                || !"megler.test.STACK_FIRST".equals(started[0][0].getAction())
+                || !"megler.test.STACK_LAST".equals(started[0][1].getAction())
+                || started[0][1].getIntExtra("value", 0) != 2 || !started[0][1].getBooleanExtra("fill", false)
+                || options[0] == null || options[0].getInt("launch", 0) != 7) {
+            throw new IllegalStateException("getActivities did not preserve its stack, update, fill-in, and options");
+        }
+        Log.i("CrashTest", "pending-intent activity stack and options ok");
     }
 
     @Override

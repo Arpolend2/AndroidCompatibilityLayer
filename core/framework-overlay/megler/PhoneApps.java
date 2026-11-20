@@ -104,6 +104,11 @@ public final class PhoneApps {
         boolean first = sReadAt < 0;
         sReadAt = now;
         String text = Native.appsList();
+        if (text == null || text.contains("\nMEGLER_LIBRARY_UNAVAILABLE\n")) {
+            android.util.Log.w("Megler", "phone apps: manager library list is unavailable");
+            if (first) watch();
+            return sApps;
+        }
         java.util.ArrayList<App> apps = new java.util.ArrayList<>();
         if (text != null) {
             String own = Native.packageName();

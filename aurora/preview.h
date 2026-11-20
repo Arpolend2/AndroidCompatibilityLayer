@@ -2,6 +2,7 @@
 #define ANDROID_COMPATIBILITY_LAYER_AURORA_PREVIEW_H
 
 #include <QByteArray>
+#include <QAtomicInt>
 #include <QColor>
 #include <QImage>
 #include <QMutex>
@@ -16,12 +17,17 @@
 class PreviewGpuState;
 class PreviewGpuItem;
 #endif
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+#include "preview_gpu_canvas.h"
+typedef bool (MEGLER_CB *PreviewRemoteGpuCanvasPresent)(void *user, uint32_t texture, int width, int height);
+#endif
 
 #include "../core/include/megler.h"
 #include "shared_folders.h"
 
 class PreviewKeyboard;
 class PreviewSurface;
+class QQuickItem;
 class AuroraAudioOutput;
 class AuroraPickerHost;
 class InstallRequestHost;
@@ -34,32 +40,51 @@ class PreviewPlayer : public QObject
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
     Q_PROPERTY(bool showStatus READ showStatus NOTIFY statusChanged)
     Q_PROPERTY(int backGestureEdgeDp READ backGestureEdgeDp CONSTANT)
+    Q_PROPERTY(bool closeOnBackGesture READ closeOnBackGesture CONSTANT)
 
 public:
     PreviewPlayer(const QString &root, const QString &data, const QString &apk = QString(), QObject *parent = nullptr);
+    void enableStoreWorkerTeardownTrace();
     QString status() const { return m_status; }
     bool showStatus() const { return !m_running || m_closing || frame().isNull(); }
     int renderCap() const { return m_renderCap; }
     int backGestureEdgeDp() const { return m_backGestureEdgeDp; }
     void setBackGestureEdgeDp(int width) { m_backGestureEdgeDp = width; }
+    bool closeOnBackGesture() const { return m_closeOnBackGesture; }
+    int exitStatus() const { return m_exitStatus; }
+    void setCloseOnBackGesture(bool enabled) { m_closeOnBackGesture = enabled; }
+    void setCloseOnExit(bool enabled) { m_closeOnExit = enabled; }
     void setStandaloneSettings(const QString &locale, const QString &theme, const QString &location);
     void setDeniedPermissions(const QStringList &denied) { m_deniedPermissions = denied; }
     void setSystemTheme(bool dark, const QColor &accent);
-    QImage frame() const;
+    virtual QImage frame() const;
     void start();
     void setAudio(AuroraAudioOutput *audio);
     void setPicker(AuroraPickerHost *picker);
     void setInstallHost(InstallRequestHost *host);
     void setSystemHost(const megler_system_host &host, const QString &appsDir);
     void setKeyboard(PreviewKeyboard *keyboard);
+    void setRemoteKeyboard(const megler_keyboard_host &keyboard);
+    void setCpuPresentationOnly(bool enabled) { m_cpuPresentationOnly = enabled; }
+    void setOffscreenGpuCanvas(bool enabled) { m_offscreenGpuCanvas = enabled; }
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+    void setRemoteGpuCanvasPresentation(PreviewRemoteGpuCanvasPresent present, void *user)
+    {
+        m_remoteGpuCanvasPresent = present;
+        m_remoteGpuCanvasUser = user;
+        m_remoteGpuCanvasFailed.storeRelease(0);
+    }
+#endif
     void setSurface(PreviewSurface *surface);
-    void setViewport(qreal width, qreal height, qreal pixelRatio);
+    virtual void setViewport(qreal width, qreal height, qreal pixelRatio);
+    virtual bool usesGpuSurface() const { return true; }
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     std::shared_ptr<PreviewGpuState> gpuState() const { return m_gpuState; }
 #endif
-    bool touch(int phase, float x, float y);
-    Q_INVOKABLE void close();
-    Q_INVOKABLE void back();
+    virtual bool touch(int phase, float x, float y);
+    Q_INVOKABLE virtual void close();
+    Q_INVOKABLE virtual void closeToManager();
+    Q_INVOKABLE virtual void back();
     Q_INVOKABLE bool gestureBack();
     Q_INVOKABLE bool hasFrameAfterGestureBack() const;
     Q_INVOKABLE void endGestureFrameWait();
@@ -68,6 +93,7 @@ signals:
     void statusChanged();
     void frameChanged();
     void finished();
+    void returnToManagerRequested();
 
 private slots:
     void publishFrame();
@@ -78,11 +104,19 @@ private slots:
 
 private:
     static void MEGLER_CB presentPixels(void *user, const void *pixels, int width, int height, int stride);
+    bool submitPixels(const void *pixels, int width, int height, int stride);
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     static int MEGLER_CB presentEglWindow(void *user, void *display, void *surface, int width, int height);
     static int MEGLER_CB presentEglLayer(void *user, int layer, void *display, void *surface, int width, int height);
     static bool MEGLER_CB presentEglViews(void *user, const void *pixels, int width, int height, int stride);
     static void MEGLER_CB placeEglLayer(void *user, int layer, int x, int y, int width, int height, int flags);
+#endif
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+    static bool MEGLER_CB presentGpuCanvas(void *user, uint32_t texture, int width, int height);
+    static bool MEGLER_CB releaseGpuCanvas(void *user, uint32_t texture);
+    static bool MEGLER_CB presentOffscreenGpuCanvas(void *user, const void *pixels, int width, int height, int stride);
+    static bool MEGLER_CB presentRemoteGpuCanvas(void *user, uint32_t texture, int width, int height);
+    static bool MEGLER_CB releaseRemoteGpuCanvas(void *user, uint32_t texture);
 #endif
     static void MEGLER_CB appExited(void *user, int status, const char *reason);
     void setStatus(const QString &status);
@@ -106,7 +140,19 @@ private:
     bool m_awaitingGestureFrame = false;
     bool m_gestureFrameChanged = false;
     bool m_running = false;
+    int m_exitStatus = 0;
     bool m_closing = false;
+    bool m_closeOnExit = false;
+    bool m_closeOnBackGesture = false;
+    bool m_cpuPresentationOnly = false;
+    bool m_offscreenGpuCanvas = false;
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+    PreviewRemoteGpuCanvasPresent m_remoteGpuCanvasPresent = nullptr;
+    void *m_remoteGpuCanvasUser = nullptr;
+    QAtomicInt m_remoteGpuCanvasFailed = 0;
+#endif
+    bool m_hasRemoteKeyboard = false;
+    megler_keyboard_host m_remoteKeyboard = {};
     int m_backGestureEdgeDp = 32;
     int m_surfaceWidth = 480;
     int m_surfaceHeight = 800;
@@ -123,6 +169,9 @@ private:
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     std::shared_ptr<PreviewGpuState> m_gpuState;
     int m_gpuDisplayWaits = 0;
+#endif
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+    PreviewGpuCanvasHost m_gpuCanvas;
 #endif
 };
 

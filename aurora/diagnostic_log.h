@@ -17,13 +17,14 @@ public:
     explicit DiagnosticLog(QObject *parent = nullptr);
     ~DiagnosticLog() override;
 
-    bool start(QString *error);
+    bool start(QString *error, bool persistStreams = false);
     void startNotifications();
     static void installChildQtMessageHandler();
     void watch(QProcess *process, const QString &source,
                const std::function<void(bool, const QByteArray &)> &observer = {});
     QString text() const;
     bool available() const;
+    Q_INVOKABLE QString standaloneDiagnosticFileError() const;
 
 signals:
     void changed();

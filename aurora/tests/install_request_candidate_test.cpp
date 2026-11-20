@@ -4,6 +4,7 @@
 
 #include <QCoreApplication>
 #include <QEventLoop>
+#include <QCryptographicHash>
 #include <QFile>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -53,12 +54,14 @@ int main(int argc, char **argv)
     InstallRequestCandidate candidate;
     QString error;
     writeFile(apk, "whole");
-    check(candidate.prepare(directory.path(), apk, QStringLiteral("app.apk"), 1024, &error), "prepare");
+    check(candidate.prepare(directory.path(), apk, QStringLiteral("app.apk"), 1024, &error, true), "prepare");
     check(candidate.package() == QLatin1String("org.example.app") &&
           candidate.label() == QLatin1String("Example") && candidate.version() == 42, "metadata");
     writeFile(apk, "changed");
     QFile snapshot(candidate.path());
     check(snapshot.open(QIODevice::ReadOnly) && snapshot.readAll() == "whole", "reviewed snapshot retained");
+    check(candidate.fingerprint() == QCryptographicHash::hash(QByteArray("whole"), QCryptographicHash::Sha256).toHex(),
+          "fingerprint identifies the retained snapshot");
     snapshot.close();
 
     for (const QByteArray &input : {QByteArray("invalid"), QByteArray("badpackage"), QByteArray("unrunnable"),

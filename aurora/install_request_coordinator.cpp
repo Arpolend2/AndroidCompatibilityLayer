@@ -114,7 +114,7 @@ void InstallRequestCoordinator::staged()
         if (!m_server.finish(id, QStringLiteral("installed"), tr("Installed."),
                              candidate->package(), candidate->label(), candidate->version()))
             qWarning("APK installed, but its result could not be delivered to the requesting app.");
-        emit installed();
+        emit installed(candidate->package());
     } else if (id) {
         if (error.isEmpty()) error = commit->error();
         if (error.isEmpty()) error = tr("The requesting app is no longer running.");

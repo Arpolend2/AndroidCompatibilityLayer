@@ -20,7 +20,7 @@ public:
     void unavailable(quint64 id);
 
 signals:
-    void installed();
+    void installed(const QString &package);
     void confirmationRequested(quint64 id, const QString &label, const QString &packageName, quint32 version);
     void confirmationCanceled(quint64 id);
 

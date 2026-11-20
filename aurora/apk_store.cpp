@@ -2,6 +2,7 @@
 #include "app_storage_lock.h"
 
 #include <QDir>
+#include <QDebug>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -154,8 +155,10 @@ bool ApkStore::remove(const QString &package, QString *message)
     return true;
 }
 
-bool ApkStore::install(const QString &source, QString *message)
+bool ApkStore::install(const QString &source, QString *message, QString *installedPackage)
 {
+    if (installedPackage) installedPackage->clear();
+    qInfo("APK library import: stage=open");
     if (m_root.isEmpty()) {
         *message = QObject::tr("App storage is unavailable.");
         return false;
@@ -169,6 +172,7 @@ bool ApkStore::install(const QString &source, QString *message)
         *message = QObject::tr("Cannot create the app storage directory.");
         return false;
     }
+    qInfo("APK library import: stage=copy");
     QTemporaryFile copy(QDir(m_root).filePath(QStringLiteral(".import-XXXXXX")));
     if (!copy.open()) {
         *message = QObject::tr("Cannot create a temporary APK: %1").arg(copy.errorString());
@@ -191,6 +195,7 @@ bool ApkStore::install(const QString &source, QString *message)
         *message = QObject::tr("Cannot save APK: %1").arg(copy.errorString());
         return false;
     }
+    qInfo("APK library import: stage=inspect");
     const QJsonObject info = report(copy.fileName(), QString(), message);
     if (info.isEmpty()) return false;
     const QString package = info.value(QStringLiteral("package")).toString();
@@ -202,6 +207,7 @@ bool ApkStore::install(const QString &source, QString *message)
         *message = QObject::tr("This APK cannot be started: %1").arg(info.value(QStringLiteral("reason")).toString());
         return false;
     }
+    qInfo("APK library import: stage=install");
     const QString lockName = lockPath(package);
     if (lockName.isEmpty()) {
         *message = QObject::tr("Invalid app package.");
@@ -226,6 +232,8 @@ bool ApkStore::install(const QString &source, QString *message)
         return false;
     }
     copy.setAutoRemove(false);
+    qInfo("APK library import: result=success");
+    if (installedPackage) *installedPackage = package;
     *message = QObject::tr("Added %1 to the library. Compatibility is not guaranteed.").arg(package);
     return true;
 }

@@ -2,6 +2,30 @@
 <!DOCTYPE TS>
 <TS version="2.1" language="ru_RU">
 <context>
+    <name>EmbeddedChannel</name>
+    <message><source>Preview channel disconnected.</source><translation>Канал предварительного просмотра отключён.</translation></message>
+    <message><source>Cannot send preview control message.</source><translation>Не удалось отправить команду предварительного просмотра.</translation></message>
+    <message><source>Invalid preview frame.</source><translation>Недопустимый кадр предварительного просмотра.</translation></message>
+    <message><source>Cannot send preview frame.</source><translation>Не удалось отправить кадр предварительного просмотра.</translation></message>
+    <message><source>Preview message is too large.</source><translation>Слишком большое сообщение предварительного просмотра.</translation></message>
+    <message><source>Invalid preview message size.</source><translation>Недопустимый размер сообщения предварительного просмотра.</translation></message>
+    <message><source>Invalid preview control message.</source><translation>Недопустимая команда предварительного просмотра.</translation></message>
+    <message><source>Invalid preview frame size.</source><translation>Недопустимый размер кадра предварительного просмотра.</translation></message>
+    <message><source>Invalid preview message.</source><translation>Недопустимое сообщение предварительного просмотра.</translation></message>
+</context>
+<context>
+    <name>EmbeddedPreview</name>
+    <message><source>Android preview did not connect.</source><translation>Предварительный просмотр Android не подключился.</translation></message>
+    <message><source>Cannot initialize the embedded preview channel.</source><translation>Не удалось создать канал встроенного предварительного просмотра.</translation></message>
+    <message><source>Starting Android app...</source><translation>Запуск приложения Android...</translation></message>
+    <message><source>Android app ended.</source><translation>Приложение Android завершилось.</translation></message>
+    <message><source>Could not start Android app: %1</source><translation>Не удалось запустить приложение Android: %1</translation></message>
+</context>
+<context>
+    <name>EmbeddedPreviewChild</name>
+    <message><source>Cannot authenticate the embedded preview manager.</source><translation>Не удалось проверить менеджер встроенного предварительного просмотра.</translation></message>
+</context>
+<context>
     <name>AndroidFilePicker</name>
     <message>
         <source>Select a file</source>
@@ -387,6 +411,61 @@
 </context>
 <context>
     <name>AndroidCompatibilityLayer</name>
+    <message><source>No Apps Yet</source><translation>Пока нет приложений</translation></message>
+    <message><source>No log available to save.</source><translation>Нет журнала для сохранения.</translation></message>
+    <message><source>Open Aurora Store</source><translation>Открыть Aurora Store</translation></message>
+    <message>
+        <source>Test RPMs created while detailed logging is enabled save their own logs in Documents/AndroidCompatibilityLayer-Error-Logs. They keep recording after this setting is turned off; remove them and create new RPMs to stop it. Logs may contain private data.</source>
+        <translation>Тестовые RPM, созданные при включённом подробном журнале, сохраняют свои журналы в Documents/AndroidCompatibilityLayer-Error-Logs. Они продолжают запись после отключения этой настройки; чтобы её остановить, удалите их и создайте новые RPM. Журналы могут содержать личные данные.</translation>
+    </message>
+    <message>
+        <source>Could not launch %1. Install it as an RPM?</source>
+        <translation>Не удалось запустить %1. Установить приложение как RPM?</translation>
+    </message>
+    <message>
+        <source>Automatically install apps as RPM</source>
+        <translation>Автоматически устанавливать приложения как RPM</translation>
+    </message>
+    <message>
+        <source>Create an RPM when an app is added to the library. The system installer may ask for confirmation.</source>
+        <translation>Создавать RPM при добавлении приложения в библиотеку. Системный установщик может запросить подтверждение.</translation>
+    </message>
+    <message>
+        <source>Added %1 to the library.</source>
+        <translation>%1 добавлено в библиотеку.</translation>
+    </message>
+    <message>
+        <source>Detailed log</source>
+        <translation>Подробный журнал</translation>
+    </message>
+    <message>
+        <source>Enable</source>
+        <translation>Включить</translation>
+    </message>
+    <message>
+        <source>Enable detailed log</source>
+        <translation>Включить подробный журнал</translation>
+    </message>
+    <message>
+        <source>Use short log</source>
+        <translation>Использовать краткий журнал</translation>
+    </message>
+    <message>
+        <source>Detailed logs may contain passwords, tokens, app data, paths and network addresses. The manager saves them in private storage. While enabled, newly created standalone RPMs also save test logs in Documents, accessible to other apps with Documents access. Those RPMs keep recording after detailed logging is turned off: remove them and create new RPMs to stop it. Saved files remain. If saving the cleared manager history fails, old logs may reappear. Remote events are untrusted. Review logs before sharing.</source>
+        <translation>Подробные журналы могут содержать пароли, токены, данные приложений, пути и сетевые адреса. Менеджер сохраняет их в приватном хранилище. Пока журнал включён, новые самостоятельные RPM также сохраняют тестовые журналы в Документы, доступные другим приложениям с разрешением на документы. Эти RPM продолжают запись после отключения подробного журнала: чтобы её остановить, удалите их и создайте новые RPM. Сохранённые файлы остаются. Если сохранить очищенный журнал менеджера не удастся, прежние записи могут появиться снова. События других процессов недостоверны. Проверяйте журналы перед отправкой.</translation>
+    </message>
+    <message>
+        <source>Logs are saved automatically in the manager's private storage. Recent events may be lost before they are saved or delivered. Events may be dropped; remote sources are untrusted. Older standalone apps need rebuilding for this log service.</source>
+        <translation>Журналы автоматически сохраняются в приватном хранилище менеджера. Последние события могут потеряться до сохранения или доставки. События могут теряться; источникам других процессов нельзя доверять. Для работы с этим журналом старые самостоятельные приложения нужно пересобрать.</translation>
+    </message>
+    <message>
+        <source>Automatic log storage failed: %1</source>
+        <translation>Не удалось автоматически сохранить журнал: %1</translation>
+    </message>
+    <message>
+        <source>Detailed logging is on. The log may contain private data.</source>
+        <translation>Подробный журнал включён. Он может содержать личные данные.</translation>
+    </message>
     <message>
         <source>microG</source>
         <translation>microG</translation>
@@ -865,6 +944,10 @@ Pick an Android app&apos;s APK to add it to the library.</source>
 <context>
     <name>Preview</name>
     <message>
+        <source>Diagnostic file could not be saved: %1</source>
+        <translation>Не удалось сохранить диагностический файл: %1</translation>
+    </message>
+    <message>
         <source>Close</source>
         <translation>Закрыть</translation>
     </message>
@@ -981,6 +1064,10 @@ Pick an Android app&apos;s APK to add it to the library.</source>
 <context>
     <name>PreviewSessions</name>
     <message>
+        <source>Cannot start the embedded preview channel: %1</source>
+        <translation>Не удалось запустить канал встроенного предварительного просмотра: %1</translation>
+    </message>
+    <message>
         <source>Cannot start an app without its storage paths.</source>
         <translation>Нельзя запустить приложение без путей к его хранилищу.</translation>
     </message>
@@ -1003,6 +1090,34 @@ Pick an Android app&apos;s APK to add it to the library.</source>
 </context>
 <context>
     <name>Probe</name>
+    <message><source>Could not switch to Aurora Store: %1</source><translation>Не удалось переключиться на Aurora Store: %1</translation></message>
+    <message><source>Switching to Aurora Store...</source><translation>Переключение на Aurora Store...</translation></message>
+    <message><source>Could not start Aurora Store: %1</source><translation>Не удалось запустить Aurora Store: %1</translation></message>
+    <message><source>Starting Aurora Store...</source><translation>Запуск Aurora Store...</translation></message>
+    <message>
+        <source>Cannot determine the detailed logging state: %1</source>
+        <translation>Не удалось определить состояние подробного журнала: %1</translation>
+    </message>
+    <message>
+        <source>Could not save automatic RPM installation.</source>
+        <translation>Не удалось сохранить настройку автоматической установки RPM.</translation>
+    </message>
+    <message>
+        <source>microG is still closing. Try again when it has stopped.</source>
+        <translation>microG ещё закрывается. Повторите попытку после завершения.</translation>
+    </message>
+    <message>
+        <source>Detailed logging changed, but saving its state failed: %1</source>
+        <translation>Режим подробного журнала изменён, но сохранить его состояние не удалось: %1</translation>
+    </message>
+    <message>
+        <source>Could not read the detailed log: %1</source>
+        <translation>Не удалось прочитать подробный журнал: %1</translation>
+    </message>
+    <message>
+        <source>[Earlier detailed output is not shown; save or share the log for more.]</source>
+        <translation>[Предыдущие записи не показаны; сохраните или отправьте журнал, чтобы увидеть больше.]</translation>
+    </message>
     <message>
         <source>The RPM builder timed out.</source>
         <translation>Время создания RPM истекло.</translation>

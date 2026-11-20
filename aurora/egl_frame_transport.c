@@ -63,13 +63,17 @@ static AuroraEglFrameResult reject_egl(char *failure, size_t failure_size, const
 
 void aurora_egl_frame_release(AuroraEglFrame *frame)
 {
-    PFNEGLDESTROYIMAGEKHRPROC destroy_image = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
-    PFNEGLDESTROYSYNCKHRPROC destroy_sync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
     if (!frame) return;
-    if (frame->fence && (!destroy_sync || !destroy_sync(frame->display, frame->fence)))
-        fprintf(stderr, "EGL frame fence destruction failed\n");
-    if (frame->image && (!destroy_image || !destroy_image(frame->display, frame->image)))
-        fprintf(stderr, "EGL frame image destruction failed\n");
+    if (frame->fence) {
+        PFNEGLDESTROYSYNCKHRPROC destroy_sync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+        if (!destroy_sync || !destroy_sync(frame->display, frame->fence))
+            fprintf(stderr, "EGL frame fence destruction failed\n");
+    }
+    if (frame->image) {
+        PFNEGLDESTROYIMAGEKHRPROC destroy_image = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+        if (!destroy_image || !destroy_image(frame->display, frame->image))
+            fprintf(stderr, "EGL frame image destruction failed\n");
+    }
     memset(frame, 0, sizeof(*frame));
 }
 

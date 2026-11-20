@@ -22,12 +22,10 @@
  *     right angles; other corners are neither mitered, rounded nor bevelled,
  *     and round caps are square.
  *   - A clip is a rectangle of whole pixels: the box of what was asked for
- *     when the matrix rotates, and for a path the box of the path. A
- *     rectangle cut out of the clip is kept (eight of them at most) when the
- *     matrix does not rotate, and not otherwise; a path cut out is kept the
- *     same way, as its box (exact for a rectangle's path, which is what an
- *     inverse path clipped to arrives as: the core turns that into cutting
- *     the path out).
+ *     when the matrix rotates, and for a path the pixels inside its fill
+ *     rule. A rectangle cut out of the clip is kept (eight of them at most)
+ *     when the matrix does not rotate; paths cut out of the clip use the
+ *     same per-pixel mask as intersected paths.
  *   - A layer is not a picture of its own: save_layer is a save, and its
  *     alpha multiplies what is drawn until the restore. That is the same
  *     only while what is drawn in the layer does not overlap itself, and the
@@ -62,12 +60,21 @@
 #define MAX_CUTS 8
 #define CURVE_PIECES 24
 
+typedef struct sclip {
+    size_t refs;
+    struct sclip *parent;
+    i32 box[4];
+    bool difference;
+    u8 *pixels;                        /* path coverage, packed to box */
+} sclip;
+
 typedef struct sstate {
     float m[6];
     i32 clip[4];                       /* left, top, right, bottom, in pixels, inside the bitmap */
     i32 cut[MAX_CUTS][4];              /* rectangles taken out of it */
     i32 cuts;
     u32 alpha;                         /* the layers' alphas multiplied, 0..255 */
+    sclip *path_clip;                  /* shared by saved states until a later path clip changes it */
 } sstate;
 
 typedef struct scanvas {
@@ -140,6 +147,13 @@ static u32 blend_channel(int mode, u32 s, u32 d, u32 sa, u32 da)
     case MEGLER_GFX_BLEND_PLUS: v = s + d; break;
     case MEGLER_GFX_BLEND_MODULATE: v = mul255(s, d); break;
     case MEGLER_GFX_BLEND_SCREEN: v = s + d - mul255(s, d); break;
+    case MEGLER_GFX_BLEND_OVERLAY:
+        if (2 * d <= da) v = both + 2 * mul255(s, d);
+        else {
+            u32 overlay = mul255(sa, da), subtract = 2 * mul255(da - d, sa - s);
+            v = both + (overlay > subtract ? overlay - subtract : 0);
+        }
+        break;
     case MEGLER_GFX_BLEND_DARKEN: v = both + (x < y ? x : y); break;
     case MEGLER_GFX_BLEND_LIGHTEN: v = both + (x > y ? x : y); break;
     default: v = s + mul255(d, 255 - sa); break;
@@ -158,6 +172,33 @@ static u32 blended(int mode, u32 s, u32 d)
 /* --------------------------------------------------------------- canvases */
 
 static sstate *state(scanvas *v) { return &v->st[v->depth]; }
+
+static void clip_retain(sclip *clip)
+{
+    if (clip) clip->refs++;
+}
+
+static void clip_release(sclip *clip)
+{
+    while (clip && --clip->refs == 0) {
+        sclip *parent = clip->parent;
+        free(clip->pixels);
+        free(clip);
+        clip = parent;
+    }
+}
+
+static bool path_clip_contains(const sstate *s, i32 x, i32 y)
+{
+    const sclip *clip;
+    for (clip = s->path_clip; clip; clip = clip->parent) {
+        i32 width = clip->box[2] - clip->box[0];
+        bool inside = x >= clip->box[0] && x < clip->box[2] && y >= clip->box[1] && y < clip->box[3] &&
+                      clip->pixels[(size_t)(y - clip->box[1]) * (size_t)width + (size_t)(x - clip->box[0])] != 0;
+        if (clip->difference ? inside : !inside) return false;
+    }
+    return true;
+}
 
 /* A coordinate as a pixel number that stays a number: far outside any bitmap is as good as infinitely far. */
 static i32 pixel_at(double v)
@@ -221,6 +262,7 @@ static MEGLER_CB void *s_canvas_new(void *user, void *pixels, int width, int hei
     (void)user;
     if (!pixels || width <= 0 || height <= 0 || stride < width * 4) return NULL;
     v = (scanvas *)mg_alloc(sizeof(*v));
+    memset(v, 0, sizeof(*v));
     v->px = (u8 *)pixels;
     v->w = width;
     v->h = height;
@@ -240,6 +282,7 @@ static MEGLER_CB void s_canvas_free(void *user, void *canvas)
     (void)user;
     if (!v) return;
     free(v->mask);
+    while (v->depth >= 0) clip_release(v->st[v->depth--].path_clip);
     free(v->st);
     free(v);
 }
@@ -259,6 +302,7 @@ static MEGLER_CB void s_save(void *user, void *canvas)
         v->st = (sstate *)mg_realloc(v->st, sizeof(sstate) * (size_t)v->cap);
     }
     v->st[v->depth + 1] = v->st[v->depth];
+    clip_retain(v->st[v->depth + 1].path_clip);
     v->depth++;
 }
 
@@ -283,6 +327,7 @@ static MEGLER_CB void s_restore(void *user, void *canvas)
     if (v->depth <= 0) return;
     /* The matrix is not the save's to keep (megler.h): the one in force stays. */
     memcpy(m, state(v)->m, sizeof(m));
+    clip_release(state(v)->path_clip);
     v->depth--;
     memcpy(state(v)->m, m, sizeof(m));
 }
@@ -570,7 +615,7 @@ static void mask_paint(scanvas *v, u32 color, int blend)
         for (x = v->box[0]; x < v->box[2]; x++) {
             if (!m[x]) continue;
             m[x] = 0;
-            if (s->cuts && cut_out(s, x, y)) continue;
+            if ((s->cuts && cut_out(s, x, y)) || !path_clip_contains(s, x, y)) continue;
             mg_wr32(row + 4 * (size_t)x, blended(blend, color, mg_rd32(row + 4 * (size_t)x)));
         }
     }
@@ -645,32 +690,82 @@ static MEGLER_CB void s_draw_path(void *user, void *canvas, const float *path, i
     draw_points((scanvas *)canvas, &p, fill, paint, shader);
 }
 
-/* The clip becomes what of it is in the box of the path, or that box is cut out of it: see the top of the file. */
+/* Keep the path's pixels in device space so later matrix changes do not move the clip. */
 static MEGLER_CB void s_clip_path(void *user, void *canvas, const float *path, int count, int fill, int op)
 {
     scanvas *v = (scanvas *)canvas;
     sstate *s = state(v);
     spoints p;
+    sclip *next, *old;
     double x, y, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    i32 i, box[4];
+    size_t i, mask_size;
+    i32 k, box[4], mask_box[4], mask_width, mask_height;
     (void)user;
-    (void)fill;
-    if (op != MEGLER_GFX_CLIP_INTERSECT && (s->m[1] != 0 || s->m[3] != 0 || s->cuts >= MAX_CUTS)) return;
+    if (op != MEGLER_GFX_CLIP_INTERSECT && op != MEGLER_GFX_CLIP_DIFFERENCE) return;
     memset(&p, 0, sizeof(p));
     points_path(&p, path, count);
-    for (i = 0; i < p.n; i++) {
-        map(s->m, p.xy[2 * (size_t)i], p.xy[2 * (size_t)i + 1], &x, &y);
-        if (!i || x < x0) x0 = x;
-        if (!i || x > x1) x1 = x;
-        if (!i || y < y0) y0 = y;
-        if (!i || y > y1) y1 = y;
+    if (!p.n) {
+        if (op == MEGLER_GFX_CLIP_INTERSECT) {
+            box[0] = box[1] = box[2] = box[3] = 0;
+            clip_to(s, box);
+        }
+        points_free(&p);
+        return;
+    }
+    for (k = 0; k < p.n; k++) {
+        map(s->m, p.xy[2 * (size_t)k], p.xy[2 * (size_t)k + 1], &x, &y);
+        if (!k || x < x0) x0 = x;
+        if (!k || x > x1) x1 = x;
+        if (!k || y < y0) y0 = y;
+        if (!k || y > y1) y1 = y;
     }
     box[0] = pixel_at(ceil(x0 - 0.5));
     box[1] = pixel_at(ceil(y0 - 0.5));
     box[2] = pixel_at(ceil(x1 - 0.5));
     box[3] = pixel_at(ceil(y1 - 0.5));
     if (op == MEGLER_GFX_CLIP_INTERSECT) clip_to(s, box);
-    else if (p.n) memcpy(s->cut[s->cuts++], box, sizeof(box));
+    memcpy(mask_box, box, sizeof(mask_box));
+    if (mask_box[0] < s->clip[0]) mask_box[0] = s->clip[0];
+    if (mask_box[1] < s->clip[1]) mask_box[1] = s->clip[1];
+    if (mask_box[2] > s->clip[2]) mask_box[2] = s->clip[2];
+    if (mask_box[3] > s->clip[3]) mask_box[3] = s->clip[3];
+    if (mask_box[0] < 0) mask_box[0] = 0;
+    if (mask_box[1] < 0) mask_box[1] = 0;
+    if (mask_box[2] > v->w) mask_box[2] = v->w;
+    if (mask_box[3] > v->h) mask_box[3] = v->h;
+    mask_width = mask_box[2] - mask_box[0];
+    mask_height = mask_box[3] - mask_box[1];
+    if (mask_width <= 0 || mask_height <= 0) {
+        points_free(&p);
+        return;
+    }
+    mask_fill(v, &p, fill);
+    mask_size = (size_t)mask_width * (size_t)mask_height;
+    next = (sclip *)mg_alloc(sizeof(*next));
+    next->pixels = (u8 *)mg_alloc(mask_size);
+    next->box[0] = mask_box[0];
+    next->box[1] = mask_box[1];
+    next->box[2] = mask_box[2];
+    next->box[3] = mask_box[3];
+    next->difference = op == MEGLER_GFX_CLIP_DIFFERENCE;
+    next->refs = 1;
+    old = s->path_clip;
+    next->parent = old;
+    clip_retain(old);
+    for (i = 0; i < (size_t)mask_height; i++) {
+        const u8 *source = v->mask ? v->mask + (size_t)(mask_box[1] + (i32)i) * (size_t)v->w + (size_t)mask_box[0] : NULL;
+        u8 *destination = next->pixels + i * (size_t)mask_width;
+        if (source) memcpy(destination, source, (size_t)mask_width);
+        else memset(destination, 0, (size_t)mask_width);
+    }
+    s->path_clip = next;
+    clip_release(old);
+    if (v->mask) {
+        memset(v->mask, 0, (size_t)v->w * (size_t)v->h);
+        v->box[0] = v->w;
+        v->box[1] = v->h;
+        v->box[2] = v->box[3] = 0;
+    }
     points_free(&p);
 }
 
@@ -684,7 +779,7 @@ static MEGLER_CB void s_draw_color(void *user, void *canvas, uint32_t color, int
     for (y = s->clip[1]; y < s->clip[3]; y++) {
         u8 *row = v->px + (size_t)y * (size_t)v->stride;
         for (x = s->clip[0]; x < s->clip[2]; x++) {
-            if (s->cuts && cut_out(s, x, y)) continue;
+            if ((s->cuts && cut_out(s, x, y)) || !path_clip_contains(s, x, y)) continue;
             mg_wr32(row + 4 * (size_t)x, blended(blend, c, mg_rd32(row + 4 * (size_t)x)));
         }
     }
@@ -727,7 +822,7 @@ static MEGLER_CB void s_draw_bitmap(void *user, void *canvas, const megler_gfx_i
             lx = (m[4] * dx - m[1] * dy) / det;
             ly = (m[0] * dy - m[3] * dx) / det;
             if (!(lx >= dst[0] && lx < dst[2] && ly >= dst[1] && ly < dst[3])) continue;
-            if (s->cuts && cut_out(s, x, y)) continue;
+            if ((s->cuts && cut_out(s, x, y)) || !path_clip_contains(s, x, y)) continue;
             sx = pixel_at(floor(src[0] + (lx - dst[0]) * ((double)src[2] - src[0]) / ((double)dst[2] - dst[0])));
             sy = pixel_at(floor(src[1] + (ly - dst[1]) * ((double)src[3] - src[1]) / ((double)dst[3] - dst[1])));
             if (sx < sx0) sx = sx0;

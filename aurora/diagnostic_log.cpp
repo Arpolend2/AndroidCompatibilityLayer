@@ -82,17 +82,19 @@ struct DiagnosticLog::State {
         ++revision;
     }
 
-    void ingest(const QString &source, const QByteArray &bytes, int output)
+    void ingest(const QString &source, const QByteArray &bytes, int output, bool persist = false)
     {
         if (bytes.isEmpty()) return;
+        QString text;
         {
             std::lock_guard<std::mutex> lock(mutex);
             auto &decoder = decoders[source];
             if (!decoder) decoder = std::make_shared<Decoder>();
-            const QString text = QTextCodec::codecForName("UTF-8")->toUnicode(
+            text = QTextCodec::codecForName("UTF-8")->toUnicode(
                 bytes.constData(), bytes.size(), &decoder->state);
             if (!text.isEmpty()) addText(source, text, *decoder);
         }
+        if (persist && !text.isEmpty()) ErrorLog::record(source, text, false);
         const auto writer = forward[output];
         bool lost = false;
         {
@@ -127,7 +129,6 @@ QtMessageHandler DiagnosticLog::s_previousHandler = nullptr;
 
 void DiagnosticLog::messageHandler(QtMsgType type, const QMessageLogContext &context, const QString &message)
 {
-    ErrorLog::record(QStringLiteral("Qt"), message, type == QtWarningMsg || type == QtCriticalMsg || type == QtFatalMsg);
     std::shared_ptr<State> state;
     QtMessageHandler previous;
     {
@@ -135,6 +136,8 @@ void DiagnosticLog::messageHandler(QtMsgType type, const QMessageLogContext &con
         state = s_messageState;
         previous = s_previousHandler;
     }
+    if (previous != &DiagnosticLog::childMessageHandler)
+        ErrorLog::record(QStringLiteral("Qt"), message, type == QtWarningMsg || type == QtCriticalMsg || type == QtFatalMsg);
     if (state) state->ingest(QStringLiteral("controller Qt"),
                              (qFormatLogMessage(type, context, message) + QLatin1Char('\n')).toUtf8(), 1);
     if (previous) previous(type, context, message);
@@ -176,7 +179,7 @@ DiagnosticLog::DiagnosticLog(QObject *parent)
     });
 }
 
-bool DiagnosticLog::start(QString *error)
+bool DiagnosticLog::start(QString *error, bool persistStreams)
 {
     if (error) error->clear();
     if (available()) {
@@ -255,7 +258,7 @@ bool DiagnosticLog::start(QString *error)
         }).detach();
     }
     const auto state = m_state;
-    state->reader = std::thread([state]() {
+    state->reader = std::thread([state, persistStreams]() {
         pollfd descriptors[2] = {{state->readFd[0], POLLIN, 0}, {state->readFd[1], POLLIN, 0}};
         char data[4096];
         for (;;) {
@@ -265,7 +268,7 @@ bool DiagnosticLog::start(QString *error)
                     const ssize_t count = ::read(descriptors[i].fd, data, sizeof(data));
                     if (count <= 0) break;
                     state->ingest(i == 0 ? QStringLiteral("controller stdout") : QStringLiteral("controller stderr"),
-                                  QByteArray(data, int(count)), i);
+                                  QByteArray(data, int(count)), i, persistStreams);
                 }
             }
             std::lock_guard<std::mutex> lock(state->mutex);
@@ -285,6 +288,11 @@ bool DiagnosticLog::start(QString *error)
 void DiagnosticLog::startNotifications()
 {
     m_timer->start();
+}
+
+QString DiagnosticLog::standaloneDiagnosticFileError() const
+{
+    return ErrorLog::standaloneDiagnosticFileError();
 }
 
 DiagnosticLog::~DiagnosticLog()
@@ -328,7 +336,7 @@ QString DiagnosticLog::text() const
 
 void DiagnosticLog::append(const QString &source, const QByteArray &bytes, int output)
 {
-    m_state->ingest(source, bytes, output);
+    m_state->ingest(source, bytes, output, true);
 }
 
 void DiagnosticLog::finish(const QString &source)

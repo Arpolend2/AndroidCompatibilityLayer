@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <vector>
 
 inline bool audioConvertible(const QAudioFormat &format)
@@ -83,9 +85,10 @@ class AudioConverter
 {
 public:
     AudioConverter(AudioQueue &queue, int inputRate, const QAudioFormat &format)
-        : m_queue(queue), m_inputRate(inputRate), m_format(format), m_phase(format.sampleRate()),
-          m_input(static_cast<std::size_t>(1 + (256LL * inputRate + format.sampleRate() - 1) / format.sampleRate()) * 4)
+        : m_queue(queue), m_inputRate(inputRate), m_format(format), m_phase(0),
+          m_input(maxInputFrames(inputRate, format.sampleRate()) * 4)
     {
+        m_source.reserve(maxInputFrames(inputRate, format.sampleRate()) * 2);
     }
 
     void read(char *data, std::size_t size, bool &queued, bool &nonzero)
@@ -138,42 +141,104 @@ private:
     void generate(std::size_t frames, bool &queued, bool &nonzero)
     {
         const int outputRate = m_format.sampleRate();
-        const std::size_t count = static_cast<std::size_t>((m_phase + (frames - 1) * static_cast<int64_t>(m_inputRate)) / outputRate);
-        const std::size_t bytes = count * 4;
-        const std::size_t received = m_queue.read(m_input.data(), bytes);
-        queued = queued || received != 0;
-        if (!nonzero) for (std::size_t i = 0; i < received; ++i)
-            if (m_input[i] != 0) { nonzero = true; break; }
-        std::size_t at = 0;
+        if (m_syntheticStart != noSyntheticStart) {
+            if (m_syntheticStart == 0) {
+                m_source.resize(2);
+                m_phase = m_inputRate;
+            } else {
+                m_source.resize(m_syntheticStart * 2);
+            }
+            m_syntheticStart = noSyntheticStart;
+        }
+        const int64_t lastPosition = m_phase + static_cast<int64_t>(frames - 1) * m_inputRate;
+        const std::size_t requiredFrames = static_cast<std::size_t>(lastPosition / outputRate) + 2;
+        const std::size_t sourceFrames = m_source.size() / 2;
+        if (sourceFrames < requiredFrames) {
+            const std::size_t additionalFrames = requiredFrames - sourceFrames;
+            const std::size_t bytes = additionalFrames * 4;
+            const std::size_t received = m_queue.read(m_input.data(), bytes);
+            queued = queued || received != 0;
+            if (!nonzero) for (std::size_t i = 0; i < received; ++i) {
+                if (m_input[i] != 0) { nonzero = true; break; }
+            }
+            const std::size_t receivedFrames = received / 4;
+            if (receivedFrames) {
+                std::memcpy(&m_lastLeft, m_input.data() + (receivedFrames - 1) * 4, sizeof(m_lastLeft));
+                std::memcpy(&m_lastRight, m_input.data() + (receivedFrames - 1) * 4 + 2, sizeof(m_lastRight));
+                m_haveSource = true;
+                m_paddedLookahead = false;
+            }
+            const std::size_t oldFrames = m_source.size() / 2;
+            if (receivedFrames < additionalFrames && m_haveSource && !m_paddedLookahead) {
+                char *lookahead = m_input.data() + receivedFrames * 4;
+                std::memcpy(lookahead, &m_lastLeft, sizeof(m_lastLeft));
+                std::memcpy(lookahead + 2, &m_lastRight, sizeof(m_lastRight));
+                m_paddedLookahead = true;
+            }
+            const std::size_t oldSamples = m_source.size();
+            m_source.resize(oldSamples + additionalFrames * 2);
+            std::memcpy(m_source.data() + oldSamples, m_input.data(), bytes);
+            if (receivedFrames < additionalFrames) m_syntheticStart = oldFrames + receivedFrames;
+        }
+        std::size_t sourceIndex = static_cast<std::size_t>(m_phase / outputRate);
+        int64_t phase = m_phase % outputRate;
         const int sampleBytes = m_format.sampleSize() / 8;
         const int frameBytes = m_format.bytesPerFrame();
         for (std::size_t i = 0; i < frames; ++i) {
-            while (m_phase >= outputRate) {
-                std::memcpy(&m_left, m_input.data() + at, sizeof(m_left));
-                std::memcpy(&m_right, m_input.data() + at + 2, sizeof(m_right));
-                at += 4;
-                m_phase -= outputRate;
-            }
+            const int16_t left = interpolate(m_source[sourceIndex * 2], m_source[(sourceIndex + 1) * 2],
+                                              phase, outputRate);
+            const int16_t right = interpolate(m_source[sourceIndex * 2 + 1],
+                                               m_source[(sourceIndex + 1) * 2 + 1], phase, outputRate);
             char *frame = m_output.data() + i * static_cast<std::size_t>(frameBytes);
             if (m_format.channelCount() == 1)
-                put(frame, static_cast<int16_t>((static_cast<int>(m_left) + m_right) / 2));
+                put(frame, static_cast<int16_t>((static_cast<int>(left) + right) / 2));
             else {
-                put(frame, m_left);
-                put(frame + sampleBytes, m_right);
+                put(frame, left);
+                put(frame + sampleBytes, right);
             }
-            m_phase += m_inputRate;
+            if (i + 1 < frames) {
+                phase += m_inputRate;
+                sourceIndex += static_cast<std::size_t>(phase / outputRate);
+                phase %= outputRate;
+            }
         }
+        m_phase = phase + m_inputRate;
+        if (m_syntheticStart != noSyntheticStart) {
+            if (sourceIndex >= m_syntheticStart)
+                m_syntheticStart = 0;
+            else
+                m_syntheticStart -= sourceIndex;
+        }
+        if (sourceIndex)
+            m_source.erase(m_source.begin(), m_source.begin() + static_cast<std::ptrdiff_t>(sourceIndex * 2));
         m_offset = 0;
         m_size = frames * static_cast<std::size_t>(frameBytes);
     }
+
+    static std::size_t maxInputFrames(int inputRate, int outputRate)
+    {
+        return static_cast<std::size_t>(3 + (256LL * inputRate + outputRate - 1) / outputRate);
+    }
+
+    static int16_t interpolate(int16_t first, int16_t second, int64_t phase, int outputRate)
+    {
+        const double value = first + (static_cast<int>(second) - first) *
+                                      (static_cast<double>(phase) / outputRate);
+        return static_cast<int16_t>(std::round(value));
+    }
+
+    static const std::size_t noSyntheticStart = std::numeric_limits<std::size_t>::max();
 
     AudioQueue &m_queue;
     std::mutex m_mutex;
     const int m_inputRate;
     const QAudioFormat m_format;
     int64_t m_phase;
-    int16_t m_left = 0, m_right = 0;
     std::vector<char> m_input;
+    std::vector<int16_t> m_source;
+    int16_t m_lastLeft = 0, m_lastRight = 0;
+    bool m_haveSource = false, m_paddedLookahead = false;
+    std::size_t m_syntheticStart = noSyntheticStart;
     std::array<char, 4096> m_output{};
     std::size_t m_offset = 0, m_size = 0;
 };

@@ -527,6 +527,7 @@ public class Main extends Activity {
                 && frontFacing == android.hardware.camera2.CameraMetadata.LENS_FACING_FRONT;
         Log.i(T, "camera2 ids=" + Arrays.toString(ids) + " facing=" + facing + " orientation=" + orientation + " yuv=" + Arrays.toString(yuv));
         final android.media.ImageReader reader = android.media.ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2);
+        final android.media.ImageReader jpeg = android.media.ImageReader.newInstance(320, 240, ImageFormat.JPEG, 1);
         final Set<Long> results = Collections.synchronizedSet(new HashSet<Long>()), stamps = Collections.synchronizedSet(new HashSet<Long>());
         final List<String> problems = Collections.synchronizedList(new ArrayList<String>());
         final CountDownLatch images = new CountDownLatch(3), opened = new CountDownLatch(1), configured = new CountDownLatch(1), closed = new CountDownLatch(1);
@@ -559,7 +560,7 @@ public class Main extends Activity {
         }, cameraHandler);
         if (!opened.await(20, TimeUnit.SECONDS) || device[0] == null) return false;
         final android.hardware.camera2.CameraCaptureSession[] session = new android.hardware.camera2.CameraCaptureSession[1];
-        device[0].createCaptureSession(Arrays.asList(reader.getSurface()), new android.hardware.camera2.CameraCaptureSession.StateCallback() {
+        device[0].createCaptureSession(Arrays.asList(reader.getSurface(), jpeg.getSurface()), new android.hardware.camera2.CameraCaptureSession.StateCallback() {
             @Override public void onConfigured(android.hardware.camera2.CameraCaptureSession s) { session[0] = s; configured.countDown(); }
             @Override public void onConfigureFailed(android.hardware.camera2.CameraCaptureSession s) { problems.add("configure failed"); configured.countDown(); }
         }, cameraHandler);
@@ -578,17 +579,61 @@ public class Main extends Activity {
             }
         }, cameraHandler);
         boolean got = images.await(20, TimeUnit.SECONDS);
+        android.hardware.camera2.CaptureRequest.Builder still = device[0].createCaptureRequest(android.hardware.camera2.CameraDevice.TEMPLATE_STILL_CAPTURE);
+        still.addTarget(jpeg.getSurface());
+        still.set(android.hardware.camera2.CaptureRequest.JPEG_ORIENTATION, 90);
+        still.set(android.hardware.camera2.CaptureRequest.JPEG_QUALITY, (byte) 90);
+        final CountDownLatch captures = new CountDownLatch(3);
+        final List<Long> jpegResults = Collections.synchronizedList(new ArrayList<Long>());
+        final List<Long> lost = Collections.synchronizedList(new ArrayList<Long>());
+        android.hardware.camera2.CaptureRequest shot = still.build();
+        session[0].captureBurst(Arrays.asList(shot, shot, shot), new android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
+            @Override public void onCaptureCompleted(android.hardware.camera2.CameraCaptureSession s, android.hardware.camera2.CaptureRequest r,
+                                                     android.hardware.camera2.TotalCaptureResult result) {
+                jpegResults.add(result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP));
+                captures.countDown();
+            }
+            @Override public void onCaptureBufferLost(android.hardware.camera2.CameraCaptureSession s, android.hardware.camera2.CaptureRequest r,
+                                                      android.view.Surface target, long frame) {
+                if (target == jpeg.getSurface()) lost.add(frame);
+            }
+        }, cameraHandler);
+        boolean captured = captures.await(20, TimeUnit.SECONDS);
+        Set<Long> jpegStamps = new HashSet<>();
+        boolean jpegOk = captured;
+        for (int i = 0; i < 2; i++) {
+            android.media.Image image = jpeg.acquireNextImage();
+            if (image == null) { jpegOk = false; break; }
+            try {
+                android.media.Image.Plane[] planes = image.getPlanes();
+                if (planes.length != 1) { jpegOk = false; continue; }
+                ByteBuffer data = planes[0].getBuffer();
+                byte[] bytes = new byte[data.remaining()];
+                data.get(bytes);
+                android.graphics.Bitmap decoded = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                jpegOk &= image.getFormat() == ImageFormat.JPEG && image.getWidth() == 320 && image.getHeight() == 240
+                        && decoded != null && decoded.getWidth() == 240 && decoded.getHeight() == 320;
+                if (decoded != null) decoded.recycle();
+                jpegStamps.add(image.getTimestamp());
+            } finally { image.close(); }
+        }
+        jpegOk &= jpegStamps.size() == 2 && jpegResults.containsAll(jpegStamps) && lost.size() == 1;
+        final CountDownLatch repeatingJpeg = new CountDownLatch(1);
+        jpeg.setOnImageAvailableListener(r -> repeatingJpeg.countDown(), cameraHandler);
+        session[0].setRepeatingRequest(shot, null, cameraHandler);
+        jpegOk &= repeatingJpeg.await(20, TimeUnit.SECONDS);
         session[0].stopRepeating();
         session[0].close();
         device[0].close();
         boolean wasClosed = closed.await(10, TimeUnit.SECONDS);
         reader.close();
+        jpeg.close();
         boolean paired;
         synchronized (stamps) {
             paired = !stamps.isEmpty() && results.containsAll(stamps);
         }
-        Log.i(T, "camera2 images=" + got + " closed=" + wasClosed + " paired=" + paired + " results=" + results.size() + " problems=" + problems);
-        return chars && got && wasClosed && paired && problems.isEmpty();
+        Log.i(T, "camera2 images=" + got + " jpeg=" + jpegOk + " lost=" + lost.size() + " closed=" + wasClosed + " paired=" + paired + " results=" + results.size() + " problems=" + problems);
+        return chars && got && jpegOk && wasClosed && paired && problems.isEmpty();
     }
 
     /** The back camera's parameters as an app reads and sets them. */

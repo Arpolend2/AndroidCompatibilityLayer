@@ -44,6 +44,7 @@ bool standalonePaths(const QString &appId, const QString &executableName,
     const QString theme = themeValue.toString();
     const QString location = locationValue.toString();
     const QJsonValue permissionsValue = object.value(QStringLiteral("deniedPermissions"));
+    const QJsonValue diagnosticsValue = object.value(QStringLiteral("fileDiagnostics"));
     QStringList deniedPermissions;
     const ApkStore store(QDir(privateRoot).filePath(QStringLiteral("apps")));
     const QString data = store.dataPath(package);
@@ -55,6 +56,7 @@ bool standalonePaths(const QString &appId, const QString &executableName,
         (!localeValue.isUndefined() && !localeValue.isString()) ||
         (!themeValue.isUndefined() && !themeValue.isString()) ||
         (!locationValue.isUndefined() && !locationValue.isString()) ||
+        (!diagnosticsValue.isUndefined() && !diagnosticsValue.isBool()) ||
         (!permissionsValue.isUndefined() && !PermissionSettings::parse(permissionsValue, &deniedPermissions)) ||
         (!locale.isEmpty() && !RuntimeSettings::validLocale(locale)) ||
         !RuntimeSettings::validTheme(theme) ||
@@ -71,5 +73,6 @@ bool standalonePaths(const QString &appId, const QString &executableName,
     paths->theme = theme;
     paths->location = location;
     paths->deniedPermissions = deniedPermissions;
+    paths->fileDiagnostics = diagnosticsValue.toBool(false);
     return true;
 }

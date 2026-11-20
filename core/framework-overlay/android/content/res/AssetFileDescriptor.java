@@ -50,13 +50,14 @@ public class AssetFileDescriptor implements Closeable {
         private long remaining, mark = -1, markRemaining;
         public AutoCloseInputStream(AssetFileDescriptor fd) throws IOException {
             super(fd.pfd != null ? fd.pfd : android.os.ParcelFileDescriptor.dup(fd.fd));
-            getChannel().position(fd.start);
+            if (fd.start != 0) getChannel().position(fd.start);
             remaining = fd.length < 0 ? Long.MAX_VALUE : fd.length;
         }
         @Override public int available() throws IOException { long a = Math.min(remaining, super.available()); return a > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) a; }
         @Override public int read() throws IOException { byte[] one = new byte[1]; return read(one, 0, 1) == 1 ? one[0] & 0xff : -1; }
         @Override public int read(byte[] b) throws IOException { return read(b, 0, b.length); }
         @Override public int read(byte[] b, int off, int n) throws IOException {
+            if (n == 0) return super.read(b, off, 0);
             if (remaining <= 0) return -1;
             if (n > remaining) n = (int) remaining;
             int r = super.read(b, off, n);
@@ -66,10 +67,15 @@ public class AssetFileDescriptor implements Closeable {
         @Override public long skip(long n) throws IOException {
             if (n <= 0 || remaining <= 0) return 0;
             if (n > remaining) n = remaining;
-            java.nio.channels.FileChannel ch = getChannel();
-            ch.position(ch.position() + n);
-            remaining -= n;
-            return n;
+            byte[] buffer = new byte[(int) Math.min(n, 8192)];
+            long skipped = 0;
+            while (skipped < n) {
+                int count = read(buffer, 0, (int) Math.min(buffer.length, n - skipped));
+                if (count < 0) break;
+                if (count == 0) break;
+                skipped += count;
+            }
+            return skipped;
         }
         @Override public boolean markSupported() { return true; }
         @Override public void mark(int limit) { try { mark = getChannel().position(); markRemaining = remaining; } catch (IOException e) { mark = -1; } }

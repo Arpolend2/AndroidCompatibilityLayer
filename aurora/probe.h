@@ -4,7 +4,6 @@
 #include <QObject>
 #include <QString>
 #include <QDebug>
-#include <QCloseEvent>
 #include <QDir>
 #include <QDesktopServices>
 #include <QJsonDocument>
@@ -60,6 +59,7 @@ class Probe : public QObject
     Q_PROPERTY(QString standaloneRpmStatus READ standaloneRpmStatus NOTIFY standaloneRpmChanged)
     Q_PROPERTY(bool standaloneRpmOpened READ standaloneRpmOpened NOTIFY standaloneRpmChanged)
     Q_PROPERTY(QString standaloneRpmPackage READ standaloneRpmPackage NOTIFY standaloneRpmChanged)
+    Q_PROPERTY(bool autoInstallRpm READ autoInstallRpm NOTIFY runtimeSettingsChanged)
     Q_PROPERTY(QString androidLocale READ androidLocale NOTIFY runtimeSettingsChanged)
     Q_PROPERTY(QString systemAndroidLocale READ systemAndroidLocale CONSTANT)
     Q_PROPERTY(QString androidTheme READ androidTheme NOTIFY runtimeSettingsChanged)
@@ -78,6 +78,9 @@ class Probe : public QObject
     Q_PROPERTY(QString runtimeSettingsError READ runtimeSettingsError NOTIFY runtimeSettingsChanged)
     Q_PROPERTY(QString coreLog READ coreLog NOTIFY coreLogChanged)
     Q_PROPERTY(bool coreLogAvailable READ coreLogAvailable NOTIFY coreLogChanged)
+    Q_PROPERTY(QString logStorageError READ logStorageError NOTIFY coreLogChanged)
+    Q_PROPERTY(bool detailedLogEnabled READ detailedLogEnabled NOTIFY detailedLogChanged)
+    Q_PROPERTY(QString detailedLogError READ detailedLogError NOTIFY detailedLogChanged)
     Q_PROPERTY(bool installConfirmationVisible READ installConfirmationVisible NOTIFY installConfirmationChanged)
     Q_PROPERTY(QString installConfirmationToken READ installConfirmationToken NOTIFY installConfirmationChanged)
     Q_PROPERTY(QString installConfirmationLabel READ installConfirmationLabel NOTIFY installConfirmationChanged)
@@ -87,6 +90,11 @@ class Probe : public QObject
     Q_PROPERTY(bool installConfirmationIsBundle READ installConfirmationIsBundle NOTIFY installConfirmationChanged)
 
 public:
+    void setEmbeddedMicrog(EmbeddedEndpoint *embedded) { m_embeddedMicrog = embedded; }
+    void offerStandaloneInstall(const QString &package, const QString &message)
+    {
+        emit standaloneInstallOffered(package, message);
+    }
     explicit Probe(const QString &androidRoot, QObject *parent = nullptr, DiagnosticLog *diagnosticLog = nullptr)
         : QObject(parent), m_androidRoot(androidRoot),
           m_store(appStoragePath()), m_externalInstall(appStoragePath()),
@@ -94,7 +102,18 @@ public:
           m_microgInstall(microgApkPath()),
           m_diagnosticLog(diagnosticLog)
     {
-        connect(this, &Probe::installedAppsChanged, this, [this]() { m_installedAppsValid = false; });
+        QString detailedError;
+        if (!ErrorLog::detailedEnabled(&m_detailedLogEnabled, &detailedError))
+            m_detailedLogError = detailedError;
+        m_detailedLogTimer.setInterval(1000);
+        connect(&m_detailedLogTimer, &QTimer::timeout, this, [this]() {
+            if (m_detailedLogEnabled) refreshDetailedLog();
+            emit coreLogChanged();
+        });
+        if (m_detailedLogEnabled) {
+            refreshDetailedLog();
+        }
+        m_detailedLogTimer.start();
         m_standaloneTimeout.setSingleShot(true);
         connect(&m_standaloneTimeout, &QTimer::timeout, this, [this]() {
             if (m_standaloneRpm.state() == QProcess::NotRunning) return;
@@ -106,6 +125,8 @@ public:
         });
         connect(&m_standaloneRpm, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
                 this, [this](int exitCode, QProcess::ExitStatus status) {
+            qInfo("Standalone RPM: builder finished exit=%d normal=%d timed-out=%d",
+                  exitCode, status == QProcess::NormalExit, m_standaloneTimedOut);
             m_standaloneTimeout.stop();
             const QByteArray output = m_standaloneRpm.readAllStandardOutput();
             readStandaloneRpmDiagnostics(true);
@@ -138,6 +159,7 @@ public:
             emit standaloneRpmChanged();
             if (!m_standaloneRpmOpened)
                 emit standaloneRpmError(m_standalonePackage, m_standaloneRpmStatus);
+            scheduleAutomaticRpm();
         });
         connect(&m_standaloneRpm, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
             if (error != QProcess::FailedToStart) return;
@@ -146,15 +168,21 @@ public:
             ErrorLog::record(QStringLiteral("RPM"), m_standaloneRpmStatus, true);
             emit standaloneRpmChanged();
             emit standaloneRpmError(m_standalonePackage, m_standaloneRpmStatus);
+            scheduleAutomaticRpm();
         });
         connect(&m_bundleInstall, &ApkBundleInstall::confirmationRequested, this,
                 [this](const QString &, const QString &, quint32) {
             m_bundleInstall.decision(true);
         });
-        connect(&m_bundleInstall, &ApkBundleInstall::finished, this, [this](bool installed, const QString &message) {
+        connect(&m_bundleInstall, &ApkBundleInstall::finished, this, [this](bool installed, const QString &message, const QString &package, const QByteArray &fingerprint) {
+            const bool storeHandoff = m_storeHandoff;
+            const bool retryHandoff = m_storeHandoffRetry;
+            m_storeHandoff = false;
+            m_storeHandoffRetry = false;
+            if (storeHandoff) emit storeHandoffFinished(retryHandoff, installed, fingerprint);
             m_result = message;
             if (installed) {
-                emit installedAppsChanged();
+                libraryAppAdded(package);
                 showSignatureReminder();
             } else qWarning().noquote() << "APK bundle:" << message;
             emit resultChanged();
@@ -219,30 +247,31 @@ public:
             connect(m_diagnosticLog, &DiagnosticLog::changed, this, &Probe::coreLogChanged);
         }
         connect(&m_externalInstall, &ExternalApkInstall::confirmationRequested, this,
-                [this](const QString &label, const QString &package, quint32 version) {
-            if (!m_officialStoreActive || m_officialStoreOnline || !m_externalInstall.isUpdate()) {
-                if (m_officialStoreActive) {
-                    m_officialStoreStatus = tr("Adding the Aurora Store APK to the library...");
-                    emit officialStoreChanged();
-                    if (m_officialStoreOnline)
-                        emit officialStoreDownloadNotification(m_officialStoreStatus, -1, false);
-                }
-                m_externalInstall.decision(true);
-                return;
+                [this](const QString &, const QString &, quint32) {
+            if (m_officialStoreActive) {
+                m_officialStoreStatus = tr("Adding the Aurora Store APK to the library...");
+                emit officialStoreChanged();
+                if (m_officialStoreOnline)
+                    emit officialStoreDownloadNotification(m_officialStoreStatus, -1, false);
             }
-            enqueueConfirmation(QUuid::createUuid().toString(), label, package, version, true);
+            m_externalInstall.decision(true);
         });
         connect(&m_externalInstall, &ExternalApkInstall::finished, this,
-                [this](bool installed, const QString &message) {
+                [this](bool installed, const QString &message, const QString &package, const QByteArray &fingerprint) {
+            const bool storeHandoff = m_storeHandoff;
+            const bool retryHandoff = m_storeHandoffRetry;
+            m_storeHandoff = false;
+            m_storeHandoffRetry = false;
+            if (storeHandoff) emit storeHandoffFinished(retryHandoff, installed, fingerprint);
             if (m_officialStoreActive) {
-                if (installed) emit installedAppsChanged();
+                if (installed) libraryAppAdded(package, false);
                 finishOfficialStore(installed, message);
                 emit externalInstallBusyChanged();
                 return;
             }
             if (installed) {
                 m_result = message;
-                emit installedAppsChanged();
+                libraryAppAdded(package);
                 emit resultChanged();
                 showSignatureReminder();
             } else {
@@ -252,14 +281,23 @@ public:
         });
         connect(&m_sessions, &PreviewSessions::runningChanged, this, [this]() {
             emit previewRunningChanged();
+            emit coreLogChanged();
         });
-        connect(&m_sessions, &PreviewSessions::installed, this, &Probe::installedAppsChanged);
+        connect(&m_sessions, &PreviewSessions::started, this, [this](const QString &) {
+            emit coreLogChanged();
+        });
+        connect(&m_sessions, &PreviewSessions::installed, this, [this](const QString &package) { libraryAppAdded(package); });
         connect(&m_sessions, &PreviewSessions::activationFinished, this,
                 [this](const QString &, const QString &key, bool activated, const QString &error) {
             if (activated) {
                 m_appResult = tr("%1 is open.").arg(key);
             } else
                 m_appResult = tr("Could not switch to %1: %2. Use the system app switcher.").arg(key, error);
+            if (key == QLatin1String("com.aurora.store")) {
+                m_officialStoreStatus = m_appResult;
+                emit officialStoreChanged();
+                if (!activated) emit officialStoreLaunchFailed(m_officialStoreStatus);
+            }
             emit appResultChanged();
         });
         connect(&m_sessions, &PreviewSessions::logUnavailable, this, [this](const QString &key) {
@@ -282,8 +320,8 @@ public:
             emit coreLogChanged();
         });
         connect(&m_sessions, &PreviewSessions::confirmationRequested, this,
-                [this](const QString &token, const QString &label, const QString &package, quint32 version) {
-            enqueueConfirmation(token, label, package, version, false);
+                [this](const QString &token, const QString &, const QString &, quint32) {
+            m_sessions.decision(token, true);
         });
         connect(&m_sessions, &PreviewSessions::confirmationCanceled, this, [this](const QString &token) {
             if (m_installToken == token && !m_externalPrompt) {
@@ -310,6 +348,12 @@ public:
                     : tr("Could not start microG: %1").arg(error);
                 emit microgChanged();
             }
+            if (key == QLatin1String("com.aurora.store")) {
+                m_officialStoreStatus = m_appResult;
+                emit officialStoreChanged();
+                if (!error.isEmpty() || crashed || code != 0)
+                    emit officialStoreLaunchFailed(m_officialStoreStatus);
+            }
             emit appResultChanged();
         });
     }
@@ -332,6 +376,7 @@ public:
     QString standaloneRpmStatus() const { return m_standaloneRpmStatus; }
     bool standaloneRpmOpened() const { return m_standaloneRpmOpened; }
     QString standaloneRpmPackage() const { return m_standalonePackage; }
+    bool autoInstallRpm() const { return QSettings().value(QStringLiteral("rpm/autoInstallStandalone"), false).toBool(); }
     Q_INVOKABLE QVariantList appPermissionGroups(const QString &package, const QVariantMap &app)
     {
         m_appResult.clear();
@@ -388,6 +433,7 @@ public:
     }
     Q_INVOKABLE void installStandaloneRpm(const QString &package)
     {
+        qInfo("Standalone RPM: requested");
         if (standaloneRpmBusy()) return;
         m_standaloneRpmOpened = false;
         m_standalonePackage = package;
@@ -399,16 +445,25 @@ public:
         } else if (m_store.apkPath(package).isEmpty() || !QFileInfo(m_store.apkPath(package)).isFile()) {
             m_standaloneRpmStatus = tr("The installed APK was not found.");
         } else {
-            preflightFailed = false;
-            m_standaloneTimedOut = false;
-            m_standaloneRpmStatus = tr("Preparing to create the RPM...");
-            m_standaloneRpm.start(QCoreApplication::applicationFilePath(),
-                                  QStringList() << QStringLiteral("--build-standalone") << package);
-            m_standaloneTimeout.start(15 * 60 * 1000);
+            bool detailed = false;
+            QString error;
+            if (!ErrorLog::detailedEnabled(&detailed, &error)) {
+                m_standaloneRpmStatus = tr("Cannot determine the detailed logging state: %1").arg(error);
+            } else {
+                preflightFailed = false;
+                m_standaloneTimedOut = false;
+                m_standaloneRpmStatus = tr("Preparing to create the RPM...");
+                QStringList arguments = QStringList() << QStringLiteral("--build-standalone") << package;
+                if (detailed) arguments << QStringLiteral("--file-diagnostics");
+                m_standaloneRpm.start(QCoreApplication::applicationFilePath(), arguments);
+                m_standaloneTimeout.start(15 * 60 * 1000);
+            }
         }
         emit standaloneRpmChanged();
-        if (preflightFailed)
+        if (preflightFailed) {
+            qWarning("Standalone RPM: preflight failed");
             emit standaloneRpmError(m_standalonePackage, m_standaloneRpmStatus);
+        }
     }
     QString androidLocale() const { return RuntimeSettings::selectedLocale(); }
     QString systemAndroidLocale() const { return RuntimeSettings::systemLocaleTag(QLocale::system()); }
@@ -431,26 +486,50 @@ public:
     QString runtimeSettingsError() const { return m_runtimeSettingsError; }
     QString coreLog() const
     {
-        if (m_diagnosticLog) return m_diagnosticLog->text();
-        QString result;
-        const int budget = m_logOrder.isEmpty() ? 0 : 125000 / m_logOrder.size();
-        for (const QString &instance : m_logOrder) {
-            result += QStringLiteral("[%1 %2]\n").arg(m_logKeys.value(instance), instance);
-            result += m_logTexts.value(instance).right(budget);
-            result += QLatin1Char('\n');
+        return m_detailedLogEnabled ? m_detailedLogText : ErrorLog::displayText();
+    }
+    QString logStorageError() const { return ErrorLog::persistenceError(); }
+    Q_INVOKABLE QString diagnosticReport() const {
+        if (!m_detailedLogEnabled) return ErrorLog::report();
+        QString text, error;
+        if (!ErrorLog::detailedReport(&text, &error))
+            return tr("Could not read the detailed log: %1").arg(error);
+        return text;
+    }
+    bool detailedLogEnabled() const { return m_detailedLogEnabled; }
+    QString detailedLogError() const { return m_detailedLogError; }
+    Q_INVOKABLE void setDetailedLogEnabled(bool enabled)
+    {
+        QString error;
+        if (!ErrorLog::setDetailedEnabled(enabled, &error)) {
+            QString stateError;
+            ErrorLog::detailedEnabled(&m_detailedLogEnabled, &stateError);
+            m_detailedLogText.clear();
+            if (m_detailedLogEnabled) refreshDetailedLog();
+            m_detailedLogError = tr("Detailed logging changed, but saving its state failed: %1").arg(error);
+            emit detailedLogChanged();
+            emit coreLogChanged();
+            return;
         }
-        return result;
+        m_detailedLogEnabled = enabled;
+        m_detailedLogError.clear();
+        m_detailedLogText.clear();
+        if (enabled) {
+            refreshDetailedLog();
+        }
+        emit detailedLogChanged();
+        emit coreLogChanged();
     }
     bool coreLogAvailable() const {
         return m_diagnosticLog ? m_diagnosticLog->available() : m_logChannel.available() && !m_logFailed;
     }
     Q_INVOKABLE QString saveCoreLog()
     {
-        const QString log = coreLog();
-        if (!coreLogAvailable() || log.isEmpty())
+        if (coreLog().isEmpty())
             return tr("The log is empty or unavailable.");
         QString path, error;
-        if (!ErrorLog::saveText(log, &path, &error))
+        if (!(m_detailedLogEnabled ? ErrorLog::saveDetailedReport(&path, &error)
+                                   : ErrorLog::saveReport(&path, &error)))
             return tr("Could not save the log: %1").arg(error);
         return tr("Log saved to %1.").arg(path);
     }
@@ -463,6 +542,14 @@ public:
         } else {
             m_runtimeSettingsError.clear();
         }
+        emit runtimeSettingsChanged();
+    }
+    Q_INVOKABLE void setAutoInstallRpm(bool enabled)
+    {
+        if (RuntimeSettings::save(QStringLiteral("rpm/autoInstallStandalone"), enabled))
+            m_runtimeSettingsError.clear();
+        else
+            m_runtimeSettingsError = tr("Could not save automatic RPM installation.");
         emit runtimeSettingsChanged();
     }
     Q_INVOKABLE void setAndroidLocale(const QString &input)
@@ -553,11 +640,18 @@ public:
         if (officialStoreBusy()) return;
         const QString package = QStringLiteral("com.aurora.store");
         if (QFileInfo(m_store.apkPath(package)).isFile()) {
-            m_officialStoreStatus = tr("Install Aurora Store as a standalone RPM from the app library.");
+            launchOfficialStore();
             emit officialStoreChanged();
             return;
         }
         startOfficialStore(QString(), true);
+    }
+    Q_INVOKABLE void activateManager()
+    {
+        if (!m_confirmationWindow) return;
+        m_confirmationWindow->show();
+        m_confirmationWindow->raise();
+        m_confirmationWindow->requestActivate();
     }
     Q_INVOKABLE void updateOfficialStore() { startOfficialStore(QString(), false); }
     Q_INVOKABLE void updateOfficialStoreFromLocal(const QString &path) { startOfficialStore(path, false); }
@@ -572,7 +666,6 @@ public:
     void setConfirmationWindow(QQuickView *view)
     {
         m_confirmationWindow = view;
-        view->installEventFilter(this);
         connect(view, &QWindow::activeChanged, this, [this]() {
             if (m_installVisible && m_confirmationWindow && !m_confirmationWindow->isActive())
                 unavailableConfirmation();
@@ -615,6 +708,7 @@ public:
 
     void requestExternalInstall(const QString &path)
     {
+        qInfo("APK import: source=external");
         QString error;
         if (m_externalInstall.busy() || officialStoreBusy()) {
             externalInstallError(tr("Another installation is in progress."));
@@ -634,14 +728,37 @@ public:
         emit externalInstallBusyChanged();
     }
 
+    bool requestStoreHandoff(const QString &path, QString *error)
+    {
+        if (m_externalInstall.busy() || m_bundleInstall.busy() || officialStoreBusy()) {
+            if (error) *error = tr("Another installation is in progress.");
+            return false;
+        }
+        m_storeHandoff = true;
+        const bool bundle = path.endsWith(QLatin1String(".apks"), Qt::CaseInsensitive);
+        if (bundle) m_bundleInstall.setLanguages(RuntimeSettings::locale());
+        const bool started = bundle ? m_bundleInstall.start(path, error, true)
+                                    : m_externalInstall.start(path, error, QString(), false, true);
+        if (!started) {
+            m_storeHandoff = false;
+            return false;
+        }
+        m_result = tr("Inspecting the selected APK...");
+        emit resultChanged();
+        emit externalInstallBusyChanged();
+        return true;
+    }
+
     Q_INVOKABLE void installApk(const QString &path)
     {
+        qInfo("APK import: source=manager");
         if (m_externalInstall.busy() || m_bundleInstall.busy() || officialStoreBusy()) {
             externalInstallError(tr("Another installation is in progress."));
             return;
         }
         const QString suffix = QFileInfo(path).suffix().toLower();
         if (suffix == QLatin1String("apks") || suffix == QLatin1String("xapk")) {
+            qInfo("APK import: format=bundle");
             QString error;
             m_bundleInstall.setLanguages(RuntimeSettings::locale());
             if (!m_bundleInstall.start(path, &error)) {
@@ -654,9 +771,13 @@ public:
             emit officialStoreChanged();
             return;
         }
-        if (m_store.install(path, &m_result)) {
-            emit installedAppsChanged();
+        qInfo("APK import: format=single");
+        QString package;
+        if (m_store.install(path, &m_result, &package)) {
+            libraryAppAdded(package);
             showSignatureReminder();
+        } else {
+            qWarning("APK library import: result=failed");
         }
         emit resultChanged();
     }
@@ -674,7 +795,7 @@ public:
             return false;
         }
         const bool removed = m_store.remove(package, &m_appResult);
-        emit installedAppsChanged();
+        notifyInstalledAppsChanged();
         emit appResultChanged();
         return removed;
     }
@@ -698,38 +819,70 @@ public:
     }
 
 signals:
+    void storeHandoffFinished(bool retry, bool installed, const QByteArray &fingerprint);
     void standaloneRpmChanged();
     void standaloneRpmError(const QString &appPackage, const QString &message);
+    void standaloneInstallOffered(const QString &appPackage, const QString &message);
     void signatureReminder();
     void runtimeSettingsChanged();
     void coreLogChanged();
+    void detailedLogChanged();
     void resultChanged();
     void appResultChanged();
     void previewRunningChanged();
     void externalInstallBusyChanged();
     void externalInstallNotice();
-    void controllerCloseBlocked();
     void installedAppsChanged();
+    void libraryAppAddedNotice(const QString &appPackage);
     void microgChanged();
+    void microgPreviewRequested();
     void officialStoreChanged();
+    void officialStoreLaunchFailed(const QString &message);
     void microgDownloadNotification(const QString &message, int percent, bool complete);
     void officialStoreDownloadNotification(const QString &message, int percent, bool complete);
     void installConfirmationChanged();
 
-protected:
-    bool eventFilter(QObject *watched, QEvent *event) override
+private:
+    void libraryAppAdded(const QString &package, bool allowAutomaticRpm = true)
     {
-        if (watched == m_confirmationWindow && event->type() == QEvent::Close && previewRunning()) {
-            static_cast<QCloseEvent *>(event)->ignore();
-            m_appResult = tr("Close the running Android apps before closing the compatibility layer.");
-            emit appResultChanged();
-            emit controllerCloseBlocked();
-            return true;
+        notifyInstalledAppsChanged();
+        emit libraryAppAddedNotice(package);
+        if (allowAutomaticRpm && autoInstallRpm()) {
+            m_automaticRpmQueue.enqueue(package);
+            scheduleAutomaticRpm();
         }
-        return QObject::eventFilter(watched, event);
     }
 
-private:
+    void scheduleAutomaticRpm()
+    {
+        QTimer::singleShot(0, this, [this]() {
+            if (standaloneRpmBusy() || m_automaticRpmQueue.isEmpty()) return;
+            const QString package = m_automaticRpmQueue.dequeue();
+            installStandaloneRpm(package);
+            if (!standaloneRpmBusy()) scheduleAutomaticRpm();
+        });
+    }
+
+    void refreshDetailedLog()
+    {
+        QString text, error;
+        if (!ErrorLog::detailedReport(&text, &error))
+            text = tr("Could not read the detailed log: %1").arg(error);
+        if (text.size() > 131072)
+            text = tr("[Earlier detailed output is not shown; save or share the log for more.]") +
+                   QLatin1Char('\n') + text.right(131072);
+        if (m_detailedLogText != text) {
+            m_detailedLogText = text;
+            emit coreLogChanged();
+        }
+    }
+
+    void notifyInstalledAppsChanged()
+    {
+        m_installedAppsValid = false;
+        emit installedAppsChanged();
+    }
+
     void showSignatureReminder()
     {
         QSettings settings;
@@ -782,13 +935,35 @@ private:
         m_officialStoreActive = false;
         m_officialStoreOnline = false;
         m_officialStoreOpenAfter = false;
-        m_officialStoreStatus = open
-            ? tr("%1 Install Aurora Store as a standalone RPM from the app library.").arg(message)
-            : message;
+        m_officialStoreStatus = message;
+        if (open) launchOfficialStore();
         m_result = message;
         if (online) emit officialStoreDownloadNotification(m_officialStoreStatus, -1, true);
         emit resultChanged();
         emit officialStoreChanged();
+    }
+    void launchOfficialStore()
+    {
+        const QString package = QStringLiteral("com.aurora.store");
+        if (m_sessions.running(package)) {
+            QString error;
+            if (!m_sessions.activate(package, 3000, &error)) {
+                m_officialStoreStatus = tr("Could not switch to Aurora Store: %1").arg(error);
+                emit officialStoreLaunchFailed(m_officialStoreStatus);
+            }
+            else
+                m_officialStoreStatus = tr("Switching to Aurora Store...");
+            return;
+        }
+        QString error;
+        if (!m_sessions.start(package, m_androidRoot, m_store.dataPath(package),
+                              m_store.apkPath(package), appStoragePath(), &error)) {
+            m_officialStoreStatus = tr("Could not start Aurora Store: %1").arg(error);
+            qWarning().noquote() << m_officialStoreStatus;
+            emit officialStoreLaunchFailed(m_officialStoreStatus);
+            return;
+        }
+        m_officialStoreStatus = tr("Starting Aurora Store...");
     }
     void startOfficialStore(const QString &path, bool openAfter)
     {
@@ -845,6 +1020,13 @@ private:
         }
         const QString key = QStringLiteral("__microg__");
         if (m_sessions.running(key)) {
+            if (m_embeddedMicrog) {
+                if (m_embeddedMicrog->stopping())
+                    m_microgStatus = tr("microG is still closing. Try again when it has stopped.");
+                else
+                    emit microgPreviewRequested();
+                return;
+            }
             QString error;
             if (!m_sessions.activate(key, 3000, &error))
                 m_microgStatus = tr("Could not switch to microG: %1").arg(error);
@@ -856,6 +1038,7 @@ private:
             return;
         }
         m_microgStatus = tr("Starting microG; compatibility is not guaranteed.");
+        if (m_embeddedMicrog) emit microgPreviewRequested();
     }
     static QString microgApkPath()
     {
@@ -884,6 +1067,7 @@ private:
         const QString token = m_installToken;
         const bool external = m_externalPrompt;
         const bool bundle = m_bundlePrompt;
+        if ((external || bundle) && m_storeHandoff) m_storeHandoffRetry = true;
         clearConfirmation();
         if (bundle) m_bundleInstall.unavailable();
         else if (external) m_externalInstall.unavailable();
@@ -935,7 +1119,7 @@ private:
         }
         const QString key = QStringLiteral("__microg__");
         QString error;
-        if (m_sessions.start(key, m_androidRoot, data, apk, appStoragePath(), &error)) return true;
+        if (m_sessions.start(key, m_androidRoot, data, apk, appStoragePath(), &error, m_embeddedMicrog)) return true;
         m_appResult = tr("Could not start %1: %2").arg(key, error);
         qWarning().noquote() << m_appResult;
         return false;
@@ -955,7 +1139,9 @@ private:
         return base.isEmpty() ? QString() : QDir(base).filePath(QStringLiteral("apps"));
     }
     QString m_androidRoot;
+    EmbeddedEndpoint *m_embeddedMicrog = nullptr;
     QProcess m_standaloneRpm;
+    QQueue<QString> m_automaticRpmQueue;
     QString m_standalonePackage;
     QByteArray m_standaloneErrorBuffer;
     QByteArray m_standaloneDiagnostic;
@@ -967,6 +1153,8 @@ private:
     mutable QVariantList m_cachedInstalledApps;
     mutable bool m_installedAppsValid = false;
     ExternalApkInstall m_externalInstall;
+    bool m_storeHandoff = false;
+    bool m_storeHandoffRetry = false;
     ApkBundleInstall m_bundleInstall;
     MicrogInstall m_microgInstall;
     OfficialStoreDownload m_officialStoreDownload;
@@ -984,6 +1172,10 @@ private:
     bool m_bundlePrompt = false;
     bool m_installUiReady = false;
     bool m_logFailed = false;
+    bool m_detailedLogEnabled = false;
+    QString m_detailedLogError;
+    QString m_detailedLogText;
+    QTimer m_detailedLogTimer;
     QString m_installToken, m_installLabel, m_installPackage;
     QString m_result;
     QString m_appResult;

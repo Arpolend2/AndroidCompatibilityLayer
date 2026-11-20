@@ -6,18 +6,19 @@ class InstallRequestPrepareThread : public QThread
 {
 public:
     InstallRequestPrepareThread(quint64 id, const QString &root, const QString &source,
-                                const QString &name, quint64 maxBytes)
-        : id(id), root(root), source(source), name(name), maxBytes(maxBytes) {}
+                                const QString &name, quint64 maxBytes, bool fingerprint)
+        : id(id), root(root), source(source), name(name), maxBytes(maxBytes), fingerprint(fingerprint) {}
 
     void run() override
     {
         candidate.reset(new InstallRequestCandidate);
-        if (!candidate->prepare(root, source, name, maxBytes, &error)) candidate.reset();
+        if (!candidate->prepare(root, source, name, maxBytes, &error, fingerprint)) candidate.reset();
     }
 
     quint64 id;
     QString root, source, name, error;
     quint64 maxBytes;
+    bool fingerprint;
     std::unique_ptr<InstallRequestCandidate> candidate;
 };
 
@@ -33,11 +34,11 @@ InstallRequestPrepare::~InstallRequestPrepare()
 }
 
 bool InstallRequestPrepare::start(quint64 id, const QString &senderRoot, const QString &source,
-                                  const QString &name, quint64 maxBytes)
+                                  const QString &name, quint64 maxBytes, bool fingerprint)
 {
     if (!id || busy()) return false;
     m_active = id;
-    m_worker = new InstallRequestPrepareThread(id, senderRoot, source, name, maxBytes);
+    m_worker = new InstallRequestPrepareThread(id, senderRoot, source, name, maxBytes, fingerprint);
     connect(m_worker, &QThread::finished, this, &InstallRequestPrepare::workerFinished);
     m_worker->start();
     return true;

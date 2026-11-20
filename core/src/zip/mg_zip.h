@@ -34,6 +34,8 @@ typedef struct mg_zip {
 } mg_zip;
 
 bool mg_zip_open(mg_zip *z, const char *path, char *err, size_t errlen);
+bool mg_zip_open_limited(mg_zip *z, const char *path, u32 max_entries, u64 max_directory,
+                         char *err, size_t errlen);
 void mg_zip_close(mg_zip *z);
 const mg_zip_entry *mg_zip_find(const mg_zip *z, const char *name);
 /* The entry's bytes, malloc'd and followed by a NUL; NULL when it is damaged or larger than `limit`. */

@@ -1,5 +1,8 @@
 #include "preview_text.h"
 #include "preview_image.h"
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+#include "preview_gpu_canvas.h"
+#endif
 
 #include <QFont>
 #include <QFontDatabase>
@@ -202,6 +205,15 @@ void MEGLER_CB drawText(void *user, void *canvas, const uint16_t *text, int coun
     QMutexLocker lock(&fontMutex());
     QPainterPath outline = textOutline(text, count, x, y, paint, face);
     if (outline.isEmpty()) return;
+    QVector<float> stream;
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+    if (user) {
+        stream = pathStream(outline);
+        if (!stream.isEmpty() &&
+            previewGpuCanvasDrawPath(user, canvas, stream.constData(), stream.size(), MEGLER_GFX_WINDING, paint, shader))
+            return;
+    }
+#endif
     if ((paint->flags & MEGLER_GFX_ANTI_ALIAS) && paint->style == MEGLER_GFX_FILL &&
         paint->blend == MEGLER_GFX_BLEND_SRC_OVER && paint->filter_mode < 0 && !shader) {
         const QRectF bounds = outline.boundingRect();
@@ -228,15 +240,24 @@ void MEGLER_CB drawText(void *user, void *canvas, const uint16_t *text, int coun
                 const float dst[] = { float(left), float(top), float(right), float(bottom) };
                 megler_gfx_paint bitmapPaint = *paint;
                 bitmapPaint.color = 0xff000000;
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+                if (!previewGpuCanvasDrawBitmap(user, canvas, &source, src, dst, &bitmapPaint))
+#endif
                 mg_gfx_standin()->draw_bitmap(user, canvas, &source, src, dst, &bitmapPaint);
                 return;
             }
             qWarning() << "Could not allocate antialiased preview text bitmap.";
         }
     }
-    const QVector<float> stream = pathStream(outline);
-    if (!stream.isEmpty())
+    if (stream.isEmpty())
+        stream = pathStream(outline);
+    if (!stream.isEmpty()) {
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+        if (previewGpuCanvasDrawFallbackPath(user, canvas, stream.constData(), stream.size(), MEGLER_GFX_WINDING, paint, shader))
+            return;
+#endif
         mg_gfx_standin()->draw_path(user, canvas, stream.constData(), stream.size(), MEGLER_GFX_WINDING, paint, shader);
+    }
 }
 
 void *MEGLER_CB faceCreate(void *, const char *family, int generic, int weight, bool italic)
@@ -324,3 +345,13 @@ megler_gfx_host previewGraphics()
     host.typeface_from_data = faceFromData;
     return host;
 }
+
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+megler_gfx_host previewGraphics(PreviewGpuCanvasHost *gpuCanvas)
+{
+    megler_gfx_host host = previewGraphics();
+    if (gpuCanvas)
+        gpuCanvas->install(&host);
+    return host;
+}
+#endif

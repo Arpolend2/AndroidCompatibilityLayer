@@ -47,7 +47,31 @@ public abstract class ContentProvider implements ComponentCallbacks2 {
     public AssetFileDescriptor openAssetFile(Uri u, String mode, android.os.CancellationSignal c) throws java.io.FileNotFoundException { return openAssetFile(u, mode); }
     public AssetFileDescriptor openTypedAssetFile(Uri u, String mime, Bundle o) throws java.io.FileNotFoundException { return openAssetFile(u, "r"); }
     protected final ParcelFileDescriptor openFileHelper(Uri u, String mode) throws java.io.FileNotFoundException { throw new java.io.FileNotFoundException(u.toString()); }
-    public <T> ParcelFileDescriptor openPipeHelper(Uri u, String mime, Bundle o, T args, PipeDataWriter<T> w) throws java.io.FileNotFoundException { throw new java.io.FileNotFoundException(u.toString()); }
+    public <T> ParcelFileDescriptor openPipeHelper(Uri u, String mime, Bundle o, T args, PipeDataWriter<T> w) throws java.io.FileNotFoundException {
+        final ParcelFileDescriptor[] pipe;
+        try {
+            pipe = ParcelFileDescriptor.createPipe();
+        } catch (java.io.IOException e) {
+            java.io.FileNotFoundException failure = new java.io.FileNotFoundException("Cannot create pipe for " + u);
+            failure.initCause(e);
+            throw failure;
+        }
+        try {
+            new Thread(() -> {
+                try {
+                    w.writeDataToPipe(pipe[1], u, mime, o, args);
+                } finally {
+                    try { pipe[1].close(); }
+                    catch (java.io.IOException e) { android.util.Log.w("Megler", "provider pipe close failed: " + e); }
+                }
+            }, "ContentProvider pipe").start();
+        } catch (RuntimeException | Error e) {
+            try { pipe[0].close(); } catch (java.io.IOException close) { e.addSuppressed(close); }
+            try { pipe[1].close(); } catch (java.io.IOException close) { e.addSuppressed(close); }
+            throw e;
+        }
+        return pipe[0];
+    }
     public String[] getStreamTypes(Uri u, String filter) { return null; }
     public Uri canonicalize(Uri u) { return null; }
     public Uri uncanonicalize(Uri u) { return u; }

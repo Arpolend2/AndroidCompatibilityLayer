@@ -70,7 +70,8 @@ std::string InstallRequestSnapshot::path() const
 }
 
 bool InstallRequestSnapshot::capture(const std::string &root, const std::string &source,
-                                     const std::string &displayName, uint64_t maxBytes, std::string *error)
+                                     const std::string &displayName, uint64_t maxBytes, std::string *error,
+                                     bool allowBundle)
 {
     clear();
     if (error) error->clear();
@@ -79,7 +80,7 @@ bool InstallRequestSnapshot::capture(const std::string &root, const std::string 
         source.size() <= root.size() + 1 || source.compare(0, root.size(), root) != 0 ||
         source[root.size()] != '/' || !maxBytes)
         return fail(error, "The APK is not inside the sender's data directory.");
-    if (invalidName(displayName) || bundleName(displayName) || bundleName(source))
+    if (invalidName(displayName) || (!allowBundle && (bundleName(displayName) || bundleName(source))))
         return fail(error, "Unsupported or invalid install request name.");
 
     const std::string relative = source.substr(root.size() + 1);

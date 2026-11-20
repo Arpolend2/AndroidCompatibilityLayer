@@ -3,6 +3,7 @@
 #include "install_request_coordinator.h"
 #include "log_channel.h"
 #include "diagnostic_log.h"
+#include "error_log.h"
 #include "preview_activation_channel.h"
 
 #include <QCoreApplication>
@@ -28,6 +29,7 @@ public:
     quint64 request = 0;
     bool active = true;
     bool killRequested = false;
+    qint64 processId = 0;
 };
 
 PreviewSessions::PreviewSessions(QObject *parent) : QObject(parent) {}
@@ -44,7 +46,8 @@ PreviewSessions::~PreviewSessions()
 }
 
 bool PreviewSessions::start(const QString &key, const QString &androidRoot, const QString &data,
-                            const QString &apk, const QString &storeRoot, QString *error)
+                            const QString &apk, const QString &storeRoot, QString *error,
+                            EmbeddedEndpoint *embedded)
 {
     if (error) error->clear();
     if (key.isEmpty() || androidRoot.isEmpty() || data.isEmpty() || storeRoot.isEmpty()) {
@@ -64,6 +67,11 @@ bool PreviewSessions::start(const QString &key, const QString &androidRoot, cons
     }
     if (!session->activation.listen(&channelError)) {
         if (error) *error = tr("Cannot start the preview activation channel: %1").arg(channelError);
+        delete session;
+        return false;
+    }
+    if (embedded && !embedded->listen(&session->process, &channelError)) {
+        if (error) *error = tr("Cannot start the embedded preview channel: %1").arg(channelError);
         delete session;
         return false;
     }
@@ -106,6 +114,9 @@ bool PreviewSessions::start(const QString &key, const QString &androidRoot, cons
             finish(session, -1, false, session->process.errorString());
     });
     connect(&session->process, &QProcess::started, this, [this, session]() {
+        session->processId = session->process.processId();
+        ErrorLog::record(QStringLiteral("Lifecycle"),
+                         QStringLiteral("Preview process: pid=%1 started").arg(session->processId), false);
         if (session->killRequested) session->process.kill();
         else emit started(session->key);
     });
@@ -115,10 +126,11 @@ bool PreviewSessions::start(const QString &key, const QString &androidRoot, cons
     else
         environment.remove(QStringLiteral("ANDROID_COMPATIBILITY_LAYER_CORE_LOG_SOCKET"));
     session->process.setProcessEnvironment(environment);
-    session->process.start(QCoreApplication::applicationFilePath(),
-                           QStringList() << QStringLiteral("--preview") << androidRoot << data << apk
-                                         << session->install.endpoint() << session->install.resultsDir()
-                                         << session->activation.endpoint());
+    QStringList arguments = QStringList() << QStringLiteral("--preview") << androidRoot << data << apk
+                                          << session->install.endpoint() << session->install.resultsDir()
+                                          << session->activation.endpoint();
+    if (embedded) arguments << embedded->endpoint();
+    session->process.start(QCoreApplication::applicationFilePath(), arguments);
     emit runningChanged();
     return true;
 }
@@ -150,6 +162,7 @@ bool PreviewSessions::kill(const QString &key)
             return true;
         }
         if (session->process.state() == QProcess::Running) {
+            session->killRequested = true;
             session->process.kill();
             return true;
         }
@@ -197,6 +210,16 @@ void PreviewSessions::finish(PreviewSession *session, int code, bool crashed, co
 {
     if (!session->active) return;
     session->active = false;
+    QString event;
+    if (!session->processId) {
+        event = QStringLiteral("Preview process: result=failed-to-start");
+    } else {
+        const char *result = session->killRequested && crashed ? "stopped"
+            : crashed ? "crashed" : code != 0 ? "nonzero" : "completed";
+        event = QStringLiteral("Preview process: pid=%1 result=%2")
+            .arg(session->processId).arg(QLatin1String(result));
+    }
+    ErrorLog::record(QStringLiteral("Lifecycle"), event, false);
     if (!session->token.isEmpty()) {
         const QString token = session->token;
         session->token.clear();

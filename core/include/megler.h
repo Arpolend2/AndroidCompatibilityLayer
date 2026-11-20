@@ -1434,6 +1434,9 @@ typedef struct megler_gfx_host {
     /* Optional: the outlines of a run's glyphs (see TEXT above). */
     bool (MEGLER_CB *text_path)(void *user, const uint16_t *text, int count, float x, float y, const megler_gfx_paint *paint, void *typeface,
                                 megler_gfx_write write, void *sink);
+    /* Release thread-local drawing resources on the Java main and (if used)
+       frame-rendering threads, after the last frame and before normal exit notification. */
+    void (MEGLER_CB *release_thread)(void *user);
 } megler_gfx_host;
 
 /*
