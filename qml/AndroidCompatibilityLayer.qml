@@ -12,6 +12,7 @@ ApplicationWindow {
     readonly property color systemAccent: Theme.highlightColor
     property var microgPage: null
     property var launcherPage: null
+    property var yandexFormComponent: null
     readonly property var libraryApps: {
         var result = []
         var apps = probe.installedApps
@@ -23,13 +24,50 @@ ApplicationWindow {
         return applicationActive && current && current.objectName === "launcherPage" &&
                 current.section === 0 && !probe.installConfirmationVisible
     }
-    allowedOrientations: probe.installConfirmationVisible ? Orientation.All : defaultAllowedOrientations
+    function openYandexFormPage() {
+        if (yandexFormComponent) return
+        var component = Qt.createComponent(Qt.resolvedUrl("YandexFormPage.qml"))
+        if (component.status === Component.Ready) {
+            pageStack.push(component, { "formUrl": probe.yandexLogFormUrl })
+        } else if (component.status === Component.Error) {
+            console.warn("Aurora WebView is unavailable:", component.errorString())
+            logActions.message = qsTr("Aurora WebView is unavailable.")
+        } else {
+            yandexFormComponent = component
+            component.statusChanged.connect(finishYandexFormComponentLoad)
+        }
+    }
+    function finishYandexFormComponentLoad() {
+        var component = yandexFormComponent
+        if (!component || component.status === Component.Loading) return
+        component.statusChanged.disconnect(finishYandexFormComponentLoad)
+        yandexFormComponent = null
+        if (component.status === Component.Ready) {
+            pageStack.push(component, { "formUrl": probe.yandexLogFormUrl })
+        } else {
+            console.warn("Aurora WebView is unavailable:", component.errorString())
+            logActions.message = qsTr("Aurora WebView is unavailable.")
+        }
+    }
+    allowedOrientations: probe.installConfirmationVisible || launchInstallBanner.offered ||
+                         (pageStack.depth > 1 && pageStack.find(function(page) {
+                             return page && page.objectName === "yandexFormPage"
+                         }))
+                         ? Orientation.All : defaultAllowedOrientations
     Component.onCompleted: probe.setInstallUiReady(true)
     Component.onDestruction: probe.setInstallUiReady(false)
     cover: Component {
         CoverBackground {
             id: managerCover
             objectName: "managerCover"
+            readonly property url storeIcon: Qt.resolvedUrl(window.systemDark ? "icons/cover-aurora-store-light.svg"
+                                                                               : "icons/cover-aurora-store-dark.svg")
+            function installApk() {
+                if (window.launcherPage) window.launcherPage.openApkPicker()
+            }
+            function openOfficialStore() {
+                if (!probe.officialStoreBusy) probe.openOfficialStore()
+            }
             Item {
                 anchors.top: parent.top
                 anchors.left: parent.left
@@ -85,21 +123,34 @@ ApplicationWindow {
                 }
             }
             CoverActionList {
+                objectName: "coverActionsWithoutLogs"
+                enabled: !probe.detailedLogEnabled
+                CoverAction {
+                    iconSource: "image://theme/icon-cover-new"
+                    onTriggered: managerCover.installApk()
+                }
+                CoverAction {
+                    iconSource: managerCover.storeIcon
+                    onTriggered: managerCover.openOfficialStore()
+                }
+            }
+            CoverActionList {
+                objectName: "coverActionsWithLogs"
+                enabled: probe.detailedLogEnabled
                 CoverAction {
                     objectName: "coverInstallApk"
                     iconSource: "image://theme/icon-cover-new"
-                    onTriggered: if (window.launcherPage) window.launcherPage.openApkPicker()
+                    onTriggered: managerCover.installApk()
                 }
                 CoverAction {
                     objectName: "coverSaveLog"
                     iconSource: "image://theme/icon-s-export"
-                    onTriggered: if (window.launcherPage) window.launcherPage.saveLogFromCover()
+                    onTriggered: if (probe.detailedLogEnabled && window.launcherPage) window.launcherPage.saveLogFromCover()
                 }
                 CoverAction {
                     objectName: "coverOpenOfficialStore"
-                    iconSource: Qt.resolvedUrl(window.systemDark ? "icons/cover-aurora-store-light.svg"
-                                                                  : "icons/cover-aurora-store-dark.svg")
-                    onTriggered: if (!probe.officialStoreBusy) probe.openOfficialStore()
+                    iconSource: managerCover.storeIcon
+                    onTriggered: managerCover.openOfficialStore()
                 }
             }
         }
@@ -177,65 +228,85 @@ ApplicationWindow {
         onStandaloneInstallOffered: {
             launchInstallBanner.appPackage = appPackage
             launchInstallBanner.errorMessage = message
-            launchInstallBanner.visible = true
+            launchInstallBanner.offered = true
         }
     }
     Rectangle {
         id: launchInstallBanner
         objectName: "launchInstallBanner"
-        parent: window.contentItem
+        parent: pageStack.currentPage ? pageStack.currentPage : window.contentItem
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
         z: 9000
-        visible: false
+        visible: offered
         color: window.palette.overlayBackgroundColor
-        height: launchInstallContent.height + 2 * Theme.paddingMedium
+        height: Math.min(parent.height, launchInstallContent.height + launchInstallActions.height
+                                       + 3 * Theme.paddingMedium)
+        property bool offered: false
         property string appPackage: ""
         property string errorMessage: ""
-        Column {
-            id: launchInstallContent
-            x: Theme.horizontalPageMargin
-            y: Theme.paddingMedium
-            width: parent.width - 2 * x
-            spacing: Theme.paddingSmall
-            Label {
-                width: parent.width
-                text: qsTr("Could not launch %1. Install it as an RPM?").arg(launchInstallBanner.appPackage)
-                textFormat: Text.PlainText
-                wrapMode: Text.Wrap
-            }
-            Label {
-                width: parent.width
-                visible: text.length > 0
-                text: launchInstallBanner.errorMessage
-                textFormat: Text.PlainText
-                wrapMode: Text.Wrap
-                maximumLineCount: 3
-                elide: Text.ElideRight
-                font.pixelSize: Theme.fontSizeExtraSmall
-            }
-            Row {
-                width: parent.width
-                spacing: Theme.paddingMedium
-                Button {
-                    objectName: "dismissLaunchInstall"
-                    width: (parent.width - parent.spacing) / 2
-                    text: qsTr("Cancel")
-                    onClicked: launchInstallBanner.visible = false
+        SilicaFlickable {
+            id: launchInstallScroll
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: launchInstallActions.top
+            contentHeight: launchInstallContent.height + 2 * Theme.paddingMedium
+            clip: true
+            VerticalScrollDecorator {}
+            Column {
+                id: launchInstallContent
+                x: Theme.horizontalPageMargin
+                y: Theme.paddingMedium
+                width: launchInstallScroll.width - 2 * x
+                spacing: Theme.paddingSmall
+                Label {
+                    width: parent.width
+                    text: qsTr("Could not launch %1. Install it as an RPM?").arg(launchInstallBanner.appPackage)
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
                 }
-                Button {
-                    objectName: "confirmLaunchInstall"
-                    width: (parent.width - parent.spacing) / 2
-                    text: qsTr("Install as RPM")
-                    enabled: !probe.standaloneRpmBusy
-                    onClicked: {
-                        var appPackage = launchInstallBanner.appPackage
-                        launchInstallBanner.visible = false
-                        probe.installStandaloneRpm(appPackage)
-                    }
+                Label {
+                    width: parent.width
+                    visible: text.length > 0
+                    text: launchInstallBanner.errorMessage
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    maximumLineCount: 3
+                    elide: Text.ElideRight
+                    font.pixelSize: Theme.fontSizeExtraSmall
                 }
             }
+        }
+        onAppPackageChanged: launchInstallScroll.contentY = 0
+        onOfferedChanged: if (offered) launchInstallScroll.contentY = 0
+        Row {
+            id: launchInstallActions
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.leftMargin: Theme.horizontalPageMargin
+            anchors.rightMargin: Theme.horizontalPageMargin
+            anchors.bottomMargin: Theme.paddingMedium
+            spacing: Theme.paddingMedium
+            Button {
+                objectName: "dismissLaunchInstall"
+                width: (parent.width - parent.spacing) / 2
+                text: qsTr("Cancel")
+                onClicked: launchInstallBanner.offered = false
+            }
+            Button {
+                objectName: "confirmLaunchInstall"
+                width: (parent.width - parent.spacing) / 2
+                text: qsTr("Install as RPM")
+                enabled: !probe.standaloneRpmBusy
+                onClicked: {
+                    var appPackage = launchInstallBanner.appPackage
+                    launchInstallBanner.offered = false
+                    probe.installStandaloneRpm(appPackage)
+                }
+                }
         }
     }
     Component {
@@ -339,7 +410,6 @@ ApplicationWindow {
                 onSectionRequested: {
                     launcher.section = section
                     scroll.contentY = 0
-                    if (section === 2 && logContent.following) logScrollTimer.restart()
                 }
             }
 
@@ -383,12 +453,38 @@ ApplicationWindow {
                         Column {
                             id: detailedWarningContent
                             width: parent.width
-                            DialogHeader { title: qsTr("Detailed log"); acceptText: qsTr("Enable") }
+                            DialogHeader { title: qsTr("Enable detailed logs?"); acceptText: qsTr("Enable") }
                             Label {
                                 objectName: "detailedLogWarning"
                                 x: Theme.horizontalPageMargin
                                 width: parent.width - 2 * x
-                                text: qsTr("Detailed logs may contain passwords, tokens, app data, paths, network addresses and D-Bus executable/signing-key identifiers. The manager saves them in private storage. While enabled, newly created standalone RPMs also save test logs in Documents, accessible to other apps with Documents access. Those RPMs keep recording after detailed logging is turned off: remove them and create new RPMs to stop it. Saved files remain. If saving the cleared manager history fails, old logs may reappear. Remote events are untrusted. Review logs before sharing.")
+                                text: qsTr("Detailed logs may contain passwords, tokens, app data, paths and network addresses. Standalone snapshots are stored in a shared organization folder that other apps in the organization can access. Standalone apps record only while the manager's confirmed detailed logging state is enabled. “Save to file” combines available manager and standalone logs in Documents and removes included snapshots only after a successful save. Turning logging off stops new entries, but saved files remain. Review logs before sharing.")
+                                wrapMode: Text.Wrap
+                            }
+                        }
+                        VerticalScrollDecorator {}
+                    }
+                }
+            }
+
+            Component {
+                id: clearLogFolderDialog
+                Dialog {
+                    objectName: "clearLogFolderDialog"
+                    backgroundColor: window.pageBackground
+                    allowedOrientations: Orientation.All
+                    onAccepted: logActions.message = probe.clearSavedLogs()
+                    SilicaFlickable {
+                        anchors.fill: parent
+                        contentHeight: clearLogContent.height + Theme.paddingLarge
+                        Column {
+                            id: clearLogContent
+                            width: parent.width
+                            DialogHeader { title: qsTr("Clear log folder?"); acceptText: qsTr("Delete") }
+                            Label {
+                                x: Theme.horizontalPageMargin
+                                width: parent.width - 2 * x
+                                text: qsTr("This deletes saved manager and standalone files in Documents and shared organization snapshots, but does not clear the current journal. Close running diagnostic apps first; active apps may recreate snapshot files.")
                                 wrapMode: Text.Wrap
                             }
                         }
@@ -747,7 +843,7 @@ ApplicationWindow {
                     MenuItem {
                         objectName: "toggleDetailedLog"
                         visible: launcher.section === 2
-                        text: probe.detailedLogEnabled ? qsTr("Use short log") : qsTr("Enable detailed log")
+                        text: probe.detailedLogEnabled ? qsTr("Disable logs") : qsTr("Enable logs")
                         onClicked: {
                             if (probe.detailedLogEnabled)
                                 probe.setDetailedLogEnabled(false)
@@ -756,35 +852,23 @@ ApplicationWindow {
                         }
                     }
                     MenuItem {
-                        objectName: "logFollow"
-                        visible: launcher.section === 2
-                        enabled: probe.coreLogAvailable
-                        text: logContent.following ? qsTr("Hold") : qsTr("Follow")
-                        onClicked: {
-                            logContent.following = !logContent.following
-                            if (logContent.following) logScrollTimer.restart()
-                        }
+                        objectName: "clearLogFolder"
+                        visible: launcher.section === 2 && probe.detailedLogEnabled
+                        text: qsTr("Clear log folder")
+                        onClicked: pageStack.push(clearLogFolderDialog)
                     }
                     MenuItem {
-                        objectName: "copyLog"
-                        visible: launcher.section === 2
-                        enabled: logActions.canAct
-                        text: qsTr("Copy")
-                        onClicked: logActions.copyLog()
+                        objectName: "reportToYandex"
+                        visible: launcher.section === 2 && probe.detailedLogEnabled
+                        text: qsTr("Send to developer")
+                        onClicked: logActions.openYandexForm()
                     }
                     MenuItem {
                         objectName: "saveLog"
-                        visible: launcher.section === 2
+                        visible: launcher.section === 2 && probe.detailedLogEnabled
                         enabled: logActions.canAct
                         text: qsTr("Save to file")
                         onClicked: logActions.saveLog()
-                    }
-                    MenuItem {
-                        objectName: "shareLog"
-                        visible: launcher.section === 2
-                        enabled: logActions.canAct
-                        text: qsTr("Share")
-                        onClicked: logActions.shareLog()
                     }
                 }
 
@@ -832,12 +916,21 @@ ApplicationWindow {
                         width: parent.width
                         visible: launcher.section === 1
                     }
+                    Label {
+                        objectName: "detailedLogError"
+                        x: Theme.horizontalPageMargin
+                        width: parent.width - 2 * x
+                        visible: launcher.section === 2 && probe.detailedLogError.length > 0
+                        text: probe.detailedLogError
+                        wrapMode: Text.Wrap
+                        color: palette.highlightColor
+                    }
                     Column {
                         id: logContent
                         objectName: "logContent"
                         width: parent.width
-                        visible: launcher.section === 2
-                        property bool following: true
+                        visible: launcher.section === 2 && probe.detailedLogEnabled
+                        spacing: Theme.paddingMedium
                         function newestFirst(text) {
                             var lines = text.split("\n")
                             if (lines[lines.length - 1] === "") lines.pop()
@@ -847,15 +940,22 @@ ApplicationWindow {
                         Label {
                             x: Theme.horizontalPageMargin
                             width: parent.width - 2 * x
-                            text: qsTr("Logs are saved automatically in the manager's private storage. Recent events may be lost before they are saved or delivered. Events may be dropped; remote sources are untrusted. Older standalone apps need rebuilding for this log service.")
+                            text: qsTr("How to send a log")
+                            font.bold: true
                             wrapMode: Text.Wrap
                         }
-                        Label {
-                            x: Theme.horizontalPageMargin
-                            width: parent.width - 2 * x
-                            text: qsTr("Test RPMs created while detailed logging is enabled save their own logs in Documents/AndroidCompatibilityLayer-Error-Logs. They keep recording after this setting is turned off; remove them and create new RPMs to stop it. Logs may contain private data.")
-                            wrapMode: Text.Wrap
-                            color: palette.secondaryColor
+                        Repeater {
+                            model: [
+                                qsTr("1. With logging enabled, reproduce the error in the app."),
+                                qsTr("2. In the manager, select “Save to file”. This saves the manager log and available standalone app logs as one .txt file in Documents."),
+                                qsTr("3. Check the saved file for private data. Select “Send to developer” to open the Yandex form, then attach the checked file and select “Submit”.")
+                            ]
+                            delegate: Label {
+                                x: Theme.horizontalPageMargin
+                                width: parent.width - 2 * x
+                                text: modelData
+                                wrapMode: Text.Wrap
+                            }
                         }
                         Label {
                             x: Theme.horizontalPageMargin
@@ -868,25 +968,31 @@ ApplicationWindow {
                         Label {
                             x: Theme.horizontalPageMargin
                             width: parent.width - 2 * x
-                            visible: probe.detailedLogEnabled
-                            text: qsTr("Detailed logging is on. The log may contain private data.")
+                            textFormat: Text.StyledText
+                            text: qsTr("<b>Note:</b> New standalone packages record only when logging is enabled in the manager. Other apps in the organization can access the shared log folder. After a successful save, the manager removes only the standalone snapshots included in the file that have not changed during export. The manager warns if the report is incomplete or cleanup fails.")
                             wrapMode: Text.Wrap
                             color: palette.highlightColor
                         }
                         Label {
-                            objectName: "detailedLogError"
                             x: Theme.horizontalPageMargin
                             width: parent.width - 2 * x
-                            visible: probe.detailedLogError.length > 0
-                            text: probe.detailedLogError
+                            text: qsTr("Older standalone packages keep their previous logging behavior. To switch them to shared logs, recreate and install them once. You do not need to recreate packages each time you collect a log.")
                             wrapMode: Text.Wrap
                             color: palette.highlightColor
                         }
                         LogActions {
                             id: logActions
                             width: parent.width
-                            logAvailable: probe.coreLogAvailable
+                            logAvailable: probe.detailedLogEnabled && probe.coreLogAvailable
                             logText: probe.coreLog
+                            onLogAvailableChanged: if (!logAvailable) message = ""
+                            onOpenYandexFormRequested: window.openYandexFormPage()
+                        }
+                        Rectangle {
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            height: 1
+                            color: Theme.secondaryColor
                         }
                         Label {
                             x: Theme.horizontalPageMargin
@@ -904,18 +1010,6 @@ ApplicationWindow {
                             textFormat: Text.PlainText
                             font.pixelSize: Theme.fontSizeExtraSmall
                             text: probe.coreLog ? logContent.newestFirst(probe.coreLog) : qsTr("No core messages yet.")
-                        }
-                        Connections {
-                            target: probe
-                            onCoreLogChanged: if (launcher.section === 2 && logContent.following) logScrollTimer.restart()
-                        }
-                        Timer {
-                            id: logScrollTimer
-                            interval: 0
-                            onTriggered: {
-                                if (scroll.contentY > 0 && !scroll.dragging && !scroll.moving)
-                                    scroll.contentY = 0
-                            }
                         }
                     }
                     Column {
@@ -1045,7 +1139,6 @@ ApplicationWindow {
                         onClicked: {
                             launcher.section = index
                             scroll.contentY = 0
-                            if (index === 2 && logContent.following) logScrollTimer.restart()
                         }
                         Column {
                             anchors.centerIn: parent

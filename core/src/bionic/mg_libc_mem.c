@@ -10,6 +10,7 @@
  */
 #include "mg_bionic.h"
 
+#include <errno.h>
 #include <stdio.h>
 
 #include "mg_fd.h"
@@ -2076,7 +2077,7 @@ static void wx_region_say(const u8 *p)
     mg_info("mprotect: code the app wrote at %p: %s", (const void *)(p + 64), hex);
 }
 
-static int g_mprotect(void *addr, size_t len, int prot)
+static int mprotect_impl(void *addr, size_t len, int prot, const char **commit_result, const char **protect_result)
 {
     size_t size = MG_ALIGN_UP(len, MG_PAGE);
     u8 *p = (u8 *)addr;
@@ -2135,9 +2136,13 @@ static int g_mprotect(void *addr, size_t len, int prot)
             mem_note((prot & 7) ? 'A' : 'P', p, n);
         }
         mg_lock_release(&g_region_lock);
-        if (r && !view && (prot & 7) && !mg_mem_commit(p, size, MG_PROT_RW)) {
-            mg_set_errno(GE_NOMEM);
-            return -1;
+        if (r && !view && (prot & 7)) {
+            bool ok = mg_mem_commit(p, size, MG_PROT_RW);
+            *commit_result = ok ? "ok" : "fail";
+            if (!ok) {
+                mg_set_errno(GE_NOMEM);
+                return -1;
+            }
         }
         if (r && !view && !(prot & 7)) {
             /* No access: for what is committed; what is not is no-access already. */
@@ -2156,8 +2161,13 @@ static int g_mprotect(void *addr, size_t len, int prot)
         rwx = rwx && r && !r->view;
         mg_lock_release(&g_region_lock);
         if (!kept) mg_note_once("mprotect: writable and executable at once, more library pages than are kept (%p); it stays as it is", addr);
-        else if (rwx && mg_mem_protect(p, size, MG_PROT_RWX)) mg_icache_flush(p, size);
-        else mg_mem_protect(p, size, MG_PROT_RW);
+        else if (rwx && mg_mem_protect(p, size, MG_PROT_RWX)) {
+            *protect_result = "rwx:ok";
+            mg_icache_flush(p, size);
+        } else {
+            bool ok = mg_mem_protect(p, size, MG_PROT_RW);
+            *protect_result = rwx ? (ok ? "rwx:fail,rw:ok" : "rwx:fail,rw:fail") : (ok ? "rw:ok" : "rw:fail");
+        }
         return 0;
     }
     if (!(prot & G_PROT_WRITE)) {
@@ -2170,12 +2180,31 @@ static int g_mprotect(void *addr, size_t len, int prot)
         mg_lock_release(&g_region_lock);
         if (wx && (prot & G_PROT_EXEC)) wx_region_say(p);
     }
-    if (!mg_mem_protect(p, size, host_prot(prot))) {
-        mg_set_errno(GE_ACCES);
-        return -1;
+    {
+        bool ok = mg_mem_protect(p, size, host_prot(prot));
+        if (prot & G_PROT_EXEC) *protect_result = ok ? "rx:ok" : "rx:fail";
+        if (!ok) {
+            mg_set_errno(GE_ACCES);
+            return -1;
+        }
     }
     if (prot & G_PROT_EXEC) mg_icache_flush(p, size);
     return 0;
+}
+
+static int g_mprotect(void *addr, size_t len, int prot)
+{
+    const char *commit_result = "skip", *protect_result = "skip";
+    int result = mprotect_impl(addr, len, prot, &commit_result, &protect_result);
+    if (prot & G_PROT_EXEC) {
+        int saved_host_errno = errno;
+        int *guest_errno = mg_errno_ptr(), saved_guest_errno = *guest_errno;
+        mg_trace("mprotect result %p %zu prot=%d ret=%d ge=%d c=%s p=%s", addr, len, prot, result, saved_guest_errno,
+                 commit_result, protect_result);
+        *guest_errno = saved_guest_errno;
+        errno = saved_host_errno;
+    }
+    return result;
 }
 
 /* A write-or-execute fault in a region, or a library's page, that wants both: give the page what this access needs. */

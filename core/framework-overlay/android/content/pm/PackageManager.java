@@ -136,6 +136,7 @@ public class PackageManager {
         PackageInfo p = new PackageInfo();
         p.packageName = pkg; p.versionCode = megler.GooglePackages.ownVersionCode(pkg, megler.Manifest.versionCode);
         p.versionName = megler.GooglePackages.ownVersionName(pkg, megler.Manifest.versionName != null ? megler.Manifest.versionName : "1.0");
+        p.installLocation = megler.Manifest.installLocation;
         p.applicationInfo = ApplicationInfo.self();
         if (megler.GooglePackages.VENDING.equals(pkg) || megler.GooglePackages.GMS.equals(pkg)) {
             p.signatures = new Signature[] { megler.GooglePackages.signature() };

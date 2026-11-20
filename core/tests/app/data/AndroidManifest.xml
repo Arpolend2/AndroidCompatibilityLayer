@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- The test app for databases (tools/build-test-app.sh): one Activity that goes through android.database.sqlite as an app does and says in the
      log how each step went. The test runs it twice: what the first run left in its database must be there for the second. -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="megler.test.data" android:versionCode="1" android:versionName="1.0">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="megler.test.data" android:versionCode="1" android:versionName="1.0" android:installLocation="internalOnly">
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="28" />
     <!-- The phone's text messages and calls (Main's phoneEvents): Android gives them to an app that holds these. READ_CALL_LOG
          asked for as WhatsApp asks for it, for Android 6 and later only. -->
@@ -75,6 +75,7 @@
         <service android:name=".Main$EngineWork" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
         <!-- A sync adapter and the provider it syncs (Main's step "sync"), as Gmail has them. -->
         <provider android:name=".Main$Synced" android:authorities="megler.test.sync" android:exported="false" />
+        <provider android:name=".Main$InstallNameProvider" android:authorities="megler.test.install-name" android:exported="false" />
         <service android:name=".Main$SyncService" android:exported="false">
             <intent-filter>
                 <action android:name="android.content.SyncAdapter" />

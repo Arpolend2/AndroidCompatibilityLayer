@@ -18,6 +18,10 @@ int main(int argc, char **argv)
     QString exportError;
     if (EmbeddedGpuTransport::canExportDmaBuf(&exportError) || exportError.isEmpty())
         return 15;
+    if (!EmbeddedGpuTransport::probeGbmRenderTarget(720, 1520).contains(QStringLiteral("no current worker EGL context")))
+        return 20;
+    if (!EmbeddedGpuTransport::probeGbmRenderTarget(8192, 8192).contains(QStringLiteral("transport limits")))
+        return 21;
 
     int sockets[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0)
@@ -97,6 +101,7 @@ int main(int argc, char **argv)
 
     AuroraDmaBufFrame channelFrame;
     channelFrame.id = 99;
+    channelFrame.probeOnly = true;
     channelFrame.width = 16;
     channelFrame.height = 8;
     channelFrame.fourcc = 0x34325241;
@@ -109,7 +114,7 @@ int main(int argc, char **argv)
     bool frameReceived = false;
     QEventLoop frameLoop;
     server.setFrameHandler([&](AuroraDmaBufFrame &&frame) {
-        frameReceived = frame.id == 99 && frame.width == 16 && frame.height == 8 &&
+        frameReceived = frame.id == 99 && frame.probeOnly && frame.width == 16 && frame.height == 8 &&
                         frame.planeCount == 1 && frame.fds[0] >= 0;
         const bool replied = server.sendReply(frame.id, frameReceived);
         frame.close();

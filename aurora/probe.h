@@ -18,6 +18,7 @@
 #include <QQueue>
 #include <QSet>
 #include <QStandardPaths>
+#include "application_executables.h"
 #include <QSysInfo>
 #include <QTimer>
 #include <QQuickView>
@@ -48,6 +49,7 @@ class Probe : public QObject
         bool bundle;
     };
     Q_PROPERTY(QString result READ result NOTIFY resultChanged)
+    Q_PROPERTY(QUrl yandexLogFormUrl READ yandexLogFormUrl CONSTANT)
     Q_PROPERTY(QString appResult READ appResult NOTIFY appResultChanged)
     Q_PROPERTY(bool previewRunning READ previewRunning NOTIFY previewRunningChanged)
     Q_PROPERTY(bool externalInstallBusy READ externalInstallBusy NOTIFY externalInstallBusyChanged)
@@ -445,19 +447,12 @@ public:
         } else if (m_store.apkPath(package).isEmpty() || !QFileInfo(m_store.apkPath(package)).isFile()) {
             m_standaloneRpmStatus = tr("The installed APK was not found.");
         } else {
-            bool detailed = false;
-            QString error;
-            if (!ErrorLog::detailedEnabled(&detailed, &error)) {
-                m_standaloneRpmStatus = tr("Cannot determine the detailed logging state: %1").arg(error);
-            } else {
-                preflightFailed = false;
-                m_standaloneTimedOut = false;
-                m_standaloneRpmStatus = tr("Preparing to create the RPM...");
-                QStringList arguments = QStringList() << QStringLiteral("--build-standalone") << package;
-                if (detailed) arguments << QStringLiteral("--file-diagnostics");
-                m_standaloneRpm.start(QCoreApplication::applicationFilePath(), arguments);
-                m_standaloneTimeout.start(15 * 60 * 1000);
-            }
+            preflightFailed = false;
+            m_standaloneTimedOut = false;
+            m_standaloneRpmStatus = tr("Preparing to create the RPM...");
+            const QStringList arguments = QStringList() << QStringLiteral("--build-standalone") << package;
+            m_standaloneRpm.start(ApplicationExecutables::worker(), arguments);
+            m_standaloneTimeout.start(15 * 60 * 1000);
         }
         emit standaloneRpmChanged();
         if (preflightFailed) {
@@ -486,11 +481,11 @@ public:
     QString runtimeSettingsError() const { return m_runtimeSettingsError; }
     QString coreLog() const
     {
-        return m_detailedLogEnabled ? m_detailedLogText : ErrorLog::displayText();
+        return m_detailedLogEnabled ? m_detailedLogText : QString();
     }
     QString logStorageError() const { return ErrorLog::persistenceError(); }
     Q_INVOKABLE QString diagnosticReport() const {
-        if (!m_detailedLogEnabled) return ErrorLog::report();
+        if (!m_detailedLogEnabled) return QString();
         QString text, error;
         if (!ErrorLog::detailedReport(&text, &error))
             return tr("Could not read the detailed log: %1").arg(error);
@@ -528,10 +523,41 @@ public:
         if (coreLog().isEmpty())
             return tr("The log is empty or unavailable.");
         QString path, error;
-        if (!(m_detailedLogEnabled ? ErrorLog::saveDetailedReport(&path, &error)
-                                   : ErrorLog::saveReport(&path, &error)))
+        bool partial = false;
+        QString cleanupWarning;
+        if (!ErrorLog::saveDetailedReport(&path, &error, &partial, &cleanupWarning))
             return tr("Could not save the log: %1").arg(error);
-        return tr("Log saved to %1.").arg(path);
+        QString message = tr("Log saved to %1.").arg(path);
+        if (partial)
+            message += QLatin1Char('\n') +
+                tr("The export is partial: some standalone snapshots were unavailable and remain in the organization folder.");
+        if (!cleanupWarning.isEmpty())
+            message += QLatin1Char('\n') + cleanupWarning;
+        return message;
+    }
+    Q_INVOKABLE QString clearSavedLogs()
+    {
+        int removed = 0;
+        if (!ErrorLog::clearSavedLogs(removed))
+            return tr("Could not clear the log folder completely. Files deleted: %1.").arg(removed);
+        if (!removed) return tr("There are no saved logs to delete.");
+        return tr("Log files deleted: %1.").arg(removed);
+    }
+    QUrl yandexLogFormUrl() const
+    {
+        return QUrl(QStringLiteral("https://forms.yandex.ru/u/6b006dde2c4f89816ddbc8a3"));
+    }
+    void setReportWebViewInitializer(void (*init)()) { m_initReportWebView = init; }
+    Q_INVOKABLE QString openYandexLogForm()
+    {
+        if (!m_detailedLogEnabled)
+            return tr("The log is empty or unavailable.");
+        if (!m_initReportWebView) {
+            qWarning("Yandex form: WebView is not linked into this executable.");
+            return tr("The report form is unavailable: the system WebView could not start.");
+        }
+        m_initReportWebView();
+        return QString();
     }
     Q_INVOKABLE void setRenderSizeCap(int value)
     {
@@ -719,7 +745,7 @@ public:
             installApk(path);
             return;
         }
-        if (!m_externalInstall.start(path, &error)) {
+        if (!m_externalInstall.start(path, &error, QString(), true)) {
             externalInstallError(error);
             return;
         }
@@ -735,7 +761,8 @@ public:
             return false;
         }
         m_storeHandoff = true;
-        const bool bundle = path.endsWith(QLatin1String(".apks"), Qt::CaseInsensitive);
+        const bool bundle = path.endsWith(QLatin1String(".apks"), Qt::CaseInsensitive) ||
+                            path.endsWith(QLatin1String(".xapk"), Qt::CaseInsensitive);
         if (bundle) m_bundleInstall.setLanguages(RuntimeSettings::locale());
         const bool started = bundle ? m_bundleInstall.start(path, error, true)
                                     : m_externalInstall.start(path, error, QString(), false, true);
@@ -772,14 +799,7 @@ public:
             return;
         }
         qInfo("APK import: format=single");
-        QString package;
-        if (m_store.install(path, &m_result, &package)) {
-            libraryAppAdded(package);
-            showSignatureReminder();
-        } else {
-            qWarning("APK library import: result=failed");
-        }
-        emit resultChanged();
+        requestExternalInstall(path);
     }
 
     Q_INVOKABLE bool removeApp(const QString &package)
@@ -1173,6 +1193,7 @@ private:
     bool m_installUiReady = false;
     bool m_logFailed = false;
     bool m_detailedLogEnabled = false;
+    void (*m_initReportWebView)() = nullptr;
     QString m_detailedLogError;
     QString m_detailedLogText;
     QTimer m_detailedLogTimer;

@@ -1,8 +1,12 @@
 /* <string.h>, <ctype.h>, and the number parsing of <stdlib.h>. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "mg_bionic.h"
 
 #include <ctype.h>
 #include <errno.h>
+#include <locale.h>
 #include <math.h>
 #include <stdio.h>
 
@@ -325,8 +329,44 @@ static long g_strtol(const char *s, char **end, int base) PARSE(long, strtol, st
 static unsigned long g_strtoul(const char *s, char **end, int base) PARSE(unsigned long, strtoul, strtoul(s, end, base))
 static i64 g_strtoll(const char *s, char **end, int base) PARSE(i64, strtoll, strtoll(s, end, base))
 static u64 g_strtoull(const char *s, char **end, int base) PARSE(u64, strtoull, strtoull(s, end, base))
-static double parse_double(const char *s, char **end) PARSE(double, strtod, strtod(s, end))
-static float parse_float(const char *s, char **end) PARSE(float, strtof, strtof(s, end))
+/* Guest numeric locales are C/UTF-8; never inherit the host thread's locale. */
+#ifdef _WIN32
+typedef _locale_t numeric_locale;
+#define numeric_locale_new() _create_locale(LC_NUMERIC, "C")
+#define numeric_locale_free(loc) _free_locale(loc)
+#define numeric_strtod(s, end, loc) _strtod_l(s, end, loc)
+#define numeric_strtof(s, end, loc) _strtof_l(s, end, loc)
+#else
+typedef locale_t numeric_locale;
+#define numeric_locale_new() newlocale(LC_NUMERIC_MASK, "C", (locale_t)0)
+#define numeric_locale_free(loc) freelocale(loc)
+#define numeric_strtod(s, end, loc) strtod_l(s, end, loc)
+#define numeric_strtof(s, end, loc) strtof_l(s, end, loc)
+#endif
+
+#define PARSE_C_FLOAT(ret, name, parser)                      \
+    static ret name(const char *s, char **end)               \
+    {                                                         \
+        numeric_locale loc;                                   \
+        ret value;                                            \
+        int err;                                              \
+        errno = 0;                                            \
+        loc = numeric_locale_new();                           \
+        if (!loc) {                                           \
+            if (end) *end = (char *)s;                        \
+            mg_set_errno(errno == EINVAL ? GE_INVAL : GE_NOMEM); \
+            return 0;                                         \
+        }                                                     \
+        errno = 0;                                            \
+        value = parser(s, end, loc);                          \
+        err = errno;                                          \
+        numeric_locale_free(loc);                             \
+        if (err) mg_set_errno(err == ERANGE ? GE_RANGE : GE_INVAL); \
+        return value;                                         \
+    }
+
+PARSE_C_FLOAT(double, parse_double, numeric_strtod)
+PARSE_C_FLOAT(float, parse_float, numeric_strtof)
 static gdouble g_strtod(const char *s, char **end) { return mg_gdb(parse_double(s, end)); }
 static gfloat g_strtof(const char *s, char **end) { return mg_gfb(parse_float(s, end)); }
 static gldouble g_strtold(const char *s, char **end) { return mg_gldb(parse_double(s, end)); }
@@ -340,7 +380,7 @@ static gldouble g_strtold_l(const char *s, char **end, void *loc) { (void)loc; r
 static int g_atoi(const char *s) { return (int)strtol(s, NULL, 10); }
 static long g_atol(const char *s) { return strtol(s, NULL, 10); }
 static i64 g_atoll(const char *s) { return strtoll(s, NULL, 10); }
-static gdouble g_atof(const char *s) { return mg_gdb(strtod(s, NULL)); }
+static gdouble g_atof(const char *s) { return mg_gdb(parse_double(s, NULL)); }
 static int g_abs(int v) { return v < 0 ? -v : v; }
 static glong g_labs(glong v) { return v < 0 ? -v : v; }
 static i64 g_llabs(i64 v) { return v < 0 ? -v : v; }

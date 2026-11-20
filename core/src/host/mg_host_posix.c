@@ -806,6 +806,11 @@ static void on_signal(int sig, siginfo_t *si, void *ctx)
        core's report names; the other signals keep their own. */
     f.code = sig == SIGTRAP ? 0x80000003u : (u32)sig;
     f.address = (mg_addr)si->si_addr;
+    if (sig == SIGSEGV) {
+        f.diagnostic_segv_code = si->si_code;
+        f.diagnostic_segv_reason = si->si_code == SEGV_MAPERR ? MG_FAULT_SEGV_MAPERR :
+                                   si->si_code == SEGV_ACCERR ? MG_FAULT_SEGV_ACCERR : MG_FAULT_SEGV_OTHER;
+    }
 #if defined(__arm__)
     {
         ucontext_t *uc = (ucontext_t *)ctx;

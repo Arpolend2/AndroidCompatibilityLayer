@@ -15,6 +15,7 @@
 #include <QLinearGradient>
 #include <QMutexLocker>
 #include <QOffscreenSurface>
+#include <QOpenGLExtraFunctions>
 #include <QOpenGLFunctions>
 #include <QOpenGLPaintDevice>
 #include <QPainter>
@@ -25,6 +26,7 @@
 #include <QTransform>
 #include <QVector>
 
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -43,6 +45,9 @@ struct PreviewGpuOffscreenContexts {
 
 namespace {
 
+std::atomic<quint64> nextContextId{1};
+constexpr quint64 multipleContexts = ~quint64(0);
+
 struct ThreadFramebuffer {
     GLuint id = 0;
     GLuint stencilBuffer = 0;
@@ -56,6 +61,7 @@ struct ThreadFramebuffer {
 struct ThreadContext {
     PreviewGpuCanvasHost *owner = nullptr;
     QOpenGLContext *context = nullptr;
+    quint64 contextId = 0;
     QHash<quint64, ThreadFramebuffer> framebuffers;
     GLuint filterProgram = 0;
     GLint filterTintLocation = -1;
@@ -415,7 +421,16 @@ struct PreviewGpuCanvasHost::Canvas {
     int stride = 0;
     void *cpuCanvas = nullptr;
     bool cpuMirrorCurrent = true;
+    std::atomic<quint64> contextId{0};
     QVector<State> states;
+
+    void noteContext()
+    {
+        quint64 previous = 0;
+        if (!contextId.compare_exchange_strong(previous, threadContext.contextId) &&
+            previous != threadContext.contextId && previous != multipleContexts)
+            contextId.store(multipleContexts);
+    }
 };
 
 struct PreviewGpuCanvasHost::Shader {
@@ -574,6 +589,7 @@ void PreviewGpuCanvasHost::install(megler_gfx_host *host)
     host->draw_oval = drawOval;
     host->draw_path = drawPath;
     host->draw_bitmap = drawBitmap;
+    host->draw_canvas = drawCanvas;
     host->shader_linear = shaderLinear;
     host->shader_radial = shaderRadial;
     host->shader_sweep = shaderSweep;
@@ -620,6 +636,7 @@ bool PreviewGpuCanvasHost::ensureCurrent(const char *origin)
             return false;
         }
         threadContext.context = context;
+        threadContext.contextId = nextContextId.fetch_add(1, std::memory_order_relaxed);
         if (m_offscreenContexts) {
             threadContext.offscreenContexts = m_offscreenContexts;
             threadContext.tid = ::syscall(SYS_gettid);
@@ -645,6 +662,7 @@ bool PreviewGpuCanvasHost::ensureFramebuffer(Canvas *canvas, const char *origin)
 {
     if (!canvas || !ensureCurrent(origin))
         return false;
+    canvas->noteContext();
     if (threadContext.framebuffers.contains(canvas->id))
         return true;
 
@@ -786,6 +804,7 @@ bool PreviewGpuCanvasHost::upload(Canvas *canvas)
 {
     if (!canvas || !ensureCurrent("upload"))
         return false;
+    canvas->noteContext();
     QByteArray rgba(canvas->width * canvas->height * 4, char(0));
     for (int y = 0; y < canvas->height; ++y) {
         const uchar *src = static_cast<const uchar *>(canvas->pixels) + (canvas->height - 1 - y) * canvas->stride;
@@ -814,7 +833,8 @@ bool PreviewGpuCanvasHost::upload(Canvas *canvas)
 
 bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *paint,
                                         const QRectF &deviceBounds,
-                                        const std::function<void(QPainter &)> &drawSource)
+                                        const std::function<void(QPainter &)> &drawSource,
+                                        Canvas *copyCanvas, const QRect &copySource)
 {
     if (!canvas || !paint)
         return false;
@@ -826,6 +846,16 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     if (paint->blend != MEGLER_GFX_BLEND_SRC_OVER && !filterScalesWithSource(paint->filter_mode)) {
         m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::UnsupportedBlend);
         return false;
+    }
+    const bool scaledCopy = copyCanvas && QSizeF(copySource.size()) != deviceBounds.size();
+    if (scaledCopy) {
+        GLint readFramebuffer = 0, drawFramebuffer = 0;
+        auto *gl = threadContext.context->functions();
+        gl->glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
+        gl->glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
+        // The scratch FBO allocator and paint path assume a single saved binding.
+        if (readFramebuffer != drawFramebuffer)
+            return false;
     }
     if (!ensureFilterFramebuffer(canvas) || !ensureFilterProgram()) {
         m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::GpuFailure);
@@ -849,21 +879,48 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     QOpenGLFunctions *gl = threadContext.context->functions();
     GLint previousFramebuffer = 0;
     gl->glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
-    gl->glBindFramebuffer(GL_FRAMEBUFFER, framebuffer.filterId);
-
-    QPainter maskPainter;
-    if (!maskPainter.begin(framebuffer.filterDevice)) {
-        gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
-        m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::GpuFailure);
-        return false;
+    if (scaledCopy) {
+        auto *extra = threadContext.context->extraFunctions();
+        const auto target = deviceBounds.toRect();
+        const bool scissor = gl->glIsEnabled(GL_SCISSOR_TEST);
+        if (scissor)
+            gl->glDisable(GL_SCISSOR_TEST);
+        gl->glBindFramebuffer(GL_READ_FRAMEBUFFER, threadContext.framebuffers.value(copyCanvas->id).id);
+        gl->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer.filterId);
+        extra->glBlitFramebuffer(copySource.x(), copyCanvas->height - copySource.y() - copySource.height(),
+                                 copySource.x() + copySource.width(), copyCanvas->height - copySource.y(),
+                                 target.x(), canvas->height - target.y() - target.height(),
+                                 target.x() + target.width(), canvas->height - target.y(),
+                                 GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        if (scissor)
+            gl->glEnable(GL_SCISSOR_TEST);
+    } else if (copyCanvas) {
+        const int width = scissorRight - scissorLeft, height = scissorBottom - scissorTop;
+        const QPoint origin = copySource.topLeft() + QPoint(scissorLeft, scissorTop) - deviceBounds.topLeft().toPoint();
+        GLint previousTexture = 0;
+        gl->glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+        gl->glBindFramebuffer(GL_FRAMEBUFFER, threadContext.framebuffers.value(copyCanvas->id).id);
+        gl->glBindTexture(GL_TEXTURE_2D, framebuffer.filterTexture);
+        // Snapshot into a different texture before blending, including for a self-copy.
+        gl->glCopyTexSubImage2D(GL_TEXTURE_2D, 0, scissorLeft, canvas->height - scissorBottom,
+                               origin.x(), copyCanvas->height - origin.y() - height, width, height);
+        gl->glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+    } else {
+        gl->glBindFramebuffer(GL_FRAMEBUFFER, framebuffer.filterId);
+        QPainter maskPainter;
+        if (!maskPainter.begin(framebuffer.filterDevice)) {
+            gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
+            m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::GpuFailure);
+            return false;
+        }
+        maskPainter.setRenderHint(QPainter::Antialiasing, false);
+        maskPainter.setCompositionMode(QPainter::CompositionMode_Clear);
+        maskPainter.fillRect(QRectF(scissorLeft, scissorTop, scissorRight - scissorLeft, scissorBottom - scissorTop),
+                             Qt::transparent);
+        maskPainter.setCompositionMode(QPainter::CompositionMode_Source);
+        drawSource(maskPainter);
+        maskPainter.end();
     }
-    maskPainter.setRenderHint(QPainter::Antialiasing, false);
-    maskPainter.setCompositionMode(QPainter::CompositionMode_Clear);
-    maskPainter.fillRect(QRectF(scissorLeft, scissorTop, scissorRight - scissorLeft, scissorBottom - scissorTop),
-                         Qt::transparent);
-    maskPainter.setCompositionMode(QPainter::CompositionMode_Source);
-    drawSource(maskPainter);
-    maskPainter.end();
     const GLenum maskError = gl->glGetError();
     gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
     if (maskError != GL_NO_ERROR) {
@@ -1014,6 +1071,8 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     if (drawError != GL_NO_ERROR) {
         qWarning("GPU Canvas color-filter draw reported OpenGL error 0x%x", static_cast<unsigned int>(drawError));
         m_metrics->recordFilterDrawError();
+    } else if (copyCanvas) {
+        m_metrics->recordCanvasCopy();
     }
     return true;
 }
@@ -1084,6 +1143,9 @@ bool PreviewGpuCanvasHost::drawFilteredBitmap(Canvas *canvas, const megler_gfx_i
         paint->blend == MEGLER_GFX_BLEND_DST)
         return true;
     if (image->pixels == canvas->pixels) {
+        if (image->width == canvas->width && image->height == canvas->height &&
+            image->stride == canvas->stride && copyCanvasPixels(canvas, canvas, src, dst, paint))
+            return true;
         m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::SelfBitmap);
         return false;
     }
@@ -1118,6 +1180,78 @@ bool PreviewGpuCanvasHost::drawFilteredBitmap(Canvas *canvas, const megler_gfx_i
         painter.drawImage(QRectF(dst[0], dst[1], dst[2] - dst[0], dst[3] - dst[1]), source,
                           QRectF(src[0], src[1], src[2] - src[0], src[3] - src[1]));
     });
+}
+
+bool PreviewGpuCanvasHost::copyCanvasPixels(Canvas *canvas, Canvas *source, const float *src, const float *dst,
+                                            const megler_gfx_paint *paint)
+{
+    if (!src || !dst || !paint || qAlpha(paint->color) != 255 ||
+        paint->filter_mode > MEGLER_GFX_BLEND_LIGHTEN || source->states.size() != 1)
+        return false;
+    const Canvas::State &state = canvas->states.last();
+    const auto integral = [](qreal n) {
+        return n >= -16777216 && n <= 16777216 && n == std::floor(n);
+    };
+    if (state.matrix.type() > QTransform::TxTranslate ||
+        !integral(state.matrix.dx()) || !integral(state.matrix.dy()))
+        return false;
+    for (int i = 0; i < 4; ++i) {
+        if (!integral(src[i]) || !integral(dst[i]))
+            return false;
+    }
+    if (src[0] < 0 || src[1] < 0 || src[2] > source->width || src[3] > source->height ||
+        src[2] <= src[0] || src[3] <= src[1])
+        return false;
+
+    const QRectF sourceRect(src[0], src[1], qreal(src[2]) - src[0], qreal(src[3]) - src[1]);
+    const QRectF bounds(dst[0] + state.matrix.dx(), dst[1] + state.matrix.dy(),
+                        qreal(dst[2]) - dst[0], qreal(dst[3]) - dst[1]);
+    const bool scaled = sourceRect.size() != bounds.size();
+    if (scaled && (m_offscreenContexts || canvas == source || sourceRect.size() * 2 != bounds.size() ||
+                   (paint->flags & MEGLER_GFX_FILTER_BITMAP) || paint->filter_mode >= 0 ||
+                   paint->blend != MEGLER_GFX_BLEND_SRC_OVER || state.opacity != 1.0 ||
+                   !QRectF(0, 0, canvas->width, canvas->height).contains(bounds)))
+        return false;
+    if (canvas == source && sourceRect.intersects(bounds) && sourceRect != bounds)
+        return false;
+    if (state.hasClip) {
+        const QRectF clipBounds = state.clip.boundingRect();
+        QPainterPath rectangle;
+        rectangle.addRect(clipBounds);
+        if (rectangle != state.clip || !integral(clipBounds.left()) || !integral(clipBounds.top()) ||
+            !integral(clipBounds.right()) || !integral(clipBounds.bottom()))
+            return false;
+    }
+
+    if (paint->blend == MEGLER_GFX_BLEND_DST)
+        return true;
+    GpuBlendFactors factors;
+    if (!gpuBlendFactors(paint->blend, &factors))
+        return false;
+    megler_gfx_paint copyPaint = *paint;
+    if (copyPaint.filter_mode < 0)
+        copyPaint.filter_mode = MEGLER_GFX_BLEND_DST; // Identity filter.
+    if (copyPaint.blend != MEGLER_GFX_BLEND_SRC_OVER && !filterScalesWithSource(copyPaint.filter_mode))
+        return false;
+
+    // Sharing a texture is not enough to order writes submitted by different contexts.
+    // Decline rather than impose a new cross-context fence or read stale pixels.
+    if (!ensureCurrent("copy-canvas") || source->contextId.load() != threadContext.contextId ||
+        !threadContext.framebuffers.contains(source->id))
+        return false;
+    if (scaled && (!threadContext.context->isOpenGLES() || threadContext.context->format().majorVersion() < 3))
+        return false;
+    return drawFiltered(canvas, &copyPaint, bounds, {}, source, sourceRect.toRect());
+}
+
+bool MEGLER_CB PreviewGpuCanvasHost::drawCanvas(void *user, void *handle, void *sourceHandle, const float *src,
+                                                const float *dst, const megler_gfx_paint *paint)
+{
+    auto *self = static_cast<PreviewGpuCanvasHost *>(user);
+    Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
+    Canvas *source = self ? self->findCanvas(sourceHandle) : nullptr;
+    return canvas && source && canvas != source && canvas->pixels != source->pixels &&
+           self->copyCanvasPixels(canvas, source, src, dst, paint);
 }
 
 void PreviewGpuCanvasHost::removeFramebuffer(Canvas *canvas)
@@ -1679,8 +1813,13 @@ void MEGLER_CB PreviewGpuCanvasHost::drawBitmap(void *user, void *handle, const 
         }
         return;
     }
-    if (image->pixels == canvas->pixels)
-        self->readback(canvas, PreviewGpuReadbackReason::Self);
+    if (image->pixels == canvas->pixels) {
+        if (image->width == canvas->width && image->height == canvas->height &&
+            image->stride == canvas->stride && self->copyCanvasPixels(canvas, canvas, src, dst, paint))
+            return;
+        if (!self->readback(canvas, PreviewGpuReadbackReason::Self))
+            return;
+    }
     if (!self->ensureFramebuffer(canvas, "draw-bitmap"))
         return;
     const QImage source(static_cast<const uchar *>(image->pixels), image->width, image->height, image->stride,

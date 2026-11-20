@@ -59,7 +59,9 @@
 #              data, the time zones, and the Java framework where
 #              tools/build-framework.sh has built it; 47 MB, which makes the
 #              package some 20 MB larger; and Android's System WebView where
-#              tools/webview-fetch.sh has fetched it, 87 MB more). An app that
+#              an explicitly fetched AOSP Chromium 128 test provider has been
+#              staged, 188 MB more; this outdated provider is not suitable for
+#              normal use). An app that
 #              is Java alone can then
 #              be started (megler_run finds the folder there), and the
 #              Self-test runs the Dalvik runtime's tests on that libcore;
@@ -719,11 +721,10 @@ if [ -n "$BITGAPPS" ]; then
   # variant for arm64-v8a, which a phone's package once carried, has 8 of its 40 libraries for armeabi-v7a.
   python "$(w "$ROOT/tools/bitgapps-check.py")" "$ABI" "$(w "$STAGE/bitgapps")" ||
     { echo "--bitgapps: an APK above is not for $ABI: give that of $ABI (--gms, --play-store, --microg)" >&2; exit 1; }
-  # Google's sign-in (Google Play services' MinuteMaid) is a web page in a WebView: the processor's System WebView must be in
-  # the Android root (tools/webview-fetch.sh <abi> puts it in build/webview). The desktop packages had none -- build/webview
-  # held 32-bit ARM's alone -- and Play Store's Sign In came back at once ("this phone's Android root has no WebView").
+  # Google's sign-in (Google Play services' MinuteMaid) is a web page in a WebView: the processor's System WebView must be
+  # in the Android root. The test-only AOSP Chromium 128 build is not enabled or packaged by default.
   if [ ! -f "$STAGE/android/app/webview/webview.apk" ]; then
-    echo "    WARNING: no WebView in the Android root: Google's sign-in cannot open (tools/webview-fetch.sh $ABI)" >&2
+    echo "    WARNING: no WebView in the Android root: Google's sign-in cannot open (no maintained provider is configured)" >&2
     if [ "$PACK" = 1 ]; then echo "--bitgapps: refusing to pack Google's apps without a WebView to sign in with" >&2; exit 1; fi
   fi
 fi

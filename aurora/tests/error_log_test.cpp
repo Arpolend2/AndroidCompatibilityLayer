@@ -21,7 +21,13 @@
 #include <QThread>
 #include <QTimer>
 
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
+#include <fcntl.h>
+#include <thread>
+#include <sys/file.h>
+#include <unistd.h>
 
 static void check(bool value, const char *description)
 {
@@ -35,6 +41,17 @@ static const char RemoteGpuSummary[] =
     "GPU Canvas performance: interval_ms=42 frames=1 failed=0 samples=1 producer_us=1 "
     "producer_max_us=1 qt_wait_us=1 qt_wait_max_us=1 readbacks=0 readback_samples=0 "
     "readback_us=0 readback_max_us=0";
+
+static const char FullGpuSummary[] =
+    "GPU Canvas performance: interval_ms=3000 frames=240 failed=2 samples=15 "
+    "producer_us=123456 producer_max_us=24000 qt_wait_us=9876 qt_wait_max_us=4500 "
+    "readbacks=12 readback_samples=1 readback_us=789 readback_max_us=789 "
+    "readback_flush=3 readback_filter=4 readback_self=2 readback_gl_us=600 "
+    "readback_convert_us=189 readback_present=3 "
+    "pixel_submit_samples=1 pixel_submit_us=3000 pixel_submit_max_us=3000 "
+    "filter_fallback_mode=1 filter_fallback_blend=2 filter_fallback_self=3 "
+    "filter_fallback_gles=4 filter_fallback_invalid=5 filter_draw_errors=6 "
+    "readback_cache_flush=0 readback_cache_filter=7 readback_cache_self=1 readback_cache_present=2";
 
 class Identity : public QDBusVirtualObject
 {
@@ -57,6 +74,80 @@ public:
 
 int main(int argc, char **argv)
 {
+    if (argc == 3 && QByteArray(argv[1]) == "--standalone-snapshot") {
+        QCoreApplication app(argc, argv);
+        QString error;
+        const QString appId = QStringLiteral(
+            "ru.androidcompatibilitylayer.Android0123456789abcdef01234567");
+        check(ErrorLog::initialize(QStringLiteral("standalone"), &error), "initialize snapshot-only client");
+        check(ErrorLog::startStandaloneSnapshots(QString::fromLocal8Bit(argv[2]), appId, &error),
+              "start shared standalone snapshots");
+        check(ErrorLog::startForwarding(&error), "start State-only D-Bus client");
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < 5000 && !MemoryLogBus::clientDetailedEnabled()) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            QThread::msleep(5);
+        }
+        check(MemoryLogBus::clientDetailedEnabled(), "wait for confirmed logging State");
+        ErrorLog::record(QStringLiteral("Android"), QStringLiteral("snapshot-only private event"), false);
+        check(ErrorLog::flushStandaloneSnapshots(), "publish standalone snapshot");
+        return 0;
+    }
+    if (argc == 4 && QByteArray(argv[1]) == "--standalone-snapshot-update") {
+        QCoreApplication app(argc, argv);
+        QString error;
+        const QString appId = QStringLiteral(
+            "ru.androidcompatibilitylayer.Android0123456789abcdef01234567");
+        check(ErrorLog::initialize(QStringLiteral("standalone"), &error), "initialize updating snapshot client");
+        check(ErrorLog::startStandaloneSnapshots(QString::fromLocal8Bit(argv[2]), appId, &error),
+              "start updating shared snapshot");
+        check(ErrorLog::startForwarding(&error), "start State-only updating client");
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < 5000 && !MemoryLogBus::clientDetailedEnabled()) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            QThread::msleep(5);
+        }
+        check(MemoryLogBus::clientDetailedEnabled(), "wait for confirmed logging State");
+        ErrorLog::record(QStringLiteral("Android"), QStringLiteral("snapshot-before-export"), false);
+        check(ErrorLog::flushStandaloneSnapshots(), "publish pre-export snapshot");
+        bool updated = false;
+        QTimer pollTrigger;
+        pollTrigger.setInterval(2);
+        QObject::connect(&pollTrigger, &QTimer::timeout, &app, [&]() {
+            if (!updated && QFileInfo::exists(QString::fromLocal8Bit(argv[3]))) {
+                ErrorLog::record(QStringLiteral("Android"), QStringLiteral("snapshot-during-export"), false);
+                updated = true;
+            }
+        });
+        pollTrigger.start();
+        QTimer publishTimer;
+        publishTimer.setInterval(20);
+        QObject::connect(&publishTimer, &QTimer::timeout, &app, []() {
+            ErrorLog::flushStandaloneSnapshots();
+        });
+        publishTimer.start();
+        QTimer::singleShot(2500, &app, &QCoreApplication::quit);
+        return app.exec();
+    }
+    if (argc == 2 && QByteArray(argv[1]) == "--gpu-summary") {
+        QCoreApplication app(argc, argv);
+        QString error;
+        check(ErrorLog::initialize(QStringLiteral("Android App Manager"), &error) &&
+              ErrorLog::setDetailedEnabled(true, &error), "initialize local GPU diagnostic reporting");
+        const QString old = QString::fromLatin1(FullGpuSummary);
+        const QString current = old + QStringLiteral(" canvas_copies_gpu=3");
+        ErrorLog::record(QStringLiteral("Qt"), current + QStringLiteral(" PRIVATE-GPU"), false);
+        ErrorLog::record(QStringLiteral("Qt"), old + QStringLiteral(" canvas_copies_gpu="), false);
+        check(!ErrorLog::report().contains(old), "malformed GPU summaries are not accepted");
+        ErrorLog::record(QStringLiteral("Qt"), old, false);
+        ErrorLog::record(QStringLiteral("Qt"), current, false);
+        const QString report = ErrorLog::report();
+        check(report.contains(old + QLatin1Char('\n')) && report.contains(current + QLatin1Char('\n')),
+              "old and new GPU counters are visible in safe diagnostics");
+        return 0;
+    }
     if (argc == 3) {
         QCoreApplication app(argc, argv);
         const QByteArray mode(argv[1]);
@@ -124,6 +215,30 @@ int main(int argc, char **argv)
                 return 0;
             }
             check(started && !path.isEmpty(), "start standalone diagnostic file");
+            bool locallyEnabled = true;
+            check(ErrorLog::detailedEnabled(&locallyEnabled, &error) && !locallyEnabled,
+                  "standalone file permission does not enable logging by itself");
+            QDBusConnection bus = QDBusConnection::sessionBus();
+            Identity identity;
+            bool extended = true;
+            check(bus.registerService(QStringLiteral("ru.omp.am")) &&
+                  bus.registerVirtualObject(QStringLiteral("/ru/omp/am"), &identity) &&
+                  bus.registerService(QStringLiteral("ru.androidcompatibilitylayer.appmanager")) &&
+                  MemoryLogBus::startServer([](const QString &, const QString &, const QString &,
+                                               bool, quint64) {}, [&]() { return extended; }, &error) &&
+                  ErrorLog::setDetailedEnabled(extended, &error) &&
+                  ErrorLog::startForwarding(&error), "start controlled standalone log service");
+            auto waitForState = [&](bool enabled) {
+                QElapsedTimer timer;
+                timer.start();
+                while (timer.elapsed() < 5000) {
+                    app.processEvents();
+                    if (MemoryLogBus::clientDetailedEnabled() == enabled) return true;
+                    QThread::msleep(10);
+                }
+                return false;
+            };
+            check(waitForState(true), "wait for confirmed detailed state");
             DiagnosticLog diagnostic;
             check(diagnostic.start(&error, true), "capture standalone stderr");
             check(ErrorLog::startCoreChannel(&error), "start standalone Android log channel");
@@ -132,6 +247,22 @@ int main(int argc, char **argv)
             ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("GPU test event"), false);
             std::fputs("Log IPC manager identification: access denied\n", stderr);
             std::fflush(stderr);
+            extended = false;
+            check(ErrorLog::setDetailedEnabled(extended, &error), "disable manager-owned detailed state");
+            check(waitForState(false), "stop standalone capture when manager disables it");
+            ErrorLog::record(QStringLiteral("Android"), QStringLiteral("private event while disabled"), false);
+            extended = true;
+            check(ErrorLog::setDetailedEnabled(extended, &error), "enable manager-owned detailed state");
+            check(waitForState(true), "resume standalone capture when manager enables it");
+            ErrorLog::record(QStringLiteral("Android"), QStringLiteral("private event after re-enable"), false);
+            extended = false;
+            check(ErrorLog::setDetailedEnabled(extended, &error), "disable manager-owned state a second time");
+            check(waitForState(false), "stop standalone capture a second time");
+            ErrorLog::record(QStringLiteral("Android"), QStringLiteral("private event while disabled again"), false);
+            extended = true;
+            check(ErrorLog::setDetailedEnabled(extended, &error), "enable manager-owned state a second time");
+            check(waitForState(true), "resume standalone capture a second time");
+            ErrorLog::record(QStringLiteral("Android"), QStringLiteral("private event after second re-enable"), false);
             QTimer::singleShot(6500, &app, &QCoreApplication::quit);
             return app.exec();
         }
@@ -187,11 +318,9 @@ int main(int argc, char **argv)
         }
         QThread::msleep(25);
     }
-    check(standaloneContents.contains("standalone file private test") &&
-          standaloneContents.contains("store runtime test event") &&
-          standaloneContents.contains("GPU test event") &&
-          standaloneContents.contains("Log IPC manager identification: access denied"),
-          "periodic file includes runtime and transport diagnostics before exit");
+    check(standaloneContents.contains("private event after second re-enable") &&
+          !standaloneContents.contains("private event while disabled"),
+          "periodic legacy diagnostic file follows confirmed off/on state");
     check(standaloneFile.waitForFinished(5000) && standaloneFile.exitCode() == 0 &&
           outputDirectory.entryList(QStringList() << QStringLiteral("*.txt"), QDir::Files).size() == 1,
           "standalone uses one file and flushes on exit");
@@ -217,30 +346,28 @@ int main(int argc, char **argv)
     ErrorLog::record(QStringLiteral("Android"), QStringLiteral("private secret"), true);
     check(!ErrorLog::detailedCaptureEnabled(), "detailed capture starts disabled");
     check(!ErrorLog::report().contains(QStringLiteral("private secret")), "safe report redacts message");
-    check(ErrorLog::report().contains(QStringLiteral("Android runtime error")), "safe report retains error");
+    QString disabledPath;
+    check(!ErrorLog::report().contains(QStringLiteral("Android runtime error")) &&
+          !ErrorLog::saveReport(&disabledPath, &error) && disabledPath.isEmpty(),
+          "logging off keeps no local events and cannot export");
     const QString gpuSummary = QStringLiteral("GPU Canvas performance: interval_ms=10000 frames=123 failed=0 samples=12 "
         "producer_us=123 producer_max_us=25 qt_wait_us=45 qt_wait_max_us=5 "
         "readbacks=2 readback_samples=2 readback_us=20 readback_max_us=15");
-    const QString fullGpuSummary = QStringLiteral(
-        "GPU Canvas performance: interval_ms=3000 frames=240 failed=2 samples=15 "
-        "producer_us=123456 producer_max_us=24000 qt_wait_us=9876 qt_wait_max_us=4500 "
-        "readbacks=12 readback_samples=1 readback_us=789 readback_max_us=789 "
-        "readback_flush=3 readback_filter=4 readback_self=2 readback_gl_us=600 "
-        "readback_convert_us=189 readback_present=3 "
-        "pixel_submit_samples=1 pixel_submit_us=3000 pixel_submit_max_us=3000 "
-        "filter_fallback_mode=1 filter_fallback_blend=2 filter_fallback_self=3 "
-        "filter_fallback_gles=4 filter_fallback_invalid=5 filter_draw_errors=6 "
-        "readback_cache_flush=0 readback_cache_filter=7 readback_cache_self=1 readback_cache_present=2");
+    const QString fullGpuSummary = QString::fromLatin1(FullGpuSummary);
+    const QString canvasCopySummary = fullGpuSummary + QStringLiteral(" canvas_copies_gpu=3");
     ErrorLog::record(QStringLiteral("Qt"), gpuSummary, false);
     check(!ErrorLog::report().contains(gpuSummary), "GPU summary omitted while detailed capture is disabled");
     check(ErrorLog::setDetailedEnabled(true, &error), "enable detailed capture");
     check(ErrorLog::detailedCaptureEnabled(), "detailed capture state is visible");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("another private secret"), true);
+    check(ErrorLog::report().contains(QStringLiteral("Android runtime error")) &&
+          !ErrorLog::report().contains(QStringLiteral("another private secret")), "safe report retains only error category");
     ErrorLog::record(QStringLiteral("Qt"), gpuSummary + QStringLiteral(" PRIVATE-GPU"), false);
     ErrorLog::record(QStringLiteral("Qt"), gpuSummary, false);
     {
         DiagnosticLog localDiagnostics;
         check(localDiagnostics.start(&error, false), "start local Qt diagnostics");
-        qInfo("%s", qPrintable(fullGpuSummary));
+        qInfo("%s", qPrintable(canvasCopySummary));
     }
     ErrorLog::record(QStringLiteral("Qt"), fullGpuSummary + QStringLiteral(" PRIVATE-GPU"), false);
     const QString partialCacheSummary = fullGpuSummary.left(fullGpuSummary.lastIndexOf(QLatin1Char(' ')));
@@ -256,7 +383,7 @@ int main(int argc, char **argv)
     check(ErrorLog::report().contains(gpuSummary) &&
           ErrorLog::report().contains(extendedGpuSummary) &&
           ErrorLog::report().contains(presentGpuSummary) &&
-          ErrorLog::report().contains(fullGpuSummary) &&
+          ErrorLog::report().contains(canvasCopySummary) &&
           !ErrorLog::report().contains(partialCacheSummary + QLatin1Char('\n')) &&
           !ErrorLog::report().contains(QStringLiteral("PRIVATE-GPU")) &&
           !ErrorLog::report().contains(QStringLiteral("PARTIAL-GPU")) &&
@@ -265,6 +392,10 @@ int main(int argc, char **argv)
     QString detailed;
     QDBusConnection bus = QDBusConnection::sessionBus();
     Identity identity;
+    QTemporaryDir sharedLogRoot;
+    check(sharedLogRoot.isValid() &&
+          ErrorLog::setStandaloneSnapshotRoot(sharedLogRoot.path(), &error),
+          "configure organization snapshot directory");
     check(bus.registerService(QStringLiteral("ru.omp.am")) &&
           bus.registerVirtualObject(QStringLiteral("/ru/omp/am"), &identity) &&
           bus.registerService(QStringLiteral("ru.androidcompatibilitylayer.appmanager")) &&
@@ -285,6 +416,29 @@ int main(int argc, char **argv)
     check(child.state() == QProcess::NotRunning && child.exitCode() == 0, "standalone process completed");
     check(ErrorLog::report().contains(QStringLiteral("Android runtime error: SecurityException")) &&
           !ErrorLog::report().contains(QStringLiteral("remote private secret")), "remote safe report redacted");
+    child.start(app.applicationFilePath(), QStringList() << QStringLiteral("--standalone-snapshot")
+                << sharedLogRoot.path());
+    timeout.start(5000);
+    loop.exec();
+    check(child.state() == QProcess::NotRunning && child.exitCode() == 0,
+          "snapshot-only standalone process completed");
+    const QString snapshotDirectory = sharedLogRoot.path() +
+        QStringLiteral("/AndroidCompatibilityLayer-Standalone-Logs");
+    const QStringList snapshotNames = QDir(snapshotDirectory).entryList(
+        QStringList() << QStringLiteral("standalone-*.json"), QDir::Files);
+    check(snapshotNames.size() == 1, "standalone publishes one per-instance snapshot");
+    QString standaloneSnapshotPath = QDir(snapshotDirectory).filePath(snapshotNames.first());
+    QFile snapshotFile(standaloneSnapshotPath);
+    check(snapshotFile.open(QIODevice::ReadOnly) &&
+          snapshotFile.readAll().count("snapshot-only private event") == 1,
+          "snapshot contains the standalone event once");
+    check(ErrorLog::detailedReport(&detailed, &error) &&
+          detailed.count(QStringLiteral("snapshot-only private event")) == 1 &&
+          detailed.contains(QStringLiteral("untrusted shared file")) &&
+          detailed.contains(QStringLiteral("organization apps may access it")),
+          "manager view reads standalone records from the shared file exactly once");
+    check(!ErrorLog::report().contains(QStringLiteral("snapshot-only private event")),
+          "snapshot-only standalone content does not enter the D-Bus event history");
     ErrorLog::record(QStringLiteral("test"), QStringLiteral("detailed secret"), false);
     check(ErrorLog::detailedReport(&detailed, &error) &&
           detailed.contains(QStringLiteral("detailed secret")) &&
@@ -321,8 +475,20 @@ int main(int argc, char **argv)
         QFile old(oldDir + QLatin1Char('/') + name);
         check(old.open(QIODevice::ReadOnly) && old.readAll() == QByteArray("old log"), "old log unchanged");
     }
+    const QString failedExportTarget = QDir(documents).filePath(QStringLiteral("AndroidCompatibilityLayer-Error-Logs"));
+    QFile failedExportBlocker(failedExportTarget);
+    check(failedExportBlocker.open(QIODevice::WriteOnly) &&
+          failedExportBlocker.write("block") == 5, "create export failure fixture");
+    QString failedPath, cleanupWarning;
+    bool partialExport = false;
+    check(!ErrorLog::saveDetailedReport(&failedPath, &error, &partialExport, &cleanupWarning) &&
+          failedPath.isEmpty() && QFileInfo::exists(standaloneSnapshotPath),
+          "failed atomic export preserves shared standalone source");
+    failedExportBlocker.close();
+    check(QFile::remove(failedExportTarget), "remove export failure fixture");
     QString path;
-    check(ErrorLog::saveDetailedReport(&path, &error), "explicit detailed export");
+    check(ErrorLog::saveDetailedReport(&path, &error, &partialExport, &cleanupWarning) &&
+          !partialExport && cleanupWarning.isEmpty(), "explicit detailed export");
     check(QFileInfo(path).absolutePath() ==
               QDir(documents).filePath(QStringLiteral("AndroidCompatibilityLayer-Error-Logs")),
           "detailed export is saved in Documents");
@@ -332,20 +498,153 @@ int main(int argc, char **argv)
     check(exportedContents.contains("detailed secret") &&
               exportedContents.contains("Client diagnostics (untrusted, no log data):") &&
               exportedContents.contains("[Remote source 1; events are untrusted]") &&
-              exportedContents.contains("remote private secret"),
-          "single detailed export contains manager and accepted standalone events");
+              exportedContents.contains("remote private secret") &&
+              exportedContents.count("snapshot-only private event") == 1,
+          "single detailed export contains manager, D-Bus and shared standalone sections once");
+    check(!QFileInfo::exists(standaloneSnapshotPath),
+          "successfully exported standalone snapshot is removed from organization storage");
+    const QString snapshotLink = QDir(snapshotDirectory).filePath(
+        QStringLiteral("standalone-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"));
+    QFile snapshotLinkTarget(home.path() + QStringLiteral("/snapshot-link-target"));
+    check(snapshotLinkTarget.open(QIODevice::WriteOnly) && snapshotLinkTarget.write("not a log") == 9 &&
+          snapshotLinkTarget.link(snapshotLink), "create untrusted snapshot symlink fixture");
+    QString partialPath;
+    check(ErrorLog::saveDetailedReport(&partialPath, &error, &partialExport, &cleanupWarning) &&
+          partialExport && QFileInfo(snapshotLink).isSymLink(),
+          "partial export reports and preserves a symlink snapshot");
+    QFile partialExportFile(partialPath);
+    check(partialExportFile.open(QIODevice::ReadOnly) &&
+          partialExportFile.readAll().contains("Standalone export partial"),
+          "partial export marker is written to the file");
+    check(QFile::remove(partialPath) && QFile::remove(snapshotLink) && QFile::remove(snapshotLinkTarget.fileName()),
+          "remove partial export fixtures");
+    check(ErrorLog::saveDetailedReport(&path, &error, &partialExport, &cleanupWarning),
+          "subsequent export succeeds after cleanup");
+    QFile secondExport(path);
+    check(secondExport.open(QIODevice::ReadOnly) &&
+          secondExport.readAll().count("snapshot-only private event") == 0,
+          "exported standalone lines do not reappear in the next file");
+    const QString largeManagerEntry(60000, QLatin1Char('m'));
+    for (int i = 0; i < 140; ++i)
+        ErrorLog::record(QStringLiteral("test"), largeManagerEntry, false);
+    const QString triggerPath = sharedLogRoot.path() + QStringLiteral("/update-trigger");
+    child.start(app.applicationFilePath(), QStringList() << QStringLiteral("--standalone-snapshot-update")
+                << sharedLogRoot.path() << triggerPath);
+    check(child.waitForStarted(5000), "start concurrent snapshot writer");
+    QElapsedTimer publishWait;
+    publishWait.start();
+    bool beforeSnapshotPublished = false;
+    QString updateSnapshotPath;
+    while (publishWait.elapsed() < 5000 && !beforeSnapshotPublished) {
+        app.processEvents();
+        const QStringList currentSnapshots = QDir(snapshotDirectory).entryList(
+            QStringList() << QStringLiteral("standalone-*.json"), QDir::Files);
+        if (currentSnapshots.size() == 1) {
+            updateSnapshotPath = QDir(snapshotDirectory).filePath(currentSnapshots.first());
+            QFile current(updateSnapshotPath);
+            if (current.open(QIODevice::ReadOnly))
+                beforeSnapshotPublished = current.readAll().contains("snapshot-before-export");
+        }
+        if (!beforeSnapshotPublished) QThread::msleep(5);
+    }
+    check(beforeSnapshotPublished, "publish snapshot before concurrent export");
+    const QString lockPath = updateSnapshotPath.left(updateSnapshotPath.size() - 5) +
+                             QStringLiteral(".lock");
+    const QString raceTrigger = triggerPath;
+    std::atomic<bool> triggerWritten(false);
+    std::thread updateDuringExport([&]() {
+        const int lockFd = ::open(QFile::encodeName(lockPath).constData(), O_RDWR | O_CLOEXEC);
+        if (lockFd < 0) return;
+        QElapsedTimer wait;
+        wait.start();
+        while (wait.elapsed() < 5000 && !triggerWritten.load()) {
+            if (::flock(lockFd, LOCK_EX | LOCK_NB) == 0) {
+                ::flock(lockFd, LOCK_UN);
+                QThread::msleep(1);
+                continue;
+            }
+            if (errno != EWOULDBLOCK && errno != EAGAIN) break;
+            const int triggerFd = ::open(QFile::encodeName(raceTrigger).constData(),
+                                         O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            if (triggerFd >= 0) {
+                ::write(triggerFd, "go", 2);
+                ::close(triggerFd);
+                triggerWritten.store(true);
+            }
+            break;
+        }
+        ::close(lockFd);
+    });
+    QString racePath;
+    check(ErrorLog::saveDetailedReport(&racePath, &error, &partialExport, &cleanupWarning),
+          "export snapshot while another process updates it");
+    updateDuringExport.join();
+    check(triggerWritten.load(), "writer update overlapped the export lock");
+    QFile raceExport(racePath);
+    check(raceExport.open(QIODevice::ReadOnly), "open concurrent export");
+    const QByteArray raceContents = raceExport.readAll();
+    check(raceContents.count("snapshot-before-export") == 1 &&
+          raceContents.count("snapshot-during-export") == 0,
+          "concurrent export contains only the locked snapshot version");
+    check(child.waitForFinished(6000) && child.exitCode() == 0,
+          "concurrent snapshot writer completes");
+    QFile updatedSnapshot(updateSnapshotPath);
+    check(updatedSnapshot.open(QIODevice::ReadOnly) &&
+          updatedSnapshot.readAll().contains("snapshot-during-export"),
+          "new snapshot survives export cleanup");
+    QString updatedExportPath;
+    check(ErrorLog::saveDetailedReport(&updatedExportPath, &error, &partialExport, &cleanupWarning),
+          "export snapshot update after first save");
+    QFile updatedExport(updatedExportPath);
+    check(updatedExport.open(QIODevice::ReadOnly), "open updated export");
+    const QByteArray updatedContents = updatedExport.readAll();
+    check(updatedContents.count("snapshot-before-export") == 0 &&
+          updatedContents.count("snapshot-during-export") == 1,
+          "concurrent update is exported exactly once without repeating prior entries");
     check((exported.permissions() & (QFile::ReadGroup | QFile::WriteGroup | QFile::ExeGroup |
                                       QFile::ReadOther | QFile::WriteOther | QFile::ExeOther)) == 0,
           "export is owner-only");
+    check(ErrorLog::saveReport(&path, &error), "explicit short export while detailed logging is enabled");
+    QFile shortExport(path);
+    check(shortExport.open(QIODevice::ReadOnly), "open short export");
+    const QByteArray shortContents = shortExport.readAll();
+    check(shortContents.contains("Current process context:") &&
+              !shortContents.contains("detailed secret") &&
+              !shortContents.contains("remote private secret"),
+          "short export omits raw local and remote messages");
+    const QDir exportDir(QFileInfo(path).absolutePath());
+    QFile standalone(exportDir.filePath(QStringLiteral("StandaloneDiagnostic-test.txt")));
+    QFile unrelated(exportDir.filePath(QStringLiteral("notes.txt")));
+    const QString link = exportDir.filePath(QStringLiteral("StandaloneDiagnostic-link.txt"));
+    check(standalone.open(QIODevice::WriteOnly) && unrelated.open(QIODevice::WriteOnly) &&
+          unrelated.link(link), "create saved-log cleanup fixtures");
+    standalone.close();
+    unrelated.close();
+    const QString clearSnapshotPath = QDir(snapshotDirectory).filePath(
+        QStringLiteral("standalone-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json"));
+    QFile clearSnapshot(clearSnapshotPath);
+    check(clearSnapshot.open(QIODevice::WriteOnly) &&
+          clearSnapshot.write("{\"version\":1,\"instance\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+                              "\"applicationId\":\"ru.androidcompatibilitylayer.Android0123456789abcdef01234567\","
+                              "\"dropped\":\"0\",\"events\":[]}") > 0,
+          "create organization snapshot cleanup fixture");
+    int removed = 0;
+    check(ErrorLog::clearSavedLogs(removed) && removed == 7 &&
+          !QFileInfo::exists(path) && !exported.exists() && !standalone.exists() &&
+          !clearSnapshot.exists() &&
+          unrelated.exists() && QFileInfo(link).isSymLink(), "clear only saved regular log files");
+    check(ErrorLog::clearSavedLogs(removed) && removed == 0 &&
+          ErrorLog::detailedReport(&detailed, &error) && detailed.contains(largeManagerEntry),
+          "cleanup is repeatable and preserves the current journal");
     check(ErrorLog::setDetailedEnabled(false, &error), "disable detailed capture");
     check(!ErrorLog::detailedCaptureEnabled(), "disabled detailed capture state is visible");
     child.start(app.applicationFilePath(), QStringList() << QStringLiteral("--gpu-after-disable"));
     timeout.start(5000);
     loop.exec();
     check(child.state() == QProcess::NotRunning && child.exitCode() == 0 &&
-          ErrorLog::report().contains(QStringLiteral("GPU Canvas fallback (details omitted)")) &&
+          !ErrorLog::report().contains(QStringLiteral("GPU Canvas fallback (details omitted)")) &&
           !ErrorLog::report().contains(QString::fromLatin1(RemoteGpuSummary)),
-          "manager drops GPU summaries delivered after detailed logging is disabled");
+          "manager ignores remote events when logging is disabled");
     check(!ErrorLog::detailedReport(&detailed, &error), "disabled detailed report unavailable");
     check(ErrorLog::setDetailedEnabled(true, &error), "re-enable detailed capture");
     check(ErrorLog::detailedReport(&detailed, &error) && !detailed.contains(QStringLiteral("detailed secret")),

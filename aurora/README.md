@@ -57,11 +57,24 @@ microG settings open as a page in the manager, where the back gesture can start
 anywhere on the page. The Android runtime remains in a separate process and
 continues to use the bounded CPU frame channel.
 
-Embedded workers (including Aurora Store and microG) attempt GPU Canvas
-presentation only when both experimental GPU options are enabled. The worker
-probes the current EGL context for DMA-BUF export support before selecting the
-GPU transport; when export is unavailable it uses the existing CPU frame
-channel. The parent verifies the actual format and modifier against its EGL
+Aurora Store uses CPU Canvas and the bounded CPU frame channel on all builds.
+Other embedded workers can attempt GPU Canvas presentation when both
+experimental GPU options are enabled. They probe the current EGL context for
+DMA-BUF export support before selecting the GPU transport. If direct export
+is unavailable, the one-time `Embedded GPU GBM probe` log
+checks whether the worker can allocate a buffer at the current preview size on
+a visible DRM render node and render to it after EGL import.
+For device testing, launch the manager with `ACL_EMBEDDED_GPU_GBM_VERIFY_PARENT=1`
+in the Aurora IDE run environment. The same probe line shows the flag as seen
+by the worker (`verify_parent`), the connection state before the test
+(`gpu_channel`), and the probe result or why it was skipped, including when
+the GPU channel was never negotiated. With the flag enabled, a channel
+available, and allocation successful, the worker sends one test buffer
+through the authenticated channel. The parent acknowledges it after
+EGL import and a GPU copy in the Qt scene graph, then discards the test texture
+without showing it. This opt-in test neither changes permissions nor enables
+GPU presentation. The
+parent verifies the actual format and modifier against its EGL
 importer, imports the file descriptors, and copies into a parent-owned GPU
 texture before acknowledging buffer release. A credential-checked local
 `SOCK_SEQPACKET` channel carries the descriptors and per-plane format, stride,
@@ -69,7 +82,7 @@ offset, and modifier metadata; EGL handles and process pointers are never
 serialized. Only one frame may be in flight, producer and consumer GPU work is
 completed before buffer reuse, and runtime handoff/import failure falls back
 to CPU texture readback and the existing CPU frame channel. The GPU path is
-reported active only after a frame is imported and acknowledged. This
+logged as active only after a live GPU frame is imported and acknowledged. This
 experimental path still requires device validation; it does not establish
 DMA-BUF support on Aurora ARM64.
 Returning from the microG page stops that process after the transition;
@@ -129,20 +142,66 @@ For tests, configure CMake separately with `ANDROID_COMPATIBILITY_LAYER_BUILD_TE
 Debug builds use reduced debug information for the bundled SQLite amalgamation
 to limit build time and object size; other sources keep their normal debug info.
 
-The manager and standalone Android apps collect diagnostic information.
-Explicitly saved reports go under `Documents/AndroidCompatibilityLayer-Error-Logs`.
-Short reports use an allowlist of
-operation stages, error categories, selected Android exception types, system and
-build information, timestamps and process IDs. They omit raw application and
-Qt messages, application names, file paths, URLs and network names; unrecognised
-errors are recorded without their details. This limits diagnostic detail and
-does not identify which installed app corresponds to a process ID. The Log page
-displays the current process's safe context; copying, sharing or saving exports
-the combined safe report. For apps started by the manager, process IDs and
-completion, failure or forced-stop categories help correlate lifecycle events;
-standalone processes do not have a manager observing their termination. Raw
-output may still appear in the IDE. Older reports
-created before this change are not modified and may contain private data.
+Logging is off by default. In the Log tab, select **Enable logs** and confirm
+the existing consent dialog to record detailed diagnostics. The warning calls
+out that raw logs may contain passwords, tokens, app data, paths and network
+addresses, and that standalone snapshots are stored in the shared organization
+folder, which other apps in that organization can access. Disabling logging
+stops new entries but does not delete saved files.
+
+Standalone processes use the manager's trusted D-Bus `State` only to control
+capture. New RPMs publish bounded, atomic per-instance snapshots under
+`Aurora::Application::organizationFilesDir(false)`; they do not send raw
+standalone events through D-Bus `Append` and do not request `Documents` or
+`UserDirs` permissions for logging. New RPM metadata enables snapshots
+independently of the logging state at build time. Older RPMs without the
+`standaloneSnapshots` metadata flag retain D-Bus `Append`; rebuild and install
+them once if you want to switch to shared snapshots. Rebuilding is not part of
+routine log collection. Existing `fileDiagnostics` metadata remains supported for
+those older packages. The shared folder is untrusted: snapshots
+are validated as bounded ordinary files, but their contents and claimed
+application identity are not cryptographically authenticated. The manager
+refreshes these snapshots in the Log view. Built-in preview/Store logging
+retains its existing D-Bus transport.
+
+**Save to file** atomically writes one combined
+`AndroidCompatibilityLayer-*.txt` report under
+`Documents/AndroidCompatibilityLayer-Error-Logs`, with manager history and
+available standalone snapshots. It does not import arbitrary files or older
+exports from Documents. A partial export is marked in the report and leaves
+omitted snapshots in place. After a successful save, only included snapshots
+that did not change during export are removed from the organization folder; if removal
+fails, the export still succeeds and the UI warns separately. A failed save
+leaves the source snapshots untouched. Legacy `StandaloneDiagnostic-*.txt`
+files in Documents are not imported automatically.
+
+**Clear log folder** deletes matching saved manager/legacy standalone files in
+Documents and standalone snapshots in the organization folder after
+confirmation; it does not clear the current journal or unrelated files. Close
+diagnostic apps first because active writers may recreate snapshots.
+**Send to developer** opens the public Yandex form inside the manager using
+Aurora WebView (Chromium). The
+form and its system file pickers support portrait and landscape. Single-file
+requests use the regular picker; multi-file requests use the system
+`MultiFilePickerDialog` and return the full selected list to the form. The form
+may still limit how many files it accepts. Check the saved combined report for
+private data, then select and submit it manually.
+The embedded page returns to the log view when the form reaches its success
+page with an answer key. Attachments and failed submissions do not close it.
+Opening the form does not create or attach a report, or submit the form. For apps started by the
+manager, process IDs and completion, failure or forced-stop categories help
+correlate lifecycle events; standalone processes do not have a manager
+observing their termination. Raw output may still appear in the IDE. Older
+reports created before this change are not modified and may contain private
+data. The manager declares the WebView's `Internet`, `UserDirs` and
+`DeviceInfo` permissions and depends on the system `ru.auroraos.webview`
+package. The manager links against the system WebView using `aurorawebview`
+pkg-config metadata, retaining its system CEF search path. The dynamic loader
+loads CEF when the manager process starts so it can allocate static thread-local
+storage. Preview, import and builder actions again launch the manager binary;
+they load CEF at startup but do not initialize WebView. The CEF-free
+`/usr/share/ru.androidcompatibilitylayer.appmanager/ru.androidcompatibilitylayer.appmanager.runtime`
+is a non-executable payload copied into new standalone RPMs.
 
 The manager holds bounded activity and detailed histories in RAM and periodically
 atomically saves them in its private application files directory. They are
@@ -150,8 +209,9 @@ restored when the manager restarts. The oldest output is discarded when a
 buffer fills and this is marked in the report. Snapshot write and recovery
 errors are shown in the Log page; a malformed snapshot is not overwritten.
 The snapshot and its single reusable pending file are each limited to 96 MiB.
-Standalone and preview processes send events to the manager over an append-only
-D-Bus interface; it does not offer remote log reads. The manager remains running
+Preview/Store and older standalone processes send events to the manager over an
+append-only D-Bus interface; it does not offer remote log reads. New standalone
+RPMs do not send log content over D-Bus. The manager remains running
 when its window closes, but Aurora may suspend or terminate it. Events received
 since the most recent snapshot (normally up to five seconds, or longer if
 writes fail or the process is suspended) can be lost. Delivery is best effort:
@@ -164,8 +224,10 @@ characters and accepts only
 its own executable (also used by the built-in Store worker) or a generated
 standalone executable, in either the legacy `/usr/bin` layout or the versioned
 `/opt/app/<app-id>/<version>/bin/<app-id>` package layout.
-Standalone packages built before this interface was added need rebuilding; device
-verification of activation and sandbox permissions is still required.
+Older standalone packages that predate the current shared-snapshot format need
+to be rebuilt once to use organization snapshots; this is a compatibility
+migration, not a step in the log-submission instructions. Device verification
+of activation and sandbox permissions is still required.
 Reports include per-manager-process counts of state and append requests,
 accepted calls and rejected or limited requests without sender identities.
 Clients also send bounded, predefined diagnostic stages and failure categories
@@ -223,28 +285,29 @@ source texture for shape and external-bitmap draws. For the outer paint blend,
 and `SCREEN` use premultiplied GLES blend factors when the selected filter
 preserves source coverage (`CLEAR`, `DST`, `SRC_IN`, `DST_IN`, `DST_OUT`,
 `SRC_ATOP` or `MODULATE`). Other filter/blend combinations, invalid filter
-modes, self-bitmap filters and GLES setup failures retain the CPU fallback.
-Pixel-based embedded presentation still requires its existing CPU readback
-callback.
+modes and GLES setup failures retain the CPU fallback. `canvas_copies_gpu`
+counts Canvas copies that sampled a GPU snapshot instead of reading the source
+bitmap back. In addition to integer-aligned 1:1 copies, standalone GLES 3
+supports exact 2x nearest-neighbor enlargement between different canvases
+with unfiltered, full-opacity `SRC_OVER` paint and a destination fully inside
+the target. Both paths require a source used by the current
+GLES context only and support rectangular integer clips. Other scales, complex
+clips, and unsupported paint combinations keep the existing fallback.
+Android core self-draws still settle the source first;
+the GPU host can avoid an additional readback for eligible direct self-draws.
+Embedded previews use CPU Canvas from startup if the GPU channel or EGL
+DMA-BUF export is unavailable. They do not use GPU readback as the startup
+fallback: readback still needs a current EGL context on the drawing thread.
+Standalone shared-texture presentation is unaffected.
 
-Temporary device testing: a standalone RPM created while detailed logging is
-enabled also captures its own detailed output before starting Android and saves
-one `StandaloneDiagnostic-*.txt` file per launch in
-`Documents/AndroidCompatibilityLayer-Error-Logs`, independently of D-Bus.
-The package requests the `Documents` permission (or uses its existing
-`UserDirs` permission). The mode is fixed when RPM creation starts: disabling
-detailed logging later does not stop these installed RPMs. Remove them and
-create new RPMs with detailed logging disabled to stop autonomous recording.
-These files may contain passwords, tokens and other private data, are accessible
-to the user and potentially other apps with Documents access, and remain after
-the app closes. The RAM history is bounded and overwritten when full; the
-snapshot is updated approximately every five seconds and at normal shutdown.
-Events before capture starts or after the last successful write can be lost.
-At most eight standalone diagnostic files are allocated in this folder; the
-application reports an error instead of removing old files when the limit is
-reached. Move or remove old test files manually to resume. Saving errors are
-shown in the standalone app. The normal D-Bus collection remains active and its
-sanitized stderr diagnostics are included in the standalone file when captured.
+Older standalone RPMs may continue their previous `StandaloneDiagnostic-*.txt`
+behavior in Documents, or may continue sending raw events through the D-Bus
+append interface. New RPMs use the shared-snapshot format and do not require a
+logging option at build time. Their snapshots are bounded and atomically
+replaced per process. They can contain private data and are accessible to
+other apps in the same organization; the manager treats both the folder and
+snapshot contents as untrusted. Existing legacy files are left untouched and
+are not folded into exports automatically.
 
 Standalone RPM generation is available on an app's library details page.
 Settings can also automatically create an RPM and open the system installer
@@ -272,6 +335,15 @@ removing it while the installer is still reading a package. Whether the system
 installer can access the private storage requires device verification. Each package includes a full runtime and requires substantial
 free space; its signature and standalone launch require device verification.
 Older shortcut RPMs may share app data with the main app.
+
+On a repeat request, the manager reuses its last signed RPM only if its contents
+and generation inputs still match, including APK and splits, launcher, runtime
+ABI, QML, settings and app permissions. Otherwise it builds a new package and
+removes the previous internal RPM after publishing the replacement. Importing
+an identical single APK retains the cache; an approved different APK for the
+same package replaces the library copy and invalidates that cache. Existing
+split installations cannot be replaced by a single APK. Installed standalone
+packages and their data are not removed by these operations.
 
 The app's Permissions page selects allow or deny for dangerous permission groups
 declared by the APK. The selection is embedded into newly generated RPMs; it
@@ -344,9 +416,8 @@ The host has been exercised in the x86 SDK but not on an Aurora device.
 Android video playback is not yet supported. The shared MediaCodec input normalizer accepts
 Annex-B and 1-, 2- or 4-byte MP4 NAL lengths from avcC/hvcC records for a
 future video decoder; this does not add a decoder or verify device playback.
-Android System WebView is not included in the Aurora runtime. The original
-Megler WebView requires its Android Chromium package and runtime integration;
-Aurora's native WebView is not currently connected to Android WebView calls.
+ARM64 builds include Android System WebView in the shared runtime. It is
+separate from Aurora's native WebView, which handles the manager's feedback form.
 The experimental camera bridge supports CPU-accessible NV12/NV21 preview
 frames; focus, torch and other camera formats are not yet supported.
 An experimental sensor bridge exposes supported physical sensors. Android
@@ -472,6 +543,8 @@ underlying library. It runs in a separate preview process and window; reopening
 it activates the existing window. Opening an installed app from this Store window
 queues the launch without waiting on the Store UI thread; the manager still
 handles launch failures, including a missing standalone installation. The
+RPM installation offer follows the current manager page in portrait and
+landscape and keeps both actions visible when the message needs to scroll. The
 immediate callback result indicates that the request was queued, not that the
 app started; a failed or unverified manager reply is logged.
 The desktop entry allows separate multitasking
@@ -525,14 +598,20 @@ and not the old WKWebView bridge. The abandoned Android-to-QML/Aurora bridge and
 its mock tests have been removed; the independent native diagnostic remains
 documented in `aurora/webview_native_probe.md`.
 
-CMake installs `aurora/android-runtime` into
-`/usr/share/ru.androidcompatibilitylayer.appmanager/android-runtime`.
-The manager resolves that resource directory with `Aurora::Application::pathTo`;
-preview passes it to `megler_run_config.android_root`. Standalone packages copy
-that runtime into their own resource directory and use that copy. Megler mounts
-the selected root at the guest path `/system`. Rebuilding
-`build/android9/root-arm64-v8a` alone does not update the IDE source runtime or
-an already installed standalone package.
+CMake installs `aurora/android-runtime` once, with its ABI marker, into
+`/usr/share/common/ru.androidcompatibilitylayer/appmanager/android-runtime`.
+The manager and new standalone packages resolve it with
+`Aurora::Application::organizationPathTo`. They must be signed with the same
+key for access; signing or native library loading in an ordinary Aurora sandbox
+still requires verification on a device. Previously generated standalone RPMs
+continue to use their own bundled runtime. New RPMs do not include runtime files,
+but retain their APKs, splits, settings and private storage layout. They record
+the current marker from `aurora/standalone-runtime-abi`; increment it whenever a
+runtime change is incompatible with existing standalone binaries. A missing or
+inaccessible runtime is reported separately from an ABI mismatch. Recreating an
+RPM gives it a new application identity and does not migrate private data.
+Megler mounts the selected root at the guest path `/system`. Rebuilding
+`build/android9/root-arm64-v8a` alone does not update the IDE source runtime.
 
 For Aurora aarch64 the primary ABI is `arm64-v8a` (the bundled
 `lib/libjavacore.so` is ELF64/AArch64). The required provider is a standalone
@@ -549,27 +628,51 @@ drop-in provider for this loader. The upstream standalone package name is
 than enforcing that name. It does not implement Android's WebViewUpdateService
 or authenticate the APK's signing certificate.
 
-At this implementation stage the prepared runtime contains no provider and
-there is no verified provider APK in this tree. `tools/webview-fetch.sh` records
-an AOSP source commit and hashes for Chromium 128.0.6613.88, including ARM64;
-this is an old historical prebuilt, not a maintained security baseline. It has
-not been fetched or installed as part of this port. The Android 9 image's
-Chromium 66 (odex/vdex-only code) is also not a suitable replacement. A provider
-must have reviewed provenance, redistribution licenses/notices and a maintained
-update source; neither an AOSP URL nor a matching ABI establishes suitability
-for real accounts. No binary has been substituted.
+The factory invokes the provider's public static
+`create(WebViewDelegate)` method. The APK manifest parser reads package name,
+`targetSdkVersion` and application-level metadata
+`com.android.webview.WebViewLibrary`; the latter names the shared library
+(normally `libwebviewchromium.so`). Provider DEX must contain
+`com.android.webview.chromium.WebViewChromiumFactoryProviderForT`. The loader
+does not enforce a particular package name or minimum version code. The exact
+native lookup is
+`/system/app/webview/webview.apk!/lib/arm64-v8a/libwebviewchromium.so`; it must
+be an ELF64 little-endian AArch64 shared object. Other required native
+dependencies must also exist in the APK or runtime. The
+`libwebviewchromium_plat_support.so` system-library name is currently a stub
+backed by Megler native hooks, not an APK substitute. This runtime uses an
+Android 9 (API 28) root, so a provider must also be compatible with that
+runtime's Java APIs; the factory does not validate `minSdkVersion`.
+The installed Android SDK/platform are API 36, but they supply no WebView APK;
+no emulator system image is installed either.
 
-The [pinned AOSP repository's README](https://android.googlesource.com/platform/external/chromium-webview/+/27ac2bdb9a1a4e55dc65bb6cdc752dbfdea3b9f4/)
-identifies its APKs as Chromium upstream builds and recommends newer stable
-sources. Chromium's
-[system integration guide](https://chromium.googlesource.com/chromium/src/+/HEAD/android_webview/docs/aosp-system-integration.md)
-warns that these prebuilts are not regularly updated, and documents
-`system_webview_apk` with `target_cpu="arm64"` as a source-build route.
-The [Chromium 128 license](https://chromium.googlesource.com/chromium/src/+/128.0.6613.88/LICENSE)
-permits binary redistribution with its notice and conditions; third-party
-component notices and any optional codec rights must also be reviewed for the
-specific build. This is a source/provenance lead, not approval of a particular
-binary or confirmation that a current provider runs on Megler.
+Before configuring the ARM64 Aurora build, fetch the
+[pinned AOSP Chromium 128.0.6613.88 provider](https://android.googlesource.com/platform/external/chromium-webview/+/27ac2bdb9a1a4e55dc65bb6cdc752dbfdea3b9f4/)
+with `tools/webview-fetch.sh --aosp-chromium-128 arm64-v8a`. The local build
+input is `build/webview/arm64-v8a/webview.apk`; it is not checked into Git or
+downloaded by CMake. Aurora IDE's standard apptool build uses the source tree
+in place; if building from a source archive instead, include this ignored APK
+at the same relative path as well as `aurora/android-runtime` and
+`aurora/sqlite`. The ordinary Aurora RPM spec works without a local wrapper
+or a WebView flag. CMake verifies the pinned SHA-256 and stages the APK and
+its platform support stub in the manager's installed shared runtime.
+Non-ARM64 builds do not stage this provider.
+
+Applications using that shared runtime can attempt to use the standard Android
+WebView API without an allowlist or per-app provider copy. Standalone packages
+already using the compatible shared runtime pick it up when the manager is
+updated; older packages with an embedded runtime must be rebuilt to use the
+shared provider. App data remains per application; rebuilding a standalone
+package under a new identity does not migrate it. Existing network permissions
+still apply.
+
+As in upstream Megler, the renderer runs in the Android application's
+process, not in a separate renderer sandbox. The prebuilt Chromium 128 is
+not on an automatic security update channel. Support for an app's WebView
+does not imply compatibility with every site or sign-in flow. Before public
+binary redistribution, review the
+[Chromium license](https://chromium.googlesource.com/chromium/src/+/128.0.6613.88/LICENSE)
+and the applicable third-party notices and terms for this prebuilt.
 
 The factory now reports a missing provider with its guest path and primary ABI.
 Before creating its class loader or invoking native constructors it checks the
@@ -589,14 +692,67 @@ Compile it together with
 `java -cp <temporary-output> android.webkit.WebViewProviderCheckTest`.
 It uses synthetic ZIP/DEX/ELF headers only and does not execute Chromium.
 
-Device startup remains blocked on a reviewed compatible ARM64 provider. After
-one is supplied, use Aurora IDE for an offline `loadData` page with fixed text
-and a fixed title, without accounts, network navigation or JavaScript bridges.
-Confirm native loading, page-finished callback, visible pixels and clean close;
-then investigate any actual loader/JNI/rendering failure. Renderer process
-creation, OS sandbox boundaries and engine updates remain unverified. Do not
-add `--no-sandbox`, bypass signature/trust policy or use real credentials to
-make the smoke test pass.
+Local pages, loopback, controlled HTTPS, JavaScript and text input were
+verified on the ARM64 tablet with the same provider.
+Build the test APK at `build/guest/java/webview-smoke.apk` with
+`tools/build-test-app.sh --force webview-smoke` and import it from the Android
+app library. On its details page choose **Install as RPM**, confirm in the
+system installer, then launch the installed app from the Aurora desktop/app
+menu; APKs cannot be launched directly from the library. The standalone RPM
+references the shared runtime and does not carry its own provider. Its pages
+are local APK assets and require no network permission, account or JavaScript
+bridge. The test-app script accepts
+`MEGLER_ANDROID_SDK`, `MEGLER_BUILD_TOOLS_VERSION` and `MEGLER_ANDROID_PLATFORM`
+overrides for the installed Android SDK. Its manifest opens and stays in
+landscape. It creates a standard Android `WebView`, opens
+`file:///android_asset/index.html`, and shows lifecycle/load events. Use the
+local page link or Page 2, Back, Forward and Reload buttons to check navigation.
+Leave the app and return to check pause/resume; close it to check destroy.
+
+For a separate loopback-only network test, build
+`tools/build-test-app.sh --force webview-loopback` and import
+`build/guest/java/webview-loopback.apk`. Install it from its library details
+page and launch it from the desktop as above. It binds an HTTP server to
+`127.0.0.1` on a random port and serves two static pages; its test-only
+network policy permits cleartext only to that address. JavaScript and external
+navigation are disabled. The on-screen events and `WebViewLoopbackSmoke` log
+show server startup and requests, page loads, navigation and errors. Check Page
+2, Back, Forward and Reload. `LOAD_FINISH` alone is not proof of success:
+also check the displayed page, server response and any `LOAD_ERROR`. This
+does not test DNS, HTTPS, external content or renderer isolation.
+
+For the separate HTTPS test, build
+`tools/build-test-app.sh --force webview-https`, then import and install
+`build/guest/java/webview-https.apk` from the library and launch it from the
+desktop. The default address is `https://ya.ru/robots.txt`, a plain-text
+endpoint that avoids the home page's redirects. To test another trusted address
+without rebuilding, enter it in the address field and tap Load. The test only
+allows a main-frame GET to the entered HTTPS address. Navigations, redirects
+and all subresources are blocked, and JavaScript is disabled. Normal
+TLS verification remains in effect. `WebViewHttpsSmoke` reports load, HTTP
+error, certificate and visual-readiness events without logging requested URLs.
+The displayed `PROBE_HTTP_STATUS` is from a separate HTTPS request with
+redirects disabled: Android WebView does not expose a successful main-frame
+HTTP status through these callbacks. `VISUAL_READY` means ready for the next
+draw, not that pixels were actually displayed; check the page on screen.
+This test has not established renderer isolation or production suitability.
+
+The same APK also has an **Offline JS** button. It opens a separate WebView
+with a bundled page, blocked network, no file or content access and no JavaScript
+bridge. Wait for **JavaScript ready**, then tap **Tap to test**; the visible
+counter should increment. Type a short sample in the text field, move the caret
+into the middle, insert a character and delete one. The on-page preview should
+match after each edit, including with the on-screen keyboard in landscape.
+The text is not logged or sent; the `WebViewOfflineJsSmoke` tag reports only
+the JavaScript startup and tap events. JavaScript stays disabled in the HTTPS test.
+
+`WebViewDelegate.isMultiProcessEnabled()` currently returns `false`, so
+Chromium runs its renderer on threads in the embedding app process. This
+diagnostic does not establish an OS renderer sandbox and must not be treated as
+suitable for real accounts or untrusted browsing. Do not add `--no-sandbox`,
+bypass TLS/signature/trust policy or use real credentials to make the smoke
+test pass. A separate renderer-process boundary and a secure provider update
+and qualification plan remain outstanding.
 
 The compatibility layer cannot run arbitrary APKs reliably. Development tests
 remain separate from the application build.

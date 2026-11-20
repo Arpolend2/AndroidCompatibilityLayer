@@ -94,7 +94,8 @@ extern "C" bool megler_run(const megler_run_config *run)
     testPixels.resize(size_t(run->width) * run->height);
     testCanvas = config.gfx.canvas_new(config.gfx.user, testPixels.data(), run->width, run->height, run->width * 4);
     if (!testCanvas) return false;
-    output(drawTestFrame(0xff010203) ? "gpu" : "cpu");
+    const bool presented = drawTestFrame(0xff010203);
+    output(presented ? "gpu" : config.gfx.present ? "gpu-fallback" : "cpu-canvas");
     QTimer::singleShot(150, []() {
         if (testCanvas) drawTestFrame(0xff040506);
     });
@@ -214,6 +215,7 @@ int main(int argc, char **argv)
         for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
             const QString countName = directory.path() + QLatin1Char('/') + QString::fromLatin1(modes[i]);
             EmbeddedPreview preview;
+            preview.setCpuFrameTransportOnly();
             preview.setViewport(540, 960, 1);
             preview.setUiReady(true);
             StorePreviewSupervisor supervisor(&preview, QCoreApplication::applicationFilePath(),
@@ -221,12 +223,16 @@ int main(int argc, char **argv)
             QEventLoop loop;
             bool done = false;
             int frames = 0;
+            bool sawFirstCpuFrame = false;
+            bool sawSecondCpuFrame = false;
             qint64 lastFrameKey = 0;
             QObject::connect(&preview, &EmbeddedPreview::frameChanged, &loop, [&]() {
                 const QImage frame = preview.frame();
                 if (!frame.isNull() && frame.cacheKey() != lastFrameKey) {
                     lastFrameKey = frame.cacheKey();
                     ++frames;
+                    sawFirstCpuFrame |= frame.pixel(0, 0) == 0xff010203;
+                    sawSecondCpuFrame |= frame.pixel(0, 0) == 0xff040506;
                 }
             });
             int code = -1;
@@ -249,6 +255,12 @@ int main(int argc, char **argv)
             }
             elapsed.start();
             if (!supervisor.start(&error)) { std::fprintf(stderr, "%s\n", qPrintable(error)); return 1; }
+#ifdef MG_EXPERIMENTAL_GPU_CANVAS
+            if (QFileInfo(QFileInfo(preview.endpoint()).dir().filePath(QStringLiteral("gpu"))).exists()) {
+                std::fprintf(stderr, "CPU-only Store unexpectedly opened a GPU endpoint\n");
+                return 1;
+            }
+#endif
             if (modes[i] == "close" || modes[i] == "hang-close")
                 QTimer::singleShot(200, &supervisor, &StorePreviewSupervisor::stop);
             if (modes[i] == "hang-preview-close")
@@ -270,7 +282,8 @@ int main(int argc, char **argv)
             QFile count(countName);
             if (!count.open(QIODevice::ReadOnly)) return 1;
             const int runs = count.readAll().toInt();
-            if (!done || runs != expected[i] || (modes[i] == "frames" && frames < 2) ||
+            if (!done || runs != expected[i] ||
+                    (modes[i] == "frames" && (frames < 2 || !sawFirstCpuFrame || !sawSecondCpuFrame)) ||
                     (modes[i] == "error" && code != 7) ||
                     ((modes[i] == "crash" || modes[i] == "requested-crash" ||
                       modes[i] == "hang-close" || modes[i] == "hang-preview-close" ||
@@ -284,10 +297,7 @@ int main(int argc, char **argv)
     }
     if (argc == 4 && QByteArray(argv[1]) == "--child") {
         PreviewPlayer player(QStringLiteral("."), QStringLiteral("."));
-#ifdef MG_EXPERIMENTAL_GPU_CANVAS
         player.setCpuPresentationOnly(true);
-        player.setOffscreenGpuCanvas(true);
-#endif
         AuroraPickerHost picker;
         player.setPicker(&picker);
         EmbeddedPreviewChild bridge(&player, &picker);
@@ -369,8 +379,12 @@ int main(int argc, char **argv)
         const bool normalRun = outputText.contains("started\n") && outputText.contains("touch\n") &&
                 outputText.contains("text\n") && outputText.contains("picked\n") && outputText.contains("stopped\n");
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
-        const QByteArray expectedRenderer = qgetenv("ACL_TEST_EXPECT_GPU") == "1" ? "gpu\n" : "cpu\n";
-        if (runs < 2 && !outputText.contains(expectedRenderer)) failed = true;
+        const QByteArray expectedRenderer = qgetenv("ACL_TEST_EXPECT_GPU") == "1" ? "gpu\n" : "cpu-canvas\n";
+        if (runs < 2 && !outputText.contains(expectedRenderer)) {
+            std::fprintf(stderr, "expected renderer %s; child output: %s\n",
+                         expectedRenderer.constData(), outputText.constData());
+            failed = true;
+        }
 #endif
         if (status != QProcess::NormalExit || code != 0 || (runs < 2 ? !normalRun : !outputText.isEmpty())) {
             std::fprintf(stderr, "child output: %s, code %d\n", outputText.constData(), code);

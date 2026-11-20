@@ -4401,6 +4401,11 @@ What a Java app asks of the phone beyond its window goes to the shell through
   Megler, which plays it if it has not run an app yet. A launcher therefore
   works best as an app's own package: from Megler, Megler is busy running the
   launcher.
+- **Backup flag.** The running app's `ApplicationInfo` and
+  `getPackageArchiveInfo` report `FLAG_ALLOW_BACKUP` from the application
+  manifest, including boolean resources; it defaults to true when absent.
+  `core/tests/manifest-backup/run.ps1` exercises both paths with compiled
+  manifests, and the data app checks the default alongside `installLocation`.
 - **Other apps: their activities.** Beside the list Megler describes each
   app's activities from its APK and splits, in `phone-apps\<package>\`
   (`megler_apk_describe_activities`): `activities.json`, every activity and

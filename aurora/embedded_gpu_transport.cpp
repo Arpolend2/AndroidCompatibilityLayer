@@ -1,19 +1,28 @@
 #include "embedded_gpu_transport.h"
 
 #include <QAtomicInteger>
+#include <QDir>
 #include <QFile>
+#include <QLibrary>
 #include <QMutexLocker>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
+#include <memory>
 #include <poll.h>
 #include <vector>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#if __has_include(<gbm.h>)
+#include <gbm.h>
+#define ACL_HAVE_GBM_HEADER 1
+#endif
 
 namespace {
 const quint32 wireMagic = 0x41434c47;
@@ -25,8 +34,16 @@ const quint64 invalidModifier = ~quint64(0);
 
 enum WireType {
     FramePacket = 1,
-    ResultPacket = 2
+    ResultPacket = 2,
+    ProbePacket = 3
 };
+
+quint64 nextFrameId()
+{
+    static QAtomicInteger<quint64> next(1);
+    quint64 id = next.fetchAndAddRelaxed(1);
+    return id ? id : next.fetchAndAddRelaxed(1);
+}
 
 #pragma pack(push, 1)
 struct WirePacket {
@@ -224,7 +241,7 @@ bool receivePacket(int fd, WirePacket *packet, int *fds, int *fdCount)
 bool validFrameMetadata(const WirePacket &packet, int fdCount)
 {
     if (packet.magic != wireMagic || packet.version != wireVersion ||
-        packet.type != FramePacket || !packet.id || packet.width <= 0 ||
+        (packet.type != FramePacket && packet.type != ProbePacket) || !packet.id || packet.width <= 0 ||
         packet.height <= 0 || packet.width > maxDimension || packet.height > maxDimension ||
         quint64(packet.width) * quint64(packet.height) > maxFramePixels ||
         packet.fourcc <= 0 || !packet.planeCount || packet.planeCount > maxPlanes ||
@@ -312,6 +329,7 @@ AuroraDmaBufFrame &AuroraDmaBufFrame::operator=(AuroraDmaBufFrame &&other) noexc
     if (this == &other) return *this;
     close();
     id = other.id;
+    probeOnly = other.probeOnly;
     width = other.width;
     height = other.height;
     fourcc = other.fourcc;
@@ -554,7 +572,7 @@ bool EmbeddedGpuTransport::sendFramePacket(int socket, const AuroraDmaBufFrame &
     WirePacket packet = {};
     packet.magic = wireMagic;
     packet.version = wireVersion;
-    packet.type = FramePacket;
+    packet.type = frame.probeOnly ? ProbePacket : FramePacket;
     packet.id = frame.id;
     packet.width = frame.width;
     packet.height = frame.height;
@@ -584,6 +602,7 @@ bool EmbeddedGpuTransport::receiveFramePacket(int socket, AuroraDmaBufFrame *fra
     }
     AuroraDmaBufFrame incoming;
     incoming.id = packet.id;
+    incoming.probeOnly = packet.type == ProbePacket;
     incoming.width = packet.width;
     incoming.height = packet.height;
     incoming.fourcc = packet.fourcc;
@@ -690,6 +709,147 @@ bool EmbeddedGpuTransport::canExportDmaBuf(QString *error)
     return true;
 }
 
+QString EmbeddedGpuTransport::probeGbmRenderTarget(int width, int height,
+    const std::function<bool(const AuroraDmaBufFrame &, QString *)> &verifyParent)
+{
+    if (width <= 0 || height <= 0 || width > maxDimension || height > maxDimension ||
+        quint64(width) * quint64(height) > maxFramePixels)
+        return QStringLiteral("unavailable: frame dimensions exceed the GPU transport limits");
+    const EGLDisplay display = eglGetCurrentDisplay();
+    if (display == EGL_NO_DISPLAY || eglGetCurrentContext() == EGL_NO_CONTEXT)
+        return QStringLiteral("unavailable: no current worker EGL context");
+    const char *extensions = eglQueryString(display, EGL_EXTENSIONS);
+    if (!hasExtension(extensions, "EGL_EXT_image_dma_buf_import"))
+        return QStringLiteral("unavailable: worker EGL lacks EGL_EXT_image_dma_buf_import");
+    if (!hasExtension(extensions, "EGL_KHR_image_base") || !hasGlExtension("GL_OES_EGL_image"))
+        return QStringLiteral("unavailable: worker EGL/GLES lacks image-to-texture support");
+#ifndef ACL_HAVE_GBM_HEADER
+    Q_UNUSED(verifyParent)
+    return QStringLiteral("unavailable: build SDK lacks the GBM API header");
+#else
+    QLibrary gbm(QStringLiteral("libgbm.so.1"));
+    if (!gbm.load())
+        return QStringLiteral("unavailable: libgbm.so.1 could not be loaded");
+#define ACL_RESOLVE_GBM(name) const auto name = reinterpret_cast<decltype(&::name)>(gbm.resolve(#name))
+    ACL_RESOLVE_GBM(gbm_create_device);
+    ACL_RESOLVE_GBM(gbm_device_destroy);
+    ACL_RESOLVE_GBM(gbm_bo_create);
+    ACL_RESOLVE_GBM(gbm_bo_destroy);
+    ACL_RESOLVE_GBM(gbm_bo_get_format);
+    ACL_RESOLVE_GBM(gbm_bo_get_modifier);
+    ACL_RESOLVE_GBM(gbm_bo_get_plane_count);
+    ACL_RESOLVE_GBM(gbm_bo_get_fd_for_plane);
+    ACL_RESOLVE_GBM(gbm_bo_get_stride_for_plane);
+    ACL_RESOLVE_GBM(gbm_bo_get_offset);
+#undef ACL_RESOLVE_GBM
+    if (!gbm_create_device || !gbm_device_destroy || !gbm_bo_create || !gbm_bo_destroy ||
+        !gbm_bo_get_format || !gbm_bo_get_modifier || !gbm_bo_get_plane_count ||
+        !gbm_bo_get_fd_for_plane || !gbm_bo_get_stride_for_plane || !gbm_bo_get_offset)
+        return QStringLiteral("unavailable: libgbm lacks allocation or plane-metadata entry points");
+
+    const QDir dri(QStringLiteral("/dev/dri"));
+    const auto nodes = dri.entryList({QStringLiteral("renderD*")}, QDir::System | QDir::NoSymLinks);
+    QStringList failures;
+    for (const QString &node : nodes) {
+        bool renderNumber = false;
+        const uint number = node.mid(7).toUInt(&renderNumber);
+        if (!renderNumber || number < 128 || node != QStringLiteral("renderD%1").arg(number))
+            continue;
+        const QByteArray path = QFile::encodeName(dri.filePath(node));
+        QFile renderNode;
+        const int fd = ::open(path.constData(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) {
+            failures.append(QStringLiteral("%1: open denied or unavailable (errno %2)").arg(node).arg(errno));
+            continue;
+        }
+        struct stat info = {};
+        if (fstat(fd, &info) != 0 || !S_ISCHR(info.st_mode) ||
+            !renderNode.open(fd, QIODevice::ReadWrite, QFileDevice::AutoCloseHandle)) {
+            ::close(fd);
+            failures.append(QStringLiteral("%1: not a usable character device").arg(node));
+            continue;
+        }
+        const std::unique_ptr<gbm_device, decltype(gbm_device_destroy)> device(gbm_create_device(fd), gbm_device_destroy);
+        if (!device) {
+            failures.append(QStringLiteral("%1: GBM could not initialize the device").arg(node));
+            continue;
+        }
+        const uint32_t formats[] = {GBM_FORMAT_ARGB8888, GBM_FORMAT_XRGB8888};
+        const uint32_t flags[] = {GBM_BO_USE_RENDERING, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR};
+        QString lastError;
+        for (const uint32_t format : formats) {
+            for (const uint32_t use : flags) {
+                AuroraDmaBufFrame frame;
+                frame.width = width;
+                frame.height = height;
+                const std::unique_ptr<gbm_bo, decltype(gbm_bo_destroy)> buffer(
+                    gbm_bo_create(device.get(), frame.width, frame.height, format, use), gbm_bo_destroy);
+                if (!buffer) continue;
+                frame.fourcc = int(gbm_bo_get_format(buffer.get()));
+                frame.modifier = gbm_bo_get_modifier(buffer.get());
+                frame.planeCount = gbm_bo_get_plane_count(buffer.get());
+                bool valid = frame.planeCount > 0 && frame.planeCount <= maxPlanes;
+                for (int plane = 0; valid && plane < frame.planeCount; ++plane) {
+                    const auto stride = gbm_bo_get_stride_for_plane(buffer.get(), plane);
+                    const auto offset = gbm_bo_get_offset(buffer.get(), plane);
+                    if (!stride || stride > std::numeric_limits<int>::max() ||
+                        offset > std::numeric_limits<int>::max()) {
+                        valid = false;
+                        break;
+                    }
+                    frame.strides[plane] = int(stride);
+                    frame.offsets[plane] = int(offset);
+                    frame.fds[plane] = gbm_bo_get_fd_for_plane(buffer.get(), plane);
+                    valid = frame.fds[plane] >= 0;
+                }
+                if (!valid) {
+                    lastError = QStringLiteral("allocation produced unusable plane metadata or FDs");
+                    continue;
+                }
+                const GLuint texture = aurora_import_dma_buf_texture(frame, display, &lastError);
+                if (!texture) continue;
+                GLint previous = 0;
+                glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous);
+                GLuint fbo = 0;
+                glGenFramebuffers(1, &fbo);
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+                const bool complete = fbo && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+                if (complete) {
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    glFinish();
+                }
+                const GLenum glError = glGetError();
+                glBindFramebuffer(GL_FRAMEBUFFER, GLuint(previous));
+                glDeleteFramebuffers(1, &fbo);
+                glDeleteTextures(1, &texture);
+                if (complete && glError == GL_NO_ERROR) {
+                    const QString producer = QStringLiteral("%1: allocated, imported and rendered a %2x%3 test buffer "
+                                                            "(fourcc 0x%4, modifier 0x%5, %6 plane(s))")
+                        .arg(node).arg(width).arg(height).arg(frame.fourcc, 0, 16)
+                        .arg(frame.modifier, 0, 16).arg(frame.planeCount);
+                    if (!verifyParent) return producer + QStringLiteral("; parent import and presentation not tested");
+                    frame.id = nextFrameId();
+                    frame.probeOnly = true;
+                    QString parentError;
+                    if (!verifyParent(frame, &parentError))
+                        return producer + QStringLiteral("; parent import/ACK failed: ") + parentError;
+                    return producer + QStringLiteral("; parent Qt import and GPU snapshot acknowledged; not displayed");
+                }
+                lastError = QStringLiteral("import succeeded but GLES rendering failed (GL error 0x%1)")
+                    .arg(glError, 0, 16);
+            }
+        }
+        if (lastError.isEmpty())
+            lastError = QStringLiteral("GBM could not allocate a %1x%2 render target for either tested format")
+                .arg(width).arg(height);
+        failures.append(QStringLiteral("%1: %2").arg(node, lastError));
+    }
+    return failures.isEmpty() ? QStringLiteral("unavailable: no visible DRM render node")
+                              : QStringLiteral("unavailable: %1").arg(failures.join(QStringLiteral("; ")));
+#endif
+}
+
 bool EmbeddedGpuTransport::presentTexture(GLuint texture, int width, int height, QString *error)
 {
     if (!texture || width <= 0 || height <= 0 || width > maxDimension || height > maxDimension ||
@@ -723,10 +883,8 @@ bool EmbeddedGpuTransport::presentTexture(GLuint texture, int width, int height,
     EGLint strides[maxPlanes] = {};
     EGLint offsets[maxPlanes] = {};
     if (ok) ok = exportImage(display, image, fds, strides, offsets);
-    static QAtomicInteger<quint64> nextId(1);
     AuroraDmaBufFrame exported;
-    exported.id = nextId.fetchAndAddRelaxed(1);
-    if (!exported.id) exported.id = nextId.fetchAndAddRelaxed(1);
+    exported.id = nextFrameId();
     exported.width = width;
     exported.height = height;
     exported.fourcc = fourcc;

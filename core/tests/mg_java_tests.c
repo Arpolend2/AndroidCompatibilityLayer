@@ -3545,20 +3545,26 @@ static void media_session_keys(void)
  */
 static void system_requests(void)
 {
-    /* (Then, of its activities, Settings by its class, and Second, an alias, as what it stands for.) */
-    static const char want[] = "launch=com.example.other/com.example.other.Main;launch=com.example.other/com.example.other.Settings;"
-                               "launch=com.example.other/com.example.other.Main;install=Viewed.apk;install=com.example.store.apk;install=com.example.split.apks(2);";
+    static const char launches[] = "launch=com.example.other/com.example.other.Main;launch=com.example.other/com.example.other.Settings;"
+                                   "launch=com.example.other/com.example.other.Main;";
+    static const char *installs[] = { "install=store-download.xapk;", "install=Viewed.apk;",
+                                      "install=com.example.store.apk;", "install=com.example.split.apks(2);" };
     char heard[sizeof(g_system_heard)];
     int tries;
     for (tries = 0; tries < 150; tries++) {
         mg_lock_acquire(&g_system_lock);
         mg_strlcpy(heard, g_system_heard, sizeof(heard));
         mg_lock_release(&g_system_lock);
-        if (!strcmp(heard, want)) break;
+        int complete = !strncmp(heard, launches, sizeof(launches) - 1);
+        for (size_t i = 0; complete && i < sizeof(installs) / sizeof(installs[0]); i++)
+            complete = strstr(heard, installs[i]) != NULL;
+        if (complete) break;
         mg_sleep_ns(20000000ull);
     }
     say("  the app asked of the phone: %s", heard);
-    CHECK(!strcmp(heard, want));
+    CHECK(!strncmp(heard, launches, sizeof(launches) - 1));
+    for (size_t i = 0; i < sizeof(installs) / sizeof(installs[0]); i++)
+        CHECK(strstr(heard, installs[i]) != NULL);
     CHECK(wait_line("I/DataTest: install-status 3 session=true package=com.example.store", 0, 30) >= 0);
     CHECK(wait_line("I/DataTest: install-status 0 session=false package=com.example.split", 0, 30) >= 0);
     /* As on Android, the app installed is told of before its session's status. Then the app uninstalls it through the

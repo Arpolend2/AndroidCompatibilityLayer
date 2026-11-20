@@ -67,6 +67,8 @@ private:
     static void MEGLER_CB drawPath(void *user, void *canvas, const float *path, int count, int fill, const megler_gfx_paint *paint, void *shader);
     static void MEGLER_CB drawBitmap(void *user, void *canvas, const megler_gfx_image *image, const float *src, const float *dst,
                                      const megler_gfx_paint *paint);
+    static bool MEGLER_CB drawCanvas(void *user, void *canvas, void *source, const float *src, const float *dst,
+                                    const megler_gfx_paint *paint);
     static void *MEGLER_CB shaderLinear(void *user, float x0, float y0, float x1, float y1, const uint32_t *colors,
                                         const float *positions, int count, int tile);
     static void *MEGLER_CB shaderRadial(void *user, float cx, float cy, float radius, const uint32_t *colors,
@@ -86,7 +88,10 @@ private:
     bool upload(Canvas *canvas);
     void removeFramebuffer(Canvas *canvas);
     bool drawFiltered(Canvas *canvas, const megler_gfx_paint *paint,
-                      const QRectF &deviceBounds, const std::function<void(QPainter &)> &drawSource);
+                      const QRectF &deviceBounds, const std::function<void(QPainter &)> &drawSource,
+                      Canvas *copyCanvas = nullptr, const QRect &copySource = QRect());
+    bool copyCanvasPixels(Canvas *canvas, Canvas *source, const float *src, const float *dst,
+                          const megler_gfx_paint *paint);
     bool drawFilteredPath(Canvas *canvas, const QPainterPath &path, const megler_gfx_paint *paint, void *shader);
     bool drawFilteredBitmap(Canvas *canvas, const megler_gfx_image *image, const float *src, const float *dst,
                             const megler_gfx_paint *paint);

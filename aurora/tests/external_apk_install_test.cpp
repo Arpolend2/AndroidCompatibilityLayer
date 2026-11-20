@@ -59,13 +59,15 @@ int main(int argc, char **argv)
         prompted = true;
         check(label == QLatin1String("Example") && package == QLatin1String("org.example.app") &&
               version == 42, "reviewed metadata");
-        check(install.isUpdate() == (mode == QLatin1String("update-approved")), "update confirmation state");
+        const bool updating = mode.startsWith(QLatin1String("update-"));
+        check(install.isUpdate() == updating, "update confirmation state");
         check(QFile::exists(store + QStringLiteral("/org.example.app/base.apk")) ==
-              (mode == QLatin1String("update-approved")), "existing APK is retained until approval");
+              updating, "existing APK is retained until approval");
         if (mode == QLatin1String("accept") || mode == QLatin1String("update-approved"))
             writeFile(apk, "changed");
         if (mode == QLatin1String("unavailable")) install.unavailable();
-        else install.decision(mode == QLatin1String("accept") || mode == QLatin1String("update-approved"));
+        else install.decision(mode == QLatin1String("accept") || mode == QLatin1String("update-approved") ||
+                              mode == QLatin1String("update-identical"));
     });
     QObject::connect(&install, &ExternalApkInstall::finished, &loop,
                      [&](bool ok, const QString &text) {
@@ -75,27 +77,27 @@ int main(int argc, char **argv)
         loop.quit();
     });
 
-    QString missingExpected;
-    check(!install.start(apk, &missingExpected, QString(), true) && !missingExpected.isEmpty(),
-          "update requires expected package");
+    const QString cacheDir = store + QStringLiteral("/org.example.app/standalone-rpm");
+    const QString cacheId = QStringLiteral("ru.androidcompatibilitylayer.Android0123456789abcdef01234567");
+    const QString cacheRpm = cacheDir + QLatin1Char('/') + cacheId + QStringLiteral("-1.0.0-1.aarch64.rpm");
     for (const QString &next : {QStringLiteral("decline"), QStringLiteral("unavailable"),
                                 QStringLiteral("invalid"), QStringLiteral("split"),
                                 QStringLiteral("symlink"), QStringLiteral("wrong-package"), QStringLiteral("accept"),
-                                QStringLiteral("update"), QStringLiteral("update-approved")}) {
+                                QStringLiteral("update"), QStringLiteral("update-invalid"), QStringLiteral("update-declined"),
+                                QStringLiteral("update-identical"), QStringLiteral("update-approved")}) {
         mode = next;
         prompted = completed = installed = false;
         message.clear();
         writeFile(apk, mode == QLatin1String("update-approved") ? "update payload" :
                        mode == QLatin1String("split") ? "split" :
-                       mode == QLatin1String("invalid") ? "invalid" : "original");
+                       (mode == QLatin1String("invalid") || mode == QLatin1String("update-invalid")) ? "invalid" : "original");
         const QString source = mode == QLatin1String("symlink")
             ? directory.path() + QStringLiteral("/link.apk") : apk;
         if (mode == QLatin1String("symlink")) check(QFile::link(apk, source), "create symlink");
         QString error;
         check(install.start(source, &error, mode == QLatin1String("wrong-package")
                             ? QStringLiteral("org.example.other")
-                            : mode == QLatin1String("update-approved") ? QStringLiteral("org.example.app") : QString(),
-                            mode == QLatin1String("update-approved")), "start request");
+                            : QString(), mode.startsWith(QLatin1String("update-"))), "start request");
         check(!install.start(apk, &error) && !error.isEmpty(), "concurrent request refused");
         QTimer timer;
         timer.setSingleShot(true);
@@ -104,18 +106,36 @@ int main(int argc, char **argv)
         loop.exec();
         check(completed && !message.isEmpty(), "request completed with explicit result");
         check(prompted == (mode == QLatin1String("decline") || mode == QLatin1String("unavailable") ||
-                           mode == QLatin1String("accept") || mode == QLatin1String("update-approved")),
+                           mode == QLatin1String("accept") ||
+                           (mode.startsWith(QLatin1String("update-")) && mode != QLatin1String("update-invalid"))),
               "only compatible APK is prompted");
-        check(installed == (mode == QLatin1String("accept") || mode == QLatin1String("update-approved")),
+        check(installed == (mode == QLatin1String("accept") || mode == QLatin1String("update-approved") ||
+                            mode == QLatin1String("update-identical")),
               "only approval commits");
         QFile result(store + QStringLiteral("/org.example.app/base.apk"));
-        if (mode == QLatin1String("accept") || mode == QLatin1String("update") ||
-            mode == QLatin1String("update-approved")) {
+        if (mode == QLatin1String("accept") || mode.startsWith(QLatin1String("update"))) {
             check(result.open(QIODevice::ReadOnly) &&
                   result.readAll() == (mode == QLatin1String("update-approved") ? "update payload" : "original"),
                   "commit contains reviewed snapshot");
         } else {
             check(!result.exists(), "no unapproved installation");
+        }
+        if (mode == QLatin1String("accept")) {
+            check(QDir().mkpath(cacheDir), "create cache directory");
+            writeFile(cacheDir + QStringLiteral("/.last-created-app-id"), cacheId.toLatin1());
+            writeFile(cacheDir + QStringLiteral("/.rpm-cache.json"), "metadata");
+            writeFile(cacheRpm, "cached rpm");
+            writeFile(cacheDir + QStringLiteral("/unrelated.rpm"), "unrelated");
+            check(QDir().mkpath(store + QStringLiteral("/org.example.app/data")), "create app data");
+            writeFile(store + QStringLiteral("/org.example.app/data/user"), "data");
+        } else if (mode.startsWith(QLatin1String("update"))) {
+            const bool retained = mode != QLatin1String("update-approved");
+            check(QFile::exists(cacheRpm) == retained &&
+                  QFile::exists(cacheDir + QStringLiteral("/.rpm-cache.json")) == retained,
+                  "cache retained on rejection or identical update and removed on changed update");
+            check(QFile::exists(cacheDir + QStringLiteral("/unrelated.rpm")) &&
+                  QFile::exists(store + QStringLiteral("/org.example.app/data/user")),
+                  "unrelated package and app data retained");
         }
     }
     std::puts("External APK installation OK");

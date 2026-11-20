@@ -38,10 +38,6 @@ bool ExternalApkInstall::start(const QString &path, QString *error, const QStrin
         if (error) *error = tr("Installation is unavailable or busy.");
         return false;
     }
-    if (allowUpdate && expectedPackage.isEmpty()) {
-        if (error) *error = tr("An expected application is required for updates.");
-        return false;
-    }
     QString local;
     if (!externalApkPath(path, &local, error)) return false;
     const QFileInfo file(local);

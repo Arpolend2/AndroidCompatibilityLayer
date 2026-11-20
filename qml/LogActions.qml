@@ -3,6 +3,8 @@ import Sailfish.Silica 1.0
 
 Column {
     id: root
+    objectName: "logActions"
+    signal openYandexFormRequested()
     property string logText: ""
     property bool logAvailable: false
     property string message: ""
@@ -30,6 +32,12 @@ Column {
     function saveLog() {
         if (!canAct) return
         message = probe.saveCoreLog()
+    }
+
+    function openYandexForm() {
+        message = probe.openYandexLogForm()
+        if (message.length === 0)
+            openYandexFormRequested()
     }
 
     Label {

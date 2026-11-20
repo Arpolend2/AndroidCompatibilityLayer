@@ -94,6 +94,13 @@ int main(int argc, char **argv)
     path.clear();
     receiver.openFile(QStringList() << QStringLiteral("file:///home/user/a.XAPK"));
     if (path != QLatin1String("/home/user/a.XAPK") || !rejection.isEmpty()) return 1;
+    const QByteArray xapkFingerprint(64, 'a');
+    const QString xapkResult = QStringLiteral("claimed_0123456789abcdef0123456789abcdef.xapk");
+    if (!receiver.recordStoreResult(xapkResult, true, xapkFingerprint) ||
+        receiver.storeResult(QStringLiteral("0123456789abcdef0123456789abcdef")) !=
+            QLatin1String("installed:") + QString::fromLatin1(xapkFingerprint) ||
+        receiver.recordStoreResult(QStringLiteral("claimed_1123456789abcdef0123456789abcdef.zip"), false, QByteArray()))
+        return 1;
     path.clear();
     receiver.submit(QStringList() << QStringLiteral("file:///home/user/b.apks"));
     if (path != QLatin1String("/home/user/b.apks") || !rejection.isEmpty()) return 1;

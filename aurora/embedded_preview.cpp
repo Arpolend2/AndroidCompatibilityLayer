@@ -216,11 +216,14 @@ bool EmbeddedPreview::listen(QProcess *process, QString *error)
     emit remoteStatusChanged();
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
     m_gpuTransport.close();
-    m_gpuEndpoint = m_directory.path() + QStringLiteral("/gpu");
-    QString gpuError;
-    if (!m_gpuTransport.listen(m_gpuEndpoint, -1, &gpuError)) {
-        qWarning().noquote() << "Embedded GPU transport unavailable; CPU fallback remains active:" << gpuError;
-        m_gpuEndpoint.clear();
+    m_gpuEndpoint.clear();
+    if (!m_cpuFrameTransportOnly) {
+        m_gpuEndpoint = m_directory.path() + QStringLiteral("/gpu");
+        QString gpuError;
+        if (!m_gpuTransport.listen(m_gpuEndpoint, -1, &gpuError)) {
+            qWarning().noquote() << "Embedded GPU transport unavailable; CPU fallback remains active:" << gpuError;
+            m_gpuEndpoint.clear();
+        }
     }
 #endif
     if (!m_server.listen(m_directory.path() + QStringLiteral("/channel"))) {
@@ -278,6 +281,15 @@ bool EmbeddedPreview::listen(QProcess *process, QString *error)
 void EmbeddedPreview::receiveGpuFrame(AuroraDmaBufFrame &&frame)
 {
     const quint64 id = frame.id;
+    const bool probeOnly = frame.probeOnly;
+    if (probeOnly) {
+        QPointer<EmbeddedPreview> self(this);
+        if (!gpuState()->submitDmaBuf(std::move(frame), this, [self](quint64 frameId, bool accepted) {
+                if (self) self->m_gpuTransport.sendReply(frameId, accepted);
+            }))
+            m_gpuTransport.sendReply(id, false);
+        return;
+    }
     QImage placeholder(frame.width, frame.height, QImage::Format_RGB32);
     if (placeholder.isNull()) {
         m_gpuTransport.sendReply(id, false);
@@ -619,7 +631,7 @@ void EmbeddedPreviewChild::receive(const QJsonObject &message)
             qWarning().noquote() << "Embedded GPU channel unavailable; using CPU presentation:"
                                  << (error.isEmpty() ? QStringLiteral("missing endpoint") : error);
         } else {
-            m_player->setRemoteGpuCanvasPresentation(presentGpuCanvas, this);
+            m_player->setRemoteGpuCanvasPresentation(presentGpuCanvas, this, &m_gpuTransport);
             qInfo("Embedded worker authenticated a GPU channel to its parent");
         }
         maybeStart();

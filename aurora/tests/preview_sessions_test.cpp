@@ -130,6 +130,7 @@ int main(int argc, char **argv)
           "create documents directory");
     QString logError;
     check(ErrorLog::initialize(QStringLiteral("Android App Manager"), &logError), "initialize safe log");
+    check(ErrorLog::setDetailedEnabled(true, &logError), "enable preview diagnostics");
     const QString first = directory.path() + QStringLiteral("/first");
     const QString second = directory.path() + QStringLiteral("/second");
     const QString cancel = directory.path() + QStringLiteral("/cancel");

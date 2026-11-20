@@ -2133,6 +2133,25 @@ public class Main extends Activity {
             detail = "sourceDir=" + source + " codePath=" + code + " there=" + new java.io.File(source).isFile();
             return source.equals("/data/app/" + getPackageName() + "-1/base.apk") && source.equals(code) && new java.io.File(source).isFile();
         });
+        step("package-install-location", () -> {
+            android.content.pm.PackageManager pm = getPackageManager();
+            java.lang.reflect.Field field = android.content.pm.PackageInfo.class.getField("installLocation");
+            int installed = field.getInt(pm.getPackageInfo(getPackageName(), 0));
+            int archive = field.getInt(pm.getPackageArchiveInfo(getApplicationInfo().sourceDir, 0));
+            detail = "installed=" + installed + " archive=" + archive;
+            return installed == 1 && archive == 1;
+        });
+        step("package-allow-backup-default", () -> {
+            android.content.pm.PackageManager pm = getPackageManager();
+            int flag = android.content.pm.ApplicationInfo.FLAG_ALLOW_BACKUP;
+            android.content.pm.PackageInfo installed = pm.getPackageInfo(getPackageName(), 0);
+            android.content.pm.PackageInfo archive = pm.getPackageArchiveInfo(getApplicationInfo().sourceDir, 0);
+            boolean own = (pm.getApplicationInfo(getPackageName(), 0).flags & flag) != 0;
+            boolean packageInfo = installed.applicationInfo != null && (installed.applicationInfo.flags & flag) != 0;
+            boolean archiveInfo = archive != null && archive.applicationInfo != null && (archive.applicationInfo.flags & flag) != 0;
+            detail = "own=" + own + " package=" + packageInfo + " archive=" + archiveInfo;
+            return own && packageInfo && archiveInfo;
+        });
         step("archive-meta-data", () -> {
             // An APK asked about as a file (PackageManager.getPackageArchiveInfo) gives its application's own meta-data with
             // GET_META_DATA -- a string, a number, a boolean and a resource, and none of a service's -- and null without it
@@ -5144,6 +5163,30 @@ public class Main extends Activity {
             }
             if (!"/config".equals(u.getPath())) throw new java.io.FileNotFoundException(String.valueOf(u));
             return android.os.ParcelFileDescriptor.open(new java.io.File(getContext().getFilesDir(), "provider-config"), android.os.ParcelFileDescriptor.MODE_READ_ONLY);
+        }
+    }
+
+    public static final class InstallNameProvider extends android.content.ContentProvider {
+        @Override public boolean onCreate() { return true; }
+        @Override public android.database.Cursor query(android.net.Uri u, String[] p, String s, String[] a, String o) {
+            String[] columns = p != null ? p : new String[] { android.provider.OpenableColumns.DISPLAY_NAME };
+            android.database.MatrixCursor cursor = new android.database.MatrixCursor(columns);
+            cursor.addRow(new Object[] { "xapk".equals(u.getLastPathSegment()) ? "store-download.xapk" : "notes.txt" });
+            return cursor;
+        }
+        @Override public String getType(android.net.Uri u) { return "application/zip"; }
+        @Override public android.net.Uri insert(android.net.Uri u, android.content.ContentValues v) { return null; }
+        @Override public int delete(android.net.Uri u, String s, String[] a) { return 0; }
+        @Override public int update(android.net.Uri u, android.content.ContentValues v, String s, String[] a) { return 0; }
+        @Override public android.os.ParcelFileDescriptor openFile(android.net.Uri u, String mode) throws java.io.FileNotFoundException {
+            if (!"xapk".equals(u.getLastPathSegment())) throw new java.io.FileNotFoundException(String.valueOf(u));
+            return openPipeHelper(u, "application/zip", null, "xapk-fixture", (out, uri, mime, options, text) -> {
+                try (java.io.OutputStream stream = new android.os.ParcelFileDescriptor.AutoCloseOutputStream(out)) {
+                    stream.write(text.getBytes("UTF-8"));
+                } catch (java.io.IOException e) {
+                    android.util.Log.w("DataTest", "XAPK provider pipe write failed", e);
+                }
+            });
         }
     }
 
@@ -8727,6 +8770,28 @@ public class Main extends Activity {
      * PendingIntent it was given.
      */
     private void installs() {
+        step("install-content-display-name", () -> {
+            try {
+                java.lang.reflect.Method isInstall = Class.forName("megler.Installs")
+                        .getMethod("isInstall", android.content.Context.class, android.content.Intent.class);
+                android.content.Intent xapk = new android.content.Intent(android.content.Intent.ACTION_VIEW)
+                        .setDataAndType(android.net.Uri.parse("content://megler.test.install-name/xapk"), "application/zip");
+                android.content.Intent unrelated = new android.content.Intent(android.content.Intent.ACTION_VIEW)
+                        .setDataAndType(android.net.Uri.parse("content://megler.test.install-name/other"), "application/zip");
+                boolean recognized = (Boolean) isInstall.invoke(null, this, xapk);
+                boolean ignored = !(Boolean) isInstall.invoke(null, this, unrelated);
+                detail = "opaque XAPK name recognized=" + recognized + " unrelated archive ignored=" + ignored;
+                return recognized && ignored;
+            } catch (ReflectiveOperationException e) {
+                detail = e.toString();
+                return false;
+            }
+        });
+        step("install-content-pipe", () -> {
+            startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW)
+                    .setDataAndType(android.net.Uri.parse("content://megler.test.install-name/xapk"), "application/zip"));
+            return true;
+        });
         step("install-intent", () -> {
             java.io.File apk = new java.io.File(getCacheDir(), "Viewed.apk");
             try (java.io.FileOutputStream o = new java.io.FileOutputStream(apk)) { o.write(new byte[] { 'P', 'K', 3, 4 }); }

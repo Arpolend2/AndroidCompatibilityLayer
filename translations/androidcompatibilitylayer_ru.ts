@@ -174,6 +174,14 @@
         <source>Log saving is already in progress.</source>
         <translation>Сохранение журнала уже выполняется.</translation>
     </message>
+    <message>
+        <source>Export succeeded, but the standalone export cursor could not be saved.</source>
+        <translation>Экспорт выполнен, но не удалось сохранить позицию экспорта журналов standalone-приложений.</translation>
+    </message>
+    <message>
+        <source>Export succeeded, but some organization snapshots could not be removed.</source>
+        <translation>Экспорт выполнен, но некоторые снимки журналов в папке организации не удалось удалить.</translation>
+    </message>
 </context>
 <context>
     <name>ExportThread</name>
@@ -413,10 +421,11 @@
     <name>AndroidCompatibilityLayer</name>
     <message><source>No Apps Yet</source><translation>Пока нет приложений</translation></message>
     <message><source>No log available to save.</source><translation>Нет журнала для сохранения.</translation></message>
+    <message><source>Aurora WebView is unavailable.</source><translation>Aurora WebView недоступен.</translation></message>
     <message><source>Open Aurora Store</source><translation>Открыть Aurora Store</translation></message>
     <message>
-        <source>Test RPMs created while detailed logging is enabled save their own logs in Documents/AndroidCompatibilityLayer-Error-Logs. They keep recording after this setting is turned off; remove them and create new RPMs to stop it. Logs may contain private data.</source>
-        <translation>Тестовые RPM, созданные при включённом подробном журнале, сохраняют свои журналы в Documents/AndroidCompatibilityLayer-Error-Logs. Они продолжают запись после отключения этой настройки; чтобы её остановить, удалите их и создайте новые RPM. Журналы могут содержать личные данные.</translation>
+        <source>Standalone snapshots are stored in a shared organization folder that other apps in the organization can access. Standalone apps record only while the manager's confirmed detailed logging state is enabled. Save to file combines available manager and standalone logs in Documents. Logs may contain private data.</source>
+        <translation>Снимки отдельных приложений хранятся в общей папке организации, доступной другим приложениям этой организации. Отдельные приложения ведут журнал только при подтверждённом включённом подробном журнале менеджера. Команда «Сохранить в файл» объединяет доступные журналы менеджера и отдельных приложений в папке «Документы». Журналы могут содержать личные данные.</translation>
     </message>
     <message>
         <source>Could not launch %1. Install it as an RPM?</source>
@@ -443,20 +452,68 @@
         <translation>Включить</translation>
     </message>
     <message>
-        <source>Enable detailed log</source>
-        <translation>Включить подробный журнал</translation>
+        <source>Enable logs</source>
+        <translation>Включить журналы</translation>
     </message>
     <message>
-        <source>Use short log</source>
-        <translation>Использовать краткий журнал</translation>
+        <source>Disable logs</source>
+        <translation>Выключить журналы</translation>
     </message>
     <message>
-        <source>Detailed logs may contain passwords, tokens, app data, paths and network addresses. The manager saves them in private storage. While enabled, newly created standalone RPMs also save test logs in Documents, accessible to other apps with Documents access. Those RPMs keep recording after detailed logging is turned off: remove them and create new RPMs to stop it. Saved files remain. If saving the cleared manager history fails, old logs may reappear. Remote events are untrusted. Review logs before sharing.</source>
-        <translation>Подробные журналы могут содержать пароли, токены, данные приложений, пути и сетевые адреса. Менеджер сохраняет их в приватном хранилище. Пока журнал включён, новые самостоятельные RPM также сохраняют тестовые журналы в Документы, доступные другим приложениям с разрешением на документы. Эти RPM продолжают запись после отключения подробного журнала: чтобы её остановить, удалите их и создайте новые RPM. Сохранённые файлы остаются. Если сохранить очищенный журнал менеджера не удастся, прежние записи могут появиться снова. События других процессов недостоверны. Проверяйте журналы перед отправкой.</translation>
+        <source>Clear log folder</source>
+        <translation>Очистить папку журналов</translation>
     </message>
     <message>
-        <source>Logs are saved automatically in the manager's private storage. Recent events may be lost before they are saved or delivered. Events may be dropped; remote sources are untrusted. Older standalone apps need rebuilding for this log service.</source>
-        <translation>Журналы автоматически сохраняются в приватном хранилище менеджера. Последние события могут потеряться до сохранения или доставки. События могут теряться; источникам других процессов нельзя доверять. Для работы с этим журналом старые самостоятельные приложения нужно пересобрать.</translation>
+        <source>Clear log folder?</source>
+        <translation>Очистить папку журналов?</translation>
+    </message>
+    <message>
+        <source>Delete</source>
+        <translation>Удалить</translation>
+    </message>
+    <message>
+        <source>This deletes saved manager and standalone files in Documents and shared organization snapshots, but does not clear the current journal. Close running diagnostic apps first; active apps may recreate snapshot files.</source>
+        <translation>Удаляются сохранённые журналы менеджера и отдельных приложений из папки «Документы» и снимки в общей папке организации, но текущий журнал не очищается. Сначала закройте диагностические приложения: активные приложения могут создать снимки снова.</translation>
+    </message>
+    <message>
+        <source>Enable detailed logs?</source>
+        <translation>Включить подробные журналы?</translation>
+    </message>
+    <message>
+        <source>Detailed logs may contain passwords, tokens, app data, paths and network addresses. Standalone snapshots are stored in a shared organization folder that other apps in the organization can access. Standalone apps record only while the manager's confirmed detailed logging state is enabled. “Save to file” combines available manager and standalone logs in Documents and removes included snapshots only after a successful save. Turning logging off stops new entries, but saved files remain. Review logs before sharing.</source>
+        <translation>Подробные журналы могут содержать пароли, токены, данные приложений, пути и сетевые адреса. Снимки отдельных приложений хранятся в общей папке организации, доступной другим приложениям этой организации. Отдельные приложения ведут журнал только при подтверждённом включённом подробном журнале менеджера. Команда «Сохранить в файл» объединяет доступные журналы менеджера и отдельных приложений в папке «Документы» и удаляет включённые снимки только после успешного сохранения. После выключения журнала новые записи прекращаются, но сохранённые файлы остаются. Проверяйте журналы перед отправкой.</translation>
+    </message>
+    <message>
+        <source>How to send a log</source>
+        <translation>Как отправить журнал</translation>
+    </message>
+    <message>
+        <source>1. With logging enabled, reproduce the error in the app.</source>
+        <translation>1. Воспроизведите ошибку в приложении при включённых журналах.</translation>
+    </message>
+    <message>
+        <source>2. In the manager, select “Save to file”. This saves the manager log and available standalone app logs as one .txt file in Documents.</source>
+        <translation>2. В менеджере выберите «Сохранить в файл». Журнал менеджера и доступные журналы отдельных приложений сохранятся в одном файле .txt в папке «Документы».</translation>
+    </message>
+    <message>
+        <source>3. Check the saved file for private data. Select “Send to developer” to open the Yandex form, then attach the checked file and select “Submit”.</source>
+        <translation>3. Проверьте сохранённый файл на наличие личных данных. Выберите «Передать разработчику», чтобы открыть Яндекс Форму, затем прикрепите проверенный файл и нажмите «Отправить».</translation>
+    </message>
+    <message>
+        <source>&lt;b&gt;Note:&lt;/b&gt; New standalone packages record only when logging is enabled in the manager. Other apps in the organization can access the shared log folder. After a successful save, the manager removes only the standalone snapshots included in the file that have not changed during export. The manager warns if the report is incomplete or cleanup fails.</source>
+        <translation>&lt;b&gt;Примечание:&lt;/b&gt; Новые отдельные приложения ведут журнал только при включённой записи в менеджере. Общая папка журналов доступна другим приложениям организации. После успешного сохранения менеджер удаляет только те снимки журналов отдельных приложений, которые вошли в файл и не изменились во время экспорта. Если отчёт неполный или очистка не удалась, менеджер предупредит об этом.</translation>
+    </message>
+    <message>
+        <source>Older standalone packages keep their previous logging behavior. To switch them to shared logs, recreate and install them once. You do not need to recreate packages each time you collect a log.</source>
+        <translation>Старые пакеты отдельных приложений ведут журналы по прежней схеме. Чтобы перейти на общую папку журналов, один раз пересоздайте и установите эти пакеты. При каждом сборе журналов пересоздавать их не нужно.</translation>
+    </message>
+    <message>
+        <source>Detailed logs may contain passwords, tokens, app data, paths and network addresses. The manager stores its log in private storage; standalone snapshots are in a shared organization folder accessible to other apps in the organization. Standalone apps record only while the manager's confirmed detailed state is enabled. Save to file combines available sections and removes included snapshots only after a successful atomic save. Turning logging off stops new entries but does not delete saved files. If saving the cleared manager history fails, old logs may reappear. Remote events and shared snapshots are untrusted and not cryptographically authenticated. Review logs before sharing.</source>
+        <translation>Подробные журналы могут содержать пароли, токены, данные приложений, пути и сетевые адреса. Журнал менеджера хранится в приватном хранилище, а снимки отдельных приложений — в общей папке организации, доступной другим приложениям этой организации. Отдельные приложения ведут журнал только при подтверждённом включённом подробном журнале менеджера. Команда «Сохранить в файл» объединяет доступные разделы и удаляет включённые снимки только после атомарного сохранения файла. После выключения журнала новые записи прекращаются, но сохранённые файлы не удаляются. Если сохранить очищенный журнал менеджера не удастся, прежние записи могут появиться снова. События других процессов и общие снимки недостоверны и не имеют криптографического подтверждения. Проверяйте журналы перед отправкой.</translation>
+    </message>
+    <message>
+        <source>Logs are saved automatically in the manager's private storage and standalone organization snapshots. Recent events may be lost before they are saved or delivered. Events may be dropped; remote sources and shared snapshots are untrusted.</source>
+        <translation>Журналы автоматически сохраняются в приватном хранилище менеджера и в снимках отдельных приложений в общей папке организации. Последние события могут потеряться до сохранения или доставки. События могут теряться; источникам других процессов и общим снимкам нельзя доверять.</translation>
     </message>
     <message>
         <source>Automatic log storage failed: %1</source>
@@ -719,6 +776,10 @@ Pick an Android app&apos;s APK to add it to the library.</source>
     <message>
         <source>Save to file</source>
         <translation>Сохранить в файл</translation>
+    </message>
+    <message>
+        <source>Send to developer</source>
+        <translation>Передать разработчику</translation>
     </message>
 </context>
 <context>
@@ -1089,7 +1150,26 @@ Pick an Android app&apos;s APK to add it to the library.</source>
     </message>
 </context>
 <context>
+    <name>YandexFormPage</name>
+    <message><source>Yandex form</source><translation>Яндекс Форма</translation></message>
+    <message><source>Could not load the Yandex form.</source><translation>Не удалось загрузить Яндекс Форму.</translation></message>
+    <message><source>Select log file</source><translation>Выберите файл журнала</translation></message>
+    <message><source>Select log files</source><translation>Выберите файлы журналов</translation></message>
+</context>
+<context>
     <name>Probe</name>
+    <message>
+        <source>Could not clear the log folder completely. Files deleted: %1.</source>
+        <translation>Не удалось полностью очистить папку журналов. Удалено файлов: %1.</translation>
+    </message>
+    <message>
+        <source>There are no saved logs to delete.</source>
+        <translation>Нет сохранённых журналов для удаления.</translation>
+    </message>
+    <message>
+        <source>Log files deleted: %1.</source>
+        <translation>Удалено файлов журналов: %1.</translation>
+    </message>
     <message><source>Could not switch to Aurora Store: %1</source><translation>Не удалось переключиться на Aurora Store: %1</translation></message>
     <message><source>Switching to Aurora Store...</source><translation>Переключение на Aurora Store...</translation></message>
     <message><source>Could not start Aurora Store: %1</source><translation>Не удалось запустить Aurora Store: %1</translation></message>
@@ -1229,6 +1309,14 @@ Pick an Android app&apos;s APK to add it to the library.</source>
     <message>
         <source>Close the Android app before creating its RPM.</source>
         <translation>Закройте Android-приложение перед созданием RPM.</translation>
+    </message>
+    <message>
+        <source>The shared Android runtime is unavailable.</source>
+        <translation>Общая среда Android недоступна.</translation>
+    </message>
+    <message>
+        <source>The manager and shared Android runtime are incompatible. Restart the manager after updating it.</source>
+        <translation>Менеджер и общая среда Android несовместимы. Перезапустите менеджер после обновления.</translation>
     </message>
     <message>
         <source>The installed APK was not found.</source>
@@ -1391,12 +1479,20 @@ Pick an Android app&apos;s APK to add it to the library.</source>
         <translation>Журнал пуст или недоступен.</translation>
     </message>
     <message>
+        <source>The report form is unavailable: the system WebView could not start.</source>
+        <translation>Форма отчёта недоступна: не удалось запустить системный WebView.</translation>
+    </message>
+    <message>
         <source>Could not save the log: %1</source>
         <translation>Не удалось сохранить журнал: %1</translation>
     </message>
     <message>
         <source>Log saved to %1.</source>
         <translation>Журнал сохранён: %1.</translation>
+    </message>
+    <message>
+        <source>The export is partial: some standalone snapshots were unavailable and remain in the organization folder.</source>
+        <translation>Экспорт неполный: некоторые снимки журналов standalone-приложений недоступны и остаются в папке организации.</translation>
     </message>
 </context>
 <context>
@@ -1777,6 +1873,21 @@ Pick an Android app&apos;s APK to add it to the library.</source>
     <message>
         <source>Unsupported executable architecture.</source>
         <translation>Неподдерживаемая архитектура исполняемого файла.</translation>
+    </message>
+</context>
+<context>
+    <name>StandaloneRuntimeError</name>
+    <message>
+        <source>The shared Android runtime is incompatible. Recreate the RPM in the manager and reinstall it.</source>
+        <translation>Общая среда Android несовместима с приложением. Создайте RPM заново в менеджере и переустановите его.</translation>
+    </message>
+    <message>
+        <source>The shared Android runtime is unavailable. This app requires the manager and access to its runtime. The manager and this app must be signed with the same key.</source>
+        <translation>Общая среда Android недоступна. Для работы приложения нужны менеджер и доступ к его среде. Менеджер и приложение должны быть подписаны одним ключом.</translation>
+    </message>
+    <message>
+        <source>Close</source>
+        <translation>Закрыть</translation>
     </message>
 </context>
 <context>

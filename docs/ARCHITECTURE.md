@@ -459,6 +459,16 @@ the SHA-256 and, if available, ELF build ID of the running process's
 `/proc/<pid>/exe`, and retain that exact binary and its matching debug symbols.
 Do not assume a later build with the same filename is the one that crashed.
 
+On Linux, `Linux SIGSEGV reason` reports the kernel's `si_code`: `MAPERR` means
+the address was not mapped, `ACCERR` means access was denied, and other codes
+are reported without guessing. Executable guest `mprotect` requests also leave
+a bounded trace line `mprotect result`: `ret` and `ge` are the guest result and
+errno (errno is meaningful on failure); `c` records the commit attempt and `p`
+the host protection attempt, including an RW fallback after failed RWX. `skip`
+means no corresponding attempt. These are operation results, not a snapshot of
+current permissions; a successful guest result need not mean execution was
+granted.
+
 Such code is that of a service's class scope, a dex whose loader's parents
 include a service's loader (DroidGuard's VM, a `DexClassLoader` of Google Play
 services'), or the platform's own on a thread a service's code started. What a

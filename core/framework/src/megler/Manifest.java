@@ -22,7 +22,8 @@ public final class Manifest {
     }
     public static String packageName, applicationClass, versionName, appComponentFactory, appTaskAffinity;
     public static int versionCode, minSdk = 21, targetSdk = 34, appTheme, appLabel, appIcon, appFlags;
-    public static boolean debuggable, largeHeap, hardwareAccelerated = true, extractNativeLibs = true;
+    public static int installLocation = -1;
+    public static boolean debuggable, largeHeap, hardwareAccelerated = true, extractNativeLibs = true, allowBackup = true;
     /** Whether the manifest has <uses-sdk>: one without is an app of Android 1's, whose target is that (megler.Permissions). */
     public static boolean usesSdk;
     public static Bundle appMetaData = new Bundle();
@@ -62,6 +63,7 @@ public final class Manifest {
                 case "manifest":
                     packageName = p.getAttributeValue(null, "package");
                     versionCode = p.getAttributeIntValue(NS, "versionCode", 1);
+                    installLocation = p.getAttributeIntValue(NS, "installLocation", -1);
                     versionName = p.getAttributeValue(NS, "versionName");
                     break;
                 case "uses-sdk":
@@ -90,6 +92,7 @@ public final class Manifest {
                     appIcon = p.getAttributeResourceValue(NS, "icon", 0);
                     debuggable = p.getAttributeBooleanValue(NS, "debuggable", false);
                     largeHeap = p.getAttributeBooleanValue(NS, "largeHeap", false);
+                    allowBackup = booleanAttribute(p, "allowBackup", true, null, false);
                     extractNativeLibs = p.getAttributeBooleanValue(NS, "extractNativeLibs", true);
                     hardwareAccelerated = p.getAttributeBooleanValue(NS, "hardwareAccelerated", true);
                     appComponentFactory = full(p.getAttributeValue(NS, "appComponentFactory"));
@@ -164,6 +167,24 @@ public final class Manifest {
         } catch (Exception e) { android.util.Log.e("Megler", "the manifest could not be read", e); }
     }
     public static Component activity(String cls) { read(); for (Component c : activities) if (c.name.equals(cls)) return c; return null; }
+    static boolean booleanAttribute(XmlBlock.Parser p, String name, boolean defaultValue, android.content.res.ResTable archive, boolean isArchive) {
+        int index = p.indexOf(NS, name);
+        if (index < 0) return defaultValue;
+        int ref = p.getAttributeResourceValue(index, 0);
+        if (ref == 0) return p.getAttributeBooleanValue(index, defaultValue);
+        android.content.res.Resources resources = android.content.res.Resources.getSystem();
+        if (!isArchive) return resources.getBoolean(ref);
+        TypedValue value = new TypedValue();
+        for (int depth = 0; depth < 20; depth++) {
+            if ((ref >>> 24) == 1) return resources.getBoolean(ref);
+            android.content.res.ResTable.Entry entry = archive == null ? null : archive.find(ref, resources.meglerConfig());
+            if (entry == null || !archive.value(entry, value)) break;
+            if (value.type >= TypedValue.TYPE_FIRST_INT && value.type <= TypedValue.TYPE_LAST_INT) return value.data != 0;
+            if (value.type != TypedValue.TYPE_REFERENCE || value.data == 0) break;
+            ref = value.data;
+        }
+        throw new android.content.res.Resources.NotFoundException("Invalid boolean resource #0x" + Integer.toHexString(ref));
+    }
     public static Component launcher() {
         read();
         for (Component c : activities) for (Filter f : c.filters) if (f.categories.contains("android.intent.category.LAUNCHER") && f.actions.contains("android.intent.action.MAIN")) return c;

@@ -165,6 +165,18 @@ void PreviewPlayer::start()
     bool gpuCanvasReady = false;
     bool remoteGpuCanvasReady = false;
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    constexpr char verifyParentVariable[] = "ACL_EMBEDDED_GPU_GBM_VERIFY_PARENT";
+    const bool verifyParentEnabled = m_cpuPresentationOnly &&
+                                     qEnvironmentVariableIntValue(verifyParentVariable) == 1;
+    const bool gpuChannelConnected = m_remoteGpuTransport && m_remoteGpuTransport->connected();
+    const auto logGbmProbe = [&](const QString &result) {
+        const char *flag = verifyParentEnabled ? "enabled" :
+                           (qEnvironmentVariableIsSet(verifyParentVariable) ? "disabled" : "unset");
+        qInfo().noquote() << QStringLiteral("Embedded GPU GBM probe: verify_parent=%1; gpu_channel=%2; %3")
+                                 .arg(QLatin1String(flag),
+                                      QLatin1String(gpuChannelConnected ? "connected" : "unavailable"),
+                                      result);
+    };
     if (m_cpuPresentationOnly && m_remoteGpuCanvasPresent) {
         QOpenGLContext *context = new QOpenGLContext(this);
         QSurfaceFormat format = QSurfaceFormat::defaultFormat();
@@ -179,53 +191,56 @@ void PreviewPlayer::start()
             probeSurface.create();
             if (probeSurface.isValid() && context->makeCurrent(&probeSurface)) {
                 exportAvailable = EmbeddedGpuTransport::canExportDmaBuf(&exportError);
+                if (!exportAvailable) {
+                    std::function<bool(const AuroraDmaBufFrame &, QString *)> verifyParent;
+                    if (m_remoteGpuTransport && verifyParentEnabled) {
+                        verifyParent = [this](const AuroraDmaBufFrame &frame, QString *error) {
+                            const bool ok = m_remoteGpuTransport->sendFrame(frame, error);
+                            // Do not leave a late reply on the stream after a timeout.
+                            if (!ok) m_remoteGpuTransport->closePeer();
+                            return ok;
+                        };
+                    }
+                    logGbmProbe(EmbeddedGpuTransport::probeGbmRenderTarget(run.width, run.height, verifyParent));
+                } else {
+                    logGbmProbe(QStringLiteral("skipped: EGL DMA-BUF export is available"));
+                }
                 context->doneCurrent();
             } else {
                 exportError = tr("Could not make the worker EGL context current for the DMA-BUF capability probe.");
+                logGbmProbe(QStringLiteral("skipped: worker EGL context could not be made current"));
             }
         } else {
             exportError = tr("Could not create the worker GLES context.");
+            logGbmProbe(QStringLiteral("skipped: worker GLES context unavailable"));
         }
         if (exportAvailable) {
             remoteGpuCanvasReady = m_gpuCanvas.prepareRemotePresentation(
                 context, presentRemoteGpuCanvas, releaseRemoteGpuCanvas, this);
             gpuCanvasReady = remoteGpuCanvasReady;
         }
-        if (!gpuCanvasReady && context->isValid() && context->isOpenGLES()) {
-            gpuCanvasReady = m_gpuCanvas.prepareCpuPresentation(context, presentOffscreenGpuCanvas, this);
-            if (gpuCanvasReady) {
-                if (exportError.isEmpty())
-                    exportError = tr("The DMA-BUF GPU Canvas could not be initialized.");
-                qWarning().noquote() << "Embedded GPU DMA-BUF presentation unavailable; using CPU frame transport:"
-                                     << exportError;
-            }
+        if (!gpuCanvasReady) {
+            delete context;
+            if (exportError.isEmpty())
+                exportError = tr("The DMA-BUF GPU Canvas could not be initialized.");
+            // GPU readback still needs a working EGL binding on the drawing thread.
+            qWarning().noquote() << "Embedded GPU DMA-BUF presentation unavailable; using CPU Canvas:"
+                                 << exportError;
         }
-        if (!gpuCanvasReady)
-            delete context;
-    } else
+    } else if (m_cpuPresentationOnly) {
+        logGbmProbe(QStringLiteral("skipped: GPU channel was not negotiated"));
+    }
 #endif
-    if (m_cpuPresentationOnly && m_offscreenGpuCanvas) {
-        QOpenGLContext *context = new QOpenGLContext(this);
-        QSurfaceFormat format = QSurfaceFormat::defaultFormat();
-        format.setRenderableType(QSurfaceFormat::OpenGLES);
-        format.setVersion(2, 0);
-        context->setFormat(format);
-        gpuCanvasReady = context->create() && context->isOpenGLES() &&
-                         m_gpuCanvas.prepareCpuPresentation(context, presentOffscreenGpuCanvas, this);
-        if (!gpuCanvasReady)
-            delete context;
-    } else if (!m_cpuPresentationOnly) {
+    if (!m_cpuPresentationOnly) {
         gpuCanvasReady = m_gpuCanvas.prepare(m_gpuState->qtContext(), presentGpuCanvas, releaseGpuCanvas, this);
     }
     if (gpuCanvasReady) {
         run.gfx = previewGraphics(&m_gpuCanvas);
         if (remoteGpuCanvasReady)
-            qInfo("Embedded GPU DMA-BUF export is available; waiting for the first imported frame");
-        else if (!m_remoteGpuCanvasPresent)
-            qInfo("Experimental GPU Canvas active; Android 2D draws into a shared GLES texture");
+            qInfo("Embedded GPU DMA-BUF producer is ready; waiting for the first live frame");
         else
-            qInfo("Experimental GPU Canvas uses CPU readback for the embedded worker");
-    } else if (!m_cpuPresentationOnly || m_offscreenGpuCanvas) {
+            qInfo("Experimental GPU Canvas active; Android 2D draws into a shared GLES texture");
+    } else if (!m_cpuPresentationOnly) {
         qWarning("Experimental GPU Canvas unavailable; using the CPU Canvas fallback");
     }
 #endif
@@ -369,11 +384,6 @@ bool PreviewPlayer::submitPixels(const void *pixels, int width, int height, int 
 
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
-bool MEGLER_CB PreviewPlayer::presentOffscreenGpuCanvas(void *user, const void *pixels, int width, int height, int stride)
-{
-    return static_cast<PreviewPlayer *>(user)->submitPixels(pixels, width, height, stride);
-}
-
 bool MEGLER_CB PreviewPlayer::presentRemoteGpuCanvas(void *user, uint32_t texture, int width, int height)
 {
     PreviewPlayer *self = static_cast<PreviewPlayer *>(user);

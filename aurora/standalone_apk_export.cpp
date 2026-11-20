@@ -245,7 +245,7 @@ bool cleanAndCount(int dir, int *count, QString *error)
         *error = QCoreApplication::translate("ExportThread", "Cannot inspect shared installation requests.");
         return false;
     }
-    static const QRegularExpression pattern(QStringLiteral("^(request|pending|claimed)_[0-9a-f]{32}\\.apks?$"));
+    static const QRegularExpression pattern(QStringLiteral("^(request|pending|claimed)_[0-9a-f]{32}\\.(apk|apks|xapk)$"));
     const qint64 cutoff = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch() / 1000 - HandoffTtl;
     *count = 0;
     int visited = 0;
@@ -293,7 +293,8 @@ public:
         InstallRequestCandidate candidate;
         InstallRequestSnapshot bundle;
         QString snapshotPath;
-        const bool isBundle = name.endsWith(QLatin1String(".apks"));
+        const bool isBundle = name.endsWith(QLatin1String(".apks")) ||
+                              name.endsWith(QLatin1String(".xapk"));
         if (isBundle) {
             std::string why;
             if (!bundle.capture(root.toUtf8().toStdString(), source.toUtf8().toStdString(),
@@ -322,7 +323,8 @@ public:
         id.remove(QLatin1Char('{'));
         id.remove(QLatin1Char('}'));
         id.remove(QLatin1Char('-'));
-        const QString extension = isBundle ? QStringLiteral(".apks") : QStringLiteral(".apk");
+        const QString extension = name.endsWith(QLatin1String(".xapk")) ? QStringLiteral(".xapk")
+            : isBundle ? QStringLiteral(".apks") : QStringLiteral(".apk");
         const QString fileName = QStringLiteral("request_") + id + extension;
         const QByteArray nameBytes = fileName.toLatin1();
         const QByteArray pendingBytes = (QStringLiteral("pending_") + id + extension).toLatin1();
@@ -479,7 +481,7 @@ QString StandaloneApkExport::takeNext(const QString &sharedRoot, QString *error)
         if (error) *error = tr("Cannot inspect shared installation requests.");
         return QString();
     }
-    static const QRegularExpression pattern(QStringLiteral("^(request|claimed)_([0-9a-f]{32})(\\.apks?)$"));
+    static const QRegularExpression pattern(QStringLiteral("^(request|claimed)_([0-9a-f]{32})(\\.apk|\\.apks|\\.xapk)$"));
     QString result;
     int visited = 0;
     for (;;) {
@@ -528,7 +530,7 @@ bool StandaloneApkExport::removeClaimed(const QString &sharedRoot, const QString
 {
     if (error) error->clear();
     const QFileInfo file(path);
-    static const QRegularExpression pattern(QStringLiteral("^claimed_[0-9a-f]{32}\\.apks?$"));
+    static const QRegularExpression pattern(QStringLiteral("^claimed_[0-9a-f]{32}\\.(apk|apks|xapk)$"));
     if (file.absolutePath() != QDir(sharedRoot).filePath(QStringLiteral("store-install-handoffs")) ||
         !pattern.match(file.fileName()).hasMatch()) {
         if (error) *error = tr("Invalid shared installation request.");
@@ -645,7 +647,7 @@ bool MEGLER_CB StandaloneApkExport::install(void *user, const char *path, const 
     const size_t pathLength = strnlen(path, 4097), nameLength = strnlen(name, 256);
     if (!pathLength || pathLength > 4096 || nameLength > 255) return false;
     const QString request = QString::fromLatin1(name, static_cast<int>(nameLength));
-    static const QRegularExpression pattern(QStringLiteral("^request_[0-9a-f]{32}(_[0-9]{1,10}_[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+)?\\.apks?$"));
+    static const QRegularExpression pattern(QStringLiteral("^request_[0-9a-f]{32}(_[0-9]{1,10}_[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+)?\\.(apk|apks|xapk)$"));
     if (!pattern.match(request).hasMatch()) return false;
     QMutexLocker lock(&self->m_mutex);
     if (self->m_busy || self->m_pendingRequests.size() >= 16 || self->m_pendingRequests.contains(request)) return false;

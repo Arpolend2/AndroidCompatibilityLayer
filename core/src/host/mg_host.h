@@ -396,6 +396,7 @@ MG_HOSTAPI bool mg_guest_scratch_where(u32 *opc2, u32 *offset);
  */
 /* MG_FAULT_BREAKPOINT: a thread stopped at one of the process's hardware breakpoints (mg_breakpoint_add), before the instruction. */
 enum { MG_FAULT_ILLEGAL = 1, MG_FAULT_ACCESS, MG_FAULT_OTHER, MG_FAULT_BREAKPOINT };
+enum { MG_FAULT_SEGV_NONE, MG_FAULT_SEGV_OTHER, MG_FAULT_SEGV_MAPERR, MG_FAULT_SEGV_ACCERR };
 
 /*
  * A faulting thread's registers, in the order of mg_fault's regs: 32-bit ARM r0..r15; x86_64 rax, rcx, rdx, rbx, rsp,
@@ -418,6 +419,7 @@ typedef struct mg_fault {
     mg_addr address;       /* for MG_FAULT_ACCESS: what was touched */
     bool write, exec;
     int diagnostic_access; /* independent of the access used for fault recovery */
+    int diagnostic_segv_reason, diagnostic_segv_code;
     mg_addr *regs;         /* MG_REG_COUNT of them, writable; NULL where the host cannot say */
     u32 *cpsr;             /* the flags (CPSR, EFLAGS, PSTATE), writable */
 } mg_fault;

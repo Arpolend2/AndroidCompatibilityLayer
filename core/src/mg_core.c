@@ -425,6 +425,12 @@ static MG_HOSTCB bool on_fault(mg_fault *f)
             size_t n = strlen(report);
             snprintf(report + n, sizeof(report) - n, "\n  ARM64 syndrome access: %s", access);
         }
+        if (f->diagnostic_segv_reason != MG_FAULT_SEGV_NONE) {
+            const char *reason = f->diagnostic_segv_reason == MG_FAULT_SEGV_MAPERR ? "MAPERR (not mapped)" :
+                                 f->diagnostic_segv_reason == MG_FAULT_SEGV_ACCERR ? "ACCERR (access denied)" : "other/unknown";
+            size_t n = strlen(report);
+            snprintf(report + n, sizeof(report) - n, "\n  Linux SIGSEGV reason: %s (si_code %d)", reason, f->diagnostic_segv_code);
+        }
         if (lib && base) {
             size_t n = strlen(report);
             snprintf(report + n, sizeof(report) - n, "\n  %s+0x%x", lib, (unsigned)(pc - (mg_addr)base));

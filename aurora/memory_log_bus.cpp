@@ -295,9 +295,15 @@ private:
 class Client : public QObject
 {
 public:
-    explicit Client(const QDBusConnection &bus)
-        : QObject(QCoreApplication::instance()), m_bus(bus)
+    explicit Client(const QDBusConnection &bus, bool sendAppend)
+        : QObject(QCoreApplication::instance()), m_bus(bus), m_ownerWatcher(this),
+          m_sendAppend(sendAppend)
     {
+        m_ownerWatcher.setConnection(bus);
+        m_ownerWatcher.setWatchMode(QDBusServiceWatcher::WatchForOwnerChange);
+        connect(&m_ownerWatcher, &QDBusServiceWatcher::serviceOwnerChanged, this,
+                [this](const QString &, const QString &, const QString &) { invalidateOwner(); });
+        m_ownerWatcher.addWatchedService(QString::fromLatin1(Service));
         m_clock.start();
         m_timer.setInterval(50);
         connect(&m_timer, &QTimer::timeout, this, [this]() { pump(); });
@@ -315,7 +321,29 @@ public:
     }
     void enqueue(const QString &source, const QString &message, bool error)
     {
+        if (!m_sendAppend) return;
         QMutexLocker lock(&m_mutex);
+        const int state = m_detailState.load(std::memory_order_relaxed);
+        if (state == 0) {
+            if (m_beforeState != std::numeric_limits<quint64>::max()) ++m_beforeState;
+            return;
+        }
+        if (state != 2) return;
+        enqueueLocked(source, message, error);
+    }
+    void record(const QString &source, const QString &message, const QString &safe, bool error)
+    {
+        if (!m_sendAppend) return;
+        QMutexLocker lock(&m_mutex);
+        const int state = m_detailState.load(std::memory_order_relaxed);
+        if (state == 0 && m_beforeState != std::numeric_limits<quint64>::max()) ++m_beforeState;
+        if (state == 2) enqueueLocked(source, message, error);
+        Q_UNUSED(safe);
+    }
+
+private:
+    void enqueueLocked(const QString &source, const QString &message, bool error)
+    {
         Event event{source.left(MaxSource), message.left(MaxMessage), error};
         if ((message.size() > MaxMessage || source.size() > MaxSource) &&
             m_dropped != std::numeric_limits<quint64>::max()) ++m_dropped;
@@ -326,19 +354,7 @@ public:
         m_queue.push_back(event);
         m_bytes += event.bytes();
     }
-    void record(const QString &source, const QString &message, const QString &safe, bool error)
-    {
-        int state;
-        {
-            QMutexLocker lock(&m_mutex);
-            state = m_detailState.load(std::memory_order_relaxed);
-            if (state == 0 && m_beforeState != std::numeric_limits<quint64>::max()) ++m_beforeState;
-        }
-        if (state == 2) enqueue(source, message, error);
-        else if (!safe.isEmpty()) enqueue(source, safe, error);
-    }
 
-private:
     static QString failureCategory(const QDBusMessage &reply)
     {
         if (reply.type() != QDBusMessage::ErrorMessage) return QStringLiteral("invalid response");
@@ -365,6 +381,21 @@ private:
         sendStatus();
         const QByteArray output = QStringLiteral("Log IPC %1\n").arg(current).toUtf8();
         std::fwrite(output.constData(), 1, size_t(output.size()), stderr);
+    }
+
+    void invalidateOwner()
+    {
+        m_owner.clear();
+        m_wellKnownCompared = false;
+        ++m_ownerGeneration;
+        m_detailState.store(0, std::memory_order_relaxed);
+        clientDetailedState.store(false, std::memory_order_relaxed);
+        QMutexLocker lock(&m_mutex);
+        const quint64 queued = quint64(m_queue.size());
+        const quint64 available = std::numeric_limits<quint64>::max() - m_dropped;
+        m_dropped += qMin(available, queued);
+        m_queue.clear();
+        m_bytes = 0;
     }
 
     void sendStatus()
@@ -406,16 +437,18 @@ private:
         });
     }
 
-    void compareWellKnownIdentity(const QString &executable, const QString &key)
+    bool compareWellKnownIdentity(const QString &executable, const QString &key,
+                                  const QString &owner, quint64 generation)
     {
-        if (m_wellKnownCompared) return;
+        if (m_wellKnownCompared) return false;
         m_wellKnownCompared = true;
         QDBusMessage identify = QDBusMessage::createMethodCall(
             QStringLiteral("ru.omp.am"), QStringLiteral("/ru/omp/am"),
             QStringLiteral("ru.omp.am.Identify"), QStringLiteral("IdentifyByBusName"));
         identify << QString::fromLatin1(Service);
         QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(m_bus.asyncCall(identify, CallTimeout), this);
-        connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher, executable, key]() {
+        connect(watcher, &QDBusPendingCallWatcher::finished, this,
+                [this, watcher, executable, key, owner, generation]() {
             const QDBusMessage reply = watcher->reply();
             const QList<QVariant> fields = reply.arguments();
             if (reply.type() == QDBusMessage::ErrorMessage) {
@@ -430,23 +463,58 @@ private:
                     .arg(isTrustedAppManagerExecutable(otherExecutable) ? 1 : 0)
                     .arg(otherExecutable == executable ? 1 : 0).arg(otherKey == key ? 1 : 0);
                 diagnostic(QStringLiteral("manager well-known comparison"), result);
+                if (isTrustedAppManagerExecutable(otherExecutable) && otherKey == key &&
+                    !otherKey.isEmpty() && otherKey.size() <= MaxAppManagerIdentityKeyLength &&
+                    generation == m_ownerGeneration && m_owner.isEmpty()) {
+                    QDBusMessage request = QDBusMessage::createMethodCall(
+                        QStringLiteral("org.freedesktop.DBus"), QStringLiteral("/org/freedesktop/DBus"),
+                        QStringLiteral("org.freedesktop.DBus"), QStringLiteral("GetNameOwner"));
+                    request << QString::fromLatin1(Service);
+                    QDBusPendingCallWatcher *ownerWatcher =
+                        new QDBusPendingCallWatcher(m_bus.asyncCall(request, CallTimeout), this);
+                    connect(ownerWatcher, &QDBusPendingCallWatcher::finished, this,
+                            [this, ownerWatcher, owner, generation]() {
+                        const QDBusMessage ownerReply = ownerWatcher->reply();
+                        const QList<QVariant> ownerFields = ownerReply.arguments();
+                        if (generation == m_ownerGeneration && m_owner.isEmpty() &&
+                            ownerReply.type() == QDBusMessage::ReplyMessage &&
+                            ownerFields.size() == 1 && ownerFields.at(0).type() == QVariant::String &&
+                            ownerFields.at(0).toString() == owner) {
+                            m_owner = owner;
+                        } else if (ownerReply.type() == QDBusMessage::ErrorMessage) {
+                            diagnostic(QStringLiteral("manager discovery"), failureCategory(ownerReply));
+                        }
+                        m_busy = false;
+                        ownerWatcher->deleteLater();
+                    });
+                    watcher->deleteLater();
+                    return;
+                }
             }
+            m_busy = false;
             watcher->deleteLater();
         });
+        return true;
     }
 
     void identifyManager()
     {
         m_busy = true;
+        const quint64 generation = m_ownerGeneration;
         QDBusMessage owner = QDBusMessage::createMethodCall(
             QStringLiteral("org.freedesktop.DBus"), QStringLiteral("/org/freedesktop/DBus"),
             QStringLiteral("org.freedesktop.DBus"), QStringLiteral("GetNameOwner"));
         owner << QString::fromLatin1(Service);
         QDBusPendingCallWatcher *ownerWatcher = new QDBusPendingCallWatcher(m_bus.asyncCall(owner, CallTimeout), this);
-        connect(ownerWatcher, &QDBusPendingCallWatcher::finished, this, [this, ownerWatcher]() {
+        connect(ownerWatcher, &QDBusPendingCallWatcher::finished, this,
+                [this, ownerWatcher, generation]() {
             const QDBusMessage ownerReply = ownerWatcher->reply();
             const QList<QVariant> values = ownerReply.arguments();
             ownerWatcher->deleteLater();
+            if (generation != m_ownerGeneration) {
+                m_busy = false;
+                return;
+            }
             if (ownerReply.type() == QDBusMessage::ErrorMessage &&
                 ownerReply.errorName() != QLatin1String("org.freedesktop.DBus.Error.NameHasNoOwner") &&
                 ownerReply.errorName() != QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown")) {
@@ -467,11 +535,13 @@ private:
                     QStringLiteral("org.freedesktop.DBus"), QStringLiteral("StartServiceByName"));
                 activate << QString::fromLatin1(Service) << uint(0);
                 QDBusPendingCallWatcher *activation = new QDBusPendingCallWatcher(m_bus.asyncCall(activate, CallTimeout), this);
-                connect(activation, &QDBusPendingCallWatcher::finished, this, [this, activation]() {
+                connect(activation, &QDBusPendingCallWatcher::finished, this,
+                        [this, activation, generation]() {
                 const QDBusMessage reply = activation->reply();
                 if (reply.type() == QDBusMessage::ErrorMessage)
                     diagnostic(QStringLiteral("manager activation"), failureCategory(reply));
                     m_busy = false;
+                    if (generation != m_ownerGeneration) m_lastIdentity = -1;
                     activation->deleteLater();
                 });
                 return;
@@ -482,8 +552,14 @@ private:
                 QStringLiteral("ru.omp.am.Identify"), QStringLiteral("IdentifyByBusName"));
             identify << unique;
             QDBusPendingCallWatcher *identity = new QDBusPendingCallWatcher(m_bus.asyncCall(identify, CallTimeout), this);
-            connect(identity, &QDBusPendingCallWatcher::finished, this, [this, identity, unique]() {
+            connect(identity, &QDBusPendingCallWatcher::finished, this,
+                    [this, identity, unique, generation]() {
                 const QDBusMessage reply = identity->reply();
+                if (generation != m_ownerGeneration) {
+                    m_busy = false;
+                    identity->deleteLater();
+                    return;
+                }
                 const QList<QVariant> fields = reply.arguments();
                 if (reply.type() == QDBusMessage::ReplyMessage && fields.size() == 2 &&
                     fields.at(0).type() == QVariant::String &&
@@ -512,7 +588,12 @@ private:
                     }
                     sendIdentityDetails(fields.at(0).toString(), key);
                     diagnostic(QStringLiteral("manager identification"), category);
-                    compareWellKnownIdentity(fields.at(0).toString(), key);
+                    const bool comparisonPending =
+                        compareWellKnownIdentity(fields.at(0).toString(), key, unique, generation);
+                    if (comparisonPending) {
+                        identity->deleteLater();
+                        return;
+                    }
                 }
                 m_busy = false;
                 identity->deleteLater();
@@ -534,18 +615,24 @@ private:
         if (m_lastState < 0 || m_clock.elapsed() - m_lastState >= 1000) {
             m_busy = true;
             m_lastState = m_clock.elapsed();
+            const QString owner = m_owner;
+            const quint64 generation = m_ownerGeneration;
             QDBusMessage request = QDBusMessage::createMethodCall(
-                m_owner, QString::fromLatin1(Path), QString::fromLatin1(Interface), QStringLiteral("State"));
+                owner, QString::fromLatin1(Path), QString::fromLatin1(Interface), QStringLiteral("State"));
             QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(m_bus.asyncCall(request, CallTimeout), this);
-            connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher]() {
+            connect(watcher, &QDBusPendingCallWatcher::finished, this,
+                    [this, watcher, owner, generation]() {
                 const QDBusMessage reply = watcher->reply();
                 const QList<QVariant> args = reply.arguments();
+                if (generation != m_ownerGeneration || owner != m_owner) {
+                    m_busy = false;
+                    watcher->deleteLater();
+                    return;
+                }
                 if (reply.type() != QDBusMessage::ReplyMessage || args.size() != 1 ||
                     args.at(0).type() != QVariant::Bool) {
                     diagnostic(QStringLiteral("state request"), failureCategory(reply));
-                    m_owner.clear();
-                    m_detailState.store(0, std::memory_order_relaxed);
-                    clientDetailedState.store(false, std::memory_order_relaxed);
+                    invalidateOwner();
                 } else {
                     const bool enabled = args.at(0).toBool();
                     quint64 beforeState = 0;
@@ -555,6 +642,11 @@ private:
                         clientDetailedState.store(enabled, std::memory_order_relaxed);
                         beforeState = m_beforeState;
                         m_beforeState = 0;
+                        if (!enabled) {
+                            m_queue.clear();
+                            m_bytes = 0;
+                            m_dropped = 0;
+                        }
                     }
                     if (enabled && beforeState)
                         enqueue(QStringLiteral("IPC"),
@@ -570,6 +662,8 @@ private:
             });
             return;
         }
+        const QString owner = m_owner;
+        const quint64 generation = m_ownerGeneration;
         Event event;
         quint64 dropped;
         bool hadEvent;
@@ -587,11 +681,23 @@ private:
         }
         m_busy = true;
         QDBusMessage request = QDBusMessage::createMethodCall(
-            m_owner, QString::fromLatin1(Path), QString::fromLatin1(Interface), QStringLiteral("Append"));
+            owner, QString::fromLatin1(Path), QString::fromLatin1(Interface), QStringLiteral("Append"));
         request << event.source << event.message << event.error << QVariant::fromValue<qulonglong>(dropped);
         QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(m_bus.asyncCall(request, CallTimeout), this);
-        connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher, dropped, hadEvent]() {
+        connect(watcher, &QDBusPendingCallWatcher::finished, this,
+                [this, watcher, dropped, hadEvent, owner, generation]() {
             const QDBusMessage reply = watcher->reply();
+            if (generation != m_ownerGeneration || owner != m_owner) {
+                QMutexLocker lock(&m_mutex);
+                const quint64 available = std::numeric_limits<quint64>::max() - m_dropped;
+                const quint64 lost = dropped == std::numeric_limits<quint64>::max()
+                    ? dropped : dropped + (hadEvent ? 1 : 0);
+                m_dropped += qMin(available, lost);
+                lock.unlock();
+                m_busy = false;
+                watcher->deleteLater();
+                return;
+            }
             if (reply.type() != QDBusMessage::ReplyMessage || !reply.arguments().isEmpty()) {
                 const bool countedByServer = reply.errorName() == QLatin1String("ru.androidcompatibilitylayer.appmanager.log.Error.Counted");
                 {
@@ -603,9 +709,7 @@ private:
                 }
                 if (!countedByServer) {
                     diagnostic(QStringLiteral("event delivery"), failureCategory(reply));
-                    m_owner.clear();
-                    m_detailState.store(0, std::memory_order_relaxed);
-                    clientDetailedState.store(false, std::memory_order_relaxed);
+                    invalidateOwner();
                 }
             }
             m_busy = false;
@@ -614,11 +718,14 @@ private:
     }
     QDBusConnection m_bus;
     QTimer m_timer;
+    QDBusServiceWatcher m_ownerWatcher;
+    const bool m_sendAppend;
     QElapsedTimer m_clock;
     qint64 m_lastState = -1;
     qint64 m_lastIdentity = -1;
     qint64 m_lastStatus = -1;
     QString m_owner;
+    quint64 m_ownerGeneration = 0;
     QMutex m_mutex;
     std::deque<Event> m_queue;
     int m_bytes = 0;
@@ -662,7 +769,7 @@ bool MemoryLogBus::startServer(const Receiver &receiver, const DetailedState &st
     return true;
 }
 
-bool MemoryLogBus::startClient(QString *error)
+bool MemoryLogBus::startClient(QString *error, bool sendAppend)
 {
     if (error) error->clear();
     const QDBusConnection bus = QDBusConnection::sessionBus();
@@ -670,7 +777,7 @@ bool MemoryLogBus::startClient(QString *error)
         if (error) *error = QStringLiteral("Cannot initialize the log client.");
         return false;
     }
-    client = new Client(bus);
+    client = new Client(bus, sendAppend);
     QObject::connect(client, &QObject::destroyed, []() { client = nullptr; });
     return true;
 }

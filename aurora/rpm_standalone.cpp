@@ -5,8 +5,12 @@
 #include "rpm_icon.h"
 #include "rpm_writer.h"
 #include "runtime_settings.h"
+#include "shared_runtime.h"
 #include "permission_settings.h"
+#include "standalone_app_mapping.h"
 
+#include <QBuffer>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
@@ -14,6 +18,7 @@
 #include <QJsonObject>
 #include <QLockFile>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSet>
 #include <QUuid>
 
@@ -77,6 +82,143 @@ void addBytes(std::vector<RpmWriter::StreamFile> *files, const QString &path, co
     files->push_back(file);
 }
 
+void hashValue(QCryptographicHash *hash, const QByteArray &value)
+{
+    hash->addData(QByteArray::number(value.size()));
+    hash->addData(":", 1);
+    hash->addData(value);
+}
+
+QByteArray fileHash(const QString &path)
+{
+    QFile file(path);
+    if (!QFileInfo(path).isFile() || !file.open(QIODevice::ReadOnly)) return {};
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    if (!hash.addData(&file) || file.error() != QFile::NoError) return {};
+    return hash.result();
+}
+
+bool hashTree(QCryptographicHash *hash, const QString &path, const QString &relative,
+              const QString &privateData, QSet<QString> *ancestors)
+{
+    const QFileInfo info(path);
+    const QString resolved = info.canonicalFilePath();
+    if (resolved.isEmpty() || inside(resolved, privateData)) return false;
+    hashValue(hash, relative.toUtf8());
+    if (info.isFile()) {
+        const QByteArray digest = fileHash(resolved);
+        if (digest.isEmpty()) return false;
+        hashValue(hash, QByteArray("file"));
+        hashValue(hash, digest);
+        return true;
+    }
+    if (!info.isDir() || !info.isReadable() || ancestors->contains(resolved)) return false;
+    hashValue(hash, QByteArray("directory"));
+    ancestors->insert(resolved);
+    const QFileInfoList children = QDir(resolved).entryInfoList(
+        QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System, QDir::Name);
+    for (const QFileInfo &child : children)
+        if (!hashTree(hash, child.filePath(), relative + QLatin1Char('/') + child.fileName(),
+                      privateData, ancestors)) return false;
+    ancestors->remove(resolved);
+    return true;
+}
+
+QString cachePath(const QString &directory)
+{
+    return QDir(directory).filePath(QStringLiteral(".rpm-cache.json"));
+}
+
+}
+
+QByteArray RpmStandalone::cacheFingerprint(const QString &package, const QString &label, const QImage &icon,
+                                           const QString &storeRoot, const QString &runtimeRoot,
+                                           const QString &qmlRoot, const QString &executable, bool fileDiagnostics)
+{
+    const ApkStore store(storeRoot);
+    const QString apk = store.apkPath(package);
+    const QFileInfo appDir(QFileInfo(apk).absolutePath());
+    const QString abi = SharedRuntime::version(runtimeRoot);
+    if (apk.isEmpty() || appDir.isSymLink() || !appDir.isDir() ||
+        abi != QLatin1String(STANDALONE_RUNTIME_ABI) || icon.isNull()) return {};
+    QStringList denied;
+    QString error;
+    if (!PermissionSettings::read(appDir.filePath(), &denied, &error)) return {};
+    denied.sort();
+    const QString dataPath = store.dataPath(package);
+    QString privateData = QFileInfo(dataPath).canonicalFilePath();
+    if (privateData.isEmpty())
+        privateData = QDir(appDir.canonicalFilePath()).filePath(QStringLiteral("data"));
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    for (const QByteArray &value : {QByteArray("standalone-rpm-cache-v1"), package.toUtf8(), label.toUtf8(),
+         abi.toUtf8(), RuntimeSettings::selectedLocale().toUtf8(), RuntimeSettings::theme().toUtf8(),
+         RuntimeSettings::location().toUtf8(), QJsonDocument(QJsonArray::fromStringList(denied)).toJson(QJsonDocument::Compact),
+         QByteArray(fileDiagnostics ? "1" : "0")})
+        hashValue(&hash, value);
+    QByteArray image;
+    QBuffer buffer(&image);
+    if (!buffer.open(QIODevice::WriteOnly) || !icon.save(&buffer, "PNG")) return {};
+    hashValue(&hash, image);
+    QSet<QString> ancestors;
+    if (!hashTree(&hash, apk, QStringLiteral("apk"), privateData, &ancestors) ||
+        !hashTree(&hash, executable, QStringLiteral("launcher"), privateData, &ancestors) ||
+        !hashTree(&hash, qmlRoot, QStringLiteral("qml"), privateData, &ancestors)) return {};
+    const QString splits = QDir(appDir.filePath()).filePath(QStringLiteral("splits"));
+    if (QFileInfo(splits).exists() || QFileInfo(splits).isSymLink()) {
+        if (!hashTree(&hash, splits, QStringLiteral("splits"), privateData, &ancestors)) return {};
+    } else {
+        hashValue(&hash, QByteArray("no-splits"));
+    }
+    return hash.result().toHex();
+}
+
+QString RpmStandalone::cachedRpm(const QString &directory, const QByteArray &fingerprint)
+{
+    if (fingerprint.size() != 64 || QFileInfo(directory).isSymLink() ||
+        !QFileInfo(directory).isDir() || QFileInfo(cachePath(directory)).isSymLink()) return {};
+    QFile metadata(cachePath(directory));
+    if (!metadata.open(QIODevice::ReadOnly) || metadata.size() > 4096) return {};
+    QJsonParseError error;
+    const QJsonDocument document = QJsonDocument::fromJson(metadata.readAll(), &error);
+    if (metadata.error() != QFile::NoError || error.error != QJsonParseError::NoError || !document.isObject()) return {};
+    const QJsonObject object = document.object();
+    const QString id = StandaloneAppMapping::read(directory);
+    const QString name = object.value(QStringLiteral("file")).toString();
+    static const QRegularExpression pattern(QStringLiteral(
+        "\\Aru\\.androidcompatibilitylayer\\.Android[0-9a-f]{24}-1\\.0\\.0-1\\.(?:aarch64|x86_64)\\.rpm\\z"));
+    if (id.isEmpty() || !pattern.match(name).hasMatch() || !name.startsWith(id + QLatin1Char('-')) ||
+        object.value(QStringLiteral("inputs")).toString().toLatin1() != fingerprint) return {};
+    const QString path = QDir(directory).filePath(name);
+    const QFileInfo rpm(path);
+    if (rpm.isSymLink() || !rpm.isFile() ||
+        fileHash(path).toHex() != object.value(QStringLiteral("sha256")).toString().toLatin1()) return {};
+    return path;
+}
+
+bool RpmStandalone::saveCache(const QString &directory, const QString &rpm, const QByteArray &fingerprint)
+{
+    const QFileInfo dir(directory), file(rpm);
+    if (fingerprint.size() != 64 || dir.isSymLink() || !dir.isDir() || file.isSymLink() ||
+        !file.isFile() || QDir::cleanPath(file.absolutePath()) != QDir::cleanPath(dir.absoluteFilePath()) ||
+        QFileInfo(cachePath(directory)).isSymLink()) return false;
+    const QByteArray digest = fileHash(rpm);
+    if (digest.isEmpty()) return false;
+    QJsonObject object;
+    object.insert(QStringLiteral("file"), file.fileName());
+    object.insert(QStringLiteral("inputs"), QString::fromLatin1(fingerprint));
+    object.insert(QStringLiteral("sha256"), QString::fromLatin1(digest.toHex()));
+    const QByteArray bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    QSaveFile metadata(cachePath(directory));
+    return metadata.open(QIODevice::WriteOnly) && metadata.write(bytes) == bytes.size() && metadata.commit();
+}
+
+bool RpmStandalone::reuseOrGenerate(const std::function<QString()> &lookup,
+                                    const std::function<bool(QString *)> &generate,
+                                    QString *output, bool *cacheHit)
+{
+    *output = lookup();
+    *cacheHit = !output->isEmpty();
+    return *cacheHit || generate(output);
 }
 
 bool RpmStandalone::createUnsigned(const QString &package, const QString &label, const QImage &icon,
@@ -153,8 +295,17 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     if ((QFileInfo(splitRoot).exists() || QFileInfo(splitRoot).isSymLink()) &&
         !addDirectory(splitRoot, dataRoot + QStringLiteral("/apk/splits"), &files, problem, privateData, &ancestors))
         return false;
-    if (!addDirectory(runtimeRoot, dataRoot + QStringLiteral("/android-runtime"), &files, problem, privateData, &ancestors) ||
-        !addDirectory(qmlRoot, dataRoot + QStringLiteral("/qml"), &files, problem, privateData, &ancestors))
+    const QString runtimeVersion = SharedRuntime::version(runtimeRoot);
+    if (runtimeVersion.isEmpty()) {
+        *problem = QCoreApplication::translate("RpmStandalone", "The shared Android runtime is unavailable.");
+        return false;
+    }
+    if (runtimeVersion != QLatin1String(STANDALONE_RUNTIME_ABI)) {
+        *problem = QCoreApplication::translate("RpmStandalone",
+            "The manager and shared Android runtime are incompatible. Restart the manager after updating it.");
+        return false;
+    }
+    if (!addDirectory(qmlRoot, dataRoot + QStringLiteral("/qml"), &files, problem, privateData, &ancestors))
         return false;
     QString title = label.trimmed();
     title.replace(QRegularExpression(QStringLiteral("[\\r\\n\\t]+")), QStringLiteral(" "));
@@ -162,6 +313,8 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     title = title.left(512);
     QJsonObject metadata;
     metadata.insert(QStringLiteral("appId"), appId);
+    metadata.insert(QStringLiteral("sharedRuntimeAbi"), runtimeVersion);
+    metadata.insert(QStringLiteral("standaloneSnapshots"), true);
     metadata.insert(QStringLiteral("fileDiagnostics"), fileDiagnostics);
     metadata.insert(QStringLiteral("package"), package);
     metadata.insert(QStringLiteral("displayName"), title);
@@ -207,8 +360,6 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
         }
         if (allowedGroups.contains(QStringLiteral("read_media_aural"))) osPermissions << QStringLiteral("Music");
     }
-    if (fileDiagnostics && !osPermissions.contains(QStringLiteral("UserDirs")))
-        osPermissions << QStringLiteral("Documents");
     const QString desktop = QStringLiteral(
         "[Desktop Entry]\nType=Application\nX-Nemo-Application-Type=silica-qt5\n"
         "Icon=%1\nExec=%2 --standalone\nName=%3\n\n[X-Application]\n"
@@ -237,7 +388,7 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     rpm.version = "1.0.0";
     rpm.release = "1";
     rpm.summary = "Standalone Android application";
-    rpm.description = "Android application with its own compatibility runtime.";
+    rpm.description = "Android application using the manager's shared compatibility runtime.";
     rpm.license = "GPL-3.0-only AND LicenseRef-AndroidApp";
     rpm.buildTime = uint32_t(QDateTime::currentMSecsSinceEpoch() / 1000);
 #if defined(Q_PROCESSOR_ARM_64)

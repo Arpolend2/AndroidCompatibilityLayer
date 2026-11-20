@@ -51,11 +51,104 @@ int main(int argc, char **argv)
     StandalonePaths paths;
     QString error;
     if (!standalonePaths(appId, appId, root, storage, &paths, &error) ||
+        paths.androidRoot != QDir(root).filePath(QStringLiteral("android-runtime")) ||
         paths.apk != apk.fileName() || paths.displayName != QStringLiteral("Example app") ||
         paths.locale != QStringLiteral("zh-Hant-TW") || paths.theme != QStringLiteral("dark") ||
         paths.location != QStringLiteral("55.5,37.5") ||
         paths.data != QDir(storage).filePath(QStringLiteral("apps/org.example.app/data")) ||
-        paths.fileDiagnostics || QFileInfo::exists(storage)) return 1;
+        paths.standaloneSnapshots || paths.fileDiagnostics || QFileInfo::exists(storage)) return 1;
+    {
+        QFile file(metadataPath);
+        if (!file.open(QIODevice::ReadOnly)) return 1;
+        QJsonObject object = QJsonDocument::fromJson(file.readAll()).object();
+        file.close();
+        object.insert(QStringLiteral("standaloneSnapshots"), true);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            file.write(QJsonDocument(object).toJson()) < 0) return 1;
+        file.close();
+        if (!standalonePaths(appId, appId, root, storage, &paths, &error) ||
+            !paths.standaloneSnapshots || paths.fileDiagnostics) return 1;
+        object.insert(QStringLiteral("standaloneSnapshots"), QStringLiteral("yes"));
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            file.write(QJsonDocument(object).toJson()) < 0) return 1;
+        file.close();
+        if (standalonePaths(appId, appId, root, storage, &paths, &error) || error.isEmpty()) return 1;
+    }
+    if (!metadata(appId, package, QStringLiteral("zh-Hant-TW"), QStringLiteral("dark"),
+                  QStringLiteral("55.5,37.5"))) return 1;
+    {
+        QFile file(metadataPath);
+        if (!file.open(QIODevice::ReadOnly)) return 1;
+        QJsonObject object = QJsonDocument::fromJson(file.readAll()).object();
+        file.close();
+        object.insert(QStringLiteral("sharedRuntimeAbi"), QStringLiteral("1"));
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            file.write(QJsonDocument(object).toJson()) < 0) return 1;
+        file.close();
+        const QString shared = QDir(dir.path()).filePath(QStringLiteral("shared"));
+        StandaloneRuntimeError runtimeError = StandaloneRuntimeError::None;
+        if (standalonePaths(appId, appId, root, storage, &paths, &error, shared, &runtimeError) ||
+            runtimeError != StandaloneRuntimeError::Unavailable || error.isEmpty()) return 1;
+        if (!QDir().mkpath(shared)) return 1;
+        QFile marker(QDir(shared).filePath(QStringLiteral(".standalone-abi")));
+        if (!marker.open(QIODevice::WriteOnly) || marker.write("1\n") != 2) return 1;
+        marker.close();
+        if (!standalonePaths(appId, appId, root, storage, &paths, &error, shared, &runtimeError) ||
+            runtimeError != StandaloneRuntimeError::None || paths.androidRoot != shared ||
+            paths.apk != apk.fileName()) return 1;
+        const QString firstData = paths.data;
+        const QString providerDir = QDir(shared).filePath(QStringLiteral("app/webview"));
+        if (!QDir().mkpath(providerDir)) return 1;
+        QFile provider(QDir(providerDir).filePath(QStringLiteral("webview.apk")));
+        if (!provider.open(QIODevice::WriteOnly) || provider.write("provider") != 8) return 1;
+        provider.close();
+        if (!standalonePaths(appId, appId, root, storage, &paths, &error, shared, &runtimeError) ||
+            paths.androidRoot != shared || paths.apk != apk.fileName() || paths.data != firstData ||
+            !QFileInfo::exists(QDir(paths.androidRoot).filePath(QStringLiteral("app/webview/webview.apk")))) return 1;
+        const QString otherPackage = QStringLiteral("org.example.other");
+        const QString otherId = QStringLiteral("ru.androidcompatibilitylayer.Android") + QString::fromLatin1(
+            QCryptographicHash::hash(otherPackage.toUtf8(), QCryptographicHash::Sha256).toHex().left(24));
+        const QString otherRoot = QDir(dir.path()).filePath(QStringLiteral("other-resources"));
+        const QString otherStorage = QDir(dir.path()).filePath(QStringLiteral("other-private"));
+        if (!QDir().mkpath(QDir(otherRoot).filePath(QStringLiteral("apk")))) return 1;
+        QFile otherApk(QDir(otherRoot).filePath(QStringLiteral("apk/base.apk")));
+        if (!otherApk.open(QIODevice::WriteOnly) || otherApk.write("other") != 5) return 1;
+        otherApk.close();
+        QJsonObject otherObject = object;
+        otherObject.insert(QStringLiteral("appId"), otherId);
+        otherObject.insert(QStringLiteral("package"), otherPackage);
+        QFile otherMetadata(QDir(otherRoot).filePath(QStringLiteral("standalone.json")));
+        if (!otherMetadata.open(QIODevice::WriteOnly) ||
+            otherMetadata.write(QJsonDocument(otherObject).toJson()) < 0) return 1;
+        otherMetadata.close();
+        if (!standalonePaths(otherId, otherId, otherRoot, otherStorage, &paths, &error, shared, &runtimeError) ||
+            paths.androidRoot != shared || paths.apk != otherApk.fileName() ||
+            paths.data != QDir(otherStorage).filePath(QStringLiteral("apps/org.example.other/data")) ||
+            paths.data == firstData) return 1;
+        otherObject.remove(QStringLiteral("sharedRuntimeAbi"));
+        if (!QDir().mkpath(QDir(otherRoot).filePath(QStringLiteral("android-runtime"))) ||
+            !otherMetadata.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            otherMetadata.write(QJsonDocument(otherObject).toJson()) < 0) return 1;
+        otherMetadata.close();
+        if (!standalonePaths(otherId, otherId, otherRoot, otherStorage, &paths, &error, shared, &runtimeError) ||
+            paths.androidRoot != QDir(otherRoot).filePath(QStringLiteral("android-runtime")) ||
+            QFileInfo::exists(QDir(paths.androidRoot).filePath(QStringLiteral("app/webview/webview.apk")))) return 1;
+        if (!marker.open(QIODevice::WriteOnly | QIODevice::Truncate) || marker.write("2\n") != 2) return 1;
+        marker.close();
+        if (standalonePaths(appId, appId, root, storage, &paths, &error, shared, &runtimeError) ||
+            runtimeError != StandaloneRuntimeError::Incompatible || error.isEmpty()) return 1;
+        if (!marker.open(QIODevice::WriteOnly | QIODevice::Truncate) || marker.write("invalid\n") != 8) return 1;
+        marker.close();
+        if (standalonePaths(appId, appId, root, storage, &paths, &error, shared, &runtimeError) ||
+            runtimeError != StandaloneRuntimeError::Unavailable || error.isEmpty()) return 1;
+        object.insert(QStringLiteral("sharedRuntimeAbi"), QJsonValue(1));
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            file.write(QJsonDocument(object).toJson()) < 0) return 1;
+        file.close();
+        if (standalonePaths(appId, appId, root, storage, &paths, &error, shared, &runtimeError) ||
+            runtimeError != StandaloneRuntimeError::None || error.isEmpty()) return 1;
+        if (!metadata(appId, package, QStringLiteral("zh-Hant-TW"), QStringLiteral("dark"), QStringLiteral("55.5,37.5"))) return 1;
+    }
     {
         QFile file(metadataPath);
         if (!file.open(QIODevice::ReadOnly)) return 1;

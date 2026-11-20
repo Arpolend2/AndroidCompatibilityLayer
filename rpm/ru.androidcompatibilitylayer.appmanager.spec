@@ -1,21 +1,23 @@
 Name:       ru.androidcompatibilitylayer.appmanager
 Summary:    AndroidCompatibilityLayer for Aurora OS
-Version:    0.2.10
+Version:    0.3.0
 Release:    1
 License:    GPL-3.0-only
 URL:        https://github.com/Arpolend2/AndroidCompatibilityLayer
 Source0:    %{name}-%{version}.tar.bz2
 
-%global __provides_exclude_from ^%{_datadir}/%{name}/(fixtures|android-runtime)/.*$
-%global __requires_exclude_from ^%{_datadir}/%{name}/android-runtime/.*$
+%global __provides_exclude_from ^%{_datadir}/(%{name}/fixtures|common/ru.androidcompatibilitylayer/appmanager/android-runtime)/.*$
+%global __requires_exclude_from ^%{_datadir}/common/ru.androidcompatibilitylayer/appmanager/android-runtime/.*$
 
 Requires:       sailfishsilica-qt5 >= 0.10.9
 Requires:       qt5-plugin-imageformat-jpeg
 Requires:       nemo-qml-plugin-notifications-qt5
+Requires:       ru.auroraos.webview
 BuildRequires:  cmake
 BuildRequires:  qt5-qttools-linguist
 BuildRequires:  python3
 BuildRequires:  pkgconfig(auroraapp)
+BuildRequires:  pkgconfig(aurorawebview)
 BuildRequires:  pkgconfig(runtime-manager-qt5)
 BuildRequires:  pkgconfig(Qt5Core)
 BuildRequires:  pkgconfig(Qt5DBus)
@@ -53,5 +55,6 @@ DESTDIR=%{buildroot} cmake --build . --target install
 %files
 %{_bindir}/%{name}
 %{_datadir}/%{name}
+%{_datadir}/common/ru.androidcompatibilitylayer/appmanager
 %{_datadir}/applications/%{name}.desktop
 %{_datadir}/icons/hicolor/*/apps/%{name}.png

@@ -11,6 +11,7 @@
 #include <QJsonObject>
 #include <QLockFile>
 #include <QQmlContext>
+#include <QQmlEngine>
 #include <QQuickView>
 #include <QRegularExpression>
 #include <QScopedPointer>
@@ -24,12 +25,15 @@
 #include <QtQml>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include <signal.h>
 #include <unistd.h>
 
 #include "audio_output.h"
+#include "application_executables.h"
 #include "camera_host.h"
 #include "bluetooth_host.h"
 #include "diagnostic_log.h"
@@ -56,6 +60,7 @@
 #include "preview_keyboard.h"
 #include "probe.h"
 #include "standalone_paths.h"
+#include "shared_runtime.h"
 #include "rpm_standalone.h"
 #include "rpm_signers.h"
 #include "rpm_test_keys.h"
@@ -142,6 +147,181 @@ static bool validateStoreBundle(const QString &path, int *splitCount, QString *e
     return true;
 }
 
+static bool safeStoreExpansionPath(QString path, const QString &package, bool directory = false)
+{
+    if (path.startsWith(QLatin1Char('/'))) path.remove(0, 1);
+    if (path.endsWith(QLatin1Char('/'))) path.chop(1);
+    const QStringList parts = path.split(QLatin1Char('/'));
+    static const QRegularExpression safePart(QStringLiteral("^[A-Za-z0-9._-]{1,200}$"));
+    if (parts.isEmpty() || parts.at(0) != QLatin1String("Android") ||
+        (!directory && parts.size() < 4) || (directory && parts.size() < 1)) return false;
+    if (parts.size() == 1) return directory;
+    if (parts.at(1) != QLatin1String("obb") && parts.at(1) != QLatin1String("data")) return false;
+    if (parts.size() == 2) return directory;
+    if (!package.isEmpty() && parts.at(2) != package) return false;
+    if (!directory && parts.size() < 4) return false;
+    for (const QString &part : parts) {
+        if (part == QLatin1String(".") || part == QLatin1String("..") || !safePart.match(part).hasMatch())
+            return false;
+    }
+    return true;
+}
+
+static bool validateStoreXapk(const QString &path, QString *package, int *expansionCount, QString *error)
+{
+    const QByteArray source = QFile::encodeName(path);
+    char why[256] = {};
+    mg_zip zip;
+    if (!mg_zip_open_limited(&zip, source.constData(), 256, 16u * 1024 * 1024, why, sizeof(why))) {
+        *error = QString::fromUtf8(why);
+        return false;
+    }
+    QTemporaryDir temporary(QFileInfo(path).absolutePath() + QStringLiteral("/.verify-XXXXXX"));
+    bool ok = temporary.isValid() && zip.count > 0;
+    quint64 total = 0;
+    int apkCount = 0;
+    int bases = 0;
+    int version = 0;
+    QString parsedPackage;
+    QString manifestPackage;
+    QJsonObject manifest;
+    bool sawManifest = false;
+    bool sawIcon = false;
+    QSet<QString> names;
+    QSet<QString> splits;
+    QSet<QString> expansionEntries;
+    QStringList expansionDirectories;
+    const QRegularExpression safeApkName(QStringLiteral("^[A-Za-z0-9._-]{1,200}\\.apk$"),
+                                         QRegularExpression::CaseInsensitiveOption);
+    for (u32 i = 0; ok && i < zip.count; ++i) {
+        const mg_zip_entry &entry = zip.entries[i];
+        const QString name = QString::fromLatin1(entry.name);
+        const QByteArray encodedName = name.toLatin1();
+        if (encodedName.size() != static_cast<int>(std::strlen(entry.name)) ||
+            names.contains(name) || (entry.flags & 1) ||
+            (entry.method != 0 && entry.method != 8) ||
+            entry.usize > 512u * 1024 * 1024 ||
+            entry.usize > 512u * 1024 * 1024 - total) {
+            ok = false;
+            break;
+        }
+        names.insert(name);
+        total += entry.usize;
+        if (name.endsWith(QLatin1Char('/'))) {
+            if (!safeStoreExpansionPath(name, QString(), true))
+                ok = false;
+            else expansionDirectories.append(name);
+            continue;
+        }
+        if (name.endsWith(QLatin1String(".apk"), Qt::CaseInsensitive)) {
+            if (!safeApkName.match(name).hasMatch() || ++apkCount > 11) {
+                ok = false;
+                break;
+            }
+            const QString part = temporary.path() + QLatin1Char('/') + QString::number(i) + QStringLiteral(".apk");
+            const QByteArray partName = QFile::encodeName(part);
+            if (!mg_zip_extract(&zip, &entry, partName.constData(), nullptr, nullptr, why, sizeof(why))) {
+                ok = false;
+                break;
+            }
+            mg_apk_info info;
+            if (!mg_apk_read_info(partName.constData(), &info) || !info.package[0]) {
+                ok = false;
+                break;
+            }
+            const QString partPackage = QString::fromUtf8(info.package);
+            if (parsedPackage.isEmpty()) {
+                parsedPackage = partPackage;
+                version = info.version_code;
+            } else if (parsedPackage != partPackage || version != info.version_code) {
+                ok = false;
+                break;
+            }
+            const QString split = QString::fromUtf8(info.split);
+            if (split.isEmpty()) ++bases;
+            else if (splits.contains(split)) ok = false;
+            else splits.insert(split);
+            if (!QFile::remove(part)) ok = false;
+        } else if (name == QLatin1String("manifest.json")) {
+            if (sawManifest || entry.usize > 4u * 1024 * 1024) {
+                ok = false;
+                break;
+            }
+            sawManifest = true;
+            u8 *bytes = mg_zip_read(&zip, &entry, 4u * 1024 * 1024, nullptr);
+            if (!bytes) { ok = false; break; }
+            const QByteArray contents(reinterpret_cast<const char *>(bytes), static_cast<int>(entry.usize));
+            free(bytes);
+            QJsonParseError parseError;
+            const QJsonDocument document = QJsonDocument::fromJson(contents, &parseError);
+            if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+                ok = false;
+                break;
+            }
+            manifest = document.object();
+            if (manifest.contains(QStringLiteral("package_name"))) {
+                if (!manifest.value(QStringLiteral("package_name")).isString()) {
+                    ok = false;
+                    break;
+                }
+                manifestPackage = manifest.value(QStringLiteral("package_name")).toString();
+                if (manifestPackage.isEmpty()) {
+                    ok = false;
+                    break;
+                }
+            }
+        } else if (name == QLatin1String("icon.png")) {
+            if (sawIcon || entry.usize > 4u * 1024 * 1024) ok = false;
+            sawIcon = true;
+        } else if (name.startsWith(QLatin1String("Android/obb/")) ||
+                   name.startsWith(QLatin1String("Android/data/"))) {
+            expansionEntries.insert(name);
+        } else {
+            ok = false;
+        }
+    }
+    mg_zip_close(&zip);
+
+    QSet<QString> expansions = expansionEntries;
+    if (ok && sawManifest && manifest.contains(QStringLiteral("expansions"))) {
+        const QJsonValue value = manifest.value(QStringLiteral("expansions"));
+        if (!value.isArray()) ok = false;
+        else {
+            const QJsonArray list = value.toArray();
+            for (const QJsonValue &item : list) {
+                if (!item.isObject()) { ok = false; break; }
+                const QJsonObject expansion = item.toObject();
+                const QJsonValue fileValue = expansion.value(QStringLiteral("file"));
+                const QJsonValue installValue = expansion.value(QStringLiteral("install_path"));
+                if (!fileValue.isString() || !installValue.isString() ||
+                    !safeStoreExpansionPath(installValue.toString(), parsedPackage) ||
+                    !expansionEntries.contains(fileValue.toString())) {
+                    ok = false;
+                    break;
+                }
+                expansions.insert(fileValue.toString());
+            }
+        }
+    }
+    if (manifestPackage != QString() && manifestPackage != parsedPackage) ok = false;
+    for (const QString &directory : expansionDirectories)
+        if (!safeStoreExpansionPath(directory, parsedPackage, true)) ok = false;
+    for (const QString &entry : expansionEntries)
+        if (!safeStoreExpansionPath(entry, parsedPackage)) ok = false;
+    static const QRegularExpression safePackage(QStringLiteral("^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+$"));
+    if (apkCount == 0 || bases != 1 || parsedPackage.size() > 159 || !safePackage.match(parsedPackage).hasMatch() ||
+        (!manifestPackage.isEmpty() && manifestPackage != parsedPackage) ||
+        expansions.size() > 16) ok = false;
+    if (!ok) {
+        *error = QCoreApplication::translate("RpmBuilder",
+            "The XAPK is invalid, too large, or contains APKs or expansion files that do not match.");
+        return false;
+    }
+    *package = parsedPackage;
+    *expansionCount = expansions.size();
+    return true;
+}
+
 static bool limitStoreImporter()
 {
     const struct { int resource; rlim_t maximum; } limits[] = {
@@ -158,9 +338,9 @@ static bool limitStoreImporter()
     return true;
 }
 
-static int unpackBundle(int argc, char *argv[], bool storeBundle)
+static int unpackBundle(int argc, char *argv[], bool storeBundle, bool storeXapk)
 {
-    if (storeBundle && !limitStoreImporter()) {
+    if ((storeBundle || storeXapk) && !limitStoreImporter()) {
         std::fprintf(stderr, "Cannot limit APK bundle importer resources.\n");
         return 1;
     }
@@ -189,9 +369,17 @@ static int unpackBundle(int argc, char *argv[], bool storeBundle)
         return 1;
     }
     int expectedSplits = 0;
+    int expectedExpansions = 0;
+    QString expectedPackage;
     if (storeBundle) {
         QString error;
         if (!validateStoreBundle(snapshot, &expectedSplits, &error)) {
+            std::fprintf(stderr, "%s\n", qPrintable(error));
+            return 1;
+        }
+    } else if (storeXapk) {
+        QString error;
+        if (!validateStoreXapk(snapshot, &expectedPackage, &expectedExpansions, &error)) {
             std::fprintf(stderr, "%s\n", qPrintable(error));
             return 1;
         }
@@ -218,6 +406,22 @@ static int unpackBundle(int argc, char *argv[], bool storeBundle)
         QString error;
         if (storeBundle && bundle.object().value(QStringLiteral("splits")).toArray().size() != expectedSplits) {
             error = QCoreApplication::translate("RpmBuilder", "The runtime cannot retain every split APK in this session.");
+        } else if (storeXapk && bundle.object().value(QStringLiteral("package")).toString() != expectedPackage) {
+            error = QCoreApplication::translate("RpmBuilder", "The unpacked XAPK package does not match the archive.");
+        } else if (storeXapk) {
+            const QJsonArray expansions = bundle.object().value(QStringLiteral("expansions")).toArray();
+            int copiedExpansions = 0;
+            for (const QJsonValue &item : expansions) {
+                if (!item.isObject() ||
+                    !item.toObject().value(QStringLiteral("to")).isString() ||
+                    item.toObject().value(QStringLiteral("to")).toString().isEmpty()) {
+                    error = QCoreApplication::translate("RpmBuilder", "An XAPK expansion file could not be placed safely.");
+                    break;
+                }
+                ++copiedExpansions;
+            }
+            if (error.isEmpty() && copiedExpansions != expectedExpansions)
+                error = QCoreApplication::translate("RpmBuilder", "Not every XAPK expansion file could be imported.");
         } else if (inspectionError.error != QJsonParseError::NoError || !report.isObject() ||
             !report.object().value(QStringLiteral("ok")).toBool()) {
             error = report.isObject()
@@ -277,21 +481,37 @@ static int buildStandaloneRpm(const QString &package, bool fileDiagnostics)
     const int comma = iconData.indexOf(QLatin1Char(','));
     if (comma >= 0) icon.loadFromData(QByteArray::fromBase64(iconData.mid(comma + 1).toLatin1()));
     if (icon.isNull()) icon.load(QStringLiteral("/usr/share/icons/hicolor/172x172/apps/ru.androidcompatibilitylayer.appmanager.png"));
+    const QString label = selected.value(QStringLiteral("label")).toString();
+    const QString runtimeRoot = Aurora::Application::organizationPathTo(SharedRuntime::location()).toLocalFile();
+    const QString qmlRoot = Aurora::Application::pathTo(QStringLiteral("qml")).toLocalFile();
+    const QString executable = ApplicationExecutables::standalonePayload(QFileInfo(qmlRoot).absolutePath());
+    const ApkStore store(storeRoot);
+    const QString apkPath = store.apkPath(package);
+    const QString publishedDir = QDir(QFileInfo(apkPath).absolutePath()).filePath(QStringLiteral("standalone-rpm"));
+    QByteArray fingerprint;
+    bool cacheHit = false;
     bool ok = !base.isEmpty() && !selected.isEmpty();
     if (!ok) {
         error = QCoreApplication::translate("RpmBuilder", "The app or RPM output directory is unavailable.");
     } else {
-        std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:build\n", stderr);
-        std::fflush(stderr);
-        ok = RpmStandalone::createUnsigned(
-            package, selected.value(QStringLiteral("label")).toString(), icon,
-            storeRoot, Aurora::Application::pathTo(QStringLiteral("android-runtime")).toLocalFile(),
-            Aurora::Application::pathTo(QStringLiteral("qml")).toLocalFile(),
-            QCoreApplication::applicationFilePath(),
-            QDir(base).filePath(QStringLiteral("standalone-rpm-staging")), &output, &error,
-            fileDiagnostics);
+        ok = RpmStandalone::reuseOrGenerate([&]() {
+            QLockFile lock(store.lockPath(package));
+            lock.setStaleLockTime(0);
+            if (!lock.tryLock(0)) return QString();
+            fingerprint = RpmStandalone::cacheFingerprint(package, label, icon, storeRoot, runtimeRoot,
+                                                            qmlRoot, executable, fileDiagnostics);
+            return RpmStandalone::cachedRpm(publishedDir, fingerprint);
+        }, [&](QString *path) {
+            std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:build\n", stderr);
+            std::fflush(stderr);
+            return RpmStandalone::createUnsigned(
+                package, label, icon, storeRoot, runtimeRoot, qmlRoot, executable,
+                QDir(base).filePath(QStringLiteral("standalone-rpm-staging")), path, &error,
+                fileDiagnostics);
+        }, &output, &cacheHit);
+        if (cacheHit) qInfo("Standalone RPM: using cached package");
     }
-    if (ok) {
+    if (ok && !cacheHit) {
         std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:sign\n", stderr);
         std::fflush(stderr);
         std::string signingLog;
@@ -303,14 +523,11 @@ static int buildStandaloneRpm(const QString &package, bool fileDiagnostics)
                 error += QCoreApplication::translate("RpmBuilder", " Could not remove the unsigned RPM: %1").arg(output);
         }
     }
-    if (ok) {
+    if (ok && !cacheHit) {
         std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:save\n", stderr);
         std::fflush(stderr);
-        const ApkStore store(storeRoot);
-        const QString apkPath = store.apkPath(package);
         QLockFile lock(store.lockPath(package));
         lock.setStaleLockTime(0);
-        const QString publishedDir = QDir(QFileInfo(apkPath).absolutePath()).filePath(QStringLiteral("standalone-rpm"));
         const QString published = QDir(publishedDir).filePath(QFileInfo(output).fileName());
         QFile input(output);
         QSaveFile destination(published);
@@ -336,9 +553,24 @@ static int buildStandaloneRpm(const QString &package, bool fileDiagnostics)
                 ok = false;
             }
             if (ok) {
+                const QString previous = StandaloneAppMapping::read(publishedDir);
                 if (!StandaloneAppMapping::save(publishedDir, published)) {
                     error = QCoreApplication::translate("RpmBuilder", "Could not save the standalone app mapping.");
                     ok = false;
+                } else if (!fingerprint.isEmpty() &&
+                           fingerprint == RpmStandalone::cacheFingerprint(package, label, icon, storeRoot,
+                                                                           runtimeRoot, qmlRoot, executable,
+                                                                           fileDiagnostics) &&
+                           !RpmStandalone::saveCache(publishedDir, published, fingerprint)) {
+                    qWarning("Standalone RPM: could not save cache metadata");
+                }
+                if (ok && !previous.isEmpty()) {
+                    for (const QString &arch : {QStringLiteral("aarch64"), QStringLiteral("x86_64")}) {
+                        const QString old = QDir(publishedDir).filePath(previous + QStringLiteral("-1.0.0-1.") +
+                                                                        arch + QStringLiteral(".rpm"));
+                        if (old != published && QFileInfo(old).exists() && !QFile::remove(old))
+                            qWarning("Standalone RPM: could not remove obsolete cached package");
+                    }
                 }
             }
         }
@@ -370,15 +602,15 @@ struct StoreWorkerTeardownMarker {
 };
 }
 
-int main(int argc, char *argv[])
+int runApplication(int argc, char *argv[], void (*initReportWebView)())
 {
     const QByteArray mode = argc > 1 ? QByteArray(argv[1]) : QByteArray();
-    if (mode == "--unpack-bundle" || mode == "--unpack-store-bundle") {
+    if (mode == "--unpack-bundle" || mode == "--unpack-store-bundle" || mode == "--unpack-store-xapk") {
         if (argc != 10) {
             std::fprintf(stderr, "Invalid APK bundle importer arguments.\n");
             return 2;
         }
-        return unpackBundle(argc, argv, mode == "--unpack-store-bundle");
+        return unpackBundle(argc, argv, mode == "--unpack-store-bundle", mode == "--unpack-store-xapk");
     }
     const bool standalone = mode == "--standalone";
     const bool child = mode == "--preview" || standalone || mode == "--build-standalone";
@@ -387,6 +619,8 @@ int main(int argc, char *argv[])
         std::fprintf(stderr, "Invalid background manager arguments.\n");
         return 2;
     }
+    if (!child && !backgroundManager)
+        QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
     bool traceStoreWorkerExit = false;
     const StoreWorkerTeardownMarker appDestroyed{traceStoreWorkerExit, "Qt application destroyed; leaving main"};
     QScopedPointer<QGuiApplication> app;
@@ -417,19 +651,42 @@ int main(int argc, char *argv[])
         if (!ErrorLog::initialize(label, &errorLogError))
             qWarning().noquote() << "Error log unavailable:" << errorLogError;
     }
+    if (!child && !backgroundManager) {
+        QString snapshotError;
+        if (!ErrorLog::setStandaloneSnapshotRoot(sharedLogRoot, &snapshotError))
+            qWarning().noquote() << "Standalone log snapshots unavailable:" << snapshotError;
+    }
     StandalonePaths standalonePathsValue;
     QString standaloneFilePath;
     if (standalone) {
         QString pathError;
+        StandaloneRuntimeError runtimeError = StandaloneRuntimeError::None;
         if (argc != 2 || !standalonePaths(standaloneId,
                 QFileInfo(QCoreApplication::applicationFilePath()).fileName(),
                 QFileInfo(Aurora::Application::pathTo(QStringLiteral("standalone.json")).toLocalFile()).absolutePath(),
                 QStandardPaths::writableLocation(QStandardPaths::AppDataLocation),
-                &standalonePathsValue, &pathError)) {
+                &standalonePathsValue, &pathError,
+                Aurora::Application::organizationPathTo(SharedRuntime::location()).toLocalFile(),
+                &runtimeError)) {
             qWarning("Standalone app setup failed: %s", qPrintable(pathError));
+            if (runtimeError != StandaloneRuntimeError::None) {
+                QScopedPointer<QQuickView> errorView(Aurora::Application::createView());
+                errorView->setResizeMode(QQuickView::SizeRootObjectToView);
+                QObject::connect(errorView->engine(), &QQmlEngine::quit, app.data(), &QCoreApplication::quit);
+                errorView->rootContext()->setContextProperty(QStringLiteral("runtimeIncompatible"),
+                    runtimeError == StandaloneRuntimeError::Incompatible);
+                errorView->setSource(Aurora::Application::pathTo(QStringLiteral("qml/StandaloneRuntimeError.qml")));
+                if (errorView->status() == QQuickView::Error) return 1;
+                errorView->showFullScreen();
+                return app->exec();
+            }
             return 1;
         }
-        if (standalonePathsValue.fileDiagnostics) {
+        if (standalonePathsValue.standaloneSnapshots) {
+            QString error;
+            if (!ErrorLog::startStandaloneSnapshots(sharedLogRoot, standaloneId, &error))
+                qWarning().noquote() << "Standalone log snapshots unavailable:" << error;
+        } else if (standalonePathsValue.fileDiagnostics) {
             QString error;
             if (!ErrorLog::startStandaloneDiagnosticFile(&standaloneFilePath, &error))
                 qWarning().noquote() << "Standalone diagnostic file unavailable:" << error;
@@ -481,7 +738,7 @@ int main(int argc, char *argv[])
                 return 1;
             }
         } else {
-            const QString expectedRoot = Aurora::Application::pathTo(QStringLiteral("android-runtime")).toLocalFile();
+            const QString expectedRoot = Aurora::Application::organizationPathTo(SharedRuntime::location()).toLocalFile();
             const ApkStore store(QDir(base).filePath(QStringLiteral("apps")));
             const QString package = QStringLiteral("com.aurora.store");
             storePreview = !base.isEmpty() &&
@@ -529,6 +786,7 @@ int main(int argc, char *argv[])
         if (storePreview && !embedded) {
             qmlRegisterType<PreviewSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
             EmbeddedPreview remote;
+            remote.setCpuFrameTransportOnly();
             QScopedPointer<QQuickView> view(Aurora::Application::createView());
             view->setTitle(QStringLiteral("Aurora Store"));
             view->setResizeMode(QQuickView::SizeRootObjectToView);
@@ -556,7 +814,7 @@ int main(int argc, char *argv[])
                     : result == ManagerLifecycle::Unavailable ? "unavailable" : "failed";
                 qInfo("Aurora Store return to manager: activation=%s.", outcome);
                 if (result == ManagerLifecycle::NoOwner) {
-                    if (!QProcess::startDetached(QCoreApplication::applicationFilePath(), QStringList()))
+                    if (!QProcess::startDetached(ApplicationExecutables::manager(), QStringList()))
                         qWarning("Cannot reopen the manager.");
                 } else if (result != ManagerLifecycle::Delivered) {
                     qWarning().noquote() << "Cannot activate the manager:" << error;
@@ -593,7 +851,6 @@ int main(int argc, char *argv[])
         preview.setCloseOnExit(standalone || storePreview);
         if (embedded) {
             preview.setCpuPresentationOnly(true);
-            preview.setOffscreenGpuCanvas(true);
             AuroraPickerHost *picker = new AuroraPickerHost;
             preview.setPicker(picker);
             if (storePreview) {
@@ -663,7 +920,7 @@ int main(int argc, char *argv[])
                 const ManagerLifecycle::ForwardResult result =
                     ManagerLifecycle::forwardToRunningManager(QStringList(), &error);
                 if (result == ManagerLifecycle::NoOwner) {
-                    if (!QProcess::startDetached(QCoreApplication::applicationFilePath(), QStringList()))
+                    if (!QProcess::startDetached(ApplicationExecutables::manager(), QStringList()))
                         qWarning("Cannot reopen the manager.");
                 } else if (result != ManagerLifecycle::Delivered) {
                     qWarning().noquote() << "Cannot activate the manager:" << error;
@@ -768,8 +1025,9 @@ int main(int argc, char *argv[])
     std::function<bool()> showManager;
     const auto ensureProbe = [&]() {
         if (probe) return;
-        probe.reset(new Probe(Aurora::Application::pathTo(QStringLiteral("android-runtime")).toLocalFile(),
+        probe.reset(new Probe(Aurora::Application::organizationPathTo(SharedRuntime::location()).toLocalFile(),
                               nullptr, &diagnosticLog));
+        probe->setReportWebViewInitializer(initReportWebView);
         QObject::connect(probe.data(), &Probe::standaloneRpmError, probe.data(),
                          [&](const QString &, const QString &message) {
             if (view && view->isVisible()) return;

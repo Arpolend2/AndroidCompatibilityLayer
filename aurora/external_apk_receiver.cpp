@@ -106,7 +106,7 @@ bool ExternalApkReceiver::submit(const QStringList &arguments)
 
 bool ExternalApkReceiver::recordStoreResult(const QString &path, bool installed, const QByteArray &fingerprint)
 {
-    static const QRegularExpression name(QStringLiteral("^claimed_([0-9a-f]{32})\\.apks?$"));
+    static const QRegularExpression name(QStringLiteral("^claimed_([0-9a-f]{32})\\.(apk|apks|xapk)$"));
     static const QRegularExpression hash(QStringLiteral("^[0-9a-f]{64}$"));
     const QRegularExpressionMatch match = name.match(QFileInfo(path).fileName());
     if (!match.hasMatch() || (installed && !hash.match(QString::fromLatin1(fingerprint)).hasMatch()))

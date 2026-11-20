@@ -496,7 +496,7 @@ public final class AppRunner {
             if (request >= 0 && caller != null) sHandler.post(() -> caller.meglerActivityResult(request, Activity.RESULT_OK, null));
             return;
         }
-        if (megler.Installs.isInstall(i)) {
+        if (megler.Installs.isInstall(from, i)) {
             android.util.Log.d("Megler", "startActivity " + i + " -> Megler's installer");
             final Activity caller = from instanceof Activity ? (Activity) from : top();
             if (megler.Installs.hasInstallStatusProtocol()) {

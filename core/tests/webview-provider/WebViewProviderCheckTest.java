@@ -46,6 +46,7 @@ public final class WebViewProviderCheckTest {
     }
 
     public static void main(String[] args) throws Exception {
+        if (args.length > 1) throw new IllegalArgumentException("expected at most one provider APK path");
         byte[] dex = new byte[] { 'd', 'e', 'x', '\n', '0', '3', '5', 0 };
         String[] abis = { "arm64-v8a", "armeabi-v7a", "x86_64", "x86" };
         int[] classes = { 2, 1, 2, 1 }, machines = { 183, 40, 62, 3 };
@@ -72,5 +73,9 @@ public final class WebViewProviderCheckTest {
         Files.write(corrupt.toPath(), new byte[] { 1, 2, 3 });
         rejected(corrupt, "arm64-v8a", LIBRARY, "zip");
         System.out.println("PASS: WebView provider ABI/DEX/ELF preflight (no Chromium executed)");
+        if (args.length == 1) {
+            WebViewProviderCheck.check(new File(args[0]), "arm64-v8a", LIBRARY);
+            System.out.println("PASS: inspected ARM64 provider APK " + args[0]);
+        }
     }
 }

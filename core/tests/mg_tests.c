@@ -1710,6 +1710,17 @@ static void test_mmap_commit(void)
     c0 = mg_mem_committed(p, 64 * MB);
     CHECK(c0 == -1 || c0 == 0);
     CHECK(mprotect_(p + MB, MB, RW) == 0);
+    {
+        typedef int *(*errno_fn)(void);
+        errno_fn errno_ = (errno_fn)mg_bionic_find("__errno");
+        CHECK(errno_ != NULL);
+        if (errno_) {
+            *errno_() = 71;
+            CHECK(mprotect_(p + MB, MG_PAGE, 5) == 0 && *errno_() == 71);
+            CHECK(mprotect_(p + MB + 1, MG_PAGE, 5) == -1 && *errno_() == 22);
+            CHECK(mprotect_(p + MB, MG_PAGE, RW) == 0);
+        }
+    }
     c = mg_mem_committed(p, 64 * MB);
     CHECK(c == -1 || c == MB);
     say("  64 MB with no access: %lld bytes committed (-1: the host does not say); 1 MB of it given access: %lld", (long long)c0, (long long)c);

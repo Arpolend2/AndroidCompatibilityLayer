@@ -110,6 +110,12 @@ public:
             m_filterDrawErrors.fetch_add(1, std::memory_order_relaxed);
     }
 
+    void recordCanvasCopy()
+    {
+        if (updateEnabled())
+            m_canvasCopies.fetch_add(1, std::memory_order_relaxed);
+    }
+
     void finishReadback(const Sample &sample, quint64 elapsedUs, quint64 glUs, quint64 convertUs)
     {
         if (sample.enabled && sample.sampled && updateEnabled() && sample.epoch == m_epoch.load() && m_mutex.tryLock()) {
@@ -145,6 +151,7 @@ public:
         const quint64 filterFallbackGpu = m_filterFallbackGpu.exchange(0);
         const quint64 filterFallbackInvalid = m_filterFallbackInvalid.exchange(0);
         const quint64 filterDrawErrors = m_filterDrawErrors.exchange(0);
+        const quint64 canvasCopies = m_canvasCopies.exchange(0);
         QMutexLocker lock(&m_mutex);
         resetSamplesFor(m_epoch.load());
         const QString result = QStringLiteral(
@@ -154,14 +161,15 @@ public:
             "readback_present=%18 pixel_submit_samples=%19 pixel_submit_us=%20 pixel_submit_max_us=%21 "
             "filter_fallback_mode=%22 filter_fallback_blend=%23 filter_fallback_self=%24 filter_fallback_gles=%25 "
             "filter_fallback_invalid=%26 filter_draw_errors=%27 "
-            "readback_cache_flush=%28 readback_cache_filter=%29 readback_cache_self=%30 readback_cache_present=%31")
+            "readback_cache_flush=%28 readback_cache_filter=%29 readback_cache_self=%30 readback_cache_present=%31 "
+            "canvas_copies_gpu=%32")
             .arg(interval).arg(frames).arg(failed).arg(m_samples).arg(m_producerUs).arg(m_producerMaxUs)
             .arg(m_qtWaitUs).arg(m_qtWaitMaxUs).arg(readbacks).arg(m_readbackSamples).arg(m_readbackUs).arg(m_readbackMaxUs)
             .arg(readbackFlush).arg(readbackFilter).arg(readbackSelf).arg(m_readbackGlUs).arg(m_readbackConvertUs)
             .arg(readbackPresent).arg(m_pixelSubmitSamples).arg(m_pixelSubmitUs).arg(m_pixelSubmitMaxUs)
             .arg(filterFallbackMode).arg(filterFallbackBlend).arg(filterFallbackSelf).arg(filterFallbackGpu)
             .arg(filterFallbackInvalid).arg(filterDrawErrors)
-            .arg(cacheFlush).arg(cacheFilter).arg(cacheSelf).arg(cachePresent);
+            .arg(cacheFlush).arg(cacheFilter).arg(cacheSelf).arg(cachePresent).arg(canvasCopies);
         m_samples = m_producerUs = m_producerMaxUs = m_qtWaitUs = m_qtWaitMaxUs = 0;
         m_readbackSamples = m_readbackUs = m_readbackMaxUs = 0;
         m_readbackGlUs = m_readbackConvertUs = 0;
@@ -210,6 +218,7 @@ private:
             m_filterFallbackGpu.exchange(0);
             m_filterFallbackInvalid.exchange(0);
             m_filterDrawErrors.exchange(0);
+            m_canvasCopies.exchange(0);
             m_lastReportMs.store(m_clock.elapsed());
         }
         return enabled;
@@ -255,6 +264,7 @@ private:
     std::atomic<quint64> m_cacheFlush{0}, m_cacheFilter{0}, m_cacheSelf{0}, m_cachePresent{0};
     std::atomic<quint64> m_filterFallbackMode{0}, m_filterFallbackBlend{0}, m_filterFallbackSelf{0};
     std::atomic<quint64> m_filterFallbackGpu{0}, m_filterFallbackInvalid{0}, m_filterDrawErrors{0};
+    std::atomic<quint64> m_canvasCopies{0};
     QMutex m_mutex;
     quint64 m_sampleEpoch = 0;
     quint64 m_samples = 0, m_producerUs = 0, m_producerMaxUs = 0, m_qtWaitUs = 0, m_qtWaitMaxUs = 0;

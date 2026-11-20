@@ -56,6 +56,7 @@ struct DiagnosticLog::State {
     std::shared_ptr<Forward> forward[2];
     std::thread reader;
     bool stop = false;
+    bool optIn = false;
 
     void addText(const QString &source, const QString &value, Decoder &decoder)
     {
@@ -86,7 +87,7 @@ struct DiagnosticLog::State {
     {
         if (bytes.isEmpty()) return;
         QString text;
-        {
+        if (!optIn || ErrorLog::detailedCaptureEnabled()) {
             std::lock_guard<std::mutex> lock(mutex);
             auto &decoder = decoders[source];
             if (!decoder) decoder = std::make_shared<Decoder>();
@@ -186,6 +187,7 @@ bool DiagnosticLog::start(QString *error, bool persistStreams)
         if (error) *error = QStringLiteral("Log capture is already running.");
         return false;
     }
+    m_state->optIn = persistStreams;
     int pipes[2][2] = {{-1, -1}, {-1, -1}};
     for (int i = 0; i < 2; ++i) {
         m_state->savedFd[i] = ::fcntl(i + 1, F_DUPFD_CLOEXEC, 3);

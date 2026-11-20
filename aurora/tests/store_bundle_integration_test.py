@@ -70,6 +70,36 @@ def test(root, manager, session):
         "too-many": [("base.apk", base)] + [("split{}.apk".format(i), split) for i in range(11)],
         "oversized": [("base.apk", base), ("config.en.apk", split)],
         "filtered": [("base.apk", base), ("config.en.apk", split)],
+        "xapk-valid": [
+            ("base.apk", base),
+            ("config.en.apk", split),
+            ("manifest.json", json.dumps({
+                "package_name": "org.example.splitfixture",
+                "expansions": [{
+                    "file": "Android/obb/org.example.splitfixture/main.7.org.example.splitfixture.obb",
+                    "install_path": "Android/obb/org.example.splitfixture/main.7.org.example.splitfixture.obb",
+                }],
+            }).encode("utf-8")),
+            ("Android/obb/org.example.splitfixture/main.7.org.example.splitfixture.obb", b"fixture expansion"),
+        ],
+        "xapk-traversal": [
+            ("base.apk", base),
+            ("Android/obb/org.example.splitfixture/../../escape.obb", b"not allowed"),
+        ],
+        "xapk-missing-expansion": [
+            ("base.apk", base),
+            ("manifest.json", json.dumps({
+                "package_name": "org.example.splitfixture",
+                "expansions": [{
+                    "file": "Android/obb/org.example.splitfixture/missing.obb",
+                    "install_path": "Android/obb/org.example.splitfixture/missing.obb",
+                }],
+            }).encode("utf-8")),
+        ],
+        "xapk-mismatched-package": [
+            ("base.apk", base),
+            ("config.en.apk", (root / "wrong-package.apk").read_bytes()),
+        ],
         "corrupt": None,
     }
     if session:
@@ -79,7 +109,9 @@ def test(root, manager, session):
             work = Path(temporary)
             data = work / "data"
             data.mkdir()
-            source = work / "input.apks"
+            is_xapk = name.startswith("xapk-")
+            source = work / ("input.xapk" if is_xapk else "input.apks")
+            snapshot = work / ("copy.xapk" if is_xapk else "copy.apks")
             if name == "java-session":
                 source.write_bytes(session.read_bytes())
             elif entries is None:
@@ -94,19 +126,25 @@ def test(root, manager, session):
                 second = contents.index(b"PK\x01\x02", first + 4)
                 struct.pack_into("<I", contents, second + 24, 512 * 1024 * 1024 + 1)
                 source.write_bytes(contents)
-            command = [manager, "--unpack-store-bundle", str(work), str(data), str(source),
-                       str(work / "copy.apks"), str(work / "base.apk"), str(work / "splits"),
+            command = [manager, "--unpack-store-xapk" if is_xapk else "--unpack-store-bundle",
+                       str(work), str(data), str(source),
+                       str(snapshot), str(work / "base.apk"), str(work / "splits"),
                        "160", "ru" if name == "filtered" else "en"]
             result = subprocess.run(command, capture_output=True, text=True, timeout=60,
                                     env={**os.environ, "QT_QPA_PLATFORM": "minimal", "LC_ALL": "C"})
-            if name in ("valid", "java-session"):
+            if name in ("valid", "java-session", "xapk-valid"):
                 assert result.returncode == 0, (name, result.stdout, result.stderr)
                 report = json.loads(result.stdout)
                 assert report["ok"] and report["package"] == "org.example.splitfixture"
                 assert len(report["splits"]) == 1
                 assert (work / "base.apk").read_bytes() == base
                 assert (work / "splits" / "split_config.en.apk").read_bytes() == split
-                assert not (work / "copy.apks").exists()
+                assert not snapshot.exists()
+                if name == "xapk-valid":
+                    obb = data / "apps" / "org.example.splitfixture" / "sdcard" / "Android" / "obb" / \
+                        "org.example.splitfixture" / "main.7.org.example.splitfixture.obb"
+                    assert obb.read_bytes() == b"fixture expansion"
+                    assert len(report["expansions"]) == 1 and "to" in report["expansions"][0]
             else:
                 assert result.returncode != 0, (name, result.stdout, result.stderr)
                 if name == "filtered":

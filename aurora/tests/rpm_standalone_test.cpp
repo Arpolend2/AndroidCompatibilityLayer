@@ -9,6 +9,7 @@
 
 #include "../apk_store.h"
 #include "../permission_settings.h"
+#include "../standalone_app_mapping.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -59,6 +60,7 @@ int main(int argc, char **argv)
         !write(appDir + QStringLiteral("/splits/config.apk"), "split content") ||
         !write(appDir + QStringLiteral("/data/secret"), "private data must stay private") ||
         !write(runtime + QStringLiteral("/runtime.dex"), "runtime content") ||
+        !write(runtime + QStringLiteral("/.standalone-abi"), QByteArray(STANDALONE_RUNTIME_ABI) + "\n") ||
         !write(qml + QStringLiteral("/androidcompatibilitylayer_ru.qm"), "translation catalog content") ||
         !write(root.filePath(QStringLiteral("qml-source.qml")), "linked qml content") ||
         !write(root.filePath(QStringLiteral("binary-source")), "binary content") ||
@@ -96,12 +98,74 @@ int main(int argc, char **argv)
     const QString qmlLink = root.filePath(QStringLiteral("qml-link"));
     if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error) || output.isEmpty()) return 1;
+    const QString cacheDir = appDir + QStringLiteral("/standalone-rpm");
+    if (!QDir().mkpath(cacheDir)) return 1;
+    const QString cached = QDir(cacheDir).filePath(QFileInfo(output).fileName());
+    if (!QFile::copy(output, cached) || !StandaloneAppMapping::save(cacheDir, cached)) return 1;
+    const auto fingerprint = [&]() {
+        return RpmStandalone::cacheFingerprint(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+                                                store, runtimeLink, qmlLink, binary, false);
+    };
+    const QByteArray original = fingerprint();
+    if (original.isEmpty() || !RpmStandalone::saveCache(cacheDir, cached, original) ||
+        RpmStandalone::cachedRpm(cacheDir, fingerprint()) != cached) return 1;
+    int generated = 0;
+    QString resolved;
+    bool hit = false;
+    const auto generate = [&](QString *path) {
+        ++generated;
+        *path = QStringLiteral("generated.rpm");
+        return true;
+    };
+    const auto resolve = [&]() {
+        return RpmStandalone::reuseOrGenerate([&]() { return RpmStandalone::cachedRpm(cacheDir, fingerprint()); },
+                                               generate, &resolved, &hit);
+    };
+    if (!resolve() || !hit || generated != 0 || resolved != cached) return 1;
+    if (!PermissionSettings::save(appDir, QStringList() << QStringLiteral("location") << QStringLiteral("camera"), &error) ||
+        fingerprint() != original ||
+        !PermissionSettings::save(appDir, QStringList() << QStringLiteral("camera"), &error) ||
+        !RpmStandalone::cachedRpm(cacheDir, fingerprint()).isEmpty() ||
+        !PermissionSettings::save(appDir, QStringList() << QStringLiteral("camera") << QStringLiteral("location")
+                                                         << QStringLiteral("microphone"), &error) ||
+        !RpmStandalone::cachedRpm(cacheDir, fingerprint()).isEmpty() ||
+        !PermissionSettings::save(appDir, QStringList() << QStringLiteral("camera") << QStringLiteral("location"), &error))
+        return 1;
+    if (!PermissionSettings::save(appDir, QStringList() << QStringLiteral("camera"), &error)) return 1;
+    const QByteArray narrower = fingerprint();
+    if (!RpmStandalone::saveCache(cacheDir, cached, narrower) ||
+        !PermissionSettings::save(appDir, QStringList() << QStringLiteral("camera") << QStringLiteral("location"), &error) ||
+        !RpmStandalone::cachedRpm(cacheDir, fingerprint()).isEmpty() ||
+        !RpmStandalone::saveCache(cacheDir, cached, original)) return 1;
+    if (!write(root.filePath(QStringLiteral("source.apk")), "apk contenT") ||
+        RpmStandalone::cachedRpm(cacheDir, fingerprint()) == cached ||
+        !resolve() || hit || generated != 1 || resolved != QLatin1String("generated.rpm") ||
+        !write(root.filePath(QStringLiteral("source.apk")), "apk content") ||
+        !write(root.filePath(QStringLiteral("binary-source")), "binary contenT") ||
+        RpmStandalone::cachedRpm(cacheDir, fingerprint()) == cached ||
+        !write(root.filePath(QStringLiteral("binary-source")), "binary content") ||
+        !write(appDir + QStringLiteral("/splits/config.apk"), "split contenT") ||
+        RpmStandalone::cachedRpm(cacheDir, fingerprint()) == cached ||
+        !write(appDir + QStringLiteral("/splits/config.apk"), "split content") ||
+        !write(root.filePath(QStringLiteral("qml-source.qml")), "changed qml content") ||
+        !RpmStandalone::cachedRpm(cacheDir, fingerprint()).isEmpty() ||
+        !write(root.filePath(QStringLiteral("qml-source.qml")), "linked qml content") ||
+        !write(runtime + QStringLiteral("/.standalone-abi"), "999999\n") ||
+        !fingerprint().isEmpty() ||
+        !write(runtime + QStringLiteral("/.standalone-abi"), QByteArray(STANDALONE_RUNTIME_ABI) + "\n") ||
+        RpmStandalone::cachedRpm(cacheDir, fingerprint()) != cached ||
+        !write(cached, "corrupt") || !RpmStandalone::cachedRpm(cacheDir, fingerprint()).isEmpty()) return 1;
     QFile rpm(output);
     if (!rpm.open(QIODevice::ReadOnly)) return 1;
     const QByteArray contents = rpm.readAll();
     if (contents.contains("private data must stay private") ||
+        contents.contains("runtime content") ||
+        contents.contains("/android-runtime/") ||
+        !contents.contains(QByteArray("\"sharedRuntimeAbi\":\"") + STANDALONE_RUNTIME_ABI + "\"") ||
         !contents.contains("translation catalog content") ||
+        !contents.contains("\"standaloneSnapshots\":true") ||
         !contents.contains("\"fileDiagnostics\":false") ||
+        contents.contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;Documents\n") ||
         !contents.contains("OrganizationName=ru.androidcompatibilitylayer\nApplicationName=Android") ||
         !contents.contains("\"deniedPermissions\":[\"camera\",\"location\"]") ||
         !contents.contains("Permissions=Internet;Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;Bluetooth\n")) return 1;
@@ -125,7 +189,8 @@ int main(int argc, char **argv)
     if (!diagnosticRpm.open(QIODevice::ReadOnly)) return 1;
     const QByteArray diagnosticContents = diagnosticRpm.readAll();
     if (!diagnosticContents.contains("\"fileDiagnostics\":true") ||
-        !diagnosticContents.contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;Documents\n")) return 1;
+        !diagnosticContents.contains("\"standaloneSnapshots\":true") ||
+        diagnosticContents.contains("Documents\n")) return 1;
     apkReport = R"({"ok":true,"package":"org.example.app","permissions":["android.permission.NEARBY_WIFI_DEVICES","android.permission.UWB_RANGING"],"permissionMaxSdk":[0,0]})";
     if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;
@@ -136,8 +201,10 @@ int main(int argc, char **argv)
     if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;
     QFile storageRpm(output);
-    if (!storageRpm.open(QIODevice::ReadOnly) ||
-        !storageRpm.readAll().contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;UserDirs\n")) return 1;
+    if (!storageRpm.open(QIODevice::ReadOnly)) return 1;
+    const QByteArray storageContents = storageRpm.readAll();
+    if (!storageContents.contains("\"standaloneSnapshots\":true") ||
+        !storageContents.contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;UserDirs\n")) return 1;
     if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error, true)) return 1;
     QFile diagnosticStorageRpm(output);
@@ -149,16 +216,25 @@ int main(int argc, char **argv)
     apkReport = R"({"ok":true,"package":"org.example.app","permissions":[],"permissionMaxSdk":[]})";
     if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error) || output == first) return 1;
-    const QString cycle = runtime + QStringLiteral("/cycle");
-    if (!QFile::link(runtime, cycle) ||
+    const QString cycle = qml + QStringLiteral("/cycle");
+    if (!QFile::link(qml, cycle) ||
         RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error) ||
         !error.contains(QStringLiteral("cycle")) || !QFile::remove(cycle)) return 1;
-    const QString dataLink = runtime + QStringLiteral("/private");
+    const QString dataLink = qml + QStringLiteral("/private");
     if (!QFile::link(appDir + QStringLiteral("/data"), dataLink) ||
         RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error) ||
         !error.contains(QStringLiteral("private app data")) || !QFile::remove(dataLink)) return 1;
+    if (!QFile::remove(runtime + QStringLiteral("/.standalone-abi")) ||
+        RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+            store, runtimeLink, qmlLink, binary, out, &output, &error) ||
+        error.isEmpty()) return 1;
+    if (!write(runtime + QStringLiteral("/.standalone-abi"),
+               QByteArray(STANDALONE_RUNTIME_ABI) == "1" ? "2\n" : "1\n") ||
+        RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+            store, runtimeLink, qmlLink, binary, out, &output, &error) ||
+        !error.contains(QStringLiteral("incompatible"))) return 1;
 #ifdef Q_OS_UNIX
     const QString broken = qml + QStringLiteral("/broken");
     if (::symlink("missing-target", QFile::encodeName(broken).constData()) != 0 ||

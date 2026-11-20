@@ -1,3 +1,4 @@
+#include "application_executables.h"
 #include "apk_bundle_install.h"
 
 #include "apk_store.h"
@@ -20,7 +21,7 @@ namespace {
 class BundleSnapshotThread : public QThread
 {
 public:
-    QString source, destination, error;
+    QString source, destination, extension, error;
     QByteArray fingerprint;
     void run() override
     {
@@ -28,7 +29,8 @@ public:
         const QFileInfo file(source);
         std::string why;
         if (!snapshot.capture(file.absolutePath().toUtf8().toStdString(),
-                              source.toUtf8().toStdString(), "handoff.apks",
+                              source.toUtf8().toStdString(),
+                              ("handoff." + extension).toUtf8().toStdString(),
                               512u * 1024 * 1024, &why, true)) {
             error = QString::fromStdString(why);
             return;
@@ -87,7 +89,7 @@ bool ApkBundleInstall::start(const QString &path, QString *error, bool storeHand
 
     const QFileInfo source(path);
     const QString suffix = source.suffix().toLower();
-    if ((storeHandoff && suffix != QLatin1String("apks")) ||
+    if ((storeHandoff && suffix != QLatin1String("apks") && suffix != QLatin1String("xapk")) ||
         (suffix != QLatin1String("apks") && suffix != QLatin1String("xapk"))) {
         if (error) *error = tr("Only .apks and .xapk bundles are supported.");
         return false;
@@ -120,21 +122,24 @@ bool ApkBundleInstall::start(const QString &path, QString *error, bool storeHand
 
     if (storeHandoff) {
         m_storeHandoff = true;
+        m_storeSourceName = QStringLiteral(".store-source.%1").arg(suffix);
         BundleSnapshotThread *worker = new BundleSnapshotThread;
         worker->source = source.absoluteFilePath();
-        worker->destination = staging.filePath(QStringLiteral(".store-source.apks"));
+        worker->extension = suffix;
+        worker->destination = staging.filePath(m_storeSourceName);
         m_snapshotWorker = worker;
         connect(worker, &QThread::finished, this, [this, worker]() {
             m_snapshotWorker = nullptr;
             const QString error = worker->error;
             const QString source = worker->destination;
+            const QString extension = worker->extension;
             m_fingerprint = worker->fingerprint;
             worker->deleteLater();
             if (!error.isEmpty()) {
                 finish(false, error);
                 return;
             }
-            startImporter(source, QStringLiteral("apks"), true);
+            startImporter(source, extension, true);
         });
         worker->start();
         return true;
@@ -148,7 +153,10 @@ void ApkBundleInstall::startImporter(const QString &source, const QString &suffi
     const QDir staging(m_temporaryDirectory->path());
     const QString dataPath = staging.filePath(QStringLiteral("data"));
     QStringList arguments;
-    arguments << (storeHandoff ? QStringLiteral("--unpack-store-bundle") : QStringLiteral("--unpack-bundle"))
+    const QString mode = storeHandoff && suffix == QLatin1String("xapk")
+        ? QStringLiteral("--unpack-store-xapk")
+        : storeHandoff ? QStringLiteral("--unpack-store-bundle") : QStringLiteral("--unpack-bundle");
+    arguments << mode
               << m_androidRoot
               << dataPath
               << source
@@ -174,7 +182,7 @@ void ApkBundleInstall::startImporter(const QString &source, const QString &suffi
             }
         });
     }
-    m_process->start(QCoreApplication::applicationFilePath(), arguments);
+    m_process->start(ApplicationExecutables::worker(), arguments);
 }
 
 void ApkBundleInstall::processFinished(int exitCode, QProcess::ExitStatus status)
@@ -209,7 +217,7 @@ void ApkBundleInstall::processFinished(int exitCode, QProcess::ExitStatus status
     const ApkStore store(m_storeRoot);
     const QString apk = store.apkPath(package);
     const QDir staging(m_temporaryDirectory->path());
-    if (m_storeHandoff && !QFile::remove(staging.filePath(QStringLiteral(".store-source.apks")))) {
+    if (m_storeHandoff && !QFile::remove(staging.filePath(m_storeSourceName))) {
         finish(false, tr("Could not remove the temporary APK bundle copy."));
         return;
     }
@@ -281,6 +289,7 @@ void ApkBundleInstall::finish(bool installed, const QString &message)
     m_temporaryDirectory = nullptr;
     m_prompting = false;
     m_storeHandoff = false;
+    m_storeSourceName.clear();
     m_package.clear();
     m_fingerprint.clear();
     emit finished(installed, message, package, fingerprint);

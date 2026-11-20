@@ -40,6 +40,7 @@ private:
     QProcess *m_process;
     QThread *m_snapshotWorker = nullptr;
     QString m_package;
+    QString m_storeSourceName;
     bool m_prompting = false;
     bool m_storeHandoff = false;
     QByteArray m_fingerprint;

@@ -173,8 +173,9 @@ int main(int argc, char **argv)
     const PreviewGpuMetrics::Sample disabledSample = metrics->beginPresent();
     metrics->finishPresent(false, disabledSample, 12, 34);
     metrics->recordReadbackCacheHit(PreviewGpuReadbackReason::Filter);
+    metrics->recordCanvasCopy();
     const QString emptyCache = QStringLiteral(
-        "readback_cache_flush=0 readback_cache_filter=0 readback_cache_self=0 readback_cache_present=0");
+        "readback_cache_flush=0 readback_cache_filter=0 readback_cache_self=0 readback_cache_present=0 canvas_copies_gpu=0");
     const QString disabledInitial = metrics->takeReport();
     if (!expect(!disabledSample.enabled && disabledInitial.contains(QStringLiteral("frames=0 failed=0 samples=0")) &&
                 disabledInitial.endsWith(emptyCache),
@@ -219,7 +220,7 @@ int main(int argc, char **argv)
     report.contains(QStringLiteral("filter_fallback_mode=1 filter_fallback_blend=1 filter_fallback_self=1 "
                                    "filter_fallback_gles=1 filter_fallback_invalid=1 filter_draw_errors=1")) &&
                 report.endsWith(QStringLiteral(
-                    "readback_cache_flush=1 readback_cache_filter=1 readback_cache_self=1 readback_cache_present=1")),
+                    "readback_cache_flush=1 readback_cache_filter=1 readback_cache_self=1 readback_cache_present=1 canvas_copies_gpu=0")),
                 "GPU metrics aggregate sampled timings and failures") ||
         !expect(metrics->takeReport().endsWith(emptyCache), "GPU cache hits reset after a report"))
         return 1;
@@ -497,6 +498,11 @@ int main(int argc, char **argv)
     const int filterReportsBefore = metricReports.load();
     const QtMessageHandler priorFilterHandler = qInstallMessageHandler(captureMetric);
     const bool metricFrameStarted = host.present(host.user, filteredGpuCanvas, 0, 0, filterWidth, filterHeight);
+    int explicitFlushes = 0;
+    const auto flushForComparison = [&]() {
+        host.flush(host.user, filteredGpuCanvas);
+        ++explicitFlushes;
+    };
     if (metricFrameStarted)
         QThread::msleep(3050);
 
@@ -542,7 +548,7 @@ int main(int argc, char **argv)
         cpuHost->restore(cpuHost->user, filteredCpuCanvas);
         if (filterMode == MEGLER_GFX_BLEND_CLEAR)
             filteredDrawStayedGpu = filteredGpuPixels.count(char(0x5a)) == filteredGpuPixels.size();
-        host.flush(host.user, filteredGpuCanvas);
+        flushForComparison();
         const bool modeMatches = pixelsMatch(filteredGpuPixels, filteredCpuPixels, 2);
         if (!modeMatches) {
             std::fprintf(stderr, "Filter mode %d max pixel difference %d\n", filterMode,
@@ -593,13 +599,132 @@ int main(int argc, char **argv)
         cpuHost->draw_rect(cpuHost->user, filteredCpuCanvas, 28, 30, 52, 52, &shapeTint, nullptr);
         host.restore(host.user, filteredGpuCanvas);
         cpuHost->restore(cpuHost->user, filteredCpuCanvas);
-        host.flush(host.user, filteredGpuCanvas);
+        flushForComparison();
         const bool modeMatches = pixelsMatch(filteredGpuPixels, filteredCpuPixels, 2);
         if (!modeMatches)
             std::fprintf(stderr, "Paint blend mode %d max pixel difference %d\n", blendMode,
                          pixelsMaxDifference(filteredGpuPixels, filteredCpuPixels));
         filteredPixelsMatch = modeMatches && filteredPixelsMatch;
     }
+
+    // Keep the source CPU mirror stale through the supported GPU copies.
+    megler_gfx_image sourceImage = {};
+    sourceImage.width = 16;
+    sourceImage.height = 12;
+    sourceImage.stride = 16 * 4;
+    QByteArray copyGpuPixels(sourceImage.stride * sourceImage.height, char(0));
+    QByteArray copyCpuPixels = QByteArray(sourceImage.stride * sourceImage.height, char(0));
+    void *copyGpu = host.canvas_new(host.user, copyGpuPixels.data(), sourceImage.width, sourceImage.height, sourceImage.stride);
+    void *copyCpu = cpuHost->canvas_new(cpuHost->user, copyCpuPixels.data(), sourceImage.width, sourceImage.height, sourceImage.stride);
+    bool canvasCopiesMatch = copyGpu && copyCpu && host.draw_canvas;
+    bool scaledCopyMatches = false;
+    if (canvasCopiesMatch) {
+        host.draw_color(host.user, copyGpu, 0x9848b060u, MEGLER_GFX_BLEND_SRC);
+        cpuHost->draw_color(cpuHost->user, copyCpu, 0x9848b060u, MEGLER_GFX_BLEND_SRC);
+        host.draw_rect(host.user, copyGpu, 1, 2, 4, 6, &paint, nullptr);
+        cpuHost->draw_rect(cpuHost->user, copyCpu, 1, 2, 4, 6, &paint, nullptr);
+        host.draw_color(host.user, filteredGpuCanvas, translucentBackground, MEGLER_GFX_BLEND_SRC);
+        cpuHost->draw_color(cpuHost->user, filteredCpuCanvas, translucentBackground, MEGLER_GFX_BLEND_SRC);
+        const float region[] = {1, 2, 12, 10};
+        const float first[] = {3, 5, 14, 13};
+        const float unsupportedScale[] = {3, 5, 25, 20};
+        const float scaled[] = {24, 4, 46, 20};
+        const float second[] = {25, 24, 36, 32};
+        const float copiedRegion[] = {8, 12, 19, 20};
+        megler_gfx_paint copyPaint = tintPaint;
+        copyPaint.color = 0xffffffffu;
+        copyPaint.blend = MEGLER_GFX_BLEND_SRC_OVER;
+        copyPaint.filter_mode = -1;
+        host.save(host.user, filteredGpuCanvas);
+        cpuHost->save(cpuHost->user, filteredCpuCanvas);
+        host.set_matrix(host.user, filteredGpuCanvas, translated);
+        cpuHost->set_matrix(cpuHost->user, filteredCpuCanvas, translated);
+        host.clip_rect(host.user, filteredGpuCanvas, 3, 5, 14, 12, MEGLER_GFX_CLIP_INTERSECT);
+        cpuHost->clip_rect(cpuHost->user, filteredCpuCanvas, 3, 5, 14, 12, MEGLER_GFX_CLIP_INTERSECT);
+        const bool rejectedScaling = !host.draw_canvas(host.user, filteredGpuCanvas, copyGpu, region, unsupportedScale, &copyPaint);
+        const bool copiedCanvas = host.draw_canvas(host.user, filteredGpuCanvas, copyGpu, region, first, &copyPaint);
+        sourceImage.pixels = copyCpuPixels.constData();
+        cpuHost->draw_bitmap(cpuHost->user, filteredCpuCanvas, &sourceImage, region, first, &copyPaint);
+        host.restore(host.user, filteredGpuCanvas);
+        cpuHost->restore(cpuHost->user, filteredCpuCanvas);
+        host.set_matrix(host.user, filteredGpuCanvas, identityForFilter);
+        cpuHost->set_matrix(cpuHost->user, filteredCpuCanvas, identityForFilter);
+        sourceImage.width = filterWidth;
+        sourceImage.height = filterHeight;
+        sourceImage.stride = filterStride;
+        sourceImage.pixels = filteredGpuPixels.data();
+        copyPaint.filter_mode = MEGLER_GFX_BLEND_SRC_IN;
+        host.draw_bitmap(host.user, filteredGpuCanvas, &sourceImage, copiedRegion, second, &copyPaint);
+        sourceImage.pixels = filteredCpuPixels.data();
+        cpuHost->draw_bitmap(cpuHost->user, filteredCpuCanvas, &sourceImage, copiedRegion, second, &copyPaint);
+        flushForComparison();
+        canvasCopiesMatch = rejectedScaling && copiedCanvas && copyGpuPixels.count(char(0)) == copyGpuPixels.size() &&
+                            pixelsMatch(filteredGpuPixels, filteredCpuPixels, 2);
+        if (!canvasCopiesMatch) {
+            std::fprintf(stderr, "Canvas copy: scaling rejected=%d copy accepted=%d source mirror unchanged=%d max pixel difference=%d\n",
+                         int(rejectedScaling), int(copiedCanvas), int(copyGpuPixels.count(char(0)) == copyGpuPixels.size()),
+                         pixelsMaxDifference(filteredGpuPixels, filteredCpuPixels));
+            for (int i = 0, shown = 0; i < filteredGpuPixels.size() && shown < 8; i += 4) {
+                if (!pixelsMatch(filteredGpuPixels.mid(i, 4), filteredCpuPixels.mid(i, 4), 2)) {
+                    std::fprintf(stderr, "  (%d,%d) GPU=%s CPU=%s\n", i / 4 % filterWidth, i / 4 / filterWidth,
+                                 filteredGpuPixels.mid(i, 4).toHex().constData(), filteredCpuPixels.mid(i, 4).toHex().constData());
+                    ++shown;
+                }
+            }
+        }
+
+        const bool hasBlit = shareContext.format().majorVersion() >= 3;
+        host.draw_color(host.user, copyGpu, 0xff48b060u, MEGLER_GFX_BLEND_SRC);
+        cpuHost->draw_color(cpuHost->user, copyCpu, 0xff48b060u, MEGLER_GFX_BLEND_SRC);
+        host.draw_rect(host.user, copyGpu, 1, 2, 4, 6, &paint, nullptr);
+        cpuHost->draw_rect(cpuHost->user, copyCpu, 1, 2, 4, 6, &paint, nullptr);
+        megler_gfx_paint clearPaint = paint;
+        clearPaint.flags = 0;
+        clearPaint.blend = MEGLER_GFX_BLEND_CLEAR;
+        host.draw_rect(host.user, copyGpu, 7, 5, 10, 9, &clearPaint, nullptr);
+        cpuHost->draw_rect(cpuHost->user, copyCpu, 7, 5, 10, 9, &clearPaint, nullptr);
+        host.draw_color(host.user, filteredGpuCanvas, 0xff183050u, MEGLER_GFX_BLEND_SRC);
+        cpuHost->draw_color(cpuHost->user, filteredCpuCanvas, 0xff183050u, MEGLER_GFX_BLEND_SRC);
+        host.save(host.user, filteredGpuCanvas);
+        cpuHost->save(cpuHost->user, filteredCpuCanvas);
+        host.set_matrix(host.user, filteredGpuCanvas, translated);
+        cpuHost->set_matrix(cpuHost->user, filteredCpuCanvas, translated);
+        // Cut the first row and column of the 2x copy to test its sampling phase.
+        host.clip_rect(host.user, filteredGpuCanvas, 25, 5, 46, 20, MEGLER_GFX_CLIP_INTERSECT);
+        cpuHost->clip_rect(cpuHost->user, filteredCpuCanvas, 25, 5, 46, 20, MEGLER_GFX_CLIP_INTERSECT);
+        copyPaint.filter_mode = -1;
+        copyPaint.flags = MEGLER_GFX_FILTER_BITMAP;
+        const bool rejectedLinear = !host.draw_canvas(host.user, filteredGpuCanvas, copyGpu, region, scaled, &copyPaint);
+        copyPaint.flags = 0;
+        copyPaint.color = 0x80ffffffu;
+        const bool rejectedAlpha = !host.draw_canvas(host.user, filteredGpuCanvas, copyGpu, region, scaled, &copyPaint);
+        copyPaint.color = 0xffffffffu;
+        copyPaint.filter_mode = MEGLER_GFX_BLEND_SRC_IN;
+        const bool rejectedFilter = !host.draw_canvas(host.user, filteredGpuCanvas, copyGpu, region, scaled, &copyPaint);
+        copyPaint.filter_mode = -1;
+        const bool copiedScaled = host.draw_canvas(host.user, filteredGpuCanvas, copyGpu, region, scaled, &copyPaint);
+        sourceImage.width = 16;
+        sourceImage.height = 12;
+        sourceImage.stride = 16 * 4;
+        sourceImage.pixels = copyCpuPixels.constData();
+        if (hasBlit)
+            cpuHost->draw_bitmap(cpuHost->user, filteredCpuCanvas, &sourceImage, region, scaled, &copyPaint);
+        host.restore(host.user, filteredGpuCanvas);
+        cpuHost->restore(cpuHost->user, filteredCpuCanvas);
+        host.set_matrix(host.user, filteredGpuCanvas, identityForFilter);
+        cpuHost->set_matrix(cpuHost->user, filteredCpuCanvas, identityForFilter);
+        flushForComparison();
+        scaledCopyMatches = rejectedLinear && rejectedAlpha && rejectedFilter && copiedScaled == hasBlit &&
+                            copyGpuPixels.count(char(0)) == copyGpuPixels.size() &&
+                            pixelsMatch(filteredGpuPixels, filteredCpuPixels, 0);
+        std::fprintf(stderr, "2x copy: %s (GLES3=%d accepted=%d max pixel difference=%d)\n",
+                     scaledCopyMatches ? "PASS" : "FAIL", int(hasBlit), int(copiedScaled),
+                     pixelsMaxDifference(filteredGpuPixels, filteredCpuPixels));
+    }
+    if (copyGpu)
+        host.canvas_free(host.user, copyGpu);
+    if (copyCpu)
+        cpuHost->canvas_free(cpuHost->user, copyCpu);
 
     const bool filterPresent = host.present(host.user, filteredGpuCanvas, 0, 0, filterWidth, filterHeight);
     const bool filterReportFinished = QThreadPool::globalInstance()->waitForDone(3000);
@@ -610,16 +735,23 @@ int main(int argc, char **argv)
         QMutexLocker lock(&metricReportMutex);
         filterReport = lastMetricReport;
     }
-    if (!expect(metricFrameStarted && filteredDrawStayedGpu,
+    if (!expect(scaledCopyMatches, "2x Canvas copy matches CPU pixels, or declines without touching the target") ||
+        !expect(metricFrameStarted && filteredDrawStayedGpu,
                 "supported color-filter draws do not read the target back to CPU") ||
         !expect(filteredPixelsMatch, "all color-filter modes match CPU pixels for bitmap and shape under alpha, clip and transform") ||
+        !expect(canvasCopiesMatch, "GPU canvas copies match CPU; unsupported scaling requests fallback") ||
         !expect(filterPresent && filterReportFinished && metricReports.load() > filterReportsBefore &&
                 filterReport.contains(QStringLiteral("readback_filter=0")) &&
                 filterReport.contains(QStringLiteral("readback_present=0")) &&
+                filterReport.contains(QStringLiteral("readback_self=0")) &&
+                filterReport.contains(QStringLiteral(" readback_flush=%1 ").arg(explicitFlushes)) &&
+                filterReport.contains(shareContext.format().majorVersion() >= 3
+                    ? QStringLiteral("canvas_copies_gpu=3") : QStringLiteral("canvas_copies_gpu=2")) &&
                 filterReport.contains(QStringLiteral("filter_fallback_mode=0 filter_fallback_blend=0 "
                                                      "filter_fallback_self=0 filter_fallback_gles=0 "
                                                      "filter_fallback_invalid=0 filter_draw_errors=0")),
                 "supported color-filter draws report no filter or presentation readbacks")) {
+        std::fprintf(stderr, "GPU copy/filter metrics: %s\n", qPrintable(filterReport));
         host.canvas_free(host.user, filteredGpuCanvas);
         cpuHost->canvas_free(cpuHost->user, filteredCpuCanvas);
         return failCanvas();
@@ -699,7 +831,7 @@ int main(int argc, char **argv)
         return failCanvas();
 
     host.canvas_free(host.user, canvas);
-    if (!expect(presented.releases == 2, "both presented textures are released after scene-graph removal")) {
+    if (!expect(presented.releases == 3, "the release callback runs for both presented textures and the copy source")) {
         shareContext.doneCurrent();
         return 1;
     }

@@ -63,6 +63,7 @@ bool hasModifierIntersection(EGLDisplay display, EGLint format, EGLuint64KHR mod
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
+    const bool gbmProbe = app.arguments().contains(QStringLiteral("--gbm-probe"));
     EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     EGLint major = 0, minor = 0;
     if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor)) {
@@ -70,10 +71,10 @@ int main(int argc, char **argv)
         return 77;
     }
     const char *eglExtensions = eglQueryString(display, EGL_EXTENSIONS);
-    if (!hasExtension(eglExtensions, "EGL_EXT_image_dma_buf_import") ||
+    if (!gbmProbe && (!hasExtension(eglExtensions, "EGL_EXT_image_dma_buf_import") ||
         !hasExtension(eglExtensions, "EGL_MESA_image_dma_buf_export") ||
         !hasExtension(eglExtensions, "EGL_KHR_image_base") ||
-        !hasExtension(eglExtensions, "EGL_KHR_gl_texture_2D_image")) {
+        !hasExtension(eglExtensions, "EGL_KHR_gl_texture_2D_image"))) {
         eglTerminate(display);
         qInfo("SKIP: EGL/GLES DMA-BUF export/import extensions are unavailable");
         return 77;
@@ -100,6 +101,15 @@ int main(int argc, char **argv)
         eglTerminate(display);
         qInfo("SKIP: EGL could not create an ES2 pbuffer context");
         return 77;
+    }
+    if (gbmProbe) {
+        const QString result = EmbeddedGpuTransport::probeGbmRenderTarget(64, 64);
+        qInfo().noquote() << "Embedded GPU GBM probe:" << result;
+        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(display, surface);
+        eglDestroyContext(display, context);
+        eglTerminate(display);
+        return result.startsWith(QLatin1String("unavailable:")) ? 77 : 0;
     }
     if (!hasExtension(reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS)), "GL_OES_EGL_image")) {
         eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

@@ -4,7 +4,7 @@
 # javac against the SDK's android.jar, d8, and the NDK for the one that has
 # native code -- and not signed (the layer asks no signature of an APK).
 #
-#   tools/build-test-app.sh [--force]
+#   tools/build-test-app.sh [--force] [app]
 #
 #   core/tests/app/<name>/AndroidManifest.xml, res/, src/, assets/, jni/   ->   build/guest/java/<name>.apk
 #
@@ -48,25 +48,35 @@
 # given. Nothing is downloaded.
 #
 #   MEGLER_JDK          a JDK's folder (C:\Program Files\Java\jdk1.8.0_202)
-#   MEGLER_ANDROID_SDK  an Android SDK with build-tools 29.0.3 (aapt2, d8)
-#                          and platforms/android-29 (the user's Documents
-#                          folder). The apps use nothing newer than API 28.
+#   MEGLER_ANDROID_SDK  an Android SDK (the user's Documents folder)
+#   MEGLER_BUILD_TOOLS_VERSION  build-tools version (default 29.0.3)
+#   MEGLER_ANDROID_PLATFORM     platform name (default android-29)
 #   MEGLER_NDK          an Android NDK (android-ndk-r21e in the user's
 #                          Documents folder), for the apps with jni/.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 JDK="${MEGLER_JDK:-/c/Program Files/Java/jdk1.8.0_202}"
 SDK="${MEGLER_ANDROID_SDK:-$USERPROFILE/Documents}"
-BT="$SDK/build-tools/29.0.3"
+BUILD_TOOLS_VERSION="${MEGLER_BUILD_TOOLS_VERSION:-29.0.3}"
+ANDROID_PLATFORM="${MEGLER_ANDROID_PLATFORM:-android-29}"
+BT="$SDK/build-tools/$BUILD_TOOLS_VERSION"
 NDK="${MEGLER_NDK:-$USERPROFILE/Documents/android-ndk-r21e}"
 NDKCC="$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe"
-JAR="$SDK/platforms/android-29/android.jar"
+JAR="$SDK/platforms/$ANDROID_PLATFORM/android.jar"
 APPS="$ROOT/core/tests/app"
 OUT="$ROOT/build/guest/java"
 FORCE=0
-[ "${1:-}" = --force ] && FORCE=1
-[ -f "$BT/aapt2.exe" ] && [ -f "$BT/lib/d8.jar" ] && [ -f "$JAR" ] || { echo "no build-tools/29.0.3 (aapt2.exe, lib/d8.jar) or platforms/android-29/android.jar in $SDK (MEGLER_ANDROID_SDK)" >&2; exit 1; }
+APP_NAME="${1:-}"
+if [ "$APP_NAME" = --force ]; then
+  FORCE=1
+  APP_NAME="${2:-}"
+fi
+[ -f "$BT/aapt2.exe" ] && [ -f "$BT/lib/d8.jar" ] && [ -f "$JAR" ] || { echo "no build-tools/$BUILD_TOOLS_VERSION (aapt2.exe, lib/d8.jar) or platforms/$ANDROID_PLATFORM/android.jar in $SDK (MEGLER_ANDROID_SDK)" >&2; exit 1; }
 [ -f "$JDK/bin/javac.exe" ] || [ -x "$JDK/bin/javac" ] || { echo "no javac in $JDK (MEGLER_JDK)" >&2; exit 1; }
+if [ -n "$APP_NAME" ] && [ ! -d "$APPS/$APP_NAME" ]; then
+  echo "unknown test app: $APP_NAME" >&2
+  exit 2
+fi
 m() { cygpath -m "$1"; }
 mkdir -p "$OUT"
 
@@ -93,6 +103,7 @@ fi
 
 for app in "$APPS"/*/; do
   name="$(basename "$app")"
+  [ -z "$APP_NAME" ] || [ "$name" = "$APP_NAME" ] || continue
   if [ -f "$app/built-by" ]; then
     echo "(the test app $name is built by $(head -1 "$app/built-by"))"
     continue

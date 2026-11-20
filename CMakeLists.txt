@@ -14,11 +14,20 @@ if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS AND NOT ANDROID_COMPATIBI
 endif()
 
 set(APP_ID ru.androidcompatibilitylayer.appmanager)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/aurora/standalone-runtime-abi")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/aurora/standalone-runtime-abi" STANDALONE_RUNTIME_ABI)
+string(STRIP "${STANDALONE_RUNTIME_ABI}" STANDALONE_RUNTIME_ABI)
+if(NOT STANDALONE_RUNTIME_ABI MATCHES "^[1-9][0-9]*$" OR
+   STANDALONE_RUNTIME_ABI GREATER 999999999)
+    message(FATAL_ERROR "Invalid standalone runtime ABI marker")
+endif()
 
 find_package(Qt5 COMPONENTS Core Gui Qml Quick Multimedia Sensors Network DBus Positioning LinguistTools REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(AURORA REQUIRED auroraapp)
 pkg_check_modules(RUNTIME_MANAGER REQUIRED runtime-manager-qt5)
+pkg_check_modules(AURORA_WEBVIEW REQUIRED aurorawebview)
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_C_STANDARD 11)
@@ -47,7 +56,7 @@ foreach(file sqlite3.c sqlite3.h)
     endif()
 endforeach()
 
-add_executable(${APP_ID}
+add_library(acl_runtime_objects OBJECT
     aurora/main.cpp
     aurora/probe.h
     aurora/runtime_settings.h
@@ -167,37 +176,65 @@ add_executable(${APP_ID}
     core/tests/mg_gfx_standin.c
     ${ZLIB_SOURCES}
 )
-add_dependencies(${APP_ID} android_compatibility_layer_translations)
-target_include_directories(${APP_ID} PRIVATE
+add_executable(${APP_ID} aurora/application_entry.cpp aurora/report_webview.cpp)
+add_executable(acl-runtime aurora/application_entry.cpp)
+set_target_properties(acl-runtime PROPERTIES OUTPUT_NAME "${APP_ID}.runtime")
+target_link_libraries(${APP_ID} PRIVATE acl_runtime_objects)
+target_link_libraries(acl-runtime PRIVATE acl_runtime_objects)
+add_dependencies(${APP_ID} acl-runtime android_compatibility_layer_translations)
+set_target_properties(${APP_ID} PROPERTIES CXX_STANDARD 17)
+target_compile_definitions(${APP_ID} PRIVATE ACL_WITH_REPORT_WEBVIEW)
+target_include_directories(${APP_ID} PRIVATE ${AURORA_WEBVIEW_INCLUDE_DIRS})
+# Keep the SDK's ordered CEF link flags, but do not inherit SDK build paths.
+set(REPORT_WEBVIEW_LINK_FLAGS)
+set(REPORT_WEBVIEW_RPATH)
+foreach(flag IN LISTS AURORA_WEBVIEW_LDFLAGS)
+    if(flag MATCHES "^-Wl,-rpath,(/usr/lib(64)?/cef)$")
+        list(APPEND REPORT_WEBVIEW_RPATH "${CMAKE_MATCH_1}")
+    elseif(NOT flag MATCHES "^-Wl,-rpath," AND NOT flag MATCHES "^(-pie|-rdynamic)$")
+        list(APPEND REPORT_WEBVIEW_LINK_FLAGS "${flag}")
+    endif()
+endforeach()
+if(NOT REPORT_WEBVIEW_RPATH)
+    message(FATAL_ERROR "Aurora WebView pkg-config metadata did not specify a system CEF library path")
+endif()
+# Aurora's RPM build sets CMAKE_SKIP_RPATH, so pass only these SDK system
+# paths explicitly to the linker for the manager only.
+foreach(path IN LISTS REPORT_WEBVIEW_RPATH)
+    target_link_options(${APP_ID} PRIVATE "LINKER:-rpath,${path}")
+endforeach()
+target_link_libraries(${APP_ID} PRIVATE ${REPORT_WEBVIEW_LINK_FLAGS})
+target_include_directories(acl_runtime_objects PRIVATE
     ${AURORA_INCLUDE_DIRS}
     ${RUNTIME_MANAGER_INCLUDE_DIRS}
     core/third_party/zlib
 )
-target_compile_definitions(${APP_ID} PRIVATE _GNU_SOURCE MEGLER_NO_EMBEDDED_TESTS)
+target_compile_definitions(acl_runtime_objects PRIVATE _GNU_SOURCE MEGLER_NO_EMBEDDED_TESTS)
+target_compile_definitions(acl_runtime_objects PRIVATE STANDALONE_RUNTIME_ABI="${STANDALONE_RUNTIME_ABI}")
 if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL)
-    target_compile_definitions(${APP_ID} PRIVATE MG_EXPERIMENTAL_NATIVE_EGL)
+    target_compile_definitions(acl_runtime_objects PRIVATE MG_EXPERIMENTAL_NATIVE_EGL)
 endif()
 if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION)
     pkg_check_modules(EGL REQUIRED egl)
     pkg_check_modules(GLES2 REQUIRED glesv2)
-    target_sources(${APP_ID} PRIVATE aurora/egl_frame_transport.c aurora/preview_gpu.cpp aurora/preview_gpu.h
+    target_sources(acl_runtime_objects PRIVATE aurora/egl_frame_transport.c aurora/preview_gpu.cpp aurora/preview_gpu.h
         aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h)
-    target_compile_definitions(${APP_ID} PRIVATE MG_EXPERIMENTAL_GPU_COMPOSITION)
-    target_include_directories(${APP_ID} PRIVATE ${EGL_INCLUDE_DIRS} ${GLES2_INCLUDE_DIRS})
-    target_link_libraries(${APP_ID} PRIVATE ${EGL_LDFLAGS} ${GLES2_LDFLAGS})
+    target_compile_definitions(acl_runtime_objects PRIVATE MG_EXPERIMENTAL_GPU_COMPOSITION)
+    target_include_directories(acl_runtime_objects PRIVATE ${EGL_INCLUDE_DIRS} ${GLES2_INCLUDE_DIRS})
+    target_link_libraries(acl_runtime_objects PUBLIC ${EGL_LDFLAGS} ${GLES2_LDFLAGS})
 endif()
 if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS)
-    target_sources(${APP_ID} PRIVATE aurora/preview_gpu_canvas.cpp aurora/preview_gpu_canvas.h)
-    target_compile_definitions(${APP_ID} PRIVATE MG_EXPERIMENTAL_GPU_CANVAS)
+    target_sources(acl_runtime_objects PRIVATE aurora/preview_gpu_canvas.cpp aurora/preview_gpu_canvas.h)
+    target_compile_definitions(acl_runtime_objects PRIVATE MG_EXPERIMENTAL_GPU_CANVAS)
 endif()
-target_link_libraries(${APP_ID} PRIVATE
+target_link_libraries(acl_runtime_objects PUBLIC
     Qt5::Quick Qt5::Multimedia Qt5::Sensors Qt5::Network Qt5::DBus Qt5::Positioning
     ${AURORA_LDFLAGS} ${RUNTIME_MANAGER_LDFLAGS} m pthread dl
 )
 
 if(ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS)
+find_package(Qt5 COMPONENTS Test REQUIRED)
 if(ANDROID_COMPATIBILITY_LAYER_BUILD_WEBVIEW_PROBE)
-    pkg_check_modules(AURORA_WEBVIEW REQUIRED aurorawebview)
     add_executable(android_compatibility_layer_webview_native_probe EXCLUDE_FROM_ALL aurora/tests/webview_native_probe.cpp)
     set_property(TARGET android_compatibility_layer_webview_native_probe PROPERTY CXX_STANDARD 17)
     target_include_directories(android_compatibility_layer_webview_native_probe PRIVATE ${AURORA_WEBVIEW_INCLUDE_DIRS})
@@ -205,12 +242,21 @@ if(ANDROID_COMPATIBILITY_LAYER_BUILD_WEBVIEW_PROBE)
 endif()
 add_executable(android_compatibility_layer_rpm_icon_test EXCLUDE_FROM_ALL aurora/tests/rpm_icon_test.cpp aurora/rpm_icon.cpp)
 target_link_libraries(android_compatibility_layer_rpm_icon_test PRIVATE Qt5::Gui)
+add_executable(android_compatibility_layer_log_actions_qml_test EXCLUDE_FROM_ALL
+    aurora/tests/log_actions_qml_test.cpp)
+target_link_libraries(android_compatibility_layer_log_actions_qml_test PRIVATE Qt5::Quick Qt5::Test)
+add_executable(android_compatibility_layer_yandex_form_qml_test EXCLUDE_FROM_ALL
+    aurora/tests/yandex_form_qml_test.cpp)
+target_link_libraries(android_compatibility_layer_yandex_form_qml_test PRIVATE Qt5::Quick Qt5::Qml)
 add_executable(android_compatibility_layer_rpm_stream_test EXCLUDE_FROM_ALL aurora/tests/rpm_stream_test.cpp aurora/rpm_writer.cpp)
 target_link_libraries(android_compatibility_layer_rpm_stream_test PRIVATE Qt5::Core)
 add_executable(android_compatibility_layer_rpm_sign_test EXCLUDE_FROM_ALL aurora/tests/rpm_sign_test.cpp aurora/rpm_signers.cpp)
 target_link_libraries(android_compatibility_layer_rpm_sign_test PRIVATE Qt5::Core ${CMAKE_DL_LIBS})
 add_executable(android_compatibility_layer_rpm_standalone_test EXCLUDE_FROM_ALL aurora/tests/rpm_standalone_test.cpp
-    aurora/rpm_standalone.cpp aurora/rpm_icon.cpp aurora/rpm_writer.cpp aurora/apk_store.cpp)
+    aurora/rpm_standalone.cpp aurora/rpm_icon.cpp aurora/rpm_writer.cpp aurora/apk_store.cpp
+    aurora/standalone_app_mapping.cpp)
+target_compile_definitions(android_compatibility_layer_rpm_standalone_test PRIVATE
+    STANDALONE_RUNTIME_ABI="${STANDALONE_RUNTIME_ABI}")
 target_link_libraries(android_compatibility_layer_rpm_standalone_test PRIVATE Qt5::Gui)
 add_executable(android_compatibility_layer_standalone_paths_test EXCLUDE_FROM_ALL
     aurora/tests/standalone_paths_test.cpp aurora/standalone_paths.cpp aurora/apk_store.cpp)
@@ -584,6 +630,13 @@ add_executable(android_compatibility_layer_install_request_commit_test EXCLUDE_F
     aurora/tests/install_request_commit_test.cpp aurora/install_request_commit.cpp)
 target_compile_definitions(android_compatibility_layer_install_request_commit_test PRIVATE _GNU_SOURCE)
 target_link_libraries(android_compatibility_layer_install_request_commit_test PRIVATE Qt5::Core)
+add_executable(android_compatibility_layer_external_apk_install_test EXCLUDE_FROM_ALL
+    aurora/tests/external_apk_install_test.cpp aurora/external_apk_install.cpp aurora/external_apk_install.h
+    aurora/external_apk_path.cpp aurora/install_request_candidate.cpp
+    aurora/install_request_prepare.cpp aurora/install_request_prepare.h
+    aurora/install_request_snapshot.cpp aurora/install_request_commit.cpp)
+target_compile_definitions(android_compatibility_layer_external_apk_install_test PRIVATE _GNU_SOURCE)
+target_link_libraries(android_compatibility_layer_external_apk_install_test PRIVATE Qt5::Core)
 
 add_executable(android_compatibility_layer_install_request_real_test EXCLUDE_FROM_ALL
     aurora/tests/install_request_real_test.cpp aurora/install_request_candidate.cpp
@@ -611,10 +664,14 @@ foreach(target android_compatibility_layer_preview_text_test android_compatibili
 endforeach()
 endif()
 
-target_include_directories(${APP_ID} PRIVATE "${ANDROID_COMPATIBILITY_LAYER_SQLITE_DIR}")
-target_compile_definitions(${APP_ID} PRIVATE MG_HAVE_SQLITE=1)
+target_include_directories(acl_runtime_objects PRIVATE "${ANDROID_COMPATIBILITY_LAYER_SQLITE_DIR}")
+target_compile_definitions(acl_runtime_objects PRIVATE MG_HAVE_SQLITE=1)
 
 install(TARGETS ${APP_ID} RUNTIME DESTINATION bin)
+# This ELF is read only to build standalone RPMs; workers self-spawn within
+# Sailjail's private-bin instead of executing another binary.
+install(FILES "$<TARGET_FILE:acl-runtime>" DESTINATION share/${APP_ID}
+    PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
 set(ANDROID_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/aurora/android-runtime")
 foreach(file framework/megler-libcore.dex framework/core-oj.dex framework/core-libart.dex
              framework/conscrypt.dex framework/okhttp.dex framework/bouncycastle.dex framework/apache-xml.dex
@@ -626,10 +683,47 @@ foreach(file framework/megler-libcore.dex framework/core-oj.dex framework/core-l
         message(FATAL_ERROR "Android runtime is incomplete: ${ANDROID_ROOT}/${file}. See aurora/README.md.")
     endif()
 endforeach()
-install(DIRECTORY "${ANDROID_ROOT}/" DESTINATION share/${APP_ID}/android-runtime
+set(SHARED_ANDROID_RUNTIME share/common/ru.androidcompatibilitylayer/appmanager/android-runtime)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(WEBVIEW_PROVIDER "${CMAKE_CURRENT_SOURCE_DIR}/build/webview/arm64-v8a/webview.apk")
+    set(WEBVIEW_PROVIDER_SHA256 "492c3d054e4123ae0c1e6f3541e5ab515633e1fb4006e33bf343749ef1b66ae2")
+    if(NOT EXISTS "${WEBVIEW_PROVIDER}")
+        message(FATAL_ERROR
+            "The required ARM64 WebView provider is missing: ${WEBVIEW_PROVIDER}. "
+            "Fetch it with tools/webview-fetch.sh --aosp-chromium-128 arm64-v8a.")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${WEBVIEW_PROVIDER}")
+    file(SHA256 "${WEBVIEW_PROVIDER}" local_webview_sha256)
+    if(NOT local_webview_sha256 STREQUAL WEBVIEW_PROVIDER_SHA256)
+        message(FATAL_ERROR "The ARM64 WebView provider does not match the pinned AOSP Chromium 128 APK.")
+    endif()
+    set(WEBVIEW_SUPPORT_STUB
+        "${CMAKE_CURRENT_BINARY_DIR}/webview/libwebviewchromium_plat_support.so")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/webview")
+    file(WRITE "${WEBVIEW_SUPPORT_STUB}"
+        "The platform support of the WebView: its natives are answered by the core (core/src/drivers/mg_java_webview.c).\n")
+    install(CODE "
+        file(SHA256 \"${WEBVIEW_PROVIDER}\" staged_webview_sha256)
+        if(NOT staged_webview_sha256 STREQUAL \"${WEBVIEW_PROVIDER_SHA256}\")
+            message(FATAL_ERROR \"The ARM64 WebView provider changed after CMake configuration.\")
+        endif()
+    ")
+    install(FILES "${WEBVIEW_PROVIDER}"
+        DESTINATION "${SHARED_ANDROID_RUNTIME}/app/webview"
+        PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+    install(FILES "${WEBVIEW_SUPPORT_STUB}"
+        DESTINATION "${SHARED_ANDROID_RUNTIME}/lib"
+        PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+endif()
+install(DIRECTORY "${ANDROID_ROOT}/" DESTINATION "${SHARED_ANDROID_RUNTIME}"
     FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
     PATTERN "fixtures" EXCLUDE
-    PATTERN "platform-framework*.dex" EXCLUDE)
+    PATTERN "platform-framework*.dex" EXCLUDE
+    PATTERN "webview.apk" EXCLUDE
+    PATTERN "libwebviewchromium_plat_support.so" EXCLUDE
+    PATTERN ".standalone-abi" EXCLUDE)
+install(FILES aurora/standalone-runtime-abi DESTINATION "${SHARED_ANDROID_RUNTIME}"
+    RENAME .standalone-abi)
 install(DIRECTORY qml DESTINATION share/${APP_ID})
 install(FILES ${ANDROID_COMPATIBILITY_LAYER_TRANSLATIONS} DESTINATION share/${APP_ID}/qml)
 install(FILES ${APP_ID}.desktop DESTINATION share/applications)
@@ -649,4 +743,4 @@ add_custom_target(project_files SOURCES
     aurora/icons/172.png
 )
 file(WRITE "${CMAKE_BINARY_DIR}/QtCreatorDeployment.txt"
-    "${CMAKE_INSTALL_PREFIX}\n${CMAKE_BINARY_DIR}/${APP_ID}:bin\n")
+    "${CMAKE_INSTALL_PREFIX}\n${CMAKE_BINARY_DIR}/${APP_ID}:bin\n${CMAKE_BINARY_DIR}/${APP_ID}.runtime:share/${APP_ID}\n")

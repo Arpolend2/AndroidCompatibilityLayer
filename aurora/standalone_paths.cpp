@@ -3,6 +3,7 @@
 #include "apk_store.h"
 #include "runtime_settings.h"
 #include "permission_settings.h"
+#include "shared_runtime.h"
 
 #include <QDir>
 #include <QFile>
@@ -13,9 +14,11 @@
 
 bool standalonePaths(const QString &appId, const QString &executableName,
                      const QString &resourceRoot, const QString &privateRoot,
-                     StandalonePaths *paths, QString *error)
+                     StandalonePaths *paths, QString *error, const QString &sharedRuntimeRoot,
+                     StandaloneRuntimeError *runtimeError)
 {
     if (error) error->clear();
+    if (runtimeError) *runtimeError = StandaloneRuntimeError::None;
     auto fail = [error](const QString &message) {
         if (error) *error = message;
         return false;
@@ -44,26 +47,45 @@ bool standalonePaths(const QString &appId, const QString &executableName,
     const QString theme = themeValue.toString();
     const QString location = locationValue.toString();
     const QJsonValue permissionsValue = object.value(QStringLiteral("deniedPermissions"));
+    const QJsonValue snapshotsValue = object.value(QStringLiteral("standaloneSnapshots"));
     const QJsonValue diagnosticsValue = object.value(QStringLiteral("fileDiagnostics"));
     QStringList deniedPermissions;
     const ApkStore store(QDir(privateRoot).filePath(QStringLiteral("apps")));
     const QString data = store.dataPath(package);
     const QString lock = store.lockPath(package);
     const QString apk = QDir(resourceRoot).filePath(QStringLiteral("apk/base.apk"));
-    const QString androidRoot = QDir(resourceRoot).filePath(QStringLiteral("android-runtime"));
+    const QJsonValue runtimeAbi = object.value(QStringLiteral("sharedRuntimeAbi"));
     if (object.value(QStringLiteral("appId")).toString() != appId || displayName.isEmpty() ||
         displayName.size() > 512 ||
         (!localeValue.isUndefined() && !localeValue.isString()) ||
         (!themeValue.isUndefined() && !themeValue.isString()) ||
         (!locationValue.isUndefined() && !locationValue.isString()) ||
+        (!snapshotsValue.isUndefined() && !snapshotsValue.isBool()) ||
         (!diagnosticsValue.isUndefined() && !diagnosticsValue.isBool()) ||
         (!permissionsValue.isUndefined() && !PermissionSettings::parse(permissionsValue, &deniedPermissions)) ||
         (!locale.isEmpty() && !RuntimeSettings::validLocale(locale)) ||
         !RuntimeSettings::validTheme(theme) ||
         (!location.isEmpty() && !RuntimeSettings::parseLocation(location, nullptr, nullptr)) ||
         data.isEmpty() || lock.isEmpty() ||
-        !QFileInfo(apk).isFile() || !QFileInfo(androidRoot).isDir())
+        (!runtimeAbi.isUndefined() && !SharedRuntime::validVersion(runtimeAbi.toString())) ||
+        !QFileInfo(apk).isFile())
         return fail(QStringLiteral("Standalone package contents are missing or invalid."));
+    QString androidRoot = QDir(resourceRoot).filePath(QStringLiteral("android-runtime"));
+    if (runtimeAbi.isUndefined()) {
+        if (!QFileInfo(androidRoot).isDir())
+            return fail(QStringLiteral("Standalone package contents are missing or invalid."));
+    } else {
+        const QString available = SharedRuntime::version(sharedRuntimeRoot);
+        if (available.isEmpty()) {
+            if (runtimeError) *runtimeError = StandaloneRuntimeError::Unavailable;
+            return fail(QStringLiteral("The shared Android runtime is unavailable."));
+        }
+        if (available != runtimeAbi.toString()) {
+            if (runtimeError) *runtimeError = StandaloneRuntimeError::Incompatible;
+            return fail(QStringLiteral("The shared Android runtime is incompatible."));
+        }
+        androidRoot = sharedRuntimeRoot;
+    }
     paths->androidRoot = androidRoot;
     paths->apk = apk;
     paths->data = data;
@@ -73,6 +95,7 @@ bool standalonePaths(const QString &appId, const QString &executableName,
     paths->theme = theme;
     paths->location = location;
     paths->deniedPermissions = deniedPermissions;
+    paths->standaloneSnapshots = snapshotsValue.toBool(false);
     paths->fileDiagnostics = diagnosticsValue.toBool(false);
     return true;
 }

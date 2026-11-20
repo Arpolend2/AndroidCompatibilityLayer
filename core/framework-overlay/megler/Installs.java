@@ -36,7 +36,9 @@ package megler;
 
 import android.content.Context;
 import android.content.Intent;
+import android.database.Cursor;
 import android.net.Uri;
+import android.provider.OpenableColumns;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -60,6 +62,11 @@ public final class Installs {
             (pkg == null ? "" : "_" + version + "_" + pkg) + (bundle ? ".apks" : ".apk");
     }
 
+    private static String requestName(String pkg, long version, String extension) {
+        return "request_" + java.util.UUID.randomUUID().toString().replace("-", "") +
+            (pkg == null ? "" : "_" + version + "_" + pkg) + "." + extension;
+    }
+
     public interface Installed { void done(int status, String message); }
     private static boolean sIntentActive;
 
@@ -70,11 +77,12 @@ public final class Installs {
             done.done(1, "The requesting app is unavailable");
             return;
         }
-        final String displayName = nameOf(uri).toLowerCase(java.util.Locale.ROOT);
-        if (displayName.endsWith(".apks") || displayName.endsWith(".xapk") || displayName.endsWith(".apkm")) {
+        final String displayName = nameOf(from, uri).toLowerCase(java.util.Locale.ROOT);
+        if (displayName.endsWith(".apks") || displayName.endsWith(".apkm")) {
             done.done(7, "Split APK bundles are not supported");
             return;
         }
+        final boolean xapk = displayName.endsWith(".xapk");
         synchronized (Installs.class) {
             if (sIntentActive) {
                 done.done(1, "Another installation is in progress");
@@ -91,7 +99,7 @@ public final class Installs {
                 } else {
                     File dir = new File(from.getCacheDir(), "megler-install");
                     if (!dir.isDirectory() && !dir.mkdirs()) throw new java.io.IOException("cannot create cache");
-                    copy = File.createTempFile("request-", ".apk", dir);
+                    copy = File.createTempFile("request-", xapk ? ".xapk" : ".apk", dir);
                     try (InputStream in = from.getContentResolver().openInputStream(uri);
                          OutputStream out = new FileOutputStream(copy)) {
                         if (in == null) throw new java.io.IOException("cannot open content");
@@ -106,7 +114,7 @@ public final class Installs {
                     }
                     path = copy.getPath();
                 }
-                String name = requestName(null, 0);
+                String name = xapk ? requestName(null, 0, "xapk") : requestName(null, 0);
                 if (!Native.installApk(path, name)) {
                     done.done(1, "Megler could not take the request");
                     return;
@@ -163,7 +171,7 @@ public final class Installs {
     }
 
     /** Whether `i` asks to install an APK, and no activity of the app's own is named for it. */
-    public static boolean isInstall(Intent i) {
+    public static boolean isInstall(Context context, Intent i) {
         if (i == null || i.getComponent() != null) return false;
         Uri u = i.getData();
         if (u == null || !("file".equals(u.getScheme()) || "content".equals(u.getScheme()))) return false;
@@ -171,8 +179,8 @@ public final class Installs {
         if (!Intent.ACTION_VIEW.equals(i.getAction())) return false;
         String type = i.getType();
         if (APK_TYPE.equals(type)) return true;
-        String path = u.getPath() == null ? "" : u.getPath().toLowerCase(java.util.Locale.ROOT);
-        return path.endsWith(".apk") || path.endsWith(".apks") || path.endsWith(".xapk");
+        String name = contentName(context, u).toLowerCase(java.util.Locale.ROOT);
+        return name.endsWith(".apk") || name.endsWith(".apks") || name.endsWith(".xapk");
     }
 
     /** Hands the APK of an install intent to Megler, off the main thread when it is to be copied out of a provider. */
@@ -184,7 +192,7 @@ public final class Installs {
             return;
         }
         new Thread(() -> {
-            String name = nameOf(u);
+            String name = nameOf(from, u);
             File dir = new File(from.getCacheDir(), "megler-install");
             dir.mkdirs();
             File out = new File(dir, name);
@@ -200,11 +208,30 @@ public final class Installs {
         }, "Megler install").start();
     }
 
-    /** A file's name for a content:// URI: its last part, made an .apk's when it has no such ending. */
-    private static String nameOf(Uri u) {
+    private static String contentName(Context context, Uri u) {
+        if ("content".equals(u.getScheme()) && context != null) {
+            try (Cursor cursor = context.getContentResolver().query(
+                    u, new String[] { OpenableColumns.DISPLAY_NAME }, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    int column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    if (column >= 0) {
+                        String name = cursor.getString(column);
+                        if (name != null && !name.isEmpty())
+                            return name.replace('/', '_').replace('\\', '_');
+                    }
+                }
+            } catch (RuntimeException e) {
+                android.util.Log.w("Megler", "install: could not read content display name", e);
+            }
+        }
         String last = u.getLastPathSegment();
         if (last == null || last.isEmpty()) last = "app";
-        last = last.replace('/', '_').replace('\\', '_');
+        return last.replace('/', '_').replace('\\', '_');
+    }
+
+    /** A file's name for a content:// URI, made an .apk's when it has no known APK extension. */
+    private static String nameOf(Context context, Uri u) {
+        String last = contentName(context, u);
         String lower = last.toLowerCase(java.util.Locale.ROOT);
         return lower.endsWith(".apk") || lower.endsWith(".apks") || lower.endsWith(".xapk") || lower.endsWith(".apkm") ? last : last + ".apk";
     }

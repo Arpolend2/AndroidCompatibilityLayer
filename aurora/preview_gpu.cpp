@@ -110,7 +110,7 @@ bool PreviewGpuState::submitDmaBuf(AuroraDmaBufFrame &&incoming, QObject *notifi
     dmaBufFrame = std::move(incoming);
     dmaBufCompletion = completion;
     dmaBufPending = true;
-    active = true;
+    if (!dmaBufFrame.probeOnly) active = true;
     if (!QMetaObject::invokeMethod(notifier, "requestGpuFrame", Qt::QueuedConnection)) {
         dmaBufFrame.close();
         dmaBufPending = false;
@@ -497,6 +497,7 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
     }
     if (m_state->dmaBufPending) {
         const quint64 id = m_state->dmaBufFrame.id;
+        const bool probeOnly = m_state->dmaBufFrame.probeOnly;
         QString importError;
         GLuint imported = 0;
         GLuint snapshot = 0;
@@ -528,7 +529,10 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
             importError = QStringLiteral("Qt scene graph window is unavailable");
         }
         const bool ok = texture != nullptr;
-        if (ok) {
+        if (probeOnly) {
+            delete texture;
+            if (!ok) qWarning().noquote() << "Embedded GPU GBM parent probe:" << importError;
+        } else if (ok) {
             delete root->native;
             root->native = texture;
             m_state->nativeFrame = true;

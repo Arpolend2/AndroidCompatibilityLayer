@@ -4,6 +4,7 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.res.XmlBlock;
+import android.content.res.ResTable;
 import android.os.Bundle;
 import android.util.TypedValue;
 import java.io.ByteArrayOutputStream;
@@ -22,8 +23,8 @@ public final class ArchiveInfo {
     /**
      * With PackageManager.GET_META_DATA among `flags`, the application's own meta-data too (applicationInfo.metaData), as
      * Android's getPackageArchiveInfo gives it: the meta-data elements directly inside the application element, each value
-     * of its type, and null when there is none or the flag is not given. A value that refers to a resource stays the
-     * resource's id: the archive's resources are not loaded. (Alibaba's SecurityGuard reads a string of each of its
+     * of its type, and null when there is none or the flag is not given. A meta-data value that refers to a resource stays the
+     * resource's id. (Alibaba's SecurityGuard reads a string of each of its
      * plug-ins' meta-data so: Goofish ended with "BaseBundle.getString on a null object reference".)
      */
     public static PackageInfo read(String path, int flags) {
@@ -66,17 +67,39 @@ public final class ArchiveInfo {
                 } else if ("manifest".equals(parser.getName())) {
                     info.packageName = parser.getAttributeValue(null, "package");
                     info.versionCode = parser.getAttributeIntValue(NS, "versionCode", 0);
+                    info.installLocation = parser.getAttributeIntValue(NS, "installLocation", -1);
                     info.versionName = parser.getAttributeValue(NS, "versionName");
                     app.packageName = app.processName = info.packageName;
                 } else if ("uses-sdk".equals(parser.getName())) {
                     app.minSdkVersion = parser.getAttributeIntValue(NS, "minSdkVersion", app.minSdkVersion);
                     app.targetSdkVersion = parser.getAttributeIntValue(NS, "targetSdkVersion", app.minSdkVersion);
+                } else if ("application".equals(parser.getName()) && parser.getDepth() == 2) {
+                    ResTable resources = null;
+                    if (parser.getAttributeResourceValue(NS, "allowBackup", 0) != 0) {
+                        ZipEntry table = zip.getEntry("resources.arsc");
+                        if (table != null) {
+                            if (table.getSize() > 64 * 1024 * 1024) return null;
+                            ByteArrayOutputStream data = new ByteArrayOutputStream();
+                            try (InputStream in = zip.getInputStream(table)) {
+                                byte[] chunk = new byte[8192];
+                                int n;
+                                while ((n = in.read(chunk)) != -1) {
+                                    if (data.size() + n > 64 * 1024 * 1024) return null;
+                                    data.write(chunk, 0, n);
+                                }
+                            }
+                            resources = new ResTable(data.toByteArray());
+                        }
+                    }
+                    if (Manifest.booleanAttribute(parser, "allowBackup", true, resources, true))
+                        app.flags |= ApplicationInfo.FLAG_ALLOW_BACKUP;
                 }
             }
             if (info.packageName == null || info.packageName.isEmpty()) return null;
             info.applicationInfo = app;
             return info;
         } catch (Exception e) {
+            android.util.Log.w("Megler", "could not read package archive " + path, e);
             return null;
         }
     }

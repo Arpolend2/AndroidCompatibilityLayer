@@ -102,6 +102,10 @@ public abstract class JobScheduler {
         private static void start(Run run) {
             synchronized (sJobs) { run.planned = null; if (sJobs.get(run.info.getId()) != run || run.running) return; run.running = true; }
             try {
+                android.util.Log.i("Megler", "job " + run.info.getId() + " starting " + run.info.getService().getClassName()
+                    + " latency=" + run.info.getMinLatencyMillis() + " deadline=" + run.info.getMaxExecutionDelayMillis()
+                    + " network=" + run.info.getNetworkType() + " charging=" + run.info.isRequireCharging()
+                    + " idle=" + run.info.isRequireDeviceIdle() + " periodic=" + run.info.isPeriodic());
                 android.app.Service s = megler.Services.service(run.info.getService());
                 JobServiceEngine engine = null;
                 if (s != null && !(s instanceof JobService))

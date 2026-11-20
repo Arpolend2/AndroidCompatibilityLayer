@@ -67,6 +67,7 @@ public class PackageManager {
         megler.Manifest.read();
         PackageInfo p = new PackageInfo();
         p.packageName = pkg; p.versionCode = megler.Manifest.versionCode; p.versionName = megler.Manifest.versionName != null ? megler.Manifest.versionName : "1.0";
+        p.installLocation = megler.Manifest.installLocation;
         p.firstInstallTime = p.lastUpdateTime = new java.io.File(megler.Native.apkPath()).lastModified();
         p.requestedPermissions = megler.Manifest.permissions.toArray(new String[0]);
         p.requestedPermissionsFlags = new int[p.requestedPermissions.length];

@@ -24,6 +24,15 @@ static void check(bool ok, const char *description)
     }
 }
 
+class RpmUrlReceiver : public QObject
+{
+    Q_OBJECT
+public:
+    QUrl received;
+public slots:
+    void open(const QUrl &url) { received = url; }
+};
+
 extern "C" bool mg_apk_read_info(const char *path, mg_apk_info *info)
 {
     std::memset(info, 0, sizeof(*info));
@@ -88,10 +97,11 @@ int main(int argc, char **argv)
     check(temporary.isValid(), "temporary root");
     const bool rpmGuardTest = argc == 2 && QByteArray(argv[1]) == "--rpm-guard-test";
     const bool rpmProgressTest = argc == 2 && QByteArray(argv[1]) == "--rpm-progress-test";
+    const bool rpmCacheInstallerTest = argc == 2 && QByteArray(argv[1]) == "--rpm-cache-installer-test";
     const bool microgLifecycleTest = argc == 2 && QByteArray(argv[1]) == "--microg-lifecycle-test";
     const bool reminderTest = argc == 2 && QByteArray(argv[1]) == "--signature-reminder-test";
     const bool libraryRefreshTest = argc == 2 && QByteArray(argv[1]) == "--library-refresh-test";
-    if (argc == 1 || rpmGuardTest || rpmProgressTest || microgLifecycleTest || reminderTest || libraryRefreshTest)
+    if (argc == 1 || rpmGuardTest || rpmProgressTest || rpmCacheInstallerTest || microgLifecycleTest || reminderTest || libraryRefreshTest)
         qputenv("XDG_DATA_HOME", QFile::encodeName(temporary.path()));
     if (argc == 1 || reminderTest || libraryRefreshTest)
         qputenv("XDG_CONFIG_HOME", QFile::encodeName(temporary.path()));
@@ -100,7 +110,15 @@ int main(int argc, char **argv)
     app.setOrganizationName(QStringLiteral("org.test"));
     app.setApplicationName(QStringLiteral("multitask"));
     if ((argc == 3 || argc == 4) && QByteArray(argv[1]) == "--build-standalone") {
-        if (argc == 4 && QByteArray(argv[3]) != "--file-diagnostics") return 2;
+        if (argc != 3) return 2;
+        const QString cachedPath = QString::fromLocal8Bit(qgetenv("ACL_TEST_CACHED_RPM"));
+        if (!cachedPath.isEmpty()) {
+            QJsonObject result;
+            result.insert(QStringLiteral("ok"), true);
+            result.insert(QStringLiteral("path"), cachedPath);
+            std::puts(QJsonDocument(result).toJson(QJsonDocument::Compact).constData());
+            return 0;
+        }
         std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:in", stderr);
         std::fflush(stderr);
         QThread::msleep(40);
@@ -112,7 +130,7 @@ int main(int argc, char **argv)
             std::fflush(stderr);
         }
         QThread::msleep(40);
-        std::fputs(argc == 4 ? "test build failure with file diagnostics" : "test build failure", stderr);
+        std::fputs("test build failure", stderr);
         std::puts("{\"ok\":false}");
         return 1;
     }
@@ -122,12 +140,15 @@ int main(int argc, char **argv)
         std::puts("{\"ok\":true,\"package\":\"org.install.bundle\",\"versionCode\":42}");
         return 0;
     }
-    if (argc == 10 && QByteArray(argv[1]) == "--unpack-store-bundle") {
+    if (argc == 10 && (QByteArray(argv[1]) == "--unpack-store-bundle" ||
+                       QByteArray(argv[1]) == "--unpack-store-xapk")) {
         QFile input(QString::fromLocal8Bit(argv[4]));
         check(input.open(QIODevice::ReadOnly), "open store bundle snapshot");
         writeFile(QString::fromLocal8Bit(argv[6]), input.readAll());
         check(QDir().mkpath(QString::fromLocal8Bit(argv[7])), "create mock store splits");
-        std::puts("{\"ok\":true,\"package\":\"org.install.storebundle\",\"versionCode\":42}");
+        std::puts(QByteArray(argv[1]) == "--unpack-store-xapk"
+            ? "{\"ok\":true,\"package\":\"org.install.storexapk\",\"versionCode\":42}"
+            : "{\"ok\":true,\"package\":\"org.install.storebundle\",\"versionCode\":42}");
         return 0;
     }
     if (argc == 8 && QByteArray(argv[1]) == "--preview") {
@@ -337,6 +358,30 @@ int main(int argc, char **argv)
     check(!QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
                 + QStringLiteral("/shortcut-rpm")).exists(), "no shortcut RPM directory created");
     if (rpmGuardTest) return 0;
+    if (rpmCacheInstallerTest) {
+        const QString cacheDir = first + QStringLiteral("/standalone-rpm");
+        check(QDir().mkpath(cacheDir), "create RPM cache");
+        const QString cached = cacheDir + QStringLiteral("/cached.rpm");
+        writeFile(cached, "cached package");
+        qputenv("ACL_TEST_CACHED_RPM", QFile::encodeName(cached));
+        RpmUrlReceiver receiver;
+        QDesktopServices::setUrlHandler(QStringLiteral("file"), &receiver, "open");
+        QEventLoop wait;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        QObject::connect(&timeout, &QTimer::timeout, &wait, &QEventLoop::quit);
+        QObject::connect(&probe, &Probe::standaloneRpmChanged, &wait, [&]() {
+            if (!probe.standaloneRpmBusy()) wait.quit();
+        });
+        probe.installStandaloneRpm(QStringLiteral("org.example.runner1"));
+        timeout.start(10000);
+        wait.exec();
+        QDesktopServices::unsetUrlHandler(QStringLiteral("file"));
+        qunsetenv("ACL_TEST_CACHED_RPM");
+        check(timeout.isActive() && probe.standaloneRpmOpened() &&
+              receiver.received == QUrl::fromLocalFile(cached), "cached RPM reaches installer handler");
+        return 0;
+    }
     if (rpmProgressTest) {
         QSet<QString> stages;
         int errorCount = 0;
@@ -369,22 +414,23 @@ int main(int argc, char **argv)
               !probe.standaloneRpmOpened(), "builder diagnostic preserved on failure");
         check(errorCount == 1 && errorPackage == QStringLiteral("org.example.runner1") &&
               errorMessage == probe.standaloneRpmStatus(), "RPM error emitted once with the package and diagnostic");
-        check(!probe.standaloneRpmStatus().contains(QStringLiteral("with file diagnostics")),
-              "disabled detailed logging does not enable file diagnostics");
+        check(probe.standaloneRpmStatus().contains(QStringLiteral("test build failure")),
+              "RPM generation is independent of detailed logging state");
         probe.setDetailedLogEnabled(true);
         probe.installStandaloneRpm(QStringLiteral("org.example.runner1"));
         check(probe.standaloneRpmBusy(), "diagnostic RPM builder started");
         timeout.start(10000);
         wait.exec();
         check(timeout.isActive() &&
-              probe.standaloneRpmStatus().contains(QStringLiteral("with file diagnostics")),
-              "enabled detailed logging enables file diagnostics");
+              probe.standaloneRpmStatus().contains(QStringLiteral("test build failure")),
+              "RPM generation uses the same snapshot configuration while logging is enabled");
         probe.setDetailedLogEnabled(false);
         probe.installStandaloneRpm(QStringLiteral("org.example.missing"));
         check(errorCount == 3 && errorPackage == QStringLiteral("org.example.missing") &&
               errorMessage == probe.standaloneRpmStatus(), "missing APK emits an RPM error");
         return 0;
     }
+
     QQuickView view;
     view.setSource(QUrl(QStringLiteral("data:text/plain,import QtQuick 2.0%0AItem %7B%7D")));
     check(view.status() == QQuickView::Ready, "controller view ready");
@@ -516,6 +562,33 @@ int main(int argc, char **argv)
           "temporary store bundle is not retained in the library");
     importStoreBundle(false);
     check(promptCount == 0, "duplicate store bundle fails without a confirmation");
+    const QString storeXapk = temporary.path() + QStringLiteral("/handoff.xapk");
+    const QString handoffXapk = store + QStringLiteral("/org.install.storexapk/base.apk");
+    writeFile(storeXapk, "original XAPK");
+    {
+        QEventLoop wait;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        bool completed = false;
+        QObject::connect(&timeout, &QTimer::timeout, &wait, &QEventLoop::quit);
+        QObject::connect(&probe, &Probe::storeHandoffFinished, &wait,
+                         [&](bool retry, bool installed, const QByteArray &fingerprint) {
+            check(!retry && installed, "store XAPK import succeeds without confirmation UI");
+            check(fingerprint == QCryptographicHash::hash(QByteArray("original XAPK"), QCryptographicHash::Sha256).toHex(),
+                  "store XAPK result identifies the immutable snapshot");
+            completed = true;
+            wait.quit();
+        });
+        QString error;
+        check(probe.requestStoreHandoff(storeXapk, &error), "start store XAPK import");
+        timeout.start(15000);
+        wait.exec();
+        QFile importedXapk(handoffXapk);
+        check(completed && timeout.isActive() && importedXapk.open(QIODevice::ReadOnly) &&
+              importedXapk.readAll() == "original XAPK", "store XAPK reaches the bundle importer");
+        check(!QFile::exists(store + QStringLiteral("/org.install.storexapk/.store-source.xapk")),
+              "temporary store XAPK is not retained in the library");
+    }
     const QString storeSingle = temporary.path() + QStringLiteral("/handoff.apk");
     writeFile(storeSingle, "external3");
     {
@@ -600,3 +673,5 @@ int main(int argc, char **argv)
     std::puts("Probe RPM-only launch and import OK");
     return 0;
 }
+
+#include "probe_multitask_test.moc"

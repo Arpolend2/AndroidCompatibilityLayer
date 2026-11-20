@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Android's System WebView for the Android root, from AOSP's own server, into build/webview (not part of the repository):
+# Fetch the hash-pinned AOSP Chromium 128 WebView (no ongoing security updates).
 #
-#   tools/webview-fetch.sh [abi]      (from Git Bash or WSL; needs curl, tar, sha1sum and git)
+#   tools/webview-fetch.sh --aosp-chromium-128 [abi]
+#                                    (Git Bash/WSL; needs curl, tar, sha1sum and git)
 #
-#   abi: armeabi-v7a (the default, as below); arm64-v8a, x86 or x86_64 for desktop Windows' packages (docs/DESKTOP.md):
+#   abi: arm64-v8a (default); armeabi-v7a, x86 or x86_64 for desktop Windows' packages (docs/DESKTOP.md):
 #   the same Chromium release's prebuilt for that processor, from the same commit's folder of its name, into
 #   build/webview/<abi>/webview.apk.
 #
@@ -21,7 +22,9 @@
 # /system/app/webview/webview.apk (docs/JAVA.md, "The WebView"). Why this WebView and not the Android 9 image's own (Chromium
 # 66, built for 64-bit ARM alone, its bytecode only in the image's .vdex) is said there.
 #
-# What is there already is not fetched again (remove it to fetch it anew).
+# What is there already is not fetched again (remove it to fetch it anew). The root builder
+# ignores this APK unless MEGLER_WEBVIEW_TEST_PROVIDER=chromium-128-aosp is explicitly set.
+# Aurora's ARM64 CMake build stages the provider from this path independently.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/build/webview"
@@ -31,6 +34,12 @@ VERSION=128.0.6613.88
 SHA1=7698153247712ffb3fbc230db993b7dc67759428
 TAG=android-15.0.0_r36
 mkdir -p "$OUT"
+
+case "${1:-}" in
+  --aosp-chromium-128|--aosp-chromium-128-test-only) ;;
+  *) echo "usage: tools/webview-fetch.sh --aosp-chromium-128 [armeabi-v7a|arm64-v8a|x86|x86_64]" >&2; exit 2 ;;
+esac
+shift
 
 fetch() { # url, file
   local try
@@ -43,7 +52,7 @@ fetch() { # url, file
   exit 1
 }
 
-ABI="${1:-armeabi-v7a}"
+ABI="${1:-arm64-v8a}"
 if [ "$ABI" != armeabi-v7a ]; then
   # The same release built for the desktop's processors (docs/DESKTOP.md), each the one file of its folder there, into
   # build/webview/<abi>/webview.apk: checked against its git blob in that commit.
@@ -51,7 +60,7 @@ if [ "$ABI" != armeabi-v7a ]; then
     arm64-v8a) FOLDER=arm64; BLOB=258dc814a9dc02ce953889440255d6787fca7b57 ;;
     x86) FOLDER=x86; BLOB=dd8fd435da6dcfd3964db8761155958a478a0de1 ;;
     x86_64) FOLDER=x86_64; BLOB=fcd919744aaba4ff5f9d30701e0f1e135cbf0ad6 ;;
-    *) echo "usage: tools/webview-fetch.sh [armeabi-v7a|arm64-v8a|x86|x86_64]" >&2; exit 2 ;;
+    *) echo "unsupported WebView ABI: $ABI" >&2; exit 2 ;;
   esac
   DEST="$OUT/$ABI/webview.apk"
   mkdir -p "$OUT/$ABI"

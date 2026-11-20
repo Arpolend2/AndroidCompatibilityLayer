@@ -48,13 +48,14 @@ class EmbeddedPreview : public PreviewPlayer, public EmbeddedEndpoint
     Q_PROPERTY(bool showStatus READ remoteShowStatus NOTIFY remoteStatusChanged)
 public:
     explicit EmbeddedPreview(QObject *parent = nullptr);
+    void setCpuFrameTransportOnly() { m_cpuFrameTransportOnly = true; }
     bool listen(QProcess *process, QString *error) override;
     QString endpoint() const override;
     bool stopping() const override { return m_stopping; }
     bool usesGpuSurface() const override
     {
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
-        return true;
+        return !m_cpuFrameTransportOnly;
 #else
         return false;
 #endif
@@ -98,6 +99,7 @@ private:
     QPointer<QProcess> m_process;
     QPointer<PreviewKeyboard> m_keyboard;
     QImage m_frame;
+    bool m_cpuFrameTransportOnly = false;
     QString m_status;
     qreal m_width = 0, m_height = 0, m_ratio = 1;
     bool m_stopping = false;

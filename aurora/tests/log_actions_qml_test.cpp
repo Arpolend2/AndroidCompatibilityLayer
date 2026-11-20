@@ -3,6 +3,7 @@
 #include <QQmlExpression>
 #include <QQuickItem>
 #include <QQuickView>
+#include <QSignalSpy>
 #include <QTest>
 #include <QVariant>
 
@@ -14,7 +15,11 @@ class FakeProbe : public QObject
 public:
     QString report = QStringLiteral("Safe test report");
     Q_INVOKABLE QString diagnosticReport() const { return report; }
-    Q_INVOKABLE QString saveCoreLog() const { return QStringLiteral("Saved"); }
+    Q_INVOKABLE QString saveCoreLog() { ++saveCount; return QStringLiteral("Saved"); }
+    Q_INVOKABLE QString openYandexLogForm() { ++openYandexCount; return yandexFormError; }
+    int saveCount = 0;
+    int openYandexCount = 0;
+    QString yandexFormError;
 };
 
 int main(int argc, char **argv)
@@ -28,6 +33,8 @@ int main(int argc, char **argv)
     view.setSource(QUrl::fromLocalFile(QString::fromLocal8Bit(argv[1])));
     if (view.status() != QQuickView::Ready) return 1;
     QObject *root = view.rootObject();
+    QSignalSpy openFormRequested(root, SIGNAL(openYandexFormRequested()));
+    if (!openFormRequested.isValid()) return 1;
     if (root->property("canAct").toBool() ||
         root->findChild<QObject *>(QStringLiteral("logShareAction"))) {
         std::fprintf(stderr, "Initial action state incorrect\n");
@@ -36,6 +43,20 @@ int main(int argc, char **argv)
     const QString text = QString::fromUtf8("sample \xd0\xbf\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82\n");
     root->setProperty("logText", text);
     root->setProperty("logAvailable", true);
+    if (!QMetaObject::invokeMethod(root, "openYandexForm") ||
+        probe.openYandexCount != 1 || openFormRequested.count() != 1 ||
+        probe.saveCount != 0) {
+        std::fprintf(stderr, "Form action did not request the embedded form safely\n");
+        return 1;
+    }
+    probe.yandexFormError = QStringLiteral("Aurora WebView is unavailable.");
+    if (!QMetaObject::invokeMethod(root, "openYandexForm") ||
+        probe.openYandexCount != 2 || openFormRequested.count() != 1 ||
+        root->property("message").toString() != probe.yandexFormError ||
+        probe.saveCount != 0) {
+        std::fprintf(stderr, "Unavailable form was not reported without opening it\n");
+        return 1;
+    }
     if (!root->property("canAct").toBool() || !QMetaObject::invokeMethod(root, "copyLog")) {
         std::fprintf(stderr, "Actions did not enable or copy failed\n");
         return 1;

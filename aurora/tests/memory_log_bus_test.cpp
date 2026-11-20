@@ -7,6 +7,7 @@
 #include <QDBusMessage>
 #include <QDBusReply>
 #include <QDBusVirtualObject>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFileInfo>
 #include <QProcess>
@@ -115,7 +116,77 @@ int main(int argc, char **argv)
             return app.exec();
         }
         QString error;
-        if (!MemoryLogBus::startClient(&error)) return 1;
+        if (!MemoryLogBus::startClient(&error, QByteArray(argv[1]) != "no-append")) return 1;
+        if (QByteArray(argv[1]) == "no-append") {
+            QElapsedTimer timer;
+            timer.start();
+            while (timer.elapsed() < 5000 && !MemoryLogBus::clientDetailedEnabled()) {
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                QThread::msleep(5);
+            }
+            if (!MemoryLogBus::clientDetailedEnabled()) return 1;
+            MemoryLogBus::record(QStringLiteral("test"), QStringLiteral("shared snapshot event"),
+                                 QString(), false);
+            MemoryLogBus::enqueue(QStringLiteral("test"), QStringLiteral("queued event"), false);
+            QTimer::singleShot(300, &app, &QCoreApplication::quit);
+            return app.exec();
+        }
+        if (QByteArray(argv[1]) == "disabled") {
+            QTimer::singleShot(1500, &app, [&app]() {
+                MemoryLogBus::record(QStringLiteral("test"), QStringLiteral("disabled private event"),
+                                     QString(), false);
+                QTimer::singleShot(300, &app, &QCoreApplication::quit);
+            });
+            return app.exec();
+        }
+        if (QByteArray(argv[1]) == "toggle-cycle") {
+            auto waitForState = [](bool enabled, int timeoutMs) {
+                QElapsedTimer timer;
+                timer.start();
+                while (timer.elapsed() < timeoutMs) {
+                    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                    if (MemoryLogBus::clientDetailedEnabled() == enabled) return true;
+                    QThread::msleep(5);
+                }
+                return false;
+            };
+            const QStringList messages = {
+                QStringLiteral("cycle initially enabled"),
+                QStringLiteral("cycle disabled one"),
+                QStringLiteral("cycle enabled one"),
+                QStringLiteral("cycle disabled two"),
+                QStringLiteral("cycle enabled two")
+            };
+            const bool states[] = {true, false, true, false, true};
+            for (int i = 0; i < 5; ++i) {
+                if (!waitForState(states[i], 4000)) {
+                    std::fprintf(stderr, "toggle-cycle timed out at step %d; state=%d\n",
+                                 i, MemoryLogBus::clientDetailedEnabled());
+                    return 1;
+                }
+                MemoryLogBus::record(QStringLiteral("test"), messages.at(i), QString(), false);
+            }
+            QTimer::singleShot(750, &app, &QCoreApplication::quit);
+            return app.exec();
+        }
+        if (QByteArray(argv[1]) == "owner-loss") {
+            auto waitForState = [](bool enabled, int timeoutMs) {
+                QElapsedTimer timer;
+                timer.start();
+                while (timer.elapsed() < timeoutMs) {
+                    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                    if (MemoryLogBus::clientDetailedEnabled() == enabled) return true;
+                    QThread::msleep(5);
+                }
+                return false;
+            };
+            if (!waitForState(true, 5000) || !waitForState(false, 5000)) return 1;
+            MemoryLogBus::record(QStringLiteral("test"), QStringLiteral("owner loss event"), QString(), false);
+            if (!waitForState(true, 8000)) return 1;
+            MemoryLogBus::record(QStringLiteral("test"), QStringLiteral("owner restored event"), QString(), false);
+            QTimer::singleShot(500, &app, &QCoreApplication::quit);
+            return app.exec();
+        }
         if (QByteArray(argv[1]) == "early") {
             if (MemoryLogBus::clientDetailedEnabled()) return 1;
             MemoryLogBus::record(QStringLiteral("test"), QStringLiteral("PRIVATE-EARLY"),
@@ -128,6 +199,13 @@ int main(int argc, char **argv)
             QTimer::singleShot(1500, &app, &QCoreApplication::quit);
             return app.exec();
         }
+        QElapsedTimer stateTimer;
+        stateTimer.start();
+        while (stateTimer.elapsed() < 5000 && !MemoryLogBus::clientDetailedEnabled()) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            QThread::msleep(5);
+        }
+        if (!MemoryLogBus::clientDetailedEnabled()) return 1;
         for (int i = 0; i < 1000; ++i)
             MemoryLogBus::enqueue(QStringLiteral("test"), QString(1000, QLatin1Char('x')), false);
         QTimer::singleShot(2000, &app, &QCoreApplication::quit);
@@ -164,15 +242,58 @@ int main(int argc, char **argv)
                          &loop, &QEventLoop::quit);
         QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
         child.start(app.applicationFilePath(), QStringList() << mode);
-        timeout.start(5000);
+        timeout.start(mode == QLatin1String("toggle-cycle") || mode == QLatin1String("owner-loss")
+                      ? 15000 : 10000);
         loop.exec();
         childErrors = child.readAllStandardError();
-        return child.state() == QProcess::NotRunning && child.exitCode() == 0;
+        const bool succeeded = child.state() == QProcess::NotRunning && child.exitCode() == 0;
+        if (!succeeded)
+            std::fprintf(stderr, "child mode=%s state=%d exit=%d status=%d stderr=%s\n",
+                          qPrintable(mode), child.state(), child.exitCode(), child.exitStatus(),
+                          childErrors.constData());
+        return succeeded;
     };
     if (!runChild(QStringLiteral("early")) ||
         !messages.contains(QStringLiteral("Log transport: 1 early events unavailable while detailed state was unknown")) ||
         messages.contains(QStringLiteral("PRIVATE-EARLY")) || !messages.contains(QStringLiteral("PRIVATE-AFTER"))) {
         std::fprintf(stderr, "early detailed events were not accounted for correctly\n");
+        return 1;
+    }
+    const int beforeSnapshotOnly = received;
+    if (!runChild(QStringLiteral("no-append")) || received != beforeSnapshotOnly) {
+        std::fprintf(stderr, "snapshot-only client sent log content over D-Bus Append\n");
+        return 1;
+    }
+    QTimer::singleShot(1000, [&]() { extended = false; });
+    QTimer::singleShot(2500, [&]() { extended = true; });
+    QTimer::singleShot(4000, [&]() { extended = false; });
+    QTimer::singleShot(5500, [&]() { extended = true; });
+    if (!runChild(QStringLiteral("toggle-cycle")) ||
+        !messages.contains(QStringLiteral("cycle initially enabled")) ||
+        messages.contains(QStringLiteral("cycle disabled one")) ||
+        !messages.contains(QStringLiteral("cycle enabled one")) ||
+        messages.contains(QStringLiteral("cycle disabled two")) ||
+        !messages.contains(QStringLiteral("cycle enabled two"))) {
+        std::fprintf(stderr, "detailed state did not follow repeated off/on changes; received=%d child=%s\n",
+                    received, childErrors.constData());
+        for (const QString &message : messages)
+           std::fprintf(stderr, "message=%s\n", qPrintable(message));
+        return 1;
+    }
+    bool ownerReleased = false;
+    bool ownerRestored = false;
+    QTimer::singleShot(1000, [&]() {
+        ownerReleased = bus.unregisterService(QStringLiteral("ru.androidcompatibilitylayer.appmanager"));
+        extended = false;
+    });
+    QTimer::singleShot(3500, [&]() {
+        ownerRestored = bus.registerService(QStringLiteral("ru.androidcompatibilitylayer.appmanager"));
+        extended = true;
+    });
+    if (!runChild(QStringLiteral("owner-loss")) || !ownerReleased || !ownerRestored ||
+        messages.contains(QStringLiteral("owner loss event")) ||
+        !messages.contains(QStringLiteral("owner restored event"))) {
+        std::fprintf(stderr, "manager owner loss did not stop logging and reconnect safely\n");
         return 1;
     }
     const QString legacySender = identity.senderPath;
@@ -256,19 +377,44 @@ int main(int argc, char **argv)
     identity.failSender = false;
     identity.acceptManager = false;
     identity.acceptWellKnownManager = true;
-    if (!runChild() || received != before + 1 ||
-        !childErrors.contains("Log IPC manager identification: identity rejected: executable mismatch, key present") ||
-        !childErrors.contains("Log IPC manager well-known comparison: expected=1; executable_equal=0; key_equal=1") ||
-        !MemoryLogBus::statistics().contains(QStringLiteral("manager identification / identity rejected: executable mismatch, key present = ")) ||
-        childErrors.contains("test-key") || childErrors.contains("/usr/bin/") ||
-        !messages.last().contains(QStringLiteral("\"executable\":\"/usr/bin/ru.androidcompatibilitylayer.Android0123456789abcdef01234567\""))) {
-        std::fprintf(stderr, "client sent logs to an unidentified manager\n");
+    const bool identityChildResult = runChild();
+    const QString expectedIdentity = QStringLiteral(
+        "\"executable\":\"/usr/bin/ru.androidcompatibilitylayer.Android0123456789abcdef01234567\"");
+    QElapsedTimer identityDetailTimer;
+    identityDetailTimer.start();
+    bool identityPayload = false;
+    while (identityDetailTimer.elapsed() < 1000 && !identityPayload) {
+        for (const QString &message : messages)
+           if (message.contains(expectedIdentity)) identityPayload = true;
+        if (!identityPayload) {
+           QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+           QThread::msleep(5);
+        }
+    }
+    const bool identityChecks = received > before &&
+        childErrors.contains("Log IPC manager identification: identity rejected: executable mismatch, key present") &&
+        childErrors.contains("Log IPC manager well-known comparison: expected=1; executable_equal=0; key_equal=1") &&
+        MemoryLogBus::statistics().contains(QStringLiteral("manager identification / identity rejected: executable mismatch, key present = ")) &&
+        !childErrors.contains("test-key") && !childErrors.contains("/usr/bin/") &&
+        identityPayload;
+    if (!identityChildResult || !identityChecks) {
+        std::fprintf(stderr, "trusted well-known manager identity was not safely confirmed; before=%d received=%d errors=%s stats=%s last=%s\n",
+                     before, received, childErrors.constData(),
+                     qPrintable(MemoryLogBus::statistics()),
+                     qPrintable(messages.isEmpty() ? QString() : messages.last().left(160)));
+        std::fprintf(stderr, "child=%d checks=%d diag=%d comparison=%d statistic=%d redacted=%d payload=%d\n",
+                     identityChildResult, identityChecks,
+                     childErrors.contains("Log IPC manager identification: identity rejected: executable mismatch, key present"),
+                     childErrors.contains("Log IPC manager well-known comparison: expected=1; executable_equal=0; key_equal=1"),
+                     MemoryLogBus::statistics().contains(QStringLiteral("manager identification / identity rejected: executable mismatch, key present = ")),
+                     !childErrors.contains("test-key") && !childErrors.contains("/usr/bin/"),
+                     identityPayload);
         return 1;
     }
     extended = false;
     identity.accept = false;
     const int beforeIdentityDetails = received;
-    if (!runChild() || received != beforeIdentityDetails ||
+    if (!runChild(QStringLiteral("disabled")) || received != beforeIdentityDetails ||
         messages.join(QLatin1Char('\n')).contains(QStringLiteral("/usr/bin/unrelated"))) {
         std::fprintf(stderr, "identity details escaped while extended logging was disabled\n");
         return 1;
@@ -284,7 +430,7 @@ int main(int argc, char **argv)
     identity.accept = true;
     identity.acceptManager = true;
     identity.managerKey.clear();
-    if (!runChild() || received != before + 1 ||
+    if (!runChild(QStringLiteral("disabled")) || received != before + 1 ||
         !childErrors.contains("identity rejected: key empty") ||
         !MemoryLogBus::statistics().contains(QStringLiteral("identity rejected: key empty = "))) {
         std::fprintf(stderr, "empty manager key was not reported\n");
@@ -292,7 +438,7 @@ int main(int argc, char **argv)
     }
     before = received;
     identity.acceptManager = false;
-    if (!runChild() || received != before + 1 ||
+    if (!runChild(QStringLiteral("disabled")) || received != before + 1 ||
         !childErrors.contains("identity rejected: executable mismatch, key empty") ||
         !MemoryLogBus::statistics().contains(QStringLiteral("identity rejected: executable mismatch, key empty = "))) {
         std::fprintf(stderr, "empty key with executable mismatch was not reported\n");
@@ -301,14 +447,14 @@ int main(int argc, char **argv)
     before = received;
     identity.acceptManager = true;
     identity.managerKey = QString(257, QLatin1Char('x'));
-    if (!runChild() || received != before ||
+    if (!runChild(QStringLiteral("disabled")) || received != before ||
         !childErrors.contains("identity rejected: key oversized") ||
         childErrors.contains(identity.managerKey.toUtf8())) {
         std::fprintf(stderr, "oversized manager key was not safely reported\n");
         return 1;
     }
     identity.acceptManager = false;
-    if (!runChild() || received != before ||
+    if (!runChild(QStringLiteral("disabled")) || received != before ||
         !childErrors.contains("identity rejected: executable mismatch, key oversized")) {
         std::fprintf(stderr, "oversized key with executable mismatch was not reported\n");
         return 1;
@@ -316,7 +462,7 @@ int main(int argc, char **argv)
     identity.acceptManager = true;
     identity.managerKey = QStringLiteral("test-key");
     identity.failManager = true;
-    if (!runChild() || received != before ||
+    if (!runChild(QStringLiteral("disabled")) || received != before ||
         !MemoryLogBus::statistics().contains(QStringLiteral("manager identification / access denied = ")) ||
         MemoryLogBus::statistics().contains(QStringLiteral("PRIVATE-ERROR-CONTENT"))) {
         std::fprintf(stderr, "manager identification failure was not safely reported\n");

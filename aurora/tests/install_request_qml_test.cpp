@@ -122,7 +122,9 @@ public:
     Q_INVOKABLE void setDetailedLogEnabled(bool enabled) { m_detailedLogEnabled = enabled; emit detailedLogChanged(); }
     Q_INVOKABLE QString diagnosticReport() const { return QStringLiteral("Safe test report"); }
     Q_INVOKABLE QString saveCoreLog() { ++saveLogCount; return saveLogResult; }
+    Q_INVOKABLE QString clearSavedLogs() { ++clearLogsCount; return QStringLiteral("Log files deleted: 2."); }
     int saveLogCount = 0;
+    int clearLogsCount = 0;
     QString saveLogResult = QStringLiteral("Saved for test");
     void setCoreLog(const QString &text) { m_coreLog = text; emit coreLogChanged(); }
     bool visible() const { return m_visible; }
@@ -280,15 +282,26 @@ static void coverItemsNamed(QQuickItem *parent, const QString &name, QList<QQuic
 
 static bool checkDetailedLog(QObject *root, FakeProbe &probe)
 {
-    QObject *toggle = root->findChild<QObject *>(QStringLiteral("toggleDetailedLog"));
-    if (!toggle || !QMetaObject::invokeMethod(toggle, "clicked")) return false;
+    auto *toggle = root->findChild<QQuickItem *>(QStringLiteral("toggleDetailedLog"));
+    auto *save = root->findChild<QQuickItem *>(QStringLiteral("saveLog"));
+    auto *send = root->findChild<QQuickItem *>(QStringLiteral("reportToYandex"));
+    auto *clear = root->findChild<QQuickItem *>(QStringLiteral("clearLogFolder"));
+    auto *content = root->findChild<QQuickItem *>(QStringLiteral("logContent"));
+    auto *menu = root->findChild<QQuickItem *>(QStringLiteral("mainPulleyMenu"));
+    if (!menu || !menu->setProperty("active", true)) return false;
+    QCoreApplication::processEvents();
+    if (!toggle || !save || !send || !clear || !content || save->isVisible() || send->isVisible() ||
+        clear->isVisible() ||
+        !toggle->isVisible() || content->isVisible() ||
+        toggle->property("text").toString() != QStringLiteral("Enable logs")) return false;
+    menu->setProperty("active", false);
+    if (!QMetaObject::invokeMethod(toggle, "clicked")) return false;
     QTest::qWait(100);
     QObject *dialog = root->findChild<QObject *>(QStringLiteral("detailedLogDialog"));
     QObject *warning = root->findChild<QObject *>(QStringLiteral("detailedLogWarning"));
     if (!dialog || !warning || probe.detailedLogEnabled() ||
         !warning->property("text").toString().contains(QStringLiteral("passwords")) ||
-        !warning->property("text").toString().contains(QStringLiteral("Documents")) ||
-        !warning->property("text").toString().contains(QStringLiteral("keep recording"))) {
+        !warning->property("text").toString().contains(QStringLiteral("tokens"))) {
         std::fprintf(stderr, "Detailed logging did not require a privacy warning\n");
         return false;
     }
@@ -307,8 +320,69 @@ static bool checkDetailedLog(QObject *root, FakeProbe &probe)
     popDialog.evaluate();
     if (popDialog.hasError()) return false;
     QTest::qWait(100);
-    return toggle->property("text").toString() == QStringLiteral("Use short log") &&
-           QMetaObject::invokeMethod(toggle, "clicked") && !probe.detailedLogEnabled();
+    menu->setProperty("active", true);
+    QCoreApplication::processEvents();
+    QList<QQuickItem *> items;
+    for (auto *item : toggle->parentItem()->childItems()) {
+        if (item->isVisible() && item->metaObject()->indexOfSignal("clicked()") >= 0)
+            items.append(item);
+    }
+    if (!content->isVisible() || !save->isVisible() || !send->isVisible() ||
+        toggle->property("text").toString() != QStringLiteral("Disable logs") ||
+        !clear->isVisible() || items.indexOf(clear) != items.indexOf(toggle) + 1 ||
+        items.indexOf(send) <= items.indexOf(clear) || items.indexOf(save) <= items.indexOf(send)) {
+        std::fprintf(stderr, "Enabled journal menu or order is incorrect (visible entries: %d; toggle=%d clear=%d send=%d save=%d)\n",
+                     items.size(), items.indexOf(toggle), items.indexOf(clear), items.indexOf(send), items.indexOf(save));
+        return false;
+    }
+    auto *message = root->findChild<QObject *>(QStringLiteral("logActionMessage"));
+    if (!message || save->isEnabled() || !send->isEnabled() ||
+        probe.saveLogCount != 0 || !message->property("text").toString().isEmpty()) return false;
+    probe.setCoreLog(QStringLiteral("first line\nsecond line\n"));
+    auto *logText = root->findChild<QQuickItem *>(QStringLiteral("coreLogText"));
+    if (!logText ||
+        logText->property("text").toString() != QStringLiteral("second line\nfirst line") ||
+        !save->isEnabled() || !QMetaObject::invokeMethod(save, "clicked") ||
+        probe.saveLogCount != 1 || message->property("text").toString() != probe.saveLogResult ||
+        !send->isEnabled() || probe.saveLogCount != 1) return false;
+    menu->setProperty("active", false);
+    QTest::qWait(100);
+    if (!QMetaObject::invokeMethod(clear, "clicked")) return false;
+    QQmlExpression currentPage(qmlContext(root), root, QStringLiteral("pageStack.currentPage"));
+    auto activePage = [&]() { return currentPage.evaluate().value<QObject *>(); };
+    auto waitForCleanupDialog = [&]() -> QObject * {
+        for (int i = 0; i < 50; ++i) {
+            QObject *page = activePage();
+            if (page && page->objectName() == QStringLiteral("clearLogFolderDialog")) return page;
+            QTest::qWait(20);
+        }
+        return nullptr;
+    };
+    if (!waitForCleanupDialog() || probe.clearLogsCount != 0) {
+        std::fprintf(stderr, "Cleanup did not wait for confirmation\n");
+        return false;
+    }
+    cancelDialog.evaluate();
+    if (cancelDialog.hasError() || probe.clearLogsCount != 0) {
+        std::fprintf(stderr, "Cleanup cancellation failed\n");
+        return false;
+    }
+    QTest::qWait(100);
+    if (!QMetaObject::invokeMethod(clear, "clicked")) return false;
+    auto *clearDialog = waitForCleanupDialog();
+    if (!clearDialog || !QMetaObject::invokeMethod(clearDialog, "accepted") ||
+        probe.clearLogsCount != 1 || message->property("text").toString() != QStringLiteral("Log files deleted: 2.")) {
+        std::fprintf(stderr, "Cleanup confirmation failed (dialog: %d; calls: %d; message: %s)\n",
+                     clearDialog != nullptr, probe.clearLogsCount, qPrintable(message->property("text").toString()));
+        return false;
+    }
+    popDialog.evaluate();
+    if (popDialog.hasError()) return false;
+    QTest::qWait(100);
+    const bool disabled = QMetaObject::invokeMethod(toggle, "clicked") && !probe.detailedLogEnabled() &&
+                          !content->isVisible() && !save->isVisible() && !send->isVisible() && !clear->isVisible();
+    menu->setProperty("active", false);
+    return disabled;
 }
 
 int main(int argc, char **argv)
@@ -361,6 +435,8 @@ int main(int argc, char **argv)
             QObject *install = cover->findChild<QObject *>(QStringLiteral("coverInstallApk"));
             QObject *save = cover->findChild<QObject *>(QStringLiteral("coverSaveLog"));
             QObject *store = cover->findChild<QObject *>(QStringLiteral("coverOpenOfficialStore"));
+            QObject *withLogs = cover->findChild<QObject *>(QStringLiteral("coverActionsWithLogs"));
+            QObject *withoutLogs = cover->findChild<QObject *>(QStringLiteral("coverActionsWithoutLogs"));
             QObject *banner = root->findChild<QObject *>(QStringLiteral("coverActionBanner"));
             QObject *storeMenu = root->findChild<QObject *>(QStringLiteral("openOfficialStore"));
             if (!apps || apps->property("count").toInt() != 7 || !install || !save || !store || !banner ||
@@ -421,11 +497,17 @@ int main(int argc, char **argv)
                 std::fprintf(stderr, "Landscape columns or odd app count is incorrect\n");
                 return 1;
             }
-            if (!QMetaObject::invokeMethod(save, "triggered") || probe.saveLogCount != 0 ||
-                banner->property("previewBody").toString().isEmpty()) return 1;
             probe.setCoreLog(QStringLiteral("log"));
-            if (!QMetaObject::invokeMethod(save, "triggered") || probe.saveLogCount != 1 ||
+            if (!withLogs || !withoutLogs || withLogs->property("enabled").toBool() ||
+                !withoutLogs->property("enabled").toBool() ||
+                !QMetaObject::invokeMethod(save, "triggered") || probe.saveLogCount != 0) return 1;
+            probe.setDetailedLogEnabled(true);
+            if (!withLogs->property("enabled").toBool() || withoutLogs->property("enabled").toBool() ||
+                !QMetaObject::invokeMethod(save, "triggered") || probe.saveLogCount != 1 ||
                 banner->property("previewBody").toString() != probe.saveLogResult) return 1;
+            probe.setDetailedLogEnabled(false);
+            if (withLogs->property("enabled").toBool() || !withoutLogs->property("enabled").toBool() ||
+                !QMetaObject::invokeMethod(save, "triggered") || probe.saveLogCount != 1) return 1;
             if (!QMetaObject::invokeMethod(store, "triggered") || probe.storeOpenCount != 2) return 1;
             if (!QMetaObject::invokeMethod(install, "triggered") || probe.activationCount != 1) return 1;
             QQmlExpression picker(qmlContext(root), root,
@@ -436,10 +518,11 @@ int main(int argc, char **argv)
         }
         if (argc == 3 && QByteArray(argv[2]) == "--launch-install-only") {
             probe.setVisible(false);
-            QObject *banner = root->findChild<QObject *>(QStringLiteral("launchInstallBanner"));
+            QQuickItem *banner = root->findChild<QQuickItem *>(QStringLiteral("launchInstallBanner"));
+            QQuickItem *page = root->findChild<QQuickItem *>(QStringLiteral("launcherPage"));
             QQuickItem *install = root->findChild<QQuickItem *>(QStringLiteral("confirmLaunchInstall"));
             QQuickItem *dismiss = root->findChild<QQuickItem *>(QStringLiteral("dismissLaunchInstall"));
-            if (!banner || !install || !dismiss || banner->property("visible").toBool()) {
+            if (!banner || !page || !install || !dismiss || banner->isVisible()) {
                 std::fprintf(stderr, "Initial banner state: banner=%d install=%d dismiss=%d visible=%d\n",
                              bool(banner), bool(install), bool(dismiss),
                              banner && banner->property("visible").toBool());
@@ -452,6 +535,25 @@ int main(int argc, char **argv)
                 std::fprintf(stderr, "Offer banner not shown\n");
                 return 1;
             }
+            if (banner->parentItem() != page ||
+                root->property("allowedOrientations") != page->property("allowedOrientations") ||
+                page->property("_allowedOrientations") != page->property("allowedOrientations")) {
+                std::fprintf(stderr, "RPM offer is not attached to the rotating page\n");
+                return 1;
+            }
+            struct Layout { int rotation; int width; int height; };
+            for (const Layout &layout : {
+                     Layout{0, 480, 854}, Layout{90, 854, 480}, Layout{270, 320, 240}}) {
+                page->setRotation(layout.rotation);
+                page->setWidth(layout.width);
+                page->setHeight(layout.height);
+                QCoreApplication::processEvents();
+                if (!fits(banner, page) || !fits(install, banner) || !fits(dismiss, banner)) {
+                    std::fprintf(stderr, "RPM offer geometry invalid at %d degrees (%dx%d)\n",
+                                 layout.rotation, layout.width, layout.height);
+                    return 1;
+                }
+            }
             probe.setRpmState(true, QString());
             if (install->property("enabled").toBool()) {
                 std::fprintf(stderr, "Install enabled during RPM operation\n");
@@ -460,7 +562,8 @@ int main(int argc, char **argv)
             probe.setRpmState(false, QString());
             if (!install->property("enabled").toBool() || !click(install) ||
                 probe.rpmPackage != QStringLiteral("org.example.second") ||
-                banner->property("visible").toBool()) {
+                banner->property("visible").toBool() ||
+                root->property("allowedOrientations") != root->property("defaultAllowedOrientations")) {
                 std::fprintf(stderr, "Install action failed\n");
                 return 1;
             }
@@ -1009,57 +1112,6 @@ int main(int argc, char **argv)
         if (!page->setProperty("section", 2)) return 1;
         if (!mainMenu->isVisible()) {
             std::fprintf(stderr, "Log menu visibility is incorrect\n");
-            return 1;
-        }
-        QQuickItem *copyLog = root->findChild<QQuickItem *>(QStringLiteral("copyLog"));
-        QQuickItem *saveLog = root->findChild<QQuickItem *>(QStringLiteral("saveLog"));
-        QQuickItem *shareLog = root->findChild<QQuickItem *>(QStringLiteral("shareLog"));
-        if (!copyLog || !saveLog || !shareLog || copyLog->property("enabled").toBool() ||
-            saveLog->property("text").toString() != QStringLiteral("Save to file") ||
-            saveLog->property("enabled").toBool() ||
-            shareLog->property("enabled").toBool()) {
-            std::fprintf(stderr, "Empty log actions are not disabled\n");
-            return 1;
-        }
-        probe.setCoreLog(QStringLiteral("first line\nsecond line\n"));
-        QQuickItem *logText = root->findChild<QQuickItem *>(QStringLiteral("coreLogText"));
-        if (!logText || logText->x() <= 0 ||
-            logText->property("text").toString() != QStringLiteral("second line\nfirst line")) {
-            std::fprintf(stderr, "Log is not displayed newest first\n");
-            return 1;
-        }
-        if (!copyLog->property("enabled").toBool() || !shareLog->property("enabled").toBool() ||
-            !QMetaObject::invokeMethod(copyLog, "clicked")) {
-            std::fprintf(stderr, "Log pulley actions are not available\n");
-            return 1;
-        }
-        QObject *logActionMessage = root->findChild<QObject *>(QStringLiteral("logActionMessage"));
-        if (!saveLog->property("enabled").toBool() || !QMetaObject::invokeMethod(saveLog, "clicked") ||
-            probe.saveLogCount != 1 || !logActionMessage ||
-            logActionMessage->property("text").toString() != probe.saveLogResult) return 1;
-        probe.saveLogResult = QStringLiteral("Save failed for test");
-        if (!QMetaObject::invokeMethod(saveLog, "clicked") || probe.saveLogCount != 2 ||
-            logActionMessage->property("text").toString() != probe.saveLogResult) return 1;
-        QQmlExpression clipboard(qmlContext(root), root, QStringLiteral("Clipboard.text"));
-        if (clipboard.evaluate().toString() != QStringLiteral("Safe test report") || clipboard.hasError()) {
-            std::fprintf(stderr, "Log pulley copy did not copy the log\n");
-            return 1;
-        }
-        QQuickItem *follow = root->findChild<QQuickItem *>(QStringLiteral("logFollow"));
-        if (!follow || follow->property("text").toString() != QStringLiteral("Hold") ||
-            !QMetaObject::invokeMethod(follow, "clicked") || follow->property("text").toString() != QStringLiteral("Follow") ||
-            !QMetaObject::invokeMethod(follow, "clicked") || follow->property("text").toString() != QStringLiteral("Hold")) {
-            std::fprintf(stderr, "Log follow control did not toggle\n");
-            return 1;
-        }
-        probe.setCoreLog(QStringLiteral("older line\n").repeated(200) + QStringLiteral("latest line"));
-        QTest::qWait(100);
-        mainScroll->setProperty("contentY", 100);
-        probe.setCoreLog(probe.coreLog() + QStringLiteral("\nnewest line"));
-        QTest::qWait(100);
-        if (!logText->property("text").toString().startsWith(QStringLiteral("newest line\nlatest line\n")) ||
-            mainScroll->property("contentY").toReal() > 0.1) {
-            std::fprintf(stderr, "Log following did not return to the newest entries at the top\n");
             return 1;
         }
         if (!checkDetailedLog(root, probe)) return 1;

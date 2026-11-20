@@ -141,7 +141,7 @@
 # the framework's android.database.sqlite, twice, the second run on what the
 # first left, where the core has SQLite in it (build/sqlite). And `webview`,
 # Android's System WebView on pages of the app's own server, where the
-# Android root carries the WebView (tools/webview-fetch.sh). And `camera`, the
+# Android root carries the explicitly staged WebView test provider. And `camera`, the
 # old android.hardware.Camera on a stand-in for the shell's cameras, twice: the
 # second time with every camera refused. And `screen`, whose surface is resized
 # and turned from the host's side (megler_set_surface), as a PC's window or a
@@ -318,13 +318,13 @@ EOF
       else
         echo "(the Java test app data is not run: the core was built without SQLite)"
       fi
-      # The WebView app: Android's System WebView, Chromium, from the Android root (tools/webview-fetch.sh brings it), on pages
-      # of the app's own server on loopback. Only where the root carries it.
+      # The WebView app: Android's System WebView, Chromium, from the Android root, on pages of the app's own server on
+      # loopback. Only where the root has an explicitly staged test provider.
       if [ -f "$ROOT/build/guest/java/webview.apk" ] && [ -f "$ROOT/build/android9/root/app/webview/webview.apk" ]; then
         echo "the Java test app webview (build/guest/java/webview.apk), through megler_run: Android's System WebView from the Android root"
         MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" wsl.exe -- bash -c "cp -u '$WROOT/build/guest/java/webview.apk' $WB/webview.apk && rm -rf $WB/java-data-webview && qemu-arm -L /usr/arm-linux-gnueabihf $WB/mg_tests --java webview $WB/webview.apk $WB/java-data-webview $WB/android-root '$WROOT/build/java-pictures' 0 480x800@160 2>&1" || STATUS=1
       else
-        echo "(the Java test app webview is not run: no WebView in the Android root -- tools/webview-fetch.sh fetches it)"
+        echo "(the Java test app webview is not run: no explicit WebView test provider in the Android root)"
       fi
       # The camera app: the old android.hardware.Camera on a stand-in for the shell's cameras (core/tests/mg_camera_standin.c),
       # its previews' pictures checked in the window; and once more with every camera refused, as Windows refuses Megler the

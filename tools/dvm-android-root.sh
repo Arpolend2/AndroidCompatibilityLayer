@@ -76,13 +76,11 @@
 #                           reads (Chromium's Skia, in the WebView)
 #   usr/icu/icudt60l.dat    ICU's data
 #   usr/share/zoneinfo/*    the time zones
-#   app/webview/webview.apk Android's System WebView, AOSP's prebuilt of
-#                           Chromium for 32-bit ARM, where Android's image has
-#                           it (/system/app/webview): android.webkit.WebView
-#                           loads it into the app (WebViewFactory). Where
-#                           tools/webview-fetch.sh has fetched it
-#                           (build/webview/webview.apk); without it a WebView
-#                           cannot be made, as on a phone without one
+#   app/webview/webview.apk Android's System WebView at the Android image's
+#                           path (/system/app/webview): android.webkit.WebView
+#                           loads it into the app (WebViewFactory). Absent by
+#                           default; the outdated AOSP Chromium 128 build can
+#                           be staged only for an explicitly enabled test.
 #   lib/libwebviewchromium_plat_support.so
 #                           the name of the platform's WebView support, which
 #                           the WebView loads by name: a file that says so, as
@@ -103,6 +101,9 @@
 #                            480 dpi; a resource for another is scaled)
 #   MEGLER_ANDROID_SDK    an Android SDK with build-tools 29.0.3, for aapt2
 #                            (the user's Documents folder)
+#   MEGLER_WEBVIEW_TEST_PROVIDER=chromium-128-aosp
+#                           explicitly stages the old, hash-pinned AOSP provider
+#                           for the WebView smoke test only; disabled by default
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 A9="$ROOT/build/android9"
@@ -202,22 +203,26 @@ if [ -f "$A9/system/etc/fonts.xml" ]; then
   cp -u "$A9/system/etc/fonts.xml" "$OUT/etc/"
 fi
 size() { du -sk "$1" | cut -f1; }
-# Android's System WebView, where tools/webview-fetch.sh has put it, and the name of its platform support library.
+# Android's System WebView. Chromium 128 is staged only for an explicitly selected test provider.
 WEBVIEW="no WebView"
-# (32-bit ARM's is build/webview/webview.apk; the desktop's processors' build/webview/<abi>/webview.apk, the same release
-# built for them: tools/webview-fetch.sh <abi>. x86_64's has x86's library too, and serves x86 where x86's own is not there.)
-WEBVIEW_APK="$ROOT/build/webview/webview.apk"
-if [ "$ABI" != armeabi-v7a ]; then
-  WEBVIEW_APK="$ROOT/build/webview/$ABI/webview.apk"
-  [ "$ABI" = x86 ] && [ ! -f "$WEBVIEW_APK" ] && WEBVIEW_APK="$ROOT/build/webview/x86_64/webview.apk"
+WEBVIEW_APK=""
+if [ "${MEGLER_WEBVIEW_TEST_PROVIDER:-}" = chromium-128-aosp ]; then
+  [ "$ABI" = arm64-v8a ] || { echo "Chromium 128 smoke provider is enabled only for arm64-v8a" >&2; exit 2; }
+  WEBVIEW_APK="$ROOT/build/webview/arm64-v8a/webview.apk"
+  [ -f "$WEBVIEW_APK" ] || { echo "no AOSP Chromium 128 test provider at $WEBVIEW_APK; run tools/webview-fetch.sh --aosp-chromium-128-test-only arm64-v8a" >&2; exit 1; }
+  [ "$(git -C "$ROOT" hash-object "$WEBVIEW_APK")" = 258dc814a9dc02ce953889440255d6787fca7b57 ] \
+    || { echo "AOSP Chromium 128 test provider failed its pinned Git blob check" >&2; exit 1; }
+elif [ -n "${MEGLER_WEBVIEW_TEST_PROVIDER:-}" ]; then
+  echo "unknown MEGLER_WEBVIEW_TEST_PROVIDER: $MEGLER_WEBVIEW_TEST_PROVIDER" >&2
+  exit 2
 fi
-if [ -f "$WEBVIEW_APK" ]; then
+if [ -n "$WEBVIEW_APK" ]; then
   mkdir -p "$OUT/app/webview"
   cmp -s "$WEBVIEW_APK" "$OUT/app/webview/webview.apk" || cp "$WEBVIEW_APK" "$OUT/app/webview/webview.apk"
   echo "The platform support of the WebView: its natives are answered by the core (core/src/drivers/mg_java_webview.c)." > "$OUT/lib/libwebviewchromium_plat_support.so"
   WEBVIEW="the WebView $(size "$OUT/app/webview") KB"
 else
-  echo "  (not there: ${WEBVIEW_APK#$ROOT/}: tools/webview-fetch.sh $([ "$ABI" = armeabi-v7a ] || echo "$ABI ")fetches Android's System WebView)"
+  echo "  (WebView disabled; explicitly set MEGLER_WEBVIEW_TEST_PROVIDER=chromium-128-aosp for the ARM64 smoke test)"
   rm -rf "$OUT/app/webview" "$OUT/lib/libwebviewchromium_plat_support.so"
 fi
 # The system's libraries whose functions the core answers itself, each named in lib by a file that says so, as Android has

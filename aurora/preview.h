@@ -20,6 +20,7 @@ class PreviewGpuItem;
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
 #include "preview_gpu_canvas.h"
 typedef bool (MEGLER_CB *PreviewRemoteGpuCanvasPresent)(void *user, uint32_t texture, int width, int height);
+class EmbeddedGpuTransport;
 #endif
 
 #include "../core/include/megler.h"
@@ -66,12 +67,13 @@ public:
     void setKeyboard(PreviewKeyboard *keyboard);
     void setRemoteKeyboard(const megler_keyboard_host &keyboard);
     void setCpuPresentationOnly(bool enabled) { m_cpuPresentationOnly = enabled; }
-    void setOffscreenGpuCanvas(bool enabled) { m_offscreenGpuCanvas = enabled; }
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
-    void setRemoteGpuCanvasPresentation(PreviewRemoteGpuCanvasPresent present, void *user)
+    void setRemoteGpuCanvasPresentation(PreviewRemoteGpuCanvasPresent present, void *user,
+                                        EmbeddedGpuTransport *transport)
     {
         m_remoteGpuCanvasPresent = present;
         m_remoteGpuCanvasUser = user;
+        m_remoteGpuTransport = transport;
         m_remoteGpuCanvasFailed.storeRelease(0);
     }
 #endif
@@ -114,7 +116,6 @@ private:
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
     static bool MEGLER_CB presentGpuCanvas(void *user, uint32_t texture, int width, int height);
     static bool MEGLER_CB releaseGpuCanvas(void *user, uint32_t texture);
-    static bool MEGLER_CB presentOffscreenGpuCanvas(void *user, const void *pixels, int width, int height, int stride);
     static bool MEGLER_CB presentRemoteGpuCanvas(void *user, uint32_t texture, int width, int height);
     static bool MEGLER_CB releaseRemoteGpuCanvas(void *user, uint32_t texture);
 #endif
@@ -145,9 +146,9 @@ private:
     bool m_closeOnExit = false;
     bool m_closeOnBackGesture = false;
     bool m_cpuPresentationOnly = false;
-    bool m_offscreenGpuCanvas = false;
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
     PreviewRemoteGpuCanvasPresent m_remoteGpuCanvasPresent = nullptr;
+    EmbeddedGpuTransport *m_remoteGpuTransport = nullptr;
     void *m_remoteGpuCanvasUser = nullptr;
     QAtomicInt m_remoteGpuCanvasFailed = 0;
 #endif

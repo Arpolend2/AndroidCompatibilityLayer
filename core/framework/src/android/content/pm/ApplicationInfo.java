@@ -66,7 +66,7 @@ public class ApplicationInfo extends PackageItemInfo implements android.os.Parce
             a.name = megler.Manifest.applicationClass;
             a.theme = megler.Manifest.appTheme; a.labelRes = megler.Manifest.appLabel; a.icon = megler.Manifest.appIcon;
             a.targetSdkVersion = megler.Manifest.targetSdk; a.minSdkVersion = megler.Manifest.minSdk;
-            a.flags = FLAG_HAS_CODE | FLAG_INSTALLED | FLAG_ALLOW_BACKUP | FLAG_SUPPORTS_RTL | FLAG_HARDWARE_ACCELERATED | (megler.Manifest.debuggable ? FLAG_DEBUGGABLE : 0) | (megler.Manifest.largeHeap ? FLAG_LARGE_HEAP : 0)
+            a.flags = FLAG_HAS_CODE | FLAG_INSTALLED | FLAG_SUPPORTS_RTL | FLAG_HARDWARE_ACCELERATED | (megler.Manifest.allowBackup ? FLAG_ALLOW_BACKUP : 0) | (megler.Manifest.debuggable ? FLAG_DEBUGGABLE : 0) | (megler.Manifest.largeHeap ? FLAG_LARGE_HEAP : 0)
                 | (megler.Manifest.extractNativeLibs ? FLAG_EXTRACT_NATIVE_LIBS : 0);   /* Qt looks for its plugins in nativeLibraryDir then */
             a.metaData = megler.Manifest.appMetaData;
             a.appComponentFactory = megler.Manifest.appComponentFactory;

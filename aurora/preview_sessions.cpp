@@ -1,3 +1,4 @@
+#include "application_executables.h"
 #include "preview_sessions.h"
 
 #include "install_request_coordinator.h"
@@ -130,7 +131,7 @@ bool PreviewSessions::start(const QString &key, const QString &androidRoot, cons
                                           << session->install.endpoint() << session->install.resultsDir()
                                           << session->activation.endpoint();
     if (embedded) arguments << embedded->endpoint();
-    session->process.start(QCoreApplication::applicationFilePath(), arguments);
+    session->process.start(ApplicationExecutables::worker(), arguments);
     emit runningChanged();
     return true;
 }

@@ -405,6 +405,7 @@ int main(int argc, char **argv)
     const QByteArray name("request_0123456789abcdef0123456789abcdef.apk");
     const QByteArray mismatch("request_0123456789abcdef0123456789abcdef_43_org.example.app.apk");
     const QByteArray bundleName("request_0123456789abcdef0123456789abcdef_42_org.example.app.apks");
+    const QByteArray xapkName("request_3123456789abcdef0123456789abcdef.xapk");
     const QByteArray tamperedName("request_1123456789abcdef0123456789abcdef.apk");
     const QByteArray declinedName("request_2123456789abcdef0123456789abcdef.apk");
     if (!callbacks.install_apk || callbacks.install_apk(callbacks.user, "/outside.apk", "../bad.apk"))
@@ -421,15 +422,16 @@ int main(int argc, char **argv)
     bool submitted = false;
     QTimer poll;
     QObject::connect(&poll, &QTimer::timeout, &app, [&]() {
-        const QString resultPath = stage == 1 || stage == 4 || stage == 5 || stage == 6
+        const QString resultPath = stage == 1 || stage == 4 || stage == 5 || stage == 6 || stage == 7
             ? QDir(exporter.appsDir()).filePath(QStringLiteral("installs/") +
                 QString::fromLatin1(stage == 1 ? mismatch : stage == 4 ? bundleName :
-                                    stage == 5 ? tamperedName : declinedName) + QStringLiteral(".txt"))
+                                    stage == 5 ? tamperedName : stage == 6 ? declinedName : xapkName) + QStringLiteral(".txt"))
             : result;
         if ((stage == 2 || stage >= 4) && !submitted) {
             const QDir handoffs(QDir(root.path()).filePath(QStringLiteral("store-install-handoffs")));
             const QStringList names = handoffs.entryList(QStringList() <<
-                (stage == 4 ? QStringLiteral("request_*.apks") : QStringLiteral("request_*.apk")), QDir::Files);
+                (stage == 4 ? QStringLiteral("request_*.apks") :
+                 stage == 7 ? QStringLiteral("request_*.xapk") : QStringLiteral("request_*.apk")), QDir::Files);
             if (names.isEmpty()) return;
             if (QFile::exists(resultPath) || names.size() != 1) {
                 std::fprintf(stderr, "Handoff reported before manager import\n");
@@ -439,7 +441,8 @@ int main(int argc, char **argv)
             QString error;
             const QString claimed = StandaloneApkExport::takeNext(root.path(), &error);
             QFile shared(claimed);
-            const QByteArray expected = stage == 4 ? QByteArray("test bundle") : QByteArray("test APK");
+            const QByteArray expected = stage == 4 ? QByteArray("test bundle") :
+                stage == 7 ? QByteArray("test XAPK") : QByteArray("test APK");
             if (claimed.isEmpty() || !error.isEmpty() ||
                 !shared.open(QIODevice::ReadOnly) || shared.readAll() != expected) {
                 app.exit(1);
@@ -482,7 +485,7 @@ int main(int argc, char **argv)
         if (!file.open(QIODevice::ReadOnly)) return;
         const QByteArray status = file.readAll();
         file.close();
-        if (!status.contains(stage == 2 || stage == 4 ? "\tinstalled\t" : "\tfailed\t")) {
+        if (!status.contains(stage == 2 || stage == 4 || stage == 7 ? "\tinstalled\t" : "\tfailed\t")) {
             std::fprintf(stderr, "Unexpected status: %s\n", status.constData());
             app.exit(1);
             return;
@@ -605,6 +608,20 @@ int main(int argc, char **argv)
                 return;
             }
             ++stage;
+            submitted = false;
+        } else if (stage == 6) {
+            const QString sourceXapk = QDir(root.path()).filePath(QStringLiteral("source.xapk"));
+            QFile xapk(sourceXapk);
+            if (!xapk.open(QIODevice::WriteOnly) || xapk.write("test XAPK") != 9) {
+                app.exit(1);
+                return;
+            }
+            xapk.close();
+            if (!callbacks.install_apk(callbacks.user, QFile::encodeName(sourceXapk).constData(), xapkName.constData())) {
+                app.exit(1);
+                return;
+            }
+            stage = 7;
             submitted = false;
         } else {
             poll.stop();

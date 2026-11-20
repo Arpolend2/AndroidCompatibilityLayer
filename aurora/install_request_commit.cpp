@@ -14,6 +14,53 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+namespace {
+bool identicalFiles(int first, int second, bool *identical)
+{
+    *identical = false;
+    struct stat a, b;
+    if (fstat(first, &a) != 0 || fstat(second, &b) != 0) return false;
+    if (a.st_size != b.st_size) return true;
+    char left[65536], right[65536];
+    off_t offset = 0;
+    while (offset < a.st_size) {
+        const size_t size = size_t(qMin<off_t>(sizeof(left), a.st_size - offset));
+        const ssize_t n = pread(first, left, size, offset);
+        const ssize_t m = pread(second, right, size, offset);
+        if (n <= 0 || m != n) return false;
+        if (std::memcmp(left, right, size_t(n)) != 0) return true;
+        offset += n;
+    }
+    *identical = true;
+    return true;
+}
+
+void removeRpmCache(int appDir)
+{
+    const int cache = openat(appDir, "standalone-rpm", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (cache < 0) return;
+    const int mapping = openat(cache, ".last-created-app-id", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    char value[128];
+    const ssize_t length = mapping < 0 ? -1 : read(mapping, value, sizeof(value));
+    if (mapping >= 0) close(mapping);
+    const QByteArray id = length > 0 ? QByteArray(value, int(length)) : QByteArray();
+    static const QRegularExpression pattern(
+        QStringLiteral("\\Aru\\.androidcompatibilitylayer\\.Android[0-9a-f]{24}\\z"));
+    if (pattern.match(QString::fromLatin1(id)).hasMatch()) {
+        for (const char *arch : {"aarch64", "x86_64"}) {
+            const QByteArray name = id + "-1.0.0-1." + arch + ".rpm";
+            if (unlinkat(cache, name.constData(), 0) != 0 && errno != ENOENT)
+                qWarning("Could not remove the obsolete cached RPM.");
+        }
+    }
+    if (unlinkat(cache, ".rpm-cache.json", 0) != 0 && errno != ENOENT)
+        qWarning("Could not remove obsolete RPM cache metadata.");
+    if (unlinkat(cache, ".last-created-app-id", 0) != 0 && errno != ENOENT)
+        qWarning("Could not remove the obsolete standalone app mapping.");
+    close(cache);
+}
+}
+
 InstallRequestCommit::InstallRequestCommit(const QString &source, const QString &root, const QString &package,
                                            bool allowUpdate)
     : m_source(source), m_root(root), m_package(package), m_canceled(false), m_file(-1), m_rootFd(-1),
@@ -108,6 +155,25 @@ bool InstallRequestCommit::commit(QString *error)
                 if (error) *error = QObject::tr("The installed APK cannot be updated safely.");
                 return false;
             }
+            const int oldApk = openat(dir, "base.apk", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            bool identical = false;
+            const bool compared = oldApk >= 0 && identicalFiles(oldApk, m_file, &identical);
+            if (oldApk >= 0) close(oldApk);
+            if (!compared || m_canceled.load()) {
+                close(dir);
+                if (error) *error = QObject::tr("Cannot compare the installed APK safely.");
+                return false;
+            }
+            if (identical) {
+                close(dir);
+                return true;
+            }
+            struct stat splits;
+            if (fstatat(dir, "splits", &splits, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) {
+                close(dir);
+                if (error) *error = QObject::tr("A split APK installation cannot be replaced with a single APK.");
+                return false;
+            }
             const QByteArray name = (QStringLiteral(".update-") +
                                      QUuid::createUuid().toString()).toUtf8();
             const QByteArray staged = QByteArray("/proc/self/fd/") + QByteArray::number(m_file);
@@ -116,9 +182,32 @@ bool InstallRequestCommit::commit(QString *error)
                 if (error) *error = QObject::tr("Cannot stage the APK update safely.");
                 return false;
             }
+            const int cache = openat(dir, "standalone-rpm", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            const QByteArray pending = name + "-cache";
+            bool cacheMoved = false;
+            if (cache < 0 && errno != ENOENT) {
+                unlinkat(dir, name.constData(), 0);
+                close(dir);
+                if (error) *error = QObject::tr("Cannot invalidate the previous RPM cache safely.");
+                return false;
+            }
+            if (cache >= 0) {
+                if (renameat(cache, ".rpm-cache.json", cache, pending.constData()) == 0)
+                    cacheMoved = true;
+                else if (errno != ENOENT) {
+                    unlinkat(dir, name.constData(), 0);
+                    close(cache);
+                    close(dir);
+                    if (error) *error = QObject::tr("Cannot invalidate the previous RPM cache safely.");
+                    return false;
+                }
+            }
 #if defined(SYS_renameat2)
             const unsigned exchange = 2;
             if (m_canceled.load() || syscall(SYS_renameat2, dir, name.constData(), dir, "base.apk", exchange) != 0) {
+                if (cacheMoved && renameat(cache, pending.constData(), cache, ".rpm-cache.json") != 0)
+                    qWarning("Could not restore the RPM cache after a failed APK update.");
+                if (cache >= 0) close(cache);
                 unlinkat(dir, name.constData(), 0);
                 close(dir);
                 if (error) *error = QObject::tr("This filesystem cannot replace the APK safely.");
@@ -126,6 +215,9 @@ bool InstallRequestCommit::commit(QString *error)
             }
             if (fsync(dir) != 0) {
                 const bool restored = syscall(SYS_renameat2, dir, name.constData(), dir, "base.apk", exchange) == 0;
+                if (restored && cacheMoved && renameat(cache, pending.constData(), cache, ".rpm-cache.json") != 0)
+                    qWarning("Could not restore the RPM cache after a failed APK update.");
+                if (cache >= 0) close(cache);
                 if (restored) unlinkat(dir, name.constData(), 0);
                 if (!restored || fsync(dir) != 0)
                     qWarning("APK update rollback could not be fully confirmed; inspect the app library.");
@@ -133,14 +225,22 @@ bool InstallRequestCommit::commit(QString *error)
                 if (error) *error = QObject::tr("The APK update could not be saved reliably; check the app library.");
                 return false;
             }
+            if (cacheMoved && unlinkat(cache, pending.constData(), 0) != 0)
+                qWarning("Could not remove obsolete RPM cache metadata.");
+            if (cache >= 0) close(cache);
             if (unlinkat(dir, name.constData(), 0) != 0 || fsync(dir) != 0) {
+                removeRpmCache(dir);
                 close(dir);
                 if (error) *error = QObject::tr("The APK was updated, but its backup could not be removed reliably.");
                 return false;
             }
+            removeRpmCache(dir);
             close(dir);
             return true;
 #else
+            if (cacheMoved && renameat(cache, pending.constData(), cache, ".rpm-cache.json") != 0)
+                qWarning("Could not restore the RPM cache after a failed APK update.");
+            if (cache >= 0) close(cache);
             unlinkat(dir, name.constData(), 0);
             close(dir);
             if (error) *error = QObject::tr("This platform cannot replace the APK safely.");

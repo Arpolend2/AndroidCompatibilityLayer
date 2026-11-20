@@ -15,6 +15,7 @@
 struct AuroraDmaBufFrame
 {
     quint64 id = 0;
+    bool probeOnly = false;
     int width = 0;
     int height = 0;
     int fourcc = 0;
@@ -51,6 +52,8 @@ public:
     bool sendFrame(const AuroraDmaBufFrame &frame, QString *error);
     bool presentTexture(GLuint texture, int width, int height, QString *error);
     static bool canExportDmaBuf(QString *error);
+    static QString probeGbmRenderTarget(int width, int height,
+        const std::function<bool(const AuroraDmaBufFrame &, QString *)> &verifyParent = {});
     static bool sendFramePacket(int socket, const AuroraDmaBufFrame &frame);
     static bool receiveFramePacket(int socket, AuroraDmaBufFrame *frame);
     static bool sendReplyPacket(int socket, quint64 frameId, bool accepted);
