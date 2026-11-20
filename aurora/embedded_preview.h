@@ -24,11 +24,17 @@ class EmbeddedChannel : public QObject
     Q_OBJECT
 public:
     explicit EmbeddedChannel(QObject *parent = nullptr);
+    ~EmbeddedChannel() override;
     void attach(QLocalSocket *socket);
     void reset();
     bool send(const QJsonObject &message);
     bool sendFrame(const QImage &frame);
     bool connected() const;
+    /* Frames through a shared mapping instead of the socket: the child writes each frame into the
+       file at `path` and sends only its size and generation, so no pixels cross the socket. Both
+       ends call this with the same path (the preview channel's directory, "<dir>/frame"). Empty
+       disables it and the frames go over the socket as before. */
+    void useSharedFrames(const QString &path);
 signals:
     void message(const QJsonObject &message);
     void frame(const QImage &frame);
@@ -39,6 +45,15 @@ private:
     QPointer<QLocalSocket> m_socket;
     QByteArray m_input;
     bool m_failed = false;
+    bool ensureShared(qint64 bytes, bool writable);
+    void closeShared();
+    QString m_sharedPath;
+    int m_sharedFd = -1;
+    uchar *m_sharedMap = nullptr;
+    qint64 m_sharedBytes = 0;
+    bool m_sharedWritable = false;
+    quint32 m_sharedGeneration = 0;
+    bool m_sharedLogged = false;
 };
 
 class EmbeddedPreview : public PreviewPlayer, public EmbeddedEndpoint

@@ -22,7 +22,7 @@ bool valid(const QString &id)
 bool StandaloneAppMapping::save(const QString &directory, const QString &rpmFile)
 {
     static const QRegularExpression pattern(QStringLiteral(
-        "\\A(ru\\.androidcompatibilitylayer\\.Android[0-9a-f]{24})-1\\.0\\.0-1\\.(?:aarch64|x86_64)\\.rpm\\z"));
+        "\\A(ru\\.androidcompatibilitylayer\\.Android[0-9a-f]{24})-1\\.0\\.0-1\\.(?:aarch64|armv7hl|x86_64)\\.rpm\\z"));
     const QFileInfo dir(directory), rpm(rpmFile);
     const QRegularExpressionMatch match = pattern.match(rpm.fileName());
     if (!dir.isDir() || dir.isSymLink() || rpm.isSymLink() || !rpm.isFile() ||

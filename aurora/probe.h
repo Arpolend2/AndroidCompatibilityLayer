@@ -370,7 +370,19 @@ public:
         return m_cachedInstalledApps;
     }
     QString deviceOperatingSystem() const { return QSysInfo::prettyProductName(); }
-    QString deviceCpuArchitecture() const { return QSysInfo::currentCpuArchitecture(); }
+    /* The architecture the manager and the Android runtime were built for, which is what an app
+       runs as here, and not what uname() says: a 32-bit Aurora armv7hl phone has a 64-bit kernel,
+       so currentCpuArchitecture() is "aarch64" though no 64-bit code can run on it. The kernel's
+       name is shown beside it only when the two differ. */
+    QString deviceCpuArchitecture() const
+    {
+        QString userspace = QSysInfo::buildCpuArchitecture();
+        if (userspace == QLatin1String("arm")) userspace = QStringLiteral("armv7l");
+        else if (userspace == QLatin1String("arm64")) userspace = QStringLiteral("aarch64");
+        const QString kernel = QSysInfo::currentCpuArchitecture();
+        if (kernel.isEmpty() || kernel == userspace) return userspace;
+        return userspace + QStringLiteral(" (") + kernel + QStringLiteral(" kernel)");
+    }
     int renderSizeCap() const { return RuntimeSettings::renderCap(); }
     bool standaloneRpmBusy() const { return m_standaloneRpm.state() != QProcess::NotRunning; }
     QString standaloneRpmStatus() const { return m_standaloneRpmStatus; }

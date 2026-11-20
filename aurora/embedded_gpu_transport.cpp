@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <vector>
@@ -17,8 +18,9 @@
 
 namespace {
 const quint32 wireMagic = 0x41434c47;
-const quint16 wireVersion = 1;
+const quint16 wireVersion = 2;
 const int maxPlanes = 4;
+const int maxNativeInts = 64;
 const int maxDimension = 4096;
 const quint64 maxFramePixels = (32 * 1024 * 1024) / 4;
 const quint64 invalidModifier = ~quint64(0);
@@ -42,6 +44,11 @@ struct WirePacket {
     qint32 strides[maxPlanes];
     qint32 offsets[maxPlanes];
     qint32 result;
+    quint32 nativeBuffer;
+    qint32 nativeFormat;
+    qint32 nativeStride;
+    quint32 nativeIntCount;
+    qint32 nativeInts[maxNativeInts];
 };
 #pragma pack(pop)
 
@@ -227,9 +234,16 @@ bool validFrameMetadata(const WirePacket &packet, int fdCount)
         packet.type != FramePacket || !packet.id || packet.width <= 0 ||
         packet.height <= 0 || packet.width > maxDimension || packet.height > maxDimension ||
         quint64(packet.width) * quint64(packet.height) > maxFramePixels ||
-        packet.fourcc <= 0 || !packet.planeCount || packet.planeCount > maxPlanes ||
-        fdCount != int(packet.planeCount))
+        !packet.planeCount || packet.planeCount > maxPlanes ||
+        fdCount != int(packet.planeCount) || packet.nativeBuffer > 1)
         return false;
+    if (packet.nativeBuffer) {
+        if (packet.nativeFormat <= 0 || packet.nativeStride < packet.width ||
+            packet.nativeIntCount > maxNativeInts)
+            return false;
+    } else if (packet.fourcc <= 0 || packet.nativeIntCount) {
+        return false;
+    }
     for (uint32_t i = 0; i < packet.planeCount; ++i)
         if (packet.strides[i] <= 0 || packet.offsets[i] < 0)
             return false;
@@ -300,6 +314,182 @@ bool modifierSupported(EGLDisplay display, EGLint format, quint64 modifier, QStr
     setError(error, QStringLiteral("consumer does not support the exported DMA-BUF modifier"));
     return false;
 }
+
+/* ---------------------------------------------------------- Hybris gralloc */
+
+struct NativeBase {
+    int magic;
+    int version;
+    void *reserved[4];
+    void (*incRef)(NativeBase *);
+    void (*decRef)(NativeBase *);
+};
+
+struct NativeWindowBuffer {
+    NativeBase common;
+    int width;
+    int height;
+    int stride;
+    int format;
+    int usageDeprecated;
+    size_t layerCount;
+    void *reserved;
+    const void *handle;
+    unsigned long long usage;
+    void *reservedProc[7];
+};
+
+void nativeBufferNoopRef(NativeBase *) {}
+
+struct GrallocApi {
+    void *library = nullptr;
+    int (*initialize)(int) = nullptr;
+    int (*allocate)(unsigned int, unsigned int, int, unsigned int, void **, unsigned int *) = nullptr;
+    int (*release)(void *, int) = nullptr;
+    void (*deinitialize)() = nullptr;
+    bool attempted = false;
+    QString failure;
+};
+
+GrallocApi *grallocApi()
+{
+    // Process-lifetime allocator: do not deinitialize it while worker textures exist.
+    static GrallocApi *api = new GrallocApi;
+    static QMutex mutex;
+    QMutexLocker lock(&mutex);
+    if (api->attempted) return api;
+    api->attempted = true;
+    api->library = dlopen("libgralloc.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!api->library) api->library = dlopen("/usr/lib/libgralloc.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!api->library) {
+        api->failure = QStringLiteral("cannot load Hybris libgralloc.so.1");
+        return api;
+    }
+    api->initialize = reinterpret_cast<decltype(api->initialize)>(dlsym(api->library, "hybris_gralloc_initialize"));
+    api->allocate = reinterpret_cast<decltype(api->allocate)>(dlsym(api->library, "hybris_gralloc_allocate"));
+    api->release = reinterpret_cast<decltype(api->release)>(dlsym(api->library, "hybris_gralloc_release"));
+    api->deinitialize = reinterpret_cast<decltype(api->deinitialize)>(dlsym(api->library, "hybris_gralloc_deinitialize"));
+    if (!api->initialize || !api->allocate || !api->release || !api->deinitialize) {
+        api->failure = QStringLiteral("Hybris gralloc entry points are incomplete");
+    } else if (api->initialize(0) != 0) {
+        api->failure = QStringLiteral("hybris_gralloc_initialize failed");
+    }
+    return api;
+}
+
+struct NativeAllocation {
+    GrallocApi *api = nullptr;
+    void *handle = nullptr;
+    int fdCount = 0;
+    int intCount = 0;
+    unsigned int stride = 0;
+
+    ~NativeAllocation()
+    {
+        if (api && handle) api->release(handle, 1);
+    }
+};
+
+bool allocateNative(int width, int height, NativeAllocation *allocation, QString *error)
+{
+    GrallocApi *api = grallocApi();
+    if (!api->failure.isEmpty()) {
+        setError(error, api->failure);
+        return false;
+    }
+    void *handle = nullptr;
+    unsigned int stride = 0;
+    // HAL_PIXEL_FORMAT_BGRA_8888, HW_RENDER | HW_TEXTURE | SW_READ_OFTEN.
+    const int result = api->allocate(unsigned(width), unsigned(height), 5, 0x303, &handle, &stride);
+    if (result != 0 || !handle || stride < unsigned(width)) {
+        setError(error, QStringLiteral("hybris_gralloc_allocate failed with code %1").arg(result));
+        return false;
+    }
+    const int *words = static_cast<const int *>(handle);
+    const int fdCount = words[1];
+    const int intCount = words[2];
+    if (words[0] != 12 || fdCount <= 0 || fdCount > maxPlanes || intCount < 0 || intCount > maxNativeInts) {
+        api->release(handle, 1);
+        setError(error, QStringLiteral("Hybris returned an unsupported native_handle layout"));
+        return false;
+    }
+    allocation->api = api;
+    allocation->handle = handle;
+    allocation->fdCount = fdCount;
+    allocation->intCount = intCount;
+    allocation->stride = stride;
+    return true;
+}
+
+NativeWindowBuffer nativeWindowBuffer(const void *handle, int width, int height, int stride)
+{
+    NativeWindowBuffer native = {};
+    native.common.magic = 0x5f626672; // ANDROID_NATIVE_BUFFER_MAGIC
+    native.common.version = sizeof(native);
+    native.common.incRef = nativeBufferNoopRef;
+    native.common.decRef = nativeBufferNoopRef;
+    native.width = width;
+    native.height = height;
+    native.stride = stride;
+    native.format = 5;
+    native.usageDeprecated = 0x303;
+    native.layerCount = 1;
+    native.handle = handle;
+    native.usage = 0x303;
+    return native;
+}
+
+GLuint importNativeBufferTexture(const AuroraDmaBufFrame &frame, EGLDisplay display, QString *error)
+{
+    const char *extensions = eglQueryString(display, EGL_EXTENSIONS);
+    if (!hasExtension(extensions, "EGL_ANDROID_image_native_buffer") ||
+        !hasExtension(extensions, "EGL_KHR_image_base") || !hasGlExtension("GL_OES_EGL_image")) {
+        setError(error, QStringLiteral("Qt lacks EGL_ANDROID_image_native_buffer import support"));
+        return 0;
+    }
+    CreateImage createImage = reinterpret_cast<CreateImage>(eglGetProcAddress("eglCreateImageKHR"));
+    DestroyImage destroyImage = reinterpret_cast<DestroyImage>(eglGetProcAddress("eglDestroyImageKHR"));
+    ImageTargetTexture imageTarget = reinterpret_cast<ImageTargetTexture>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+    if (!createImage || !destroyImage || !imageTarget) {
+        setError(error, QStringLiteral("Qt lacks native-buffer EGLImage entry points"));
+        return 0;
+    }
+    std::vector<int> words(size_t(3 + frame.planeCount + frame.nativeIntCount), 0);
+    words[0] = 12;
+    words[1] = frame.planeCount;
+    words[2] = frame.nativeIntCount;
+    for (int i = 0; i < frame.planeCount; ++i) words[size_t(3 + i)] = frame.fds[i];
+    for (int i = 0; i < frame.nativeIntCount; ++i)
+        words[size_t(3 + frame.planeCount + i)] = frame.nativeInts[i];
+    NativeWindowBuffer native = nativeWindowBuffer(words.data(), frame.width, frame.height, frame.nativeStride);
+    native.format = frame.nativeFormat;
+    EGLImageKHR image = createImage(display, EGL_NO_CONTEXT, 0x3140, // EGL_NATIVE_BUFFER_ANDROID
+                                    &native, nullptr);
+    if (image == EGL_NO_IMAGE_KHR) {
+        setError(error, QStringLiteral("Qt eglCreateImageKHR rejected the Hybris native buffer (EGL 0x%1)")
+                            .arg(eglGetError(), 0, 16));
+        return 0;
+    }
+    GLint previous = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    imageTarget(GL_TEXTURE_2D, image);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    const GLenum glError = glGetError();
+    glBindTexture(GL_TEXTURE_2D, GLuint(previous));
+    destroyImage(display, image);
+    if (!texture || glError != GL_NO_ERROR) {
+        if (texture) glDeleteTextures(1, &texture);
+        setError(error, QStringLiteral("GLES could not bind the Hybris native-buffer EGLImage"));
+        return 0;
+    }
+    return texture;
+}
 }
 
 AuroraDmaBufFrame::AuroraDmaBufFrame(AuroraDmaBufFrame &&other) noexcept
@@ -323,8 +513,15 @@ AuroraDmaBufFrame &AuroraDmaBufFrame::operator=(AuroraDmaBufFrame &&other) noexc
         offsets[i] = other.offsets[i];
         other.fds[i] = -1;
     }
+    nativeBuffer = other.nativeBuffer;
+    nativeFormat = other.nativeFormat;
+    nativeStride = other.nativeStride;
+    nativeIntCount = other.nativeIntCount;
+    std::copy(other.nativeInts, other.nativeInts + maxNativeInts, nativeInts);
     other.id = 0;
     other.planeCount = 0;
+    other.nativeBuffer = false;
+    other.nativeIntCount = 0;
     return *this;
 }
 
@@ -340,6 +537,8 @@ void AuroraDmaBufFrame::close()
         fd = -1;
     }
     planeCount = 0;
+    nativeBuffer = false;
+    nativeIntCount = 0;
 }
 
 EmbeddedGpuTransport::EmbeddedGpuTransport(QObject *parent) : QObject(parent) {}
@@ -549,7 +748,10 @@ bool EmbeddedGpuTransport::sendFramePacket(int socket, const AuroraDmaBufFrame &
     if (socket < 0 || !frame.id || frame.width <= 0 || frame.height <= 0 ||
         frame.width > maxDimension || frame.height > maxDimension ||
         quint64(frame.width) * quint64(frame.height) > maxFramePixels ||
-        frame.fourcc <= 0 || frame.planeCount <= 0 || frame.planeCount > maxPlanes)
+        frame.planeCount <= 0 || frame.planeCount > maxPlanes ||
+        (!frame.nativeBuffer && (frame.fourcc <= 0 || frame.nativeIntCount != 0)) ||
+        (frame.nativeBuffer && (frame.nativeFormat <= 0 || frame.nativeStride < frame.width ||
+                               frame.nativeIntCount < 0 || frame.nativeIntCount > maxNativeInts)))
         return false;
     WirePacket packet = {};
     packet.magic = wireMagic;
@@ -561,6 +763,11 @@ bool EmbeddedGpuTransport::sendFramePacket(int socket, const AuroraDmaBufFrame &
     packet.fourcc = frame.fourcc;
     packet.planeCount = quint32(frame.planeCount);
     packet.modifier = frame.modifier;
+    packet.nativeBuffer = frame.nativeBuffer ? 1 : 0;
+    packet.nativeFormat = frame.nativeFormat;
+    packet.nativeStride = frame.nativeStride;
+    packet.nativeIntCount = quint32(frame.nativeIntCount);
+    for (int i = 0; i < frame.nativeIntCount; ++i) packet.nativeInts[i] = frame.nativeInts[i];
     for (int i = 0; i < frame.planeCount; ++i) {
         if (frame.fds[i] < 0 || frame.strides[i] <= 0 || frame.offsets[i] < 0)
             return false;
@@ -589,6 +796,11 @@ bool EmbeddedGpuTransport::receiveFramePacket(int socket, AuroraDmaBufFrame *fra
     incoming.fourcc = packet.fourcc;
     incoming.planeCount = int(packet.planeCount);
     incoming.modifier = packet.modifier;
+    incoming.nativeBuffer = packet.nativeBuffer != 0;
+    incoming.nativeFormat = packet.nativeFormat;
+    incoming.nativeStride = packet.nativeStride;
+    incoming.nativeIntCount = int(packet.nativeIntCount);
+    for (int i = 0; i < incoming.nativeIntCount; ++i) incoming.nativeInts[i] = packet.nativeInts[i];
     for (int i = 0; i < incoming.planeCount; ++i) {
         incoming.fds[i] = receivedFds[i];
         incoming.strides[i] = packet.strides[i];
@@ -690,6 +902,120 @@ bool EmbeddedGpuTransport::canExportDmaBuf(QString *error)
     return true;
 }
 
+bool EmbeddedGpuTransport::canPresentTexture(QString *error)
+{
+    QString dmaError;
+    if (canExportDmaBuf(&dmaError)) {
+        if (error) error->clear();
+        return true;
+    }
+    const EGLDisplay display = eglGetCurrentDisplay();
+    const char *extensions = display != EGL_NO_DISPLAY ? eglQueryString(display, EGL_EXTENSIONS) : nullptr;
+    if (display != EGL_NO_DISPLAY && eglGetCurrentContext() != EGL_NO_CONTEXT &&
+        hasExtension(extensions, "EGL_ANDROID_image_native_buffer") &&
+        hasExtension(extensions, "EGL_KHR_image_base") && hasGlExtension("GL_OES_EGL_image") &&
+        eglGetProcAddress("eglCreateImageKHR") && eglGetProcAddress("eglDestroyImageKHR") &&
+        eglGetProcAddress("glEGLImageTargetTexture2DOES") && eglGetProcAddress("glBlitFramebuffer")) {
+        GrallocApi *api = grallocApi();
+        if (api->failure.isEmpty()) {
+            if (error) error->clear();
+            return true;
+        }
+        setError(error, api->failure);
+        return false;
+    }
+    setError(error, dmaError + QStringLiteral(" Hybris native-buffer presentation is also unavailable."));
+    return false;
+}
+
+bool presentNativeTexture(EmbeddedGpuTransport *transport, GLuint sourceTexture,
+                          int width, int height, QString *error)
+{
+    typedef void (GL_APIENTRYP BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint,
+                                                GLbitfield, GLenum);
+    const GLenum READ_FRAMEBUFFER_ = 0x8CA8;
+    const GLenum DRAW_FRAMEBUFFER_ = 0x8CA9;
+    BlitFramebuffer blitFramebuffer = reinterpret_cast<BlitFramebuffer>(eglGetProcAddress("glBlitFramebuffer"));
+    CreateImage createImage = reinterpret_cast<CreateImage>(eglGetProcAddress("eglCreateImageKHR"));
+    DestroyImage destroyImage = reinterpret_cast<DestroyImage>(eglGetProcAddress("eglDestroyImageKHR"));
+    ImageTargetTexture imageTarget = reinterpret_cast<ImageTargetTexture>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+    if (!blitFramebuffer || !createImage || !destroyImage || !imageTarget) {
+        setError(error, QStringLiteral("Native-buffer GPU blit entry points are unavailable"));
+        return false;
+    }
+    NativeAllocation allocation;
+    if (!allocateNative(width, height, &allocation, error)) return false;
+    NativeWindowBuffer native = nativeWindowBuffer(allocation.handle, width, height, int(allocation.stride));
+    const EGLDisplay display = eglGetCurrentDisplay();
+    EGLImageKHR image = createImage(display, EGL_NO_CONTEXT, 0x3140, &native, nullptr);
+    if (image == EGL_NO_IMAGE_KHR) {
+        setError(error, QStringLiteral("Worker could not create a native-buffer EGLImage (EGL 0x%1)")
+                            .arg(eglGetError(), 0, 16));
+        return false;
+    }
+
+    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {}
+    GLint previousFramebuffer = 0, previousTexture = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+    GLuint nativeTexture = 0;
+    GLuint framebuffers[2] = {0, 0};
+    glGenTextures(1, &nativeTexture);
+    glBindTexture(GL_TEXTURE_2D, nativeTexture);
+    imageTarget(GL_TEXTURE_2D, image);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    destroyImage(display, image);
+    glGenFramebuffers(2, framebuffers);
+    glBindFramebuffer(READ_FRAMEBUFFER_, framebuffers[0]);
+    glFramebufferTexture2D(READ_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sourceTexture, 0);
+    glBindFramebuffer(DRAW_FRAMEBUFFER_, framebuffers[1]);
+    glFramebufferTexture2D(DRAW_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, nativeTexture, 0);
+    bool ok = nativeTexture && framebuffers[0] && framebuffers[1] &&
+              glCheckFramebufferStatus(READ_FRAMEBUFFER_) == GL_FRAMEBUFFER_COMPLETE &&
+              glCheckFramebufferStatus(DRAW_FRAMEBUFFER_) == GL_FRAMEBUFFER_COMPLETE &&
+              glGetError() == GL_NO_ERROR;
+    if (ok) {
+        blitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glFinish();
+        ok = glGetError() == GL_NO_ERROR;
+    }
+    if (!ok) setError(error, QStringLiteral("GPU blit into the Hybris gralloc framebuffer failed"));
+
+    bool sent = false;
+    if (ok) {
+        static QAtomicInteger<quint64> nextNativeId(0x100000000ULL);
+        AuroraDmaBufFrame frame;
+        frame.id = nextNativeId.fetchAndAddRelaxed(1);
+        if (!frame.id) frame.id = nextNativeId.fetchAndAddRelaxed(1);
+        frame.width = width;
+        frame.height = height;
+        frame.planeCount = allocation.fdCount;
+        frame.nativeBuffer = true;
+        frame.nativeFormat = 5;
+        frame.nativeStride = int(allocation.stride);
+        frame.nativeIntCount = allocation.intCount;
+        const int *words = static_cast<const int *>(allocation.handle);
+        for (int i = 0; i < allocation.fdCount; ++i) {
+            frame.fds[i] = words[3 + i];
+            frame.strides[i] = int(allocation.stride * 4);
+            frame.offsets[i] = 0;
+        }
+        for (int i = 0; i < allocation.intCount; ++i)
+            frame.nativeInts[i] = words[3 + allocation.fdCount + i];
+        sent = transport->sendFrame(frame, error);
+        // sendFrame duplicates the descriptors into the socket; the allocation owns the originals.
+        frame.fds[0] = frame.fds[1] = frame.fds[2] = frame.fds[3] = -1;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, GLuint(previousFramebuffer));
+    glBindTexture(GL_TEXTURE_2D, GLuint(previousTexture));
+    glDeleteFramebuffers(2, framebuffers);
+    if (nativeTexture) glDeleteTextures(1, &nativeTexture);
+    return sent;
+}
+
 bool EmbeddedGpuTransport::presentTexture(GLuint texture, int width, int height, QString *error)
 {
     if (!texture || width <= 0 || height <= 0 || width > maxDimension || height > maxDimension ||
@@ -697,7 +1023,7 @@ bool EmbeddedGpuTransport::presentTexture(GLuint texture, int width, int height,
         setError(error, tr("The GPU texture dimensions are invalid."));
         return false;
     }
-    if (!canExportDmaBuf(error)) return false;
+    if (!canExportDmaBuf(error)) return presentNativeTexture(this, texture, width, height, error);
     EGLDisplay display = eglGetCurrentDisplay();
     EGLContext context = eglGetCurrentContext();
     CreateImage createImage = reinterpret_cast<CreateImage>(eglGetProcAddress("eglCreateImageKHR"));
@@ -763,10 +1089,11 @@ GLuint aurora_import_dma_buf_texture(const AuroraDmaBufFrame &frame, EGLDisplay 
 {
     if (display == EGL_NO_DISPLAY || eglGetCurrentDisplay() != display ||
         eglGetCurrentContext() == EGL_NO_CONTEXT || frame.width <= 0 || frame.height <= 0 ||
-        frame.planeCount <= 0 || frame.planeCount > maxPlanes || frame.fourcc <= 0) {
-        setError(error, QStringLiteral("Qt has no compatible current EGL context for DMA-BUF import."));
+        frame.planeCount <= 0 || frame.planeCount > maxPlanes || (!frame.nativeBuffer && frame.fourcc <= 0)) {
+        setError(error, QStringLiteral("Qt has no compatible current EGL context for GPU frame import."));
         return 0;
     }
+    if (frame.nativeBuffer) return importNativeBufferTexture(frame, display, error);
     if (!modifierSupported(display, frame.fourcc, frame.modifier, error))
         return 0;
     const char *extensions = eglQueryString(display, EGL_EXTENSIONS);

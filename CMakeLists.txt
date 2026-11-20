@@ -50,6 +50,8 @@ endforeach()
 add_executable(${APP_ID}
     aurora/main.cpp
     aurora/probe.h
+    aurora/gpu_probe.cpp
+    aurora/gpu_probe.h
     aurora/runtime_settings.h
     aurora/log_channel.cpp
     aurora/log_channel.h
@@ -615,7 +617,8 @@ target_include_directories(${APP_ID} PRIVATE "${ANDROID_COMPATIBILITY_LAYER_SQLI
 target_compile_definitions(${APP_ID} PRIVATE MG_HAVE_SQLITE=1)
 
 install(TARGETS ${APP_ID} RUNTIME DESTINATION bin)
-set(ANDROID_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/aurora/android-runtime")
+set(ANDROID_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/aurora/android-runtime" CACHE PATH
+    "Prepared Android runtime directory (architecture-specific)")
 foreach(file framework/megler-libcore.dex framework/core-oj.dex framework/core-libart.dex
              framework/conscrypt.dex framework/okhttp.dex framework/bouncycastle.dex framework/apache-xml.dex
              framework/megler-framework.dex framework/megler-framework-classes2.dex

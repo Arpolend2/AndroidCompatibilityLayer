@@ -8,12 +8,17 @@
 #endif
 
 #include <QCoreApplication>
+#include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QProcess>
 #include <QTimer>
 #include <QtEndian>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -49,6 +54,8 @@ bool number(const QJsonObject &o, const char *name, double min, double max, doub
 
 EmbeddedChannel::EmbeddedChannel(QObject *parent) : QObject(parent) {}
 
+EmbeddedChannel::~EmbeddedChannel() { closeShared(); }
+
 void EmbeddedChannel::attach(QLocalSocket *socket)
 {
     m_socket = socket;
@@ -70,6 +77,49 @@ void EmbeddedChannel::reset()
     }
     m_input.clear();
     m_failed = false;
+    closeShared();
+}
+
+void EmbeddedChannel::useSharedFrames(const QString &path)
+{
+    closeShared();
+    m_sharedPath = path;
+}
+
+bool EmbeddedChannel::ensureShared(qint64 bytes, bool writable)
+{
+    if (m_sharedPath.isEmpty() || bytes <= 0 || bytes > qint64(maxFrameBytes)) return false;
+    if (m_sharedFd >= 0 && m_sharedBytes == bytes && m_sharedWritable == writable) return true;
+    closeShared();
+    const QByteArray path = QFile::encodeName(m_sharedPath);
+    const int fd = writable ? ::open(path.constData(), O_RDWR | O_CREAT, 0600)
+                            : ::open(path.constData(), O_RDONLY);
+    if (fd < 0) return false;
+    if (writable && ::ftruncate(fd, off_t(bytes)) != 0) {
+        ::close(fd);
+        return false;
+    }
+    void *mapped = ::mmap(nullptr, size_t(bytes), writable ? (PROT_READ | PROT_WRITE) : PROT_READ,
+                          MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        ::close(fd);
+        return false;
+    }
+    m_sharedFd = fd;
+    m_sharedMap = static_cast<uchar *>(mapped);
+    m_sharedBytes = bytes;
+    m_sharedWritable = writable;
+    if (writable) ++m_sharedGeneration;
+    return true;
+}
+
+void EmbeddedChannel::closeShared()
+{
+    if (m_sharedMap) ::munmap(m_sharedMap, size_t(m_sharedBytes));
+    m_sharedMap = nullptr;
+    if (m_sharedFd >= 0) ::close(m_sharedFd);
+    m_sharedFd = -1;
+    m_sharedBytes = 0;
 }
 
 bool EmbeddedChannel::connected() const
@@ -97,6 +147,21 @@ bool EmbeddedChannel::sendFrame(const QImage &frame)
         frame.bytesPerLine() != frame.width() * 4) {
         fail(tr("Invalid preview frame."));
         return false;
+    }
+    if (ensureShared(bytes, true)) {
+        std::memcpy(m_sharedMap, frame.constBits(), size_t(bytes));
+        QByteArray body(21, '\0');
+        body[0] = 'S';
+        qToBigEndian<quint32>(quint32(frame.width()), reinterpret_cast<uchar *>(body.data() + 1));
+        qToBigEndian<quint32>(quint32(frame.height()), reinterpret_cast<uchar *>(body.data() + 5));
+        qToBigEndian<quint64>(quint64(bytes), reinterpret_cast<uchar *>(body.data() + 9));
+        qToBigEndian<quint32>(m_sharedGeneration, reinterpret_cast<uchar *>(body.data() + 17));
+        const QByteArray output = packet(body);
+        if (m_socket->write(output) != output.size()) {
+            fail(tr("Cannot send preview frame."));
+            return false;
+        }
+        return true;
     }
     QByteArray body(9, '\0');
     body[0] = 'F';
@@ -130,6 +195,22 @@ void EmbeddedChannel::read()
                     fail(tr("Invalid preview control message.")); return;
                 }
                 emit message(doc.object());
+            } else if (body[0] == 'S' && size == 21) {
+                const uchar *data = reinterpret_cast<const uchar *>(body.constData());
+                const quint32 w = qFromBigEndian<quint32>(data + 1);
+                const quint32 h = qFromBigEndian<quint32>(data + 5);
+                const quint64 bytes = qFromBigEndian<quint64>(data + 9);
+                if (!w || !h || w > 4096 || h > 4096 || bytes != quint64(w) * h * 4 ||
+                    bytes > maxFrameBytes || !ensureShared(qint64(bytes), false)) {
+                    fail(tr("Invalid shared preview frame.")); return;
+                }
+                if (!m_sharedLogged) {
+                    m_sharedLogged = true;
+                    qWarning().noquote() << "Embedded preview frames: shared memory, no pixels over the socket:"
+                                         << m_sharedPath;
+                }
+                const QImage image(m_sharedMap, int(w), int(h), int(w * 4), QImage::Format_RGB32);
+                emit frame(image.copy());
             } else if (body[0] == 'F' && size >= 9) {
                 const uchar *data = reinterpret_cast<const uchar *>(body.constData());
                 const quint32 w = qFromBigEndian<quint32>(data + 1);
@@ -182,8 +263,10 @@ EmbeddedPreview::EmbeddedPreview(QObject *parent)
     connect(&m_gpuTransport, &EmbeddedGpuTransport::failed, this, [this](const QString &reason) {
         gpuState()->clear();
         emit frameChanged();
-        if (!m_stopping && !m_restarting)
+        if (!m_stopping && !m_restarting) {
             qWarning().noquote() << "Embedded GPU transport unavailable; CPU fallback remains active:" << reason;
+            reportGraphicsError(tr("Embedded GPU transport; CPU fallback active"), reason);
+        }
     });
     connect(&m_gpuTransport, &EmbeddedGpuTransport::peerDisconnected, this, [this]() {
         gpuState()->clear();
@@ -212,6 +295,11 @@ bool EmbeddedPreview::listen(QProcess *process, QString *error)
     m_restarting = false;
     if (m_keyboard) m_keyboard->start();
     m_frame = QImage();
+    /* Frames from the worker do not cross the socket: both processes map <dir>/frame, and a
+       message carries only the size (EmbeddedChannel::useSharedFrames). */
+    const QString sharedFramePath = m_directory.path() + QStringLiteral("/frame");
+    QFile::remove(sharedFramePath);
+    m_channel.useSharedFrames(sharedFramePath);
     m_status = tr("Starting Android app...");
     emit remoteStatusChanged();
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
@@ -289,8 +377,9 @@ void EmbeddedPreview::receiveGpuFrame(AuroraDmaBufFrame &&frame)
             if (self) self->m_gpuTransport.sendReply(frameId, accepted);
         })) {
         m_gpuTransport.sendReply(id, false);
-        qWarning().noquote() << "Embedded GPU frame rejected; using CPU fallback:"
-                             << gpuState()->lastFailure();
+        const QString reason = gpuState()->lastFailure();
+        qWarning().noquote() << "Embedded GPU frame rejected; using CPU fallback:" << reason;
+        reportGraphicsError(tr("Qt native-buffer import; CPU fallback active"), reason);
         return;
     }
     m_frame = placeholder;
@@ -444,6 +533,9 @@ void EmbeddedPreview::receive(const QJsonObject &message)
     const QString type = message.value(QStringLiteral("type")).toString();
     if (type == QLatin1String("shutdownComplete")) {
         if (m_stopping) emit shutdownComplete();
+    } else if (type == QLatin1String("graphicsError")) {
+        reportGraphicsError(tr("Android worker graphics; CPU fallback active"),
+                            message.value(QStringLiteral("message")).toString());
     } else if (type == QLatin1String("status")) {
         m_status = message.value(QStringLiteral("status")).toString();
         emit remoteStatusChanged();
@@ -501,6 +593,7 @@ bool EmbeddedPreviewChild::connectTo(const QString &endpoint, QString *error)
         m_socket.abort();
         return false;
     }
+    m_channel.useSharedFrames(QFileInfo(endpoint).absolutePath() + QStringLiteral("/frame"));
     m_channel.attach(&m_socket);
     return true;
 }
@@ -539,12 +632,14 @@ bool MEGLER_CB EmbeddedPreviewChild::presentGpuCanvas(void *user, uint32_t textu
     self->m_gpuPresenting.storeRelease(accepted ? 1 : 0);
     if (accepted) {
         if (self->m_gpuActiveLogged.testAndSetOrdered(0, 1))
-            qInfo("Embedded GPU DMA-BUF frame imported and acknowledged; CPU readback is disabled");
+            qInfo("Embedded GPU native/DMA-BUF frame imported and acknowledged; CPU readback is disabled");
     } else {
         self->m_gpuFailed.storeRelease(1);
         self->m_gpuTransport.closePeer();
-        qWarning().noquote() << "Embedded GPU presentation unavailable; using CPU fallback:"
-                             << (error.isEmpty() ? QStringLiteral("GPU channel is unavailable") : error);
+        const QString reason = error.isEmpty() ? QStringLiteral("GPU channel is unavailable") : error;
+        qWarning().noquote() << "Embedded GPU presentation unavailable; using CPU fallback:" << reason;
+        self->m_player->reportGraphicsError(QStringLiteral("Worker gralloc/DMA-BUF presentation; CPU fallback active"), reason);
+        self->command(QStringLiteral("graphicsError"), QJsonObject{{QStringLiteral("message"), reason}});
     }
     return accepted;
 }

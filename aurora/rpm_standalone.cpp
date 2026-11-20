@@ -242,23 +242,34 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     rpm.buildTime = uint32_t(QDateTime::currentMSecsSinceEpoch() / 1000);
 #if defined(Q_PROCESSOR_ARM_64)
     rpm.arch = "aarch64";
+    const QString abiSuffix = QStringLiteral("()(64bit)");
+#elif defined(Q_PROCESSOR_ARM)
+    /* Aurora's 32-bit ARM packages (the 32-bit phones): the RPM architecture is armv7hl, and
+       their dependencies name a library plainly, with no "()(64bit)" suffix. */
+    rpm.arch = "armv7hl";
+    const QString abiSuffix = QString();
 #elif defined(Q_PROCESSOR_X86_64)
     rpm.arch = "x86_64";
+    const QString abiSuffix = QStringLiteral("()(64bit)");
 #else
     *problem = QCoreApplication::translate("RpmStandalone", "Unsupported executable architecture.");
     return false;
 #endif
-    const char *libraries[] = {
-        "libEGL.so.1()(64bit)", "libGLESv2.so.2()(64bit)", "libQt5Core.so.5()(64bit)",
-        "libQt5DBus.so.5()(64bit)", "libQt5Gui.so.5()(64bit)", "libQt5Multimedia.so.5()(64bit)",
-        "libQt5Network.so.5()(64bit)", "libQt5Positioning.so.5()(64bit)", "libQt5Qml.so.5()(64bit)", "libQt5Quick.so.5()(64bit)",
-        "libQt5Sensors.so.5()(64bit)", "libauroraapp.so.2()(64bit)", "libc.so.6()(64bit)",
-        "libgcc_s.so.1()(64bit)", "libm.so.6()(64bit)", "libruntime-manager-qt5.so.1()(64bit)",
-        "libstdc++.so.6()(64bit)", "nemo-qml-plugin-notifications-qt5", "qt5-plugin-imageformat-jpeg"
+    const char *libraryBases[] = {
+        "libEGL.so.1", "libGLESv2.so.2", "libQt5Core.so.5",
+        "libQt5DBus.so.5", "libQt5Gui.so.5", "libQt5Multimedia.so.5",
+        "libQt5Network.so.5", "libQt5Positioning.so.5", "libQt5Qml.so.5", "libQt5Quick.so.5",
+        "libQt5Sensors.so.5", "libauroraapp.so.2", "libc.so.6",
+        "libgcc_s.so.1", "libm.so.6", "libruntime-manager-qt5.so.1",
+        "libstdc++.so.6", "nemo-qml-plugin-notifications-qt5", "qt5-plugin-imageformat-jpeg"
     };
-    for (const char *name : libraries) {
+    for (const char *base : libraryBases) {
         RpmWriter::Package::Requirement requirement;
-        requirement.name = name;
+        /* The last two are package names, not shared objects: they take no ABI suffix. */
+        const QString name = QString::fromLatin1(base);
+        const bool isPackage = name.startsWith(QLatin1String("nemo-qml-plugin")) ||
+            name.startsWith(QLatin1String("qt5-plugin-"));
+        requirement.name = (name + (isPackage ? QString() : abiSuffix)).toStdString();
         rpm.requires.push_back(requirement);
     }
     RpmWriter::Package::Requirement silica;

@@ -55,6 +55,32 @@ int main(int argc, char **argv)
         !EmbeddedGpuTransport::receiveReplyPacket(sockets[0], incoming.id, &accepted) || !accepted)
         return 6;
 
+    AuroraDmaBufFrame nativeOutgoing;
+    nativeOutgoing.id = 43;
+    nativeOutgoing.width = 64;
+    nativeOutgoing.height = 64;
+    nativeOutgoing.planeCount = 1;
+    nativeOutgoing.fds[0] = fcntl(receivedFd, F_DUPFD_CLOEXEC, 0);
+    nativeOutgoing.strides[0] = 256;
+    nativeOutgoing.nativeBuffer = true;
+    nativeOutgoing.nativeFormat = 5;
+    nativeOutgoing.nativeStride = 64;
+    nativeOutgoing.nativeIntCount = 3;
+    nativeOutgoing.nativeInts[0] = 0x12345678;
+    nativeOutgoing.nativeInts[1] = -7;
+    nativeOutgoing.nativeInts[2] = 42;
+    AuroraDmaBufFrame nativeIncoming;
+    if (nativeOutgoing.fds[0] < 0 ||
+        !EmbeddedGpuTransport::sendFramePacket(sockets[0], nativeOutgoing) ||
+        !EmbeddedGpuTransport::receiveFramePacket(sockets[1], &nativeIncoming) ||
+        !nativeIncoming.nativeBuffer || nativeIncoming.nativeFormat != 5 ||
+        nativeIncoming.nativeStride != 64 || nativeIncoming.nativeIntCount != 3 ||
+        nativeIncoming.nativeInts[0] != 0x12345678 || nativeIncoming.nativeInts[1] != -7 ||
+        nativeIncoming.nativeInts[2] != 42 || nativeIncoming.fds[0] < 0)
+        return 18;
+    nativeOutgoing.close();
+    nativeIncoming.close();
+
     AuroraDmaBufFrame invalid;
     invalid.id = 43;
     invalid.width = 32;

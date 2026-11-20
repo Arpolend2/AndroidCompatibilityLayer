@@ -108,6 +108,23 @@ void PreviewPlayer::setStatus(const QString &status)
     emit statusChanged();
 }
 
+void PreviewPlayer::reportGraphicsError(const QString &stage, const QString &reason)
+{
+    QString message = stage;
+    if (!reason.isEmpty()) message += QStringLiteral(": ") + reason;
+    if (message.isEmpty()) message = tr("Unknown graphics error");
+    if (message.size() > 900) message = message.left(897) + QStringLiteral("...");
+    QMetaObject::invokeMethod(this, "setGraphicsErrorMessage", Qt::QueuedConnection,
+                              Q_ARG(QString, message));
+}
+
+void PreviewPlayer::setGraphicsErrorMessage(const QString &message)
+{
+    if (m_graphicsError == message) return;
+    m_graphicsError = message;
+    emit graphicsErrorChanged();
+}
+
 void PreviewPlayer::start()
 {
     if (m_closing) return;
@@ -178,7 +195,7 @@ void PreviewPlayer::start()
             probeSurface.setFormat(context->format());
             probeSurface.create();
             if (probeSurface.isValid() && context->makeCurrent(&probeSurface)) {
-                exportAvailable = EmbeddedGpuTransport::canExportDmaBuf(&exportError);
+                exportAvailable = EmbeddedGpuTransport::canPresentTexture(&exportError);
                 context->doneCurrent();
             } else {
                 exportError = tr("Could not make the worker EGL context current for the DMA-BUF capability probe.");
@@ -195,16 +212,17 @@ void PreviewPlayer::start()
             gpuCanvasReady = m_gpuCanvas.prepareCpuPresentation(context, presentOffscreenGpuCanvas, this);
             if (gpuCanvasReady) {
                 if (exportError.isEmpty())
-                    exportError = tr("The DMA-BUF GPU Canvas could not be initialized.");
-                qWarning().noquote() << "Embedded GPU DMA-BUF presentation unavailable; using CPU frame transport:"
+                    exportError = tr("The native GPU Canvas could not be initialized.");
+                qWarning().noquote() << "Embedded GPU presentation unavailable; using CPU frame transport:"
                                      << exportError;
+                reportGraphicsError(tr("Embedded GPU presentation; CPU fallback active"), exportError);
             }
         }
         if (!gpuCanvasReady)
             delete context;
     } else
 #endif
-    if (m_cpuPresentationOnly && m_offscreenGpuCanvas) {
+    if (m_offscreenGpuCanvas) {
         QOpenGLContext *context = new QOpenGLContext(this);
         QSurfaceFormat format = QSurfaceFormat::defaultFormat();
         format.setRenderableType(QSurfaceFormat::OpenGLES);
@@ -227,6 +245,8 @@ void PreviewPlayer::start()
             qInfo("Experimental GPU Canvas uses CPU readback for the embedded worker");
     } else if (!m_cpuPresentationOnly || m_offscreenGpuCanvas) {
         qWarning("Experimental GPU Canvas unavailable; using the CPU Canvas fallback");
+        reportGraphicsError(tr("GPU Canvas initialization; CPU fallback active"),
+                            tr("Could not create a compatible shared GLES context."));
     }
 #endif
     if (m_audio) run.audio = m_audio->callbacks();
@@ -458,8 +478,12 @@ bool MEGLER_CB PreviewPlayer::presentGpuCanvas(void *user, uint32_t texture, int
     }
     if (!self->m_gpuState->presentCanvas(texture, width, height, self)) {
         static QAtomicInt warned = Q_BASIC_ATOMIC_INITIALIZER(0);
-        if (warned.testAndSetOrdered(0, 1))
-            qWarning("Experimental GPU Canvas presentation failed; using the CPU frame fallback");
+        if (warned.testAndSetOrdered(0, 1)) {
+            QString reason = self->m_gpuState->lastFailure();
+            if (reason.isEmpty()) reason = tr("Qt could not present the shared Canvas texture.");
+            qWarning().noquote() << "Experimental GPU Canvas presentation failed; using the CPU frame fallback:" << reason;
+            self->reportGraphicsError(tr("GPU Canvas presentation; CPU fallback active"), reason);
+        }
         return false;
     }
     QMutexLocker lock(&self->m_frameMutex);
@@ -489,9 +513,10 @@ int MEGLER_CB PreviewPlayer::presentEglWindow(void *user, void *display, void *s
         static QAtomicInt warned = Q_BASIC_ATOMIC_INITIALIZER(0);
         if (result == 0 && warned.testAndSetOrdered(0, 1)) {
             const QString reason = self->m_gpuState->lastFailure();
+            const QString detail = reason.isEmpty() ? tr("unknown reason") : reason;
             qWarning().noquote() << "Experimental GPU presentation unavailable:"
-                                 << (reason.isEmpty() ? QStringLiteral("unknown reason") : reason)
-                                 << "; using CPU fallback";
+                                 << detail << "; using CPU fallback";
+            self->reportGraphicsError(tr("Native EGL window presentation; CPU fallback active"), detail);
         }
         return result;
     }
@@ -519,13 +544,20 @@ int MEGLER_CB PreviewPlayer::presentEglWindow(void *user, void *display, void *s
 int MEGLER_CB PreviewPlayer::presentEglLayer(void *user, int layer, void *display, void *surface, int width, int height)
 {
     PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
-    return self->m_gpuState->submit(display, surface, width, height, self, layer);
+    const int result = self->m_gpuState->submit(display, surface, width, height, self, layer);
+    if (result == 0)
+        self->reportGraphicsError(tr("Native EGL layer %1 presentation").arg(layer),
+                                  self->m_gpuState->lastFailure());
+    return result;
 }
 
 bool MEGLER_CB PreviewPlayer::presentEglViews(void *user, const void *pixels, int width, int height, int stride)
 {
     PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
-    if (!self->m_gpuState->setViews(pixels, width, height, stride, self)) return false;
+    if (!self->m_gpuState->setViews(pixels, width, height, stride, self)) {
+        self->reportGraphicsError(tr("Android view overlay presentation"), self->m_gpuState->lastFailure());
+        return false;
+    }
     QMutexLocker lock(&self->m_frameMutex);
     if (self->m_frame.size() != QSize(width, height)) {
         self->m_frame = QImage(width, height, QImage::Format_RGB32);

@@ -23,6 +23,13 @@ struct AuroraDmaBufFrame
     int fds[4] = {-1, -1, -1, -1};
     int strides[4] = {};
     int offsets[4] = {};
+    // A Hybris gralloc native_handle is an alternative to a dma-buf frame.
+    // Its descriptors travel in fds[], its private integer payload below.
+    bool nativeBuffer = false;
+    int nativeFormat = 0;
+    int nativeStride = 0; // pixels, as returned by hybris_gralloc_allocate
+    int nativeIntCount = 0;
+    int nativeInts[64] = {};
 
     AuroraDmaBufFrame() = default;
     AuroraDmaBufFrame(const AuroraDmaBufFrame &) = delete;
@@ -51,6 +58,7 @@ public:
     bool sendFrame(const AuroraDmaBufFrame &frame, QString *error);
     bool presentTexture(GLuint texture, int width, int height, QString *error);
     static bool canExportDmaBuf(QString *error);
+    static bool canPresentTexture(QString *error);
     static bool sendFramePacket(int socket, const AuroraDmaBufFrame &frame);
     static bool receiveFramePacket(int socket, AuroraDmaBufFrame *frame);
     static bool sendReplyPacket(int socket, quint64 frameId, bool accepted);
