@@ -96,6 +96,25 @@ ApplicationWindow {
                 text: preview.status
             }
             Rectangle {
+                objectName: "graphicsDiagnosticError"
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: graphicsErrorLabel.height + 2 * Theme.paddingSmall
+                color: Theme.rgba(Theme.errorColor, 0.92)
+                visible: preview.graphicsError.length > 0
+                z: 20
+                Label {
+                    id: graphicsErrorLabel
+                    x: Theme.horizontalPageMargin
+                    y: Theme.paddingSmall
+                    width: parent.width - 2 * x
+                    wrapMode: Text.Wrap
+                    font.pixelSize: Theme.fontSizeExtraSmall
+                    text: qsTr("Graphics diagnostic: %1").arg(preview.graphicsError)
+                }
+            }
+            Rectangle {
                 objectName: "standaloneDiagnosticError"
                 anchors.top: parent.top
                 width: parent.width

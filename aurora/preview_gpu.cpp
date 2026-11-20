@@ -104,7 +104,7 @@ bool PreviewGpuState::submitDmaBuf(AuroraDmaBufFrame &&incoming, QObject *notifi
 {
     QMutexLocker lock(&mutex);
     if (dmaBufPending || incoming.id == 0 || !notifier || !completion) {
-        failureReason = QStringLiteral("another DMA-BUF frame is still pending");
+        failureReason = QStringLiteral("another GPU frame is still pending");
         return false;
     }
     dmaBufFrame = std::move(incoming);
@@ -116,7 +116,7 @@ bool PreviewGpuState::submitDmaBuf(AuroraDmaBufFrame &&incoming, QObject *notifi
         dmaBufPending = false;
         dmaBufCompletion = {};
         active = nativeFrame || java || canvasMode;
-        failureReason = QStringLiteral("could not schedule a Qt DMA-BUF import");
+        failureReason = QStringLiteral("could not schedule a Qt GPU frame import");
         return false;
     }
     return true;
@@ -504,13 +504,18 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
             importError = QStringLiteral("Qt scene graph has no current GLES EGL display");
         } else {
             imported = aurora_import_dma_buf_texture(m_state->dmaBufFrame, m_state->consumerDisplay, &importError);
-            if (imported) {
+            if (imported && m_state->dmaBufFrame.nativeBuffer) {
+                // This gralloc allocation is per-frame and is never rendered into again.
+                // Its EGLImage/texture owns the storage after the worker releases the handle.
+                snapshot = imported;
+                imported = 0;
+            } else if (imported) {
                 snapshot = previewGpuSnapshot(context->functions(), imported,
                                               m_state->dmaBufFrame.width, m_state->dmaBufFrame.height);
                 context->functions()->glDeleteTextures(1, &imported);
                 imported = 0;
                 if (!snapshot)
-                    importError = QStringLiteral("Qt could not copy the imported DMA-BUF into its owned GPU texture");
+                    importError = QStringLiteral("Qt could not copy the imported GPU frame into its owned GPU texture");
             }
         }
         QSGTexture *texture = nullptr;

@@ -57,6 +57,7 @@
 #include "probe.h"
 #include "standalone_paths.h"
 #include "rpm_standalone.h"
+#include "gpu_probe.h"
 #include "rpm_signers.h"
 #include "rpm_test_keys.h"
 #include "../core/src/apk/mg_apk.h"
@@ -381,7 +382,8 @@ int main(int argc, char *argv[])
         return unpackBundle(argc, argv, mode == "--unpack-store-bundle");
     }
     const bool standalone = mode == "--standalone";
-    const bool child = mode == "--preview" || standalone || mode == "--build-standalone";
+    const bool child = mode == "--preview" || standalone || mode == "--build-standalone" ||
+        mode == "--gpu-probe";
     const bool backgroundManager = mode == "--microg-service";
     if (backgroundManager && argc != 2) {
         std::fprintf(stderr, "Invalid background manager arguments.\n");
@@ -450,6 +452,13 @@ int main(int argc, char *argv[])
             return 2;
         }
         return buildStandaloneRpm(QString::fromLocal8Bit(argv[2]), argc == 4);
+    }
+
+    if (mode == "--gpu-probe") {
+        const QString report = GpuProbe::report();
+        std::fputs(report.toLocal8Bit().constData(), stdout);
+        std::fflush(stdout);
+        return 0;
     }
 
     if (mode == "--preview" && argc != 5 && argc != 7 && argc != 8 && argc != 9) {
@@ -591,6 +600,12 @@ int main(int argc, char *argv[])
         const StoreWorkerTeardownMarker previewDestroyed{traceStoreWorkerExit, "preview player destroyed"};
         PreviewPlayer preview(androidRoot, data, apk);
         preview.setCloseOnExit(standalone || storePreview);
+        // ARMv7 standalone cannot currently share the Android render thread's
+        // EGL state with Qt (QWaylandGLContext fails with EGL_BAD_ACCESS).
+        // Keep the proven CPU Canvas there; embedded workers still try gralloc.
+#ifdef Q_PROCESSOR_ARM
+        if (standalone) preview.setCpuPresentationOnly(true);
+#endif
         if (embedded) {
             preview.setCpuPresentationOnly(true);
             preview.setOffscreenGpuCanvas(true);

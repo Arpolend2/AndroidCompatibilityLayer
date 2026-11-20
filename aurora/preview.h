@@ -38,6 +38,7 @@ class PreviewPlayer : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
+    Q_PROPERTY(QString graphicsError READ graphicsError NOTIFY graphicsErrorChanged)
     Q_PROPERTY(bool showStatus READ showStatus NOTIFY statusChanged)
     Q_PROPERTY(int backGestureEdgeDp READ backGestureEdgeDp CONSTANT)
     Q_PROPERTY(bool closeOnBackGesture READ closeOnBackGesture CONSTANT)
@@ -46,6 +47,8 @@ public:
     PreviewPlayer(const QString &root, const QString &data, const QString &apk = QString(), QObject *parent = nullptr);
     void enableStoreWorkerTeardownTrace();
     QString status() const { return m_status; }
+    QString graphicsError() const { return m_graphicsError; }
+    void reportGraphicsError(const QString &stage, const QString &reason);
     bool showStatus() const { return !m_running || m_closing || frame().isNull(); }
     int renderCap() const { return m_renderCap; }
     int backGestureEdgeDp() const { return m_backGestureEdgeDp; }
@@ -91,12 +94,14 @@ public:
 
 signals:
     void statusChanged();
+    void graphicsErrorChanged();
     void frameChanged();
     void finished();
     void returnToManagerRequested();
 
 private slots:
     void publishFrame();
+    void setGraphicsErrorMessage(const QString &message);
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     void requestGpuFrame();
 #endif
@@ -133,6 +138,7 @@ private:
     QByteArray m_apkUtf8;
     QByteArray m_splitsUtf8;
     QString m_status;
+    QString m_graphicsError;
     mutable QMutex m_frameMutex;
     QImage m_frame;
     QImage m_gestureFrame;

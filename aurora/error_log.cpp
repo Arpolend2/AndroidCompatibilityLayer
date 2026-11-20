@@ -89,6 +89,15 @@ struct RecordingGuard {
     ~RecordingGuard() { recording = false; }
 };
 
+QString architectureName(const QString &name)
+{
+    static const QStringList known = {QStringLiteral("arm64"), QStringLiteral("aarch64"),
+                                      QStringLiteral("armv7l"), QStringLiteral("arm"),
+                                      QStringLiteral("x86_64"), QStringLiteral("i386"),
+                                      QStringLiteral("i686")};
+    return known.contains(name) ? name : QStringLiteral("other");
+}
+
 QString reportHeader()
 {
     const QString product = QSysInfo::productType().toLower();
@@ -98,15 +107,20 @@ QString reportHeader()
         : QStringLiteral("other");
     const QString version = QSysInfo::productVersion();
     const QRegularExpression versionPattern(QStringLiteral("\\A[0-9]+(?:\\.[0-9]+){0,4}\\z"));
-    const QString architecture = QSysInfo::currentCpuArchitecture();
-    const QStringList architectures = {QStringLiteral("arm64"), QStringLiteral("aarch64"),
-                                       QStringLiteral("arm"), QStringLiteral("x86_64"),
-                                       QStringLiteral("i386"), QStringLiteral("i686")};
+    /* The architecture this process runs as is the one it was built for (buildCpuArchitecture);
+       currentCpuArchitecture() is whatever uname() says, and on a 32-bit system with a 64-bit
+       kernel (an Aurora armv7hl phone) it says aarch64, though no 64-bit code can run here. */
+    QString buildArch = QSysInfo::buildCpuArchitecture();
+    if (buildArch == QLatin1String("arm")) buildArch = QStringLiteral("armv7l");
+    else if (buildArch == QLatin1String("arm64")) buildArch = QStringLiteral("aarch64");
+    const QString kernelArch = architectureName(QSysInfo::currentCpuArchitecture());
+    const QString architecture = (kernelArch == buildArch || kernelArch == QLatin1String("other"))
+        ? buildArch : buildArch + QStringLiteral(" (") + kernelArch + QStringLiteral(" kernel)");
     return QStringLiteral("Report format: 2\nBuild: %1 %2\n"
                           "System: %3\nArchitecture: %4\nQt: %5\nTime: %6 UTC\n\n")
         .arg(QString::fromLatin1(__DATE__)).arg(QString::fromLatin1(__TIME__))
         .arg(versionPattern.match(version).hasMatch() ? system + QLatin1Char(' ') + version : system)
-        .arg(architectures.contains(architecture) ? architecture : QStringLiteral("other"))
+        .arg(architecture)
         .arg(QString::fromLatin1(qVersion())).arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
 }
 
