@@ -36,7 +36,7 @@ static bool testStream(const megler_codec_host &host, const QString &path, int k
         const qint64 time = qFromLittleEndian<qint64>(base + at + 8);
         at += 16;
         CHECK(size <= static_cast<quint32>(bytes.size() - at));
-        if (flags & 2) config = bytes.mid(at, size);
+        if (flags & 2) config += bytes.mid(at, size);
         else packets.push_back(Packet{bytes.mid(at, size), time});
         at += static_cast<int>(size);
     }
@@ -112,15 +112,156 @@ static bool testStream(const megler_codec_host &host, const QString &path, int k
     return true;
 }
 
+static bool testVideoStream(const megler_codec_host &host, const QString &path, const QString &audioPath)
+{
+    QFile file(path);
+    CHECK(file.open(QIODevice::ReadOnly));
+    const QByteArray bytes = file.readAll();
+    CHECK(bytes.size() >= 60 && bytes.left(8) == "MGMEDIA1");
+    const uchar *base = reinterpret_cast<const uchar *>(bytes.constData());
+    const quint32 count = qFromLittleEndian<quint32>(base + 56);
+    megler_codec_format format = {};
+    format.width = static_cast<int>(qFromLittleEndian<quint32>(base + 40));
+    format.height = static_cast<int>(qFromLittleEndian<quint32>(base + 44));
+    int at = 60;
+    QByteArray config;
+    std::vector<Packet> packets;
+    for (quint32 i = 0; i < count; ++i) {
+        CHECK(at <= bytes.size() - 16);
+        const quint32 flags = qFromLittleEndian<quint32>(base + at);
+        const quint32 size = qFromLittleEndian<quint32>(base + at + 4);
+        const qint64 time = qFromLittleEndian<qint64>(base + at + 8);
+        at += 16;
+        CHECK(size <= static_cast<quint32>(bytes.size() - at));
+        if (flags & 2) config += bytes.mid(at, size);
+        else packets.push_back(Packet{bytes.mid(at, size), time});
+        at += static_cast<int>(size);
+    }
+    CHECK(format.width > 0 && format.height > 0 && !config.isEmpty() && !packets.empty());
+    format.config = reinterpret_cast<const uint8_t *>(config.constData());
+    format.config_size = static_cast<size_t>(config.size());
+    megler_codec_format invalidVideo = format;
+    invalidVideo.width = 8193;
+    CHECK(!host.open(host.user, MEGLER_CODEC_H264, &invalidVideo));
+    void *decoder = host.open(host.user, MEGLER_CODEC_H264, &format);
+    CHECK(decoder);
+    QFile audioFile(audioPath);
+    CHECK(audioFile.open(QIODevice::ReadOnly));
+    const QByteArray audioBytes = audioFile.readAll();
+    CHECK(audioBytes.size() >= 60 && audioBytes.left(8) == "MGMEDIA1");
+    const uchar *audioBase = reinterpret_cast<const uchar *>(audioBytes.constData());
+    const quint32 audioCount = qFromLittleEndian<quint32>(audioBase + 56);
+    int audioAt = 60;
+    QByteArray audioConfig;
+    std::vector<Packet> audioPackets;
+    for (quint32 i = 0; i < audioCount; ++i) {
+        CHECK(audioAt <= audioBytes.size() - 16);
+        const quint32 flags = qFromLittleEndian<quint32>(audioBase + audioAt);
+        const quint32 size = qFromLittleEndian<quint32>(audioBase + audioAt + 4);
+        const qint64 time = qFromLittleEndian<qint64>(audioBase + audioAt + 8);
+        audioAt += 16;
+        CHECK(size <= static_cast<quint32>(audioBytes.size() - audioAt));
+        if (flags & 2) audioConfig += audioBytes.mid(audioAt, size);
+        else audioPackets.push_back(Packet{audioBytes.mid(audioAt, size), time});
+        audioAt += static_cast<int>(size);
+    }
+    megler_codec_format audioFormat = {};
+    audioFormat.sample_rate = static_cast<int>(qFromLittleEndian<quint32>(audioBase + 48));
+    audioFormat.channels = static_cast<int>(qFromLittleEndian<quint32>(audioBase + 52));
+    audioFormat.config = reinterpret_cast<const uint8_t *>(audioConfig.constData());
+    audioFormat.config_size = static_cast<size_t>(audioConfig.size());
+    void *audioDecoder = host.open(host.user, MEGLER_CODEC_AAC, &audioFormat);
+    CHECK(audioDecoder && !audioPackets.empty());
+    int pictures = 0;
+    std::size_t audioFrames = 0;
+    int64_t previousTime = -1;
+    auto pullPictures = [&]() {
+        megler_codec_picture picture = {};
+        void *handle;
+        while ((handle = host.pull_picture(host.user, decoder, &picture)) != nullptr) {
+            bool valid = picture.format == MEGLER_CODEC_RGBA && picture.width == format.width &&
+                         picture.height == format.height && picture.data &&
+                         picture.stride >= picture.width * 4 && picture.time_us >= previousTime;
+            if (valid) {
+                const int number = static_cast<int>((picture.time_us * 30 + 500000) / 1000000);
+                const int expected = (298 * (16 + 8 * number - 16) + 128) >> 8;
+                const uint8_t *center = picture.data +
+                    static_cast<size_t>(picture.height / 2) * picture.stride +
+                    static_cast<size_t>(picture.width / 2) * 4;
+                valid = number == pictures && std::abs(center[0] - expected) < 12 &&
+                        std::abs(center[1] - expected) < 12 && std::abs(center[2] - expected) < 12 &&
+                        center[3] == 255;
+            }
+            if (valid) {
+                previousTime = picture.time_us;
+                ++pictures;
+            }
+            host.release_picture(host.user, handle);
+            if (!valid) return false;
+        }
+        return true;
+    };
+    for (std::size_t i = 0; i < packets.size(); ++i) {
+        const Packet &packet = packets[i];
+        CHECK(host.push(host.user, decoder,
+                        reinterpret_cast<const uint8_t *>(packet.data.constData()),
+                        static_cast<size_t>(packet.data.size()), packet.time));
+        CHECK(pullPictures());
+        if (i < audioPackets.size()) {
+            const Packet &audioPacket = audioPackets[i];
+            CHECK(host.push(host.user, audioDecoder,
+                            reinterpret_cast<const uint8_t *>(audioPacket.data.constData()),
+                            static_cast<size_t>(audioPacket.data.size()), audioPacket.time));
+            megler_codec_sound sound = {};
+            while (host.pull_sound(host.user, audioDecoder, &sound)) {
+                CHECK(sound.frames > 0 && sound.sample_rate == audioFormat.sample_rate &&
+                      sound.channels == audioFormat.channels);
+                audioFrames += static_cast<size_t>(sound.frames);
+            }
+        }
+    }
+    host.drain(host.user, decoder);
+    CHECK(pullPictures());
+    CHECK(pictures == static_cast<int>(packets.size()));
+    const int decodedPictures = pictures;
+    host.drain(host.user, audioDecoder);
+    megler_codec_sound audioSound = {};
+    while (host.pull_sound(host.user, audioDecoder, &audioSound)) {
+        CHECK(audioSound.frames > 0 && audioSound.sample_rate == audioFormat.sample_rate &&
+              audioSound.channels == audioFormat.channels);
+        audioFrames += static_cast<size_t>(audioSound.frames);
+    }
+    CHECK(audioFrames > 18000);
+    host.flush(host.user, decoder);
+    host.flush(host.user, audioDecoder);
+    megler_codec_picture empty = {};
+    CHECK(!host.pull_picture(host.user, decoder, &empty));
+    CHECK(!host.pull_sound(host.user, audioDecoder, &audioSound));
+    pictures = 0;
+    previousTime = -1;
+    CHECK(host.push(host.user, decoder,
+                    reinterpret_cast<const uint8_t *>(packets.front().data.constData()),
+                    static_cast<size_t>(packets.front().data.size()), packets.front().time));
+    host.drain(host.user, decoder);
+    CHECK(pullPictures() && pictures == 1);
+    host.flush(host.user, decoder);
+    host.close(host.user, audioDecoder);
+    host.close(host.user, decoder);
+    std::printf("H.264/AAC: %d RGBA pictures at %dx%d and %zu audio frames\n",
+                decodedPictures, format.width, format.height, audioFrames);
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
     if (argc != 2) return 1;
-    const megler_codec_host host = auroraAudioCodecCallbacks();
-    if (!host.supports || !host.open || !host.push || !host.pull_sound || !host.drain || !host.flush || !host.close) return 1;
-    if (host.supports(host.user, MEGLER_CODEC_H264) || host.supports(host.user, MEGLER_CODEC_H265)) return 1;
+    const megler_codec_host host = auroraMediaCodecCallbacks();
+    if (!host.supports || !host.open || !host.push || !host.pull_picture || !host.release_picture ||
+        !host.pull_sound || !host.drain || !host.flush || !host.close) return 1;
+    if (!host.supports(host.user, MEGLER_CODEC_H264) || host.supports(host.user, MEGLER_CODEC_H265)) return 1;
     if (!host.supports(host.user, MEGLER_CODEC_AAC) || !host.supports(host.user, MEGLER_CODEC_MP3)) {
-        std::fprintf(stderr, "FFmpeg 7 AAC/MP3 decoders unavailable\n");
+        std::fprintf(stderr, "FFmpeg 7 AAC/H.264 or minimp3 decoder unavailable\n");
         return 1;
     }
     megler_codec_format invalid = {};
@@ -131,6 +272,7 @@ int main(int argc, char **argv)
     invalid.config_size = sizeof(badAac);
     if (host.open(host.user, MEGLER_CODEC_AAC, &invalid)) return 1;
     const QString dir = QString::fromLocal8Bit(argv[1]);
-    return testStream(host, dir + QStringLiteral("/aac.mgau"), MEGLER_CODEC_AAC) &&
+    return testVideoStream(host, dir + QStringLiteral("/avc.mgau"), dir + QStringLiteral("/aac.mgau")) &&
+           testStream(host, dir + QStringLiteral("/aac.mgau"), MEGLER_CODEC_AAC) &&
            testStream(host, dir + QStringLiteral("/mp3.mgau"), MEGLER_CODEC_MP3) ? 0 : 1;
 }

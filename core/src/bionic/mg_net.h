@@ -42,6 +42,11 @@ void mg_net_trace(const char *fmt, ...) MG_PRINTF(1, 2);
 /* Into a buffer the app gave with its length: as much as fits; *len then says how long the whole was. */
 void mg_net_give(const u8 *what, u32 n, void *out, u32 *len);
 
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+/* Duplicate a connected host Unix stream into the guest table. Caller retains host_fd. */
+int mg_net_import_unix_stream(int host_fd);
+#endif
+
 /* The host's interfaces under the names Android gives them: lo, wlan0, eth0, rmnet0. */
 typedef struct mg_gif {
     char name[16];

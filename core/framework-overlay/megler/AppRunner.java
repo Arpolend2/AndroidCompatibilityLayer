@@ -146,12 +146,27 @@ public final class AppRunner {
     }
 
     public static void run(String activityClass, String applicationClass) throws Exception {
+        sHeadless = activityClass == null;
+        SharedMicrogWorker.prepareIfEnabled(sHeadless);
+        SharedMicrogClientStartup.prepareIfEnabled();
+        try {
+            runApplication(activityClass, applicationClass);
+        } catch (Exception | Error failure) {
+            try { SharedMicrogClientStartup.close(); }
+            catch (Exception | Error closeError) { failure.addSuppressed(closeError); }
+            throw failure;
+        }
+        SharedMicrogClientStartup.close();
+    }
+
+    private static void runApplication(String activityClass, String applicationClass) throws Exception {
         // Watched from here, Application.onCreate and all: an app that stays on "starting" says in the log where its main thread is.
         Native.mainStarted();
         android.webkit.MimeTypeMap.meglerInstallDefault();
         KeyStoreProvider.install();
         IntegrityProfile.install();
         Looper.prepareMainLooper();
+        SharedMicrogClientStartup.startIfEnabled();
         sHandler = new Handler(Looper.getMainLooper());
         /* as RuntimeInit: every exception nothing caught is logged before any handler has it (its LoggingHandler, the pre-handler
            Thread.dispatchUncaughtException calls first), as the handler an app sets may end the process without a word -- Weather
@@ -186,8 +201,14 @@ public final class AppRunner {
         Looper.setInputSink(AppRunner::deliver);
         applyInsets();
         app.onCreate();
+        SharedMicrogWorker.startIfEnabled(app);
         Syncs.started();
         Installs.sweep(app);
+        if (sHeadless) {
+            android.util.Log.i("Megler", "headless application started");
+            Looper.loop();
+            return;
+        }
         Manifest.Component launcher = Manifest.activity(activityClass);
         Intent main = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
         // started through the launcher's alias, the activity's component is the alias (Android compares that, not the class, when
@@ -687,7 +708,9 @@ public final class AppRunner {
         exitWhenLast();
     }
     /** The app ends with its last activity, unless one it started just before (finish(); startActivity(...)) is still to come. */
+    private static boolean sHeadless;
     private static void exitWhenLast() {
+        if (sHeadless) return;
         if (sStack.isEmpty()) sHandler.post(() -> { if (sStack.isEmpty()) { endPending(); Native.exit(); } });
     }
     /*
@@ -720,7 +743,11 @@ public final class AppRunner {
     }
     /** The finished activities not stopped yet, stopped and destroyed now: before the app ends. */
     private static void endPending() { for (Runnable r : new ArrayList<>(sEnding)) r.run(); }
-    public static void finishAll() { sHandler.post(() -> { while (!sStack.isEmpty()) finishNow(top(), false); endPending(); }); }
+    public static void finishAll() { sHandler.post(() -> {
+        while (!sStack.isEmpty()) finishNow(top(), false);
+        endPending();
+        if (sHeadless) Native.exit();
+    }); }
     /*
      * Activity.finishAffinity(), as Android's ActivityStack.finishActivityAffinityLocked: the activity and those under it of
      * its task affinity (android:taskAffinity, the package's unless the manifest names another) go, together; those it

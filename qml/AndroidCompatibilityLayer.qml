@@ -24,6 +24,11 @@ ApplicationWindow {
         return applicationActive && current && current.objectName === "launcherPage" &&
                 current.section === 0 && !probe.installConfirmationVisible
     }
+    function rpmDetailsAreVisible(current, applicationActive, appPackage) {
+        return applicationActive && current && current.objectName === "appDetailsPage" &&
+                current.appPackage === appPackage && !probe.installConfirmationVisible &&
+                !launchInstallBanner.offered
+    }
     function openYandexFormPage() {
         if (yandexFormComponent) return
         var component = Qt.createComponent(Qt.resolvedUrl("YandexFormPage.qml"))
@@ -157,6 +162,15 @@ ApplicationWindow {
     }
     DownloadNotification { id: microgDownloadNotification; title: qsTr("microG") }
     DownloadNotification { id: storeDownloadNotification; title: qsTr("Aurora Store") }
+    StandaloneRpmNotification {
+        objectName: "standaloneRpmNotification"
+        busy: probe.standaloneRpmBusy
+        appPackage: probe.standaloneRpmPackage
+        status: probe.standaloneRpmStatus
+        detailsVisible: window.rpmDetailsAreVisible(pageStack.currentPage,
+                                                     Qt.application.state === Qt.ApplicationActive,
+                                                     appPackage)
+    }
     Notification {
         id: rpmErrorBanner
         objectName: "rpmErrorBanner"
@@ -219,7 +233,7 @@ ApplicationWindow {
         }
         onStandaloneRpmError: {
             var current = pageStack.currentPage
-            if (current && current.objectName === "appDetailsPage" && current.appPackage === appPackage)
+            if (window.rpmDetailsAreVisible(current, Qt.application.state === Qt.ApplicationActive, appPackage))
                 return
             rpmErrorBanner.previewBody = message
             rpmErrorBanner.replacesId = 0
@@ -948,7 +962,7 @@ ApplicationWindow {
                             model: [
                                 qsTr("1. With logging enabled, reproduce the error in the app."),
                                 qsTr("2. In the manager, select “Save to file”. This saves the manager log and available standalone app logs as one .txt file in Documents."),
-                                qsTr("3. Check the saved file for private data. Select “Send to developer” to open the Yandex form, then attach the checked file and select “Submit”.")
+                                qsTr("3. Select “Send to developer” to open the Yandex form, then attach the saved file and select “Submit”.")
                             ]
                             delegate: Label {
                                 x: Theme.horizontalPageMargin
@@ -962,21 +976,6 @@ ApplicationWindow {
                             width: parent.width - 2 * x
                             visible: probe.logStorageError.length > 0
                             text: qsTr("Automatic log storage failed: %1").arg(probe.logStorageError)
-                            wrapMode: Text.Wrap
-                            color: palette.highlightColor
-                        }
-                        Label {
-                            x: Theme.horizontalPageMargin
-                            width: parent.width - 2 * x
-                            textFormat: Text.StyledText
-                            text: qsTr("<b>Note:</b> New standalone packages record only when logging is enabled in the manager. Other apps in the organization can access the shared log folder. After a successful save, the manager removes only the standalone snapshots included in the file that have not changed during export. The manager warns if the report is incomplete or cleanup fails.")
-                            wrapMode: Text.Wrap
-                            color: palette.highlightColor
-                        }
-                        Label {
-                            x: Theme.horizontalPageMargin
-                            width: parent.width - 2 * x
-                            text: qsTr("Older standalone packages keep their previous logging behavior. To switch them to shared logs, recreate and install them once. You do not need to recreate packages each time you collect a log.")
                             wrapMode: Text.Wrap
                             color: palette.highlightColor
                         }

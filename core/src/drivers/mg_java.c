@@ -1539,7 +1539,12 @@ N(Native_toBack)
     if (late) mg_info("java: the app went to the back with no Back waiting: the next Back within five seconds is the system's");
 }
 
+static bool g_shared_microg_worker;
+void mg_java_enable_shared_microg_worker(void) { g_shared_microg_worker = true; }
+N(SharedMicrogWorker_enabled) { c->ret.i = g_shared_microg_worker ? 1 : 0; }
+
 static const mg_jhle k_native[] = {
+    { "megler/SharedMicrogWorker", "enabled", "()Z", SharedMicrogWorker_enabled },
     { "megler/Native", "log", NULL, Native_log },
     { "megler/Native", "thrownInService", NULL, Native_thrownInService },
     { "megler/Native", "readAsset", NULL, Native_readAsset },
@@ -2714,6 +2719,7 @@ static MG_HOSTCB void main_thread(void *arg)
         mg_dvm_register(mg_java_media_natives());
         mg_java_camera_set_host(&J.config->camera);
         mg_dvm_register(mg_java_camera_natives());
+        mg_dvm_register(mg_java_shared_microg_client_natives());
         mg_java_location_set_host(&J.config->location);
         mg_dvm_register(mg_java_location_natives());
         mg_dvm_register(mg_java_sensors_natives());
@@ -2739,9 +2745,10 @@ static MG_HOSTCB void main_thread(void *arg)
         mg_dvm_register(mg_java_gles_natives());
         mg_dvm_register(mg_java_gl_natives());
         memset(args, 0, sizeof(args));
-        args[0].l = mg_dvm_new_string(J.activity);
+        args[0].l = mg_run_is_headless() ? NULL : mg_dvm_new_string(J.activity);
         args[1].l = J.application[0] ? mg_dvm_new_string(J.application) : NULL;
-        mg_info("java: starting %s%s%s", J.activity, J.application[0] ? " in " : "", J.application);
+        mg_info("java: starting %s%s%s", mg_run_is_headless() ? "without an activity" : J.activity,
+                J.application[0] ? " in " : "", J.application);
         if (!mg_dvm_call_static("megler/AppRunner", "run", "(Ljava/lang/String;Ljava/lang/String;)V", args, NULL)) {
             /*
              * An exception nothing caught came all the way up the main thread: thrown in an activity's onCreate, a
@@ -2791,6 +2798,7 @@ static MG_HOSTCB void main_thread(void *arg)
     mg_strlcpy(J.end_reason, why[0] ? why : J.stop ? "stopped" : "", sizeof(J.end_reason));
     mg_atomic_xchg(&J.ended, 1);
     /* The reason is megler_last_error's too: the shell may ask after the app is gone. */
+    mg_java_close_shared_microg_client();
     if (why[0]) mg_run_set_error("%s", why);
     if (why[0]) mg_run_ended(-1, why);
     else mg_run_ended(0, J.stop ? "stopped" : NULL);
@@ -2877,7 +2885,7 @@ static bool java_start(const megler_run_config *config, const mg_apk_info *info)
         return false;
     }
     free(probe);
-    if (!J.activity[0]) {
+    if (!mg_run_is_headless() && !J.activity[0]) {
         mg_run_set_error("the manifest names no launcher activity");
         return false;
     }

@@ -56,18 +56,25 @@ int main(int argc, char **argv)
         paths.locale != QStringLiteral("zh-Hant-TW") || paths.theme != QStringLiteral("dark") ||
         paths.location != QStringLiteral("55.5,37.5") ||
         paths.data != QDir(storage).filePath(QStringLiteral("apps/org.example.app/data")) ||
-        paths.standaloneSnapshots || paths.fileDiagnostics || QFileInfo::exists(storage)) return 1;
+        paths.standaloneSnapshots || paths.fileDiagnostics || paths.sharedMicrog || QFileInfo::exists(storage)) return 1;
     {
         QFile file(metadataPath);
         if (!file.open(QIODevice::ReadOnly)) return 1;
         QJsonObject object = QJsonDocument::fromJson(file.readAll()).object();
         file.close();
         object.insert(QStringLiteral("standaloneSnapshots"), true);
+        object.insert(QStringLiteral("sharedMicrog"), true);
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
             file.write(QJsonDocument(object).toJson()) < 0) return 1;
         file.close();
         if (!standalonePaths(appId, appId, root, storage, &paths, &error) ||
-            !paths.standaloneSnapshots || paths.fileDiagnostics) return 1;
+            !paths.standaloneSnapshots || paths.fileDiagnostics || !paths.sharedMicrog) return 1;
+        object.insert(QStringLiteral("sharedMicrog"), QStringLiteral("yes"));
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            file.write(QJsonDocument(object).toJson()) < 0) return 1;
+        file.close();
+        if (standalonePaths(appId, appId, root, storage, &paths, &error) || error.isEmpty()) return 1;
+        object.insert(QStringLiteral("sharedMicrog"), true);
         object.insert(QStringLiteral("standaloneSnapshots"), QStringLiteral("yes"));
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
             file.write(QJsonDocument(object).toJson()) < 0) return 1;

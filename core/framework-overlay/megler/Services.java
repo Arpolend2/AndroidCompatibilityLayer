@@ -5,7 +5,8 @@
 // on the main thread, as on Android, and a start has its id when it is asked for (postStart). And a service the manifest puts in
 // another process (android:process) is made in that process's class scope, with its Application (megler.Processes). And the
 // services running can be listed (running), for a configuration change they hear (megler.Screen). Everything else is the
-// original's, unchanged.
+// original's, unchanged unless SharedMicrogClientSession explicitly installs shared bind routing.
+// An installed but disconnected router fails closed; there is no implicit shared startup.
 package megler;
 
 import android.app.Service;
@@ -19,6 +20,8 @@ import java.util.HashMap;
 public final class Services {
     private static final HashMap<String, Service> sRunning = new HashMap<>();
     private static final HashMap<ServiceConnection, String> sBound = new HashMap<>();
+    private static volatile SharedMicrogClientRouter sSharedMicrogRouter;
+    private static final Object sSharedMicrogLock = new Object();
     /* The id of the latest start of each of the app's services (postStart). */
     private static final HashMap<String, Integer> sLastStart = new HashMap<>();
     private Services() {}
@@ -113,6 +116,15 @@ public final class Services {
         });
     }
     public static boolean bind(Context from, Intent i, ServiceConnection conn) {
+        SharedMicrogClientRouter shared = sSharedMicrogRouter;
+        if (shared == null && SharedMicrogClientStartup.required() &&
+            SharedMicrogClientRouter.targetsSharedMicrog(i))
+            throw new IllegalStateException("The shared microG client channel is unavailable.");
+        if (shared != null && SharedMicrogClientRouter.targetsSharedMicrog(i)) {
+            if (!SharedMicrogClientRouter.canRoute(i))
+                throw new IllegalArgumentException("Unsupported shared microG bind intent.");
+            return shared.bind(i, conn);
+        }
         if (MicroG.bind(from, i, conn)) return true;
         final IBinder play = PlayStore.bind(i);
         if (play != null) {
@@ -133,7 +145,37 @@ public final class Services {
         });
         return true;
     }
-    public static void unbind(ServiceConnection conn) { if (!MicroG.unbind(conn)) sBound.remove(conn); }
+    public static void unbind(ServiceConnection conn) {
+        SharedMicrogClientRouter shared = sSharedMicrogRouter;
+        if (shared != null && shared.hasBinding(conn)) {
+            shared.unbind(conn);
+            return;
+        }
+        if (!MicroG.unbind(conn)) sBound.remove(conn);
+    }
+
+    public static void setSharedMicrogClientRouter(SharedMicrogClientRouter router) {
+        SharedMicrogClientRouter previous;
+        synchronized (sSharedMicrogLock) {
+            previous = sSharedMicrogRouter;
+            sSharedMicrogRouter = router;
+        }
+        if (previous != null && previous != router) previous.close();
+    }
+
+    static void installSharedMicrogClientRouter(SharedMicrogClientRouter router) {
+        synchronized (sSharedMicrogLock) {
+            if (sSharedMicrogRouter != null)
+                throw new IllegalStateException("A shared microG client router is already installed.");
+            sSharedMicrogRouter = router;
+        }
+    }
+
+    static void clearSharedMicrogClientRouter(SharedMicrogClientRouter expected) {
+        synchronized (sSharedMicrogLock) {
+            if (sSharedMicrogRouter == expected) sSharedMicrogRouter = null;
+        }
+    }
 
     /** A system service by name, or null for those Megler has nothing for. */
     public static Object system(String name, Context c) {

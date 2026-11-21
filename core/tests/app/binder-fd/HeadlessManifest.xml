@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="megler.test.binderfd"
+    android:versionCode="1" android:versionName="test">
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="28" />
+    <application android:name=".ServerApplication" android:label="Binder headless test" />
+</manifest>

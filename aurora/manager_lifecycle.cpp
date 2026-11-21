@@ -1,4 +1,5 @@
 #include "manager_lifecycle.h"
+#include "standalone_diagnostic_registry.h"
 
 #include <QCoreApplication>
 #include <QDBusConnectionInterface>
@@ -19,6 +20,9 @@ ManagerLifecycle::ManagerLifecycle(const std::function<bool()> &showGui, QObject
     m_idle.setInterval(idleMilliseconds);
     connect(&m_idle, &QTimer::timeout, QCoreApplication::instance(), &QCoreApplication::quit);
     m_receiver.setActivationHandler([this]() { return this->showGui(); });
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+    connect(&m_receiver, &ExternalApkReceiver::diagnosticRequested, this, [this]() { noteRequest(); });
+#endif
     connect(&m_receiver, &ExternalApkReceiver::requested, this, [this](const QString &path) {
         if (this->showGui()) emit fileRequested(path);
         else qWarning("Cannot display an incoming file request.");
@@ -26,6 +30,72 @@ ManagerLifecycle::ManagerLifecycle(const std::function<bool()> &showGui, QObject
     connect(&m_receiver, &ExternalApkReceiver::rejected, this, [this](const QString &message) {
         emit fileRejected(message);
     });
+    connect(&m_worker, &SharedMicrogSupervisor::workerDied,
+            &m_provider, &SharedMicrogProviderObject::revokeAllChannels);
+    connect(&m_worker, &SharedMicrogSupervisor::channelDisconnected,
+            &m_provider, &SharedMicrogProviderObject::releaseChannelById);
+}
+
+ManagerLifecycle::~ManagerLifecycle()
+{
+    m_provider.revokeAllChannels();
+    m_worker.stop();
+}
+
+bool ManagerLifecycle::configureSharedMicrogWorker(const QString &program,
+                                                   const QStringList &arguments,
+                                                   const SharedMicrogProviderObject::PackageResolver &packageResolver,
+                                                   QString *error)
+{
+    if (!packageResolver) {
+        if (error) *error = QStringLiteral("A trusted shared microG package resolver is required.");
+        return false;
+    }
+    if (!m_worker.configure(program, arguments, error)) return false;
+    if (!m_provider.setPackageResolver(packageResolver, error)) return false;
+    const SharedMicrogProviderObject::ChannelHandler open =
+        [this](const QString &, const QString &package, int uid, int pid, quint64 channelId,
+               const QDBusUnixFileDescriptor &server, QString *workerError) {
+            if (!server.isValid()) {
+                if (workerError) *workerError = QStringLiteral("Invalid shared microG stream.");
+                return false;
+            }
+            return m_worker.openChannel(package, uid, pid, channelId,
+                                        server.fileDescriptor(), workerError);
+        };
+    const SharedMicrogProviderObject::ChannelReleaseHandler close =
+        [this](const QString &, quint64 channelId) { m_worker.closeChannel(channelId); };
+    return m_provider.setChannelHandlers(open, close, error);
+}
+
+void ManagerLifecycle::disableSharedMicrogWorker()
+{
+    m_provider.revokeAllChannels();
+    m_worker.stop();
+    QString error;
+    if (!m_provider.clearBackend(&error))
+        qWarning("Cannot disable shared microG backend: %s", qPrintable(error));
+}
+
+SharedMicrogProviderObject::PackageResolver ManagerLifecycle::registryPackageResolver(
+    const QString &identityDirectory)
+{
+    return [identityDirectory](const QString &executable, const QString &identityKey, QString *error) {
+        if (error) error->clear();
+        if (identityKey.isEmpty()) {
+            if (error) *error = QStringLiteral("Caller identity is incomplete.");
+            return QString();
+        }
+        const QString appId = StandaloneDiagnosticRegistry::appIdFromExecutable(executable);
+        if (appId.isEmpty()) {
+            if (error) *error = QStringLiteral("Caller is not a registered standalone app.");
+            return QString();
+        }
+        const QString package = StandaloneDiagnosticRegistry::lookup(identityDirectory, appId);
+        if (package.isEmpty() && error)
+            *error = QStringLiteral("No exported package mapping exists for this caller.");
+        return package;
+    };
 }
 
 bool ManagerLifecycle::showGui()

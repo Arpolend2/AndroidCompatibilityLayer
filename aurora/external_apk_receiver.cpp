@@ -1,6 +1,11 @@
 #include "external_apk_receiver.h"
 
 #include "external_apk_path.h"
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+#include "standalone_diagnostic_registry.h"
+#include <QDBusPendingCallWatcher>
+#include <QStandardPaths>
+#endif
 
 #include <QDBusConnection>
 #include <QDBusError>
@@ -10,6 +15,7 @@
 #include <QFileInfo>
 #include <QJsonObject>
 #include <QRegularExpression>
+#include <QTimer>
 #include <RuntimeManager/RuntimeDispatcher>
 
 namespace {
@@ -26,6 +32,7 @@ ExternalApkReceiver::~ExternalApkReceiver()
 {
     auto *dispatcher = RuntimeManager::RuntimeDispatcher::instance();
     dispatcher->unregisterIntent(QStringLiteral("OpenURI"));
+    dispatcher->unregisterIntent(QStringLiteral("Start"));
     if (m_runtimeStarted) dispatcher->stopService();
     if (m_legacyRegistered) {
         QDBusConnection bus = QDBusConnection::sessionBus();
@@ -73,10 +80,21 @@ bool ExternalApkReceiver::start(QString *error)
             }
             reply(QJsonObject());
         });
+    // RuntimeManager delivers an explicitly registered Start intent to an already running instance
+    // (launcher icon). Without it a window-less background instance only gets a splash toplevel.
+    dispatcher->registerIntent(QStringLiteral("Start"),
+        [this](const QJsonObject &, const RuntimeManager::RuntimeDispatcher::HandlerCb &reply) {
+            reply(QJsonObject());
+            QTimer::singleShot(0, this, [this]() {
+                const bool shown = m_activationHandler && m_activationHandler();
+                qInfo("Runtime Start intent: manager window %s.", shown ? "shown" : "unavailable");
+            });
+        });
     const RuntimeManager::Error runtimeError = dispatcher->startService();
     m_runtimeStarted = !runtimeError;
     if (!m_runtimeStarted) {
         dispatcher->unregisterIntent(QStringLiteral("OpenURI"));
+        dispatcher->unregisterIntent(QStringLiteral("Start"));
         qWarning("RuntimeManager OpenURI service unavailable: %s", qPrintable(runtimeError.message()));
     }
     if (!m_legacyRegistered)
@@ -150,6 +168,47 @@ QString ExternalApkReceiver::libraryApps()
     }
     return m_libraryApps;
 }
+
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+QString ExternalApkReceiver::DiagnosticPing()
+{
+    if (!calledFromDBus() || !message().service().startsWith(QLatin1Char(':'))) {
+        sendErrorReply(QDBusError::AccessDenied, QStringLiteral("A D-Bus sender is required."));
+        return QString();
+    }
+    if (m_diagnosticPending >= 16) {
+        sendErrorReply(QDBusError::LimitsExceeded, QStringLiteral("Too many diagnostic requests."));
+        return QString();
+    }
+    const QDBusMessage request = message();
+    const QDBusConnection bus = connection();
+    emit diagnosticRequested();
+    QDBusMessage identify = QDBusMessage::createMethodCall(
+        QStringLiteral("ru.omp.am"), QStringLiteral("/ru/omp/am"),
+        QStringLiteral("ru.omp.am.Identify"), QStringLiteral("IdentifyByBusName"));
+    identify << request.service();
+    setDelayedReply(true);
+    ++m_diagnosticPending;
+    auto *watcher = new QDBusPendingCallWatcher(bus.asyncCall(identify, 5000), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher, bus, request]() {
+        --m_diagnosticPending;
+        const QDBusMessage identity = watcher->reply();
+        const QList<QVariant> values = identity.arguments();
+        QString id;
+        if (identity.type() == QDBusMessage::ReplyMessage && values.size() == 2 &&
+            values.at(0).type() == QVariant::String && values.at(1).type() == QVariant::String &&
+            !values.at(1).toString().isEmpty() && values.at(1).toString().size() <= 256)
+            id = StandaloneDiagnosticRegistry::appIdFromExecutable(values.at(0).toString());
+        const QString root = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        const QDBusMessage reply = id.isEmpty() || StandaloneDiagnosticRegistry::lookup(root, id).isEmpty()
+            ? request.createErrorReply(QDBusError::AccessDenied, QStringLiteral("Unknown standalone sender."))
+            : request.createReply(QVariantList() << QStringLiteral("synthetic-ok"));
+        if (!bus.send(reply)) qWarning("Cannot send standalone diagnostic reply.");
+        watcher->deleteLater();
+    });
+    return QString();
+}
+#endif
 
 QString ExternalApkReceiver::launchApp(const QString &package)
 {

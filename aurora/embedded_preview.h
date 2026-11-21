@@ -13,6 +13,8 @@
 #include <QLocalSocket>
 #include <QPointer>
 #include <QTemporaryDir>
+#include <QTemporaryFile>
+#include <memory>
 #include <QTimer>
 
 class QProcess;
@@ -28,6 +30,9 @@ public:
     void reset();
     bool send(const QJsonObject &message);
     bool sendFrame(const QImage &frame);
+    QString createSharedFrames();
+    void useSharedFrames(const QString &path);
+    void disableSharedFrames();
     bool connected() const;
 signals:
     void message(const QJsonObject &message);
@@ -38,6 +43,9 @@ private:
     void fail(const QString &reason);
     QPointer<QLocalSocket> m_socket;
     QByteArray m_input;
+    std::unique_ptr<QTemporaryDir> m_sharedDirectory;
+    std::unique_ptr<QTemporaryFile> m_sharedReader;
+    QFile m_sharedWriter;
     bool m_failed = false;
 };
 
@@ -48,13 +56,23 @@ class EmbeddedPreview : public PreviewPlayer, public EmbeddedEndpoint
     Q_PROPERTY(bool showStatus READ remoteShowStatus NOTIFY remoteStatusChanged)
 public:
     explicit EmbeddedPreview(QObject *parent = nullptr);
-    void setCpuFrameTransportOnly() { m_cpuFrameTransportOnly = true; }
+    void setCpuFrameTransportOnly(bool verifyGpuImport = false)
+    {
+        m_cpuFrameTransportOnly = true;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+        m_verifyGpuImport = verifyGpuImport;
+#else
+        Q_UNUSED(verifyGpuImport)
+#endif
+    }
     bool listen(QProcess *process, QString *error) override;
     QString endpoint() const override;
     bool stopping() const override { return m_stopping; }
     bool usesGpuSurface() const override
     {
-#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+        return !m_cpuFrameTransportOnly || m_verifyGpuImport;
+#elif defined(MG_EXPERIMENTAL_GPU_COMPOSITION)
         return !m_cpuFrameTransportOnly;
 #else
         return false;
@@ -68,17 +86,24 @@ public:
     bool touch(int phase, float x, float y) override;
     void back() override;
     void setViewport(qreal width, qreal height, qreal ratio) override;
+    void setDisplayRotation(int rotation) override;
     void expectRestart();
     Q_INVOKABLE void close() override;
     Q_INVOKABLE void closeToManager() override;
     Q_INVOKABLE void stop();
     Q_INVOKABLE void setUiReady(bool ready);
     Q_INVOKABLE void selected(const QString &token, const QString &path);
+    Q_INVOKABLE void selectedMany(const QString &token, const QStringList &paths);
+    Q_INVOKABLE void validatePhoto(const QString &token, const QString &path);
+    Q_INVOKABLE void confirmPhoto(const QString &token);
     Q_INVOKABLE void canceled(const QString &token);
     Q_INVOKABLE void showFailed(const QString &token);
 signals:
     void remoteStatusChanged();
-    void showPicker(const QString &token, const QStringList &filters);
+    void showPicker(const QString &token, const QStringList &filters, bool multiple);
+    void showPhoto(const QString &token, const QString &path);
+    void closePhoto(const QString &token);
+    void photoValidated(const QString &token, bool valid);
     void channelError(const QString &reason);
     void shutdownComplete();
 private:
@@ -95,6 +120,7 @@ private:
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
     EmbeddedGpuTransport m_gpuTransport;
     QString m_gpuEndpoint;
+    bool m_verifyGpuImport = false;
 #endif
     QPointer<QProcess> m_process;
     QPointer<PreviewKeyboard> m_keyboard;

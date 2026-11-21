@@ -11,7 +11,7 @@
  * UNICODE byte by byte (Android's own use ICU).
  *
  * A path is the app's, as Android names it (/data/data/<package>/databases/x.db);
- * SQLite is given the host's path for it. ":memory:" and the empty name stay
+ * The guest VFS converts the path once. ":memory:" and the empty name stay
  * what they are to SQLite.
  *
  * Where the core was built without SQLite every method answers as a database
@@ -72,7 +72,7 @@ static void unwal(const char *host, const char *path)
     rc = mg_file_pread(f, head, sizeof(head), 0, NULL) == (i64)sizeof(head) && head[18] == 2 && head[19] == 2;
     mg_file_close(f);
     if (!rc) return;
-    rc = sqlite3_open_v2(host, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL);
+    rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, "megler-guest");
     if (rc == SQLITE_OK) {
         sqlite3_busy_timeout(db, 5000);
         rc = sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
@@ -104,7 +104,7 @@ N(Sqlite_open)
         unwal(host, path);
         mg_lock_release(&g_open_lock);
     }
-    rc = sqlite3_open_v2(host ? host : path && path[0] ? path : ":memory:", &db, flags, NULL);
+    rc = sqlite3_open_v2(path && path[0] ? path : ":memory:", &db, flags, "megler-guest");
     if (rc != SQLITE_OK) {
         mg_lock_acquire(&g_open_lock);
         snprintf(g_open_error, sizeof(g_open_error), "%s (code %d)", db ? sqlite3_errmsg(db) : sqlite3_errstr(rc), rc);

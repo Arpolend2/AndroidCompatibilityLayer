@@ -4,6 +4,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 #include <libavutil/mem.h>
+#include <libavutil/pixfmt.h>
 #include <libavutil/samplefmt.h>
 }
 
@@ -85,6 +86,11 @@ struct Sound {
     int64_t time = 0;
 };
 
+struct Picture {
+    std::vector<uint8_t> rgba;
+    megler_codec_picture value{};
+};
+
 struct Decoder {
     AvApi &av;
     AVCodecContext *context = nullptr;
@@ -92,8 +98,10 @@ struct Decoder {
     AVFrame *frame = nullptr;
     int kind = 0;
     std::deque<Sound> ready;
+    std::deque<Picture> readyPictures;
     Sound current;
     std::size_t queuedSamples = 0;
+    std::size_t queuedPictureBytes = 0;
     bool failed = false;
 
     explicit Decoder(AvApi &functions) : av(functions) {}
@@ -108,14 +116,24 @@ struct Decoder {
 bool MEGLER_CB supports(void *, int kind)
 {
     AvApi &a = api();
-    const char *name = kind == MEGLER_CODEC_AAC ? "aac" : kind == MEGLER_CODEC_MP3 ? "mp3" : nullptr;
+    const char *name = kind == MEGLER_CODEC_H264 ? "h264" :
+                       kind == MEGLER_CODEC_AAC ? "aac" :
+                       kind == MEGLER_CODEC_MP3 ? "mp3" : nullptr;
     return name && a.ready && a.find(name);
 }
 
 void *MEGLER_CB openCodec(void *, int kind, const megler_codec_format *format)
 {
-    if (!format || !supports(nullptr, kind) || format->sample_rate <= 0 ||
-        format->sample_rate > 192000 || format->channels < 1 || format->channels > 2) {
+    const bool video = kind == MEGLER_CODEC_H264;
+    const bool validAudio = (kind == MEGLER_CODEC_AAC || kind == MEGLER_CODEC_MP3) && format &&
+                            format->sample_rate > 0 && format->sample_rate <= 192000 &&
+                            format->channels >= 1 && format->channels <= 2;
+    const bool validVideo = video && format && format->width >= 0 && format->height >= 0 &&
+                            format->width <= 8192 && format->height <= 8192 &&
+                            (!format->width || !format->height ||
+                             static_cast<int64_t>(format->width) * format->height <= 33554432);
+    if (!format || !supports(nullptr, kind) || (!validAudio && !validVideo) ||
+        format->config_size > 1048576 || (format->config_size && !format->config)) {
         qWarning() << "AndroidCompatibilityLayer audio codec: unsupported format or decoder";
         return nullptr;
     }
@@ -127,7 +145,8 @@ void *MEGLER_CB openCodec(void *, int kind, const megler_codec_format *format)
             return nullptr;
         }
     }
-    const AVCodec *codec = d->av.find(kind == MEGLER_CODEC_AAC ? "aac" : "mp3");
+    const char *name = video ? "h264" : kind == MEGLER_CODEC_AAC ? "aac" : "mp3";
+    const AVCodec *codec = d->av.find(name);
     d->context = d->av.alloc(codec);
     d->packet = d->av.packetAlloc();
     d->frame = d->av.frameAlloc();
@@ -135,7 +154,8 @@ void *MEGLER_CB openCodec(void *, int kind, const megler_codec_format *format)
         qWarning() << "AndroidCompatibilityLayer audio codec: allocation failed";
         return nullptr;
     }
-    if (kind == MEGLER_CODEC_AAC) {
+    if (video) d->context->pkt_timebase = AVRational{1, 1000000};
+    if (format->config_size) {
         d->context->extradata = static_cast<uint8_t *>(d->av.mallocz(format->config_size + AV_INPUT_BUFFER_PADDING_SIZE));
         if (!d->context->extradata) {
             qWarning() << "AndroidCompatibilityLayer audio codec: configuration allocation failed";
@@ -158,6 +178,88 @@ int16_t sample16(double value)
     return static_cast<int16_t>(std::lrint(value * 32768.0));
 }
 
+static uint8_t clampByte(int value)
+{
+    return static_cast<uint8_t>(std::max(0, std::min(value, 255)));
+}
+
+bool collectPicture(Decoder &d, AVFrame *frame)
+{
+    const int width = frame->width, height = frame->height;
+    const AVPixelFormat format = static_cast<AVPixelFormat>(frame->format);
+    const bool planar = format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P;
+    const bool nv12 = format == AV_PIX_FMT_NV12;
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192 ||
+        static_cast<int64_t>(width) * height > 33554432 ||
+        (!planar && !nv12) || !frame->data[0] || !frame->data[1] ||
+        (planar && !frame->data[2]) || frame->pts == AV_NOPTS_VALUE ||
+        std::abs(static_cast<int64_t>(frame->linesize[0])) < width) {
+        qWarning() << "AndroidCompatibilityLayer video codec: unsupported decoded picture";
+        return false;
+    }
+    const int chromaWidth = (width + 1) / 2;
+    if ((planar && (std::abs(static_cast<int64_t>(frame->linesize[1])) < chromaWidth ||
+                    std::abs(static_cast<int64_t>(frame->linesize[2])) < chromaWidth)) ||
+        (nv12 && std::abs(static_cast<int64_t>(frame->linesize[1])) < chromaWidth * 2)) {
+        qWarning() << "AndroidCompatibilityLayer video codec: invalid decoded picture stride";
+        return false;
+    }
+    const std::size_t pixels = static_cast<std::size_t>(width) * height;
+    const std::size_t bytes = pixels * 4;
+    if (bytes > 64 * 1024 * 1024 || d.queuedPictureBytes > 64 * 1024 * 1024 - bytes) {
+        qWarning() << "AndroidCompatibilityLayer video codec: decoded picture queue full";
+        return false;
+    }
+
+    const bool bt709 = frame->colorspace == AVCOL_SPC_BT709 ||
+                       (frame->colorspace == AVCOL_SPC_UNSPECIFIED && height >= 720);
+    const bool fullRange = format == AV_PIX_FMT_YUVJ420P || frame->color_range == AVCOL_RANGE_JPEG;
+    Picture picture;
+    picture.rgba.resize(bytes);
+    for (int y = 0; y < height; ++y) {
+        const uint8_t *luma = frame->data[0] + static_cast<int64_t>(y) * frame->linesize[0];
+        const uint8_t *uPlane = planar
+            ? frame->data[1] + static_cast<int64_t>(y / 2) * frame->linesize[1] : nullptr;
+        const uint8_t *vPlane = planar
+            ? frame->data[2] + static_cast<int64_t>(y / 2) * frame->linesize[2] : nullptr;
+        const uint8_t *uvPlane = nv12
+            ? frame->data[1] + static_cast<int64_t>(y / 2) * frame->linesize[1] : nullptr;
+        for (int x = 0; x < width; ++x) {
+            const int chromaX = x / 2;
+            const int u = (planar ? uPlane[chromaX] : uvPlane[chromaX * 2]) - 128;
+            const int v = (planar ? vPlane[chromaX] : uvPlane[chromaX * 2 + 1]) - 128;
+            const int rawY = luma[x];
+            const int yy = fullRange ? rawY : std::max(0, rawY - 16);
+            int r, g, b;
+            if (fullRange) {
+                r = yy + (bt709 ? (403 * v + 128) / 256 : (359 * v + 128) / 256);
+                g = yy - (bt709 ? (48 * u + 120 * v + 128) / 256
+                                : (88 * u + 183 * v + 128) / 256);
+                b = yy + (bt709 ? (475 * u + 128) / 256 : (454 * u + 128) / 256);
+            } else {
+                r = (298 * yy + (bt709 ? 459 : 409) * v + 128) / 256;
+                g = (298 * yy - (bt709 ? 55 : 100) * u - (bt709 ? 136 : 208) * v + 128) / 256;
+                b = (298 * yy + (bt709 ? 541 : 516) * u + 128) / 256;
+            }
+            uint8_t *pixel = picture.rgba.data() + (static_cast<std::size_t>(y) * width + x) * 4;
+            pixel[0] = clampByte(r);
+            pixel[1] = clampByte(g);
+            pixel[2] = clampByte(b);
+            pixel[3] = 255;
+        }
+    }
+    picture.value.format = MEGLER_CODEC_RGBA;
+    picture.value.width = width;
+    picture.value.height = height;
+    picture.value.stride = width * 4;
+    picture.value.matrix = bt709 ? MEGLER_CODEC_BT709 : MEGLER_CODEC_BT601;
+    picture.value.full_range = true;
+    picture.value.time_us = frame->pts;
+    d.queuedPictureBytes += bytes;
+    d.readyPictures.push_back(std::move(picture));
+    return true;
+}
+
 bool collect(Decoder &d)
 {
     for (;;) {
@@ -168,6 +270,12 @@ bool collect(Decoder &d)
             return false;
         }
         AVFrame *f = d.frame;
+        if (d.kind == MEGLER_CODEC_H264) {
+            const bool ok = collectPicture(d, f);
+            d.av.frameUnref(f);
+            if (!ok) return false;
+            continue;
+        }
         const int channels = f->ch_layout.nb_channels;
         const int count = f->nb_samples;
         const AVSampleFormat format = static_cast<AVSampleFormat>(f->format);
@@ -250,7 +358,7 @@ bool MEGLER_CB push(void *, void *handle, const uint8_t *data, size_t size, int6
         return false;
     }
     bool ok = true;
-    if (d->kind == MEGLER_CODEC_AAC) {
+    if (d->kind == MEGLER_CODEC_AAC || d->kind == MEGLER_CODEC_H264) {
         ok = sendPacket(*d, data, size, time);
     } else {
         while (size && ok) {
@@ -304,6 +412,20 @@ bool MEGLER_CB pull(void *, void *handle, megler_codec_sound *out)
     return true;
 }
 
+void *MEGLER_CB pullPicture(void *, void *handle, megler_codec_picture *out)
+{
+    Decoder *d = static_cast<Decoder *>(handle);
+    if (!d || !out || d->readyPictures.empty()) return nullptr;
+    std::unique_ptr<Picture> picture(new Picture(std::move(d->readyPictures.front())));
+    d->readyPictures.pop_front();
+    d->queuedPictureBytes -= picture->rgba.size();
+    picture->value.data = picture->rgba.data();
+    *out = picture->value;
+    return picture.release();
+}
+
+void MEGLER_CB releasePicture(void *, void *picture) { delete static_cast<Picture *>(picture); }
+
 void MEGLER_CB flush(void *, void *handle)
 {
     Decoder *d = static_cast<Decoder *>(handle);
@@ -311,6 +433,8 @@ void MEGLER_CB flush(void *, void *handle)
     d->av.flush(d->context);
     d->ready.clear();
     d->queuedSamples = 0;
+    d->readyPictures.clear();
+    d->queuedPictureBytes = 0;
     d->failed = false;
 }
 
@@ -321,10 +445,13 @@ void MEGLER_CB closeCodec(void *, void *handle) { delete static_cast<Decoder *>(
 megler_codec_host auroraAudioCodecCallbacks()
 {
     megler_codec_host host = {};
+    host.reorder = 0;
     host.supports = supports;
     host.open = openCodec;
     host.push = push;
     host.drain = drain;
+    host.pull_picture = pullPicture;
+    host.release_picture = releasePicture;
     host.pull_sound = pull;
     host.flush = flush;
     host.close = closeCodec;

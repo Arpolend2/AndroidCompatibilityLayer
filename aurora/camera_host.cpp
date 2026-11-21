@@ -3,6 +3,8 @@
 
 #include <QAbstractVideoSurface>
 #include <QCamera>
+#include <QCameraExposure>
+#include <QCameraFocus>
 #include <QCameraInfo>
 #include <QCameraViewfinderSettings>
 #include <QDebug>
@@ -217,6 +219,10 @@ struct Camera {
     megler_camera_caps caps = {};
     bool streaming = false;
     bool observedDefault = false;
+    megler_camera_focus_fn focusDone = nullptr;
+    void *focusCore = nullptr;
+    int focusMode = MEGLER_CAMERA_FOCUS_NONE;
+    QTimer *focusTimer = nullptr;
 };
 
 bool validSize(const QSize &size)
@@ -475,7 +481,30 @@ public:
             delete c;
             return nullptr;
         }
+        QCameraFocus *f = c->device->focus();
+        QCameraExposure *e = c->device->exposure();
+        caps->focus = f && c->device->supportedLocks().testFlag(QCamera::LockFocus) &&
+                      f->isFocusModeSupported(QCameraFocus::AutoFocus) &&
+                      f->isFocusModeSupported(QCameraFocus::ContinuousFocus);
+        caps->macro = caps->focus && f->isFocusModeSupported(QCameraFocus::MacroFocus);
+        caps->torch = e && e->isFlashModeSupported(QCameraExposure::FlashTorch) &&
+                      e->isFlashModeSupported(QCameraExposure::FlashOff);
+        qWarning() << "camera: supported focus" << caps->focus << "macro" << caps->macro
+                   << "torch" << caps->torch;
         c->caps = *caps;
+        c->focusTimer = new QTimer(c->device);
+        c->focusTimer->setSingleShot(true);
+        connect(c->focusTimer, &QTimer::timeout, c->device, [c] {
+            qWarning() << "camera: focus timed out";
+            completeFocus(c, false);
+        });
+        connect(c->device, static_cast<void (QCamera::*)(QCamera::LockType, QCamera::LockStatus,
+                                                          QCamera::LockChangeReason)>(&QCamera::lockStatusChanged),
+                c->device, [c](QCamera::LockType type, QCamera::LockStatus status, QCamera::LockChangeReason reason) {
+            if (type != QCamera::LockFocus || !c->focusDone) return;
+            if (status == QCamera::Locked) completeFocus(c, true);
+            else if (status == QCamera::Unlocked && reason == QCamera::LockFailed) completeFocus(c, false);
+        });
         connect(c->device, static_cast<void (QCamera::*)(QCamera::Error)>(&QCamera::error),
                 c->device, [c](QCamera::Error) {
             qWarning() << "camera: backend error:" << c->device->errorString();
@@ -532,9 +561,44 @@ public:
     void stop(Camera *c)
     {
         if (!c) return;
+        cancelFocus(c);
+        if (c->caps.torch) c->device->exposure()->setFlashMode(QCameraExposure::FlashOff);
         c->surface->disable();
         c->device->stop();
         c->streaming = false;
+    }
+
+    bool focus(Camera *c, int mode, megler_camera_focus_fn done, void *core)
+    {
+        if (!c) return mode == MEGLER_CAMERA_FOCUS_NONE;
+        if (!cameras.contains(c)) return false;
+        cancelFocus(c);
+        if (mode == MEGLER_CAMERA_FOCUS_NONE) return true;
+        if (!c->streaming || !c->caps.focus || !done ||
+            (mode == MEGLER_CAMERA_FOCUS_MACRO && !c->caps.macro)) return false;
+        QCameraFocus::FocusModes qtMode;
+        switch (mode) {
+        case MEGLER_CAMERA_FOCUS_ONCE: qtMode = QCameraFocus::AutoFocus; break;
+        case MEGLER_CAMERA_FOCUS_MACRO: qtMode = QCameraFocus::MacroFocus; break;
+        case MEGLER_CAMERA_FOCUS_CONTINUOUS: qtMode = QCameraFocus::ContinuousFocus; break;
+        default: return false;
+        }
+        c->focusMode = mode;
+        c->focusDone = done;
+        c->focusCore = core;
+        c->device->focus()->setFocusMode(qtMode);
+        c->focusTimer->start(10000);
+        c->device->searchAndLock(QCamera::LockFocus);
+        return true;
+    }
+
+    void torch(Camera *c, bool on)
+    {
+        if (!c || !cameras.contains(c) || !c->streaming || !c->caps.torch) {
+            if (on) qWarning() << "camera: torch unavailable";
+            return;
+        }
+        c->device->exposure()->setFlashMode(on ? QCameraExposure::FlashTorch : QCameraExposure::FlashOff);
     }
 
     void close(Camera *c)
@@ -548,6 +612,7 @@ public:
 
 #ifdef AURORA_CAMERA_TEST
     void addTestCamera(Camera *c) { cameras.insert(c); }
+    void testCompleteFocus(Camera *c, bool success) { completeFocus(c, success); }
 #endif
 
 private slots:
@@ -566,6 +631,27 @@ private slots:
     }
 
 private:
+    static void completeFocus(Camera *c, bool success)
+    {
+        megler_camera_focus_fn done = c->focusDone;
+        void *core = c->focusCore;
+        const bool continuous = c->focusMode == MEGLER_CAMERA_FOCUS_CONTINUOUS;
+        c->focusDone = nullptr;
+        c->focusCore = nullptr;
+        if (c->focusTimer) c->focusTimer->stop();
+        if (continuous) c->device->unlock(QCamera::LockFocus);
+        if (done) done(core, success);
+    }
+
+    static void cancelFocus(Camera *c)
+    {
+        c->focusDone = nullptr;
+        c->focusCore = nullptr;
+        c->focusMode = MEGLER_CAMERA_FOCUS_NONE;
+        if (c->focusTimer) c->focusTimer->stop();
+        if (c->device) c->device->unlock(QCamera::LockFocus);
+    }
+
     void release(Camera *c)
     {
         stop(c);
@@ -671,16 +757,17 @@ void MEGLER_CB stop(void *user, void *camera)
     static_cast<Worker *>(user)->call([&] { static_cast<Worker *>(user)->stop(static_cast<Camera *>(camera)); });
 }
 
-bool MEGLER_CB focus(void *, void *, int mode, megler_camera_focus_fn, void *)
+bool MEGLER_CB focus(void *user, void *camera, int mode, megler_camera_focus_fn done, void *core)
 {
-    if (mode == MEGLER_CAMERA_FOCUS_NONE) return true;
-    qWarning() << "camera: focus is not supported";
-    return false;
+    bool result = false;
+    static_cast<Worker *>(user)->call([&] { result = static_cast<Worker *>(user)->focus(static_cast<Camera *>(camera), mode, done, core); });
+    if (!result && mode != MEGLER_CAMERA_FOCUS_NONE) qWarning() << "camera: focus unavailable or invalid mode" << mode;
+    return result;
 }
 
-void MEGLER_CB torch(void *, void *, bool on)
+void MEGLER_CB torch(void *user, void *camera, bool on)
 {
-    if (on) qWarning() << "camera: torch is not supported";
+    static_cast<Worker *>(user)->call([&] { static_cast<Worker *>(user)->torch(static_cast<Camera *>(camera), on); });
 }
 
 void MEGLER_CB close(void *user, void *camera)

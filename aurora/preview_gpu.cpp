@@ -333,6 +333,7 @@ bool PreviewGpuState::setViews(const void *pixels, int width, int height, int st
     QMutexLocker lock(&mutex);
     if (consumerDisplay == EGL_NO_DISPLAY) return false;
     const quint64 currentGeneration = generation;
+    canvasMode = false;
     views = copy;
     ++viewsRevision;
     const quint64 revision = viewsRevision;
@@ -608,7 +609,7 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
         delete root;
         return nullptr;
     }
-    if (m_state->java && root->viewsRevision != m_state->viewsRevision) {
+    if (m_state->java && !m_state->canvasMode && root->viewsRevision != m_state->viewsRevision) {
         QSGTexture *views = window() && !m_state->views.isNull() ?
             window()->createTextureFromImage(m_state->views, QQuickWindow::TextureHasAlphaChannel) : nullptr;
         delete root->views;
@@ -632,10 +633,10 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
     QSGGeometry::updateRectGeometry(root->clip->geometry(), target);
     root->clip->markDirty(QSGNode::DirtyGeometry);
     root->clip->setClipRect(target);
-    if (m_state->canvasMode)
-        addTexture(root->clip, root->canvas, target, true, true);
     if (!m_state->java) {
-        if (!m_state->canvasMode)
+        if (m_state->canvasMode)
+            addTexture(root->clip, root->canvas, target, true, true);
+        else
             addTexture(root->clip, root->native, target, true);
     } else if (sourceSize.width() > 0 && sourceSize.height() > 0) {
         PreviewGpuOrderLayer orderLayers[LayerCount];
@@ -649,7 +650,10 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
         for (int i = 0; i < count; ++i) {
             const int layer = order[i];
             if (layer < 0) {
-                addTexture(root->clip, root->views, target, false);
+                if (m_state->canvasMode)
+                    addTexture(root->clip, root->canvas, target, true, true);
+                else
+                    addTexture(root->clip, root->views, target, false);
             } else {
                 const QRect &r = m_state->layers[layer].rect;
                 const QRectF rect(target.left() + r.x() * target.width() / sourceSize.width(),

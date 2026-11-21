@@ -10,7 +10,8 @@ namespace RpmStandalone {
 
 QByteArray cacheFingerprint(const QString &package, const QString &label, const QImage &icon,
                             const QString &storeRoot, const QString &runtimeRoot,
-                            const QString &qmlRoot, const QString &executable, bool fileDiagnostics);
+                            const QString &qmlRoot, const QString &executable, bool fileDiagnostics,
+                            const QString &managerVersion);
 QString cachedRpm(const QString &directory, const QByteArray &fingerprint);
 bool saveCache(const QString &directory, const QString &rpm, const QByteArray &fingerprint);
 bool reuseOrGenerate(const std::function<QString()> &lookup,

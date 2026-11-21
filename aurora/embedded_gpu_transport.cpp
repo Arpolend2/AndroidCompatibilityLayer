@@ -709,6 +709,42 @@ bool EmbeddedGpuTransport::canExportDmaBuf(QString *error)
     return true;
 }
 
+QStringList EmbeddedGpuTransport::currentGpuCapabilities()
+{
+    const EGLDisplay display = eglGetCurrentDisplay();
+    if (display == EGL_NO_DISPLAY || eglGetCurrentContext() == EGL_NO_CONTEXT)
+        return {QStringLiteral("No current EGL/GLES context.")};
+    const char *extensions = eglQueryString(display, EGL_EXTENSIONS);
+    const char *renderer = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
+    const char *version = reinterpret_cast<const char *>(glGetString(GL_VERSION));
+    QString exportError;
+    const bool canExport = canExportDmaBuf(&exportError);
+    const bool nativeImport = hasExtension(extensions, "EGL_ANDROID_image_native_buffer") &&
+        hasExtension(extensions, "EGL_KHR_image_base") && hasGlExtension("GL_OES_EGL_image") &&
+        eglGetProcAddress("eglCreateImageKHR") && eglGetProcAddress("eglDestroyImageKHR") &&
+        eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    QLibrary gralloc(QStringLiteral("libgralloc.so.1"));
+    QString grallocStatus = QStringLiteral("unavailable: libgralloc.so.1 not loaded");
+    if (gralloc.load()) {
+        const bool symbols = gralloc.resolve("hybris_gralloc_initialize") &&
+            gralloc.resolve("hybris_gralloc_allocate") && gralloc.resolve("hybris_gralloc_release") &&
+            gralloc.resolve("hybris_gralloc_deinitialize");
+        grallocStatus = !symbols ? QStringLiteral("disabled: Hybris allocator symbols are incomplete")
+            : !nativeImport ? QStringLiteral("disabled: no native-buffer EGL/GLES import support")
+            : QStringLiteral("disabled: native-buffer ABI and peer import are not verified");
+    }
+    return {
+        QStringLiteral("GLES: %1 (%2)").arg(QString::fromLatin1(renderer), QString::fromLatin1(version)),
+        QStringLiteral("DMA-BUF texture export: %1").arg(canExport ? QStringLiteral("advertised") : exportError),
+        QStringLiteral("DMA-BUF import: %1; modifiers: %2")
+            .arg(hasExtension(extensions, "EGL_EXT_image_dma_buf_import") ? QStringLiteral("advertised") : QStringLiteral("absent"),
+                 hasExtension(extensions, "EGL_EXT_image_dma_buf_import_modifiers") ? QStringLiteral("advertised") : QStringLiteral("absent")),
+        QStringLiteral("Gralloc: %1").arg(grallocStatus),
+        QStringLiteral("GBM test: %1").arg(probeGbmRenderTarget(64, 64)),
+        QStringLiteral("Aurora Store uses CPU Canvas; this probe does not test peer import or screen output.")
+    };
+}
+
 QString EmbeddedGpuTransport::probeGbmRenderTarget(int width, int height,
     const std::function<bool(const AuroraDmaBufFrame &, QString *)> &verifyParent)
 {

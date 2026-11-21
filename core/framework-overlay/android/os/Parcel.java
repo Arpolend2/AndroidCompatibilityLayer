@@ -20,7 +20,8 @@
 // And the bytes marshall gives carry the table of objects with them, and unmarshall gives a parcel its table back (see
 // marshall): Facebook keeps an activity's Parcelables as their marshalled bytes, and Messenger, restoring one in a parcel of
 // its own, read null for every object in it and ended.
-// Everything else is the original's, unchanged.
+// appendFrom also preserves local object references when the destination already has objects; unmarshalled bytes without
+// their local object table cannot acquire references from the destination.
 package android.os;
 
 import java.util.ArrayList;
@@ -38,27 +39,29 @@ public final class Parcel {
     private byte[] mBuf = new byte[64];
     private int mSize, mPos;
     private final ArrayList<Object> mObjects = new ArrayList<>();
+    private final java.util.TreeSet<Integer> mObjectPositions = new java.util.TreeSet<>();
     private Parcel() {}
     public static Parcel obtain() { return new Parcel(); }
     public static Parcel obtain(IBinder b) { return new Parcel(); }
-    public void recycle() { mSize = 0; mPos = 0; mObjects.clear(); }
+    public void recycle() { mSize = 0; mPos = 0; mObjects.clear(); mObjectPositions.clear(); }
     public int dataSize() { return mSize; }
     public int dataAvail() { return Math.max(0, mSize - mPos); }
     public int dataPosition() { return mPos; }
     public int dataCapacity() { return mBuf.length; }
     public void setDataPosition(int p) { if (p < 0) throw new IllegalArgumentException("Position cannot be negative"); mPos = p; }
-    public void setDataSize(int s) { grow(s); mSize = s; if (mPos > s) mPos = s; }
+    public void setDataSize(int s) { if (s < 0) throw new IllegalArgumentException("Negative size"); grow(s); mSize = s; if (mPos > s) mPos = s; mObjectPositions.removeIf(p -> p + 8 > s); }
     public void setDataCapacity(int c) { grow(c); }
     private void grow(int n) { if (n > mBuf.length) mBuf = java.util.Arrays.copyOf(mBuf, Math.max(n, mBuf.length * 2)); }
-    private int put(int n) { int at = mPos; grow(at + n); mPos = at + n; if (mPos > mSize) mSize = mPos; return at; }
+    private int put(int n) { int at = mPos; grow(at + n); mPos = at + n; if (mPos > mSize) mSize = mPos; if (n > 0) mObjectPositions.subSet(Math.max(0, at - 7), true, at + n, false).clear(); return at; }
     private int take(int n) { int at = mPos; if (at + n > mSize) { mPos = mSize; return -1; } mPos = at + n; return at; }
     private static int pad(int n) { return (n + 3) & ~3; }
     /*
      * marshall() and unmarshall(): the parcel's bytes, and with them its table of objects (lists, maps, bundles, Parcelables,
      * CharSequences: whatever writeObj kept), which the bytes only point into. A parcel with objects is marshalled to its
      * bytes and a trailer of 16 bytes -- a mark, a number, the objects' count, a mark -- and the table is kept under that
-     * number (MARSHALLED, at most MARSHALLED_KEPT of them, the oldest let go first); unmarshall takes the trailer off,
-     * and the parcel has the same objects again. Bytes without objects are as before, with no trailer. The objects went
+     * number (MARSHALLED, at most MARSHALLED_KEPT of them, the oldest let go first), together with their positions;
+     * unmarshall takes the trailer off,
+     * and the parcel has the same objects again. Bytes without object references have no trailer. The objects went
      * with the parcel that wrote them, and a parcel unmarshalled from its bytes read nulls where they had been: Facebook
      * keeps an activity's Parcelables as their marshalled bytes (com.facebook.base.activity.parcel.OpaqueParcelable,
      * restored by unmarshall and its creator), and Messenger, opening a conversation, read null for the list a photo
@@ -69,18 +72,23 @@ public final class Parcel {
      * marshalls all the time keeps no more than that alive on a phone allowed 390 MB.
      */
     private static final int MARSHALL_MARK = 0x8C0FFEE2, MARSHALL_END = 0x726C676D, MARSHALLED_KEPT = 2048;
-    private static final java.util.LinkedHashMap<Integer, Object[]> MARSHALLED = new java.util.LinkedHashMap<Integer, Object[]>(64, 0.75f, true) {
-        @Override protected boolean removeEldestEntry(Map.Entry<Integer, Object[]> e) { return size() > MARSHALLED_KEPT; }
+    private static final class MarshalledObjects {
+        final Object[] objects;
+        final ArrayList<Integer> positions;
+        MarshalledObjects(Parcel p) { objects = p.mObjects.toArray(); positions = new ArrayList<>(p.mObjectPositions); }
+    }
+    private static final java.util.LinkedHashMap<Integer, MarshalledObjects> MARSHALLED = new java.util.LinkedHashMap<Integer, MarshalledObjects>(64, 0.75f, true) {
+        @Override protected boolean removeEldestEntry(Map.Entry<Integer, MarshalledObjects> e) { return size() > MARSHALLED_KEPT; }
     };
     private static int sMarshalls = (int) System.nanoTime();
     private static int word(byte[] b, int at) { return (b[at] & 255) | (b[at + 1] & 255) << 8 | (b[at + 2] & 255) << 16 | (b[at + 3] & 255) << 24; }
     private static void putWord(byte[] b, int at, int v) { b[at] = (byte) v; b[at + 1] = (byte) (v >> 8); b[at + 2] = (byte) (v >> 16); b[at + 3] = (byte) (v >> 24); }
     public byte[] marshall() {
-        if (mObjects.isEmpty()) return java.util.Arrays.copyOf(mBuf, mSize);
+        if (mObjects.isEmpty() && mObjectPositions.isEmpty()) return java.util.Arrays.copyOf(mBuf, mSize);
         int key;
         synchronized (MARSHALLED) {
             key = ++sMarshalls;
-            MARSHALLED.put(key, mObjects.toArray());
+            MARSHALLED.put(key, new MarshalledObjects(this));
         }
         byte[] out = java.util.Arrays.copyOf(mBuf, mSize + 16);
         putWord(out, mSize, MARSHALL_MARK);
@@ -95,22 +103,43 @@ public final class Parcel {
     /* The table of the bytes just unmarshalled: what their trailer names, the trailer taken off; none without one. */
     private void unmarshalled() {
         mObjects.clear();
+        mObjectPositions.clear();
         if (mSize < 16 || word(mBuf, mSize - 4) != MARSHALL_END || word(mBuf, mSize - 16) != MARSHALL_MARK) return;
         int key = word(mBuf, mSize - 12), n = word(mBuf, mSize - 8);
         mSize -= 16;
-        Object[] objects;
+        MarshalledObjects objects;
         synchronized (MARSHALLED) { objects = MARSHALLED.get(key); }
-        if (objects != null && objects.length == n) mObjects.addAll(java.util.Arrays.asList(objects));
-    }
-    public void appendFrom(Parcel p, int off, int len) {
-        int at = put(len); System.arraycopy(p.mBuf, off, mBuf, at, len);
-        if (!p.mObjects.isEmpty()) { /* references in the copied range keep pointing into p's table: copy it whole, shifted */
-            int base = mObjects.size(); mObjects.addAll(p.mObjects);
-            for (int i = at; i + 4 <= at + len; i += 4) {} /* indices are not rewritten; objects are only found by position */
-            if (base != 0) { /* keep the simple case exact: a fresh parcel copying another */ }
+        if (objects != null && objects.objects.length == n) {
+            mObjects.addAll(java.util.Arrays.asList(objects.objects));
+            mObjectPositions.addAll(objects.positions);
         }
     }
-    public boolean hasFileDescriptors() { for (Object o : mObjects) if (o instanceof java.io.FileDescriptor || o instanceof ParcelFileDescriptor) return true; return false; }
+    public void appendFrom(Parcel p, int off, int len) {
+        if (off < 0 || len < 0 || off > p.mSize || len > p.mSize - off) throw new IllegalArgumentException("Invalid parcel range");
+        if (len == 0) return;
+        ArrayList<Integer> positions = new ArrayList<>();
+        for (int pos : p.mObjectPositions) {
+            if (pos < off + len && pos + 8 > off) {
+                if (pos < off || pos + 8 > off + len) throw new IllegalArgumentException("Parcel range splits an object");
+                positions.add(pos - off);
+            }
+        }
+        byte[] bytes = java.util.Arrays.copyOfRange(p.mBuf, off, off + len);
+        Object[] objects = p.mObjects.toArray();
+        int at = put(len);
+        System.arraycopy(bytes, 0, mBuf, at, len);
+        java.util.HashMap<Integer, Integer> copied = new java.util.HashMap<>();
+        for (int pos : positions) {
+            int index = word(mBuf, at + pos + 4);
+            if (index >= 0 && index < objects.length) {
+                Integer target = copied.get(index);
+                if (target == null) { target = mObjects.size(); mObjects.add(objects[index]); copied.put(index, target); }
+                putWord(mBuf, at + pos + 4, target);
+            } else if (index >= 0) putWord(mBuf, at + pos + 4, -1);
+            mObjectPositions.add(at + pos);
+        }
+    }
+    public boolean hasFileDescriptors() { for (Object o : mObjects) { if (o instanceof ParcelableWithFlags) o = ((ParcelableWithFlags) o).value; if (o instanceof java.io.FileDescriptor || o instanceof ParcelFileDescriptor) return true; } return false; }
     public boolean hasFileDescriptors(int off, int len) { return hasFileDescriptors(); }
 
     // ---- primitives
@@ -219,8 +248,388 @@ public final class Parcel {
     // ---- objects: an index into this parcel's table (-1 for null)
     /** The word before an index into the table: no count, size or flag Android writes there is this (negative, not -1). */
     private static final int OBJECT = 0x8C0FFEE1;
-    private void writeObj(Object o) { writeInt(OBJECT); if (o == null) { writeInt(-1); return; } mObjects.add(o); writeInt(mObjects.size() - 1); }
-    private Object readObj() { if (readInt() != OBJECT) return null; int i = readInt(); return i >= 0 && i < mObjects.size() ? mObjects.get(i) : null; }
+    private void writeObj(Object o) { int pos = mPos; writeInt(OBJECT); if (o == null) writeInt(-1); else { mObjects.add(o); writeInt(mObjects.size() - 1); } mObjectPositions.add(pos); }
+    private Object readObj() {
+        boolean valid = mObjectPositions.contains(mPos);
+        if (readInt() != OBJECT) return null;
+        int i = readInt();
+        Object value = valid && i >= 0 && i < mObjects.size() ? mObjects.get(i) : null;
+        if (value instanceof ParcelableWithFlags) return ((ParcelableWithFlags) value).value;
+        if (value instanceof ParcelableArrayWithFlags) return ((ParcelableArrayWithFlags) value).value;
+        return value;
+    }
+
+    private static final class ParcelableWithFlags {
+        final Parcelable value;
+        final int flags;
+        ParcelableWithFlags(Parcelable value, int flags) { this.value = value; this.flags = flags; }
+    }
+    private static final class ParcelableArrayWithFlags {
+        final Parcelable[] value;
+        final int flags;
+        ParcelableArrayWithFlags(Parcelable[] value, int flags) { this.value = value; this.flags = flags; }
+    }
+    private void writeParcelableObject(Parcelable value, int flags) {
+        writeObj(value == null || flags == 0 ? value : new ParcelableWithFlags(value, flags));
+    }
+
+    public interface MeglerBinderExporter { long exportBinder(IBinder binder); }
+    public interface MeglerBinderImporter { IBinder importBinder(long handle); }
+    private static final int BINDER_WIRE_MAGIC = 0x4d424e32;
+    private static final int BINDER_WIRE_MAX_BYTES = 1024 * 1024;
+    private static final int BINDER_WIRE_MAX_OBJECTS = 4096;
+    private static final int BINDER_WIRE_MAX_DEPTH = 16;
+
+    private static final class WireOutput extends java.io.ByteArrayOutputStream {
+        private void check(int n) {
+            if (n < 0 || count > BINDER_WIRE_MAX_BYTES - n)
+                throw new IllegalArgumentException("Binder parcel exceeds wire size limit");
+        }
+        @Override public synchronized void write(int b) { check(1); super.write(b); }
+        @Override public synchronized void write(byte[] b, int off, int len) { check(len); super.write(b, off, len); }
+    }
+
+    private static void writeWireString(java.io.DataOutputStream out, String s) throws java.io.IOException {
+        if (s == null || s.length() > BINDER_WIRE_MAX_BYTES)
+            throw new IllegalArgumentException("Invalid Binder string");
+        java.nio.ByteBuffer encoded = java.nio.charset.StandardCharsets.UTF_8.newEncoder()
+            .encode(java.nio.CharBuffer.wrap(s));
+        byte[] bytes = new byte[encoded.remaining()];
+        encoded.get(bytes);
+        out.writeInt(bytes.length);
+        out.write(bytes);
+    }
+
+    private static void writeWireValue(java.io.DataOutputStream out, Object value,
+            MeglerBinderExporter exporter, int depth, int[] count) throws java.io.IOException {
+        if (depth > BINDER_WIRE_MAX_DEPTH || ++count[0] > BINDER_WIRE_MAX_OBJECTS)
+            throw new IllegalArgumentException("Binder parcel object limit exceeded");
+        if (value instanceof ParcelableWithFlags)
+            throw new IllegalArgumentException("Unsupported Binder Parcelable write flags: " + ((ParcelableWithFlags) value).flags);
+        if (value instanceof ParcelableArrayWithFlags)
+            throw new IllegalArgumentException("Unsupported Binder Parcelable array write flags: " + ((ParcelableArrayWithFlags) value).flags);
+        if (value == null) out.writeByte(0);
+        else if (value instanceof IBinder) {
+            out.writeByte(1);
+            long handle = exporter.exportBinder((IBinder) value);
+            if (handle <= 0) throw new IllegalArgumentException("Invalid exported Binder handle");
+            out.writeLong(handle);
+        } else if (value instanceof String) {
+            out.writeByte(2); writeWireString(out, (String) value);
+        } else if (value instanceof Integer) {
+            out.writeByte(3); out.writeInt((Integer) value);
+        } else if (value instanceof Long) {
+            out.writeByte(4); out.writeLong((Long) value);
+        } else if (value instanceof Boolean) {
+            out.writeByte(5); out.writeBoolean((Boolean) value);
+        } else if (value instanceof byte[]) {
+            byte[] bytes = (byte[]) value;
+            out.writeByte(6); out.writeInt(bytes.length); out.write(bytes);
+        } else if (value instanceof Bundle) {
+            Bundle bundle = (Bundle) value;
+            out.writeByte(7);
+            out.writeInt(bundle.size());
+            for (String key : bundle.keySet()) {
+                writeWireString(out, key);
+                Object item = bundle.get(key);
+                if (item != null && !(item instanceof String) && !(item instanceof Integer) &&
+                        !(item instanceof Long) && !(item instanceof Boolean) &&
+                        !(item instanceof byte[]) && !(item instanceof IBinder) && !(item instanceof Bundle))
+                    throw new IllegalArgumentException("Unsupported Binder Bundle value");
+                writeWireValue(out, item, exporter, depth + 1, count);
+            }
+        } else if (value instanceof Parcelable[]) {
+            Parcelable[] values = (Parcelable[]) value;
+            if (values.length > BINDER_WIRE_MAX_OBJECTS - count[0])
+                throw new IllegalArgumentException("Binder Parcelable array limit exceeded");
+            out.writeByte(9);
+            out.writeInt(values.length);
+            for (Parcelable item : values) writeWireValue(out, item, exporter, depth + 1, count);
+        } else if (value instanceof Parcelable) {
+            if ((((Parcelable) value).describeContents() & Parcelable.CONTENTS_FILE_DESCRIPTOR) != 0)
+                throw new IllegalArgumentException("Parcelable file descriptors are unsupported");
+            out.writeByte(8);
+            writeWireString(out, value.getClass().getName());
+            Parcel nested = obtain();
+            try {
+                ((Parcelable) value).writeToParcel(nested, 0);
+                byte[] bytes = writeWireParcel(nested, exporter, depth + 1, count);
+                out.writeInt(bytes.length);
+                out.write(bytes);
+            } finally { nested.recycle(); }
+        } else throw new IllegalArgumentException("Binder transport cannot encode this Parcel object");
+    }
+
+    private static String readWireString(java.io.DataInputStream in) throws java.io.IOException {
+        int length = in.readInt();
+        if (length < 0 || length > in.available() || length > BINDER_WIRE_MAX_BYTES)
+            throw new IllegalArgumentException("Invalid Binder string length");
+        byte[] bytes = new byte[length];
+        in.readFully(bytes);
+        return java.nio.charset.StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(bytes)).toString();
+    }
+
+    private static Object readWireValue(java.io.DataInputStream in, MeglerBinderImporter importer,
+            boolean validateOnly, int depth, int[] count, boolean inBundle) throws java.io.IOException {
+        if (depth > BINDER_WIRE_MAX_DEPTH || ++count[0] > BINDER_WIRE_MAX_OBJECTS)
+            throw new IllegalArgumentException("Binder parcel object limit exceeded");
+        switch (in.readUnsignedByte()) {
+        case 0: return null;
+        case 1:
+            long handle = in.readLong();
+            if (handle <= 0) throw new IllegalArgumentException("Invalid Binder handle");
+            if (validateOnly) return null;
+            IBinder binder = importer.importBinder(handle);
+            if (binder == null) throw new IllegalArgumentException("Unknown Binder handle");
+            return binder;
+        case 2: return readWireString(in);
+        case 3: return in.readInt();
+        case 4: return in.readLong();
+        case 5:
+            int bool = in.readUnsignedByte();
+            if (bool > 1) throw new IllegalArgumentException("Invalid Binder boolean");
+            return bool != 0;
+        case 6:
+            int size = in.readInt();
+            if (size < 0 || size > in.available() || size > BINDER_WIRE_MAX_BYTES)
+                throw new IllegalArgumentException("Invalid Binder byte array");
+            byte[] data = new byte[size]; in.readFully(data); return data;
+        case 7:
+            int length = in.readInt();
+            if (length < 0 || length > BINDER_WIRE_MAX_OBJECTS - count[0])
+                throw new IllegalArgumentException("Invalid Binder Bundle size");
+            Bundle bundle = validateOnly ? null : new Bundle();
+            java.util.HashSet<String> keys = new java.util.HashSet<>();
+            for (int i = 0; i < length; i++) {
+                String key = readWireString(in);
+                if (!keys.add(key)) throw new IllegalArgumentException("Duplicate Binder Bundle key");
+                Object item = readWireValue(in, importer, validateOnly, depth + 1, count, true);
+                if (!validateOnly) putWireBundleValue(bundle, key, item);
+            }
+            return bundle;
+        case 8:
+            if (inBundle) throw new IllegalArgumentException("Parcelable inside Binder Bundle is unsupported");
+            String name = readWireString(in);
+            int nestedSize = in.readInt();
+            if (name.isEmpty() || nestedSize < 12 || nestedSize > in.available())
+                throw new IllegalArgumentException("Invalid Binder Parcelable");
+            byte[] nestedBytes = new byte[nestedSize];
+            in.readFully(nestedBytes);
+            Parcel nested = readWireParcel(nestedBytes, importer, validateOnly, depth + 1, count);
+            return validateOnly ? null : new WireParcelable(name, nested);
+        case 9:
+            if (inBundle) throw new IllegalArgumentException("Parcelable array inside Binder Bundle is unsupported");
+            int arraySize = in.readInt();
+            if (arraySize < 0 || arraySize > BINDER_WIRE_MAX_OBJECTS - count[0] || arraySize > in.available())
+                throw new IllegalArgumentException("Invalid Binder Parcelable array");
+            Object[] array = validateOnly ? null : new Object[arraySize];
+            for (int i = 0; i < arraySize; i++) {
+                in.mark(1);
+                int tag = in.readUnsignedByte();
+                in.reset();
+                if (tag != 0 && tag != 8) throw new IllegalArgumentException("Invalid Binder Parcelable array element");
+                Object item = readWireValue(in, importer, validateOnly, depth + 1, count, false);
+                if (!validateOnly) array[i] = item;
+            }
+            return validateOnly ? null : new WireParcelableArray(array);
+        default: throw new IllegalArgumentException("Unsupported Binder object type");
+        }
+    }
+
+    private static void putWireBundleValue(Bundle bundle, String key, Object value) {
+        if (value == null || value instanceof String) bundle.putString(key, (String) value);
+        else if (value instanceof Integer) bundle.putInt(key, (Integer) value);
+        else if (value instanceof Long) bundle.putLong(key, (Long) value);
+        else if (value instanceof Boolean) bundle.putBoolean(key, (Boolean) value);
+        else if (value instanceof byte[]) bundle.putByteArray(key, (byte[]) value);
+        else if (value instanceof IBinder) bundle.putBinder(key, (IBinder) value);
+        else if (value instanceof Bundle) bundle.putBundle(key, (Bundle) value);
+        else throw new IllegalArgumentException("Unsupported Binder Bundle value");
+    }
+
+    private static final class WireParcelable {
+        final String name;
+        final Parcel data;
+        WireParcelable(String name, Parcel data) { this.name = name; this.data = data; }
+    }
+
+    private static final class WireParcelableArray {
+        final Object[] values;
+        WireParcelableArray(Object[] values) { this.values = values; }
+    }
+
+    private static Object[] arrayValue(Object value) {
+        return value instanceof WireParcelableArray ? ((WireParcelableArray) value).values : (Object[]) value;
+    }
+
+    private static Parcelable[] readWireParcelableArray(Object value, ClassLoader loader) {
+        Object[] values = ((WireParcelableArray) value).values;
+        Parcelable[] result = new Parcelable[values.length];
+        for (int i = 0; i < values.length; i++)
+            result[i] = (Parcelable) adapt(values[i], loader);
+        return result;
+    }
+
+    /** A bounded wire format for primitives, Binder references and supported Parcel objects. */
+    public byte[] meglerMarshallBinders(MeglerBinderExporter exporter) {
+        if (exporter == null) throw new IllegalArgumentException("Binder exporter is required");
+        try {
+            final ArrayList<IBinder> binders = new ArrayList<>();
+            final java.util.IdentityHashMap<IBinder, Long> ids = new java.util.IdentityHashMap<>();
+            byte[] wire = writeWireParcel(this, binder -> {
+                Long id = ids.get(binder);
+                if (id == null) {
+                    id = (long) binders.size() + 1;
+                    binders.add(binder);
+                    ids.put(binder, id);
+                }
+                return id;
+            }, 0, new int[] {0});
+            long[] handles = new long[binders.size()];
+            for (int i = 0; i < binders.size(); i++) {
+                handles[i] = exporter.exportBinder(binders.get(i));
+                if (handles[i] <= 0) throw new IllegalArgumentException("Invalid exported Binder handle");
+            }
+            java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(wire));
+            replaceWireHandles(in, wire, handles);
+            if (in.available() != 0) throw new IllegalStateException("Invalid encoded Binder parcel");
+            return wire;
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("Cannot encode Binder parcel", e);
+        }
+    }
+
+    private static void skipWire(java.io.DataInputStream in, int n) throws java.io.IOException {
+        if (n < 0 || n > in.available() || in.skipBytes(n) != n)
+            throw new java.io.IOException("Invalid encoded Binder parcel");
+    }
+
+    private static void replaceWireHandles(java.io.DataInputStream in, byte[] wire, long[] handles)
+            throws java.io.IOException {
+        if (in.readInt() != BINDER_WIRE_MAGIC) throw new java.io.IOException("Invalid encoded Binder header");
+        int size = in.readInt(), count = in.readInt();
+        skipWire(in, size);
+        for (int i = 0; i < count; i++) {
+            in.readInt();
+            replaceWireValueHandles(in, wire, handles);
+        }
+    }
+
+    private static void replaceWireValueHandles(java.io.DataInputStream in, byte[] wire, long[] handles)
+            throws java.io.IOException {
+        switch (in.readUnsignedByte()) {
+        case 0: return;
+        case 1:
+            int offset = wire.length - in.available();
+            long id = in.readLong();
+            if (id <= 0 || id > handles.length) throw new java.io.IOException("Invalid encoded Binder handle");
+            java.nio.ByteBuffer.wrap(wire).putLong(offset, handles[(int) id - 1]);
+            return;
+        case 2: case 6: skipWire(in, in.readInt()); return;
+        case 3: skipWire(in, 4); return;
+        case 4: skipWire(in, 8); return;
+        case 5: skipWire(in, 1); return;
+        case 7:
+            int entries = in.readInt();
+            for (int i = 0; i < entries; i++) {
+                skipWire(in, in.readInt());
+                replaceWireValueHandles(in, wire, handles);
+            }
+            return;
+        case 8:
+            skipWire(in, in.readInt());
+            int length = in.readInt(), before = in.available();
+            replaceWireHandles(in, wire, handles);
+            if (before - in.available() != length) throw new java.io.IOException("Invalid nested Binder parcel");
+            return;
+        case 9:
+            int count = in.readInt();
+            for (int i = 0; i < count; i++) replaceWireValueHandles(in, wire, handles);
+            return;
+        default: throw new java.io.IOException("Invalid encoded Binder object");
+        }
+    }
+
+    private static byte[] writeWireParcel(Parcel parcel, MeglerBinderExporter exporter, int depth, int[] count)
+            throws java.io.IOException {
+        if (depth > BINDER_WIRE_MAX_DEPTH || parcel.mSize > BINDER_WIRE_MAX_BYTES ||
+                parcel.mObjectPositions.size() > BINDER_WIRE_MAX_OBJECTS)
+            throw new IllegalArgumentException("Parcel exceeds Binder transport limits");
+        WireOutput bytes = new WireOutput();
+        java.io.DataOutputStream out = new java.io.DataOutputStream(bytes);
+        out.writeInt(BINDER_WIRE_MAGIC);
+        out.writeInt(parcel.mSize);
+        out.writeInt(parcel.mObjectPositions.size());
+        byte[] data = java.util.Arrays.copyOf(parcel.mBuf, parcel.mSize);
+        ArrayList<Object> objects = new ArrayList<>();
+        for (int pos : parcel.mObjectPositions) {
+            if (pos < 0 || pos > parcel.mSize - 8 || word(data, pos) != OBJECT)
+                throw new IllegalStateException("Invalid Parcel object position");
+            int index = word(data, pos + 4);
+            Object object = null;
+            if (index != -1) {
+                if (index < 0 || index >= parcel.mObjects.size())
+                    throw new IllegalArgumentException("Invalid Parcel object reference");
+                object = parcel.mObjects.get(index);
+            }
+            objects.add(object);
+            putWord(data, pos + 4, -1);
+        }
+        out.write(data);
+        int i = 0;
+        for (int pos : parcel.mObjectPositions) {
+            out.writeInt(pos);
+            writeWireValue(out, objects.get(i++), exporter, depth, count);
+        }
+        out.flush();
+        return bytes.toByteArray();
+    }
+
+    /** Decodes a wire parcel; the importer owns handle lifetime and peer identity. */
+    public static Parcel meglerUnmarshallBinders(byte[] wire, MeglerBinderImporter importer) {
+        if (wire == null || importer == null || wire.length < 12 ||
+                wire.length > BINDER_WIRE_MAX_BYTES)
+            throw new IllegalArgumentException("Invalid Binder parcel size");
+        try {
+            readWireParcel(wire, importer, true, 0, new int[] {0});
+            return readWireParcel(wire, importer, false, 0, new int[] {0});
+        } catch (java.io.IOException e) {
+            throw new IllegalArgumentException("Invalid Binder parcel", e);
+        }
+    }
+
+    private static Parcel readWireParcel(byte[] wire, MeglerBinderImporter importer, boolean validateOnly,
+            int depth, int[] count)
+            throws java.io.IOException {
+        if (depth > BINDER_WIRE_MAX_DEPTH) throw new IllegalArgumentException("Binder parcel nesting limit exceeded");
+        java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(wire));
+        int magic = in.readInt(), size = in.readInt(), objects = in.readInt();
+        if (magic != BINDER_WIRE_MAGIC || size < 0 || size > in.available() ||
+                objects < 0 || objects > BINDER_WIRE_MAX_OBJECTS)
+            throw new IllegalArgumentException("Invalid Binder parcel header");
+        Parcel parcel = obtain();
+        parcel.grow(size);
+        in.readFully(parcel.mBuf, 0, size);
+        parcel.mSize = size;
+        int previous = -8;
+        for (int i = 0; i < objects; i++) {
+            int pos = in.readInt();
+            if (pos < 0 || pos > size - 8 || pos < previous + 8 ||
+                    word(parcel.mBuf, pos) != OBJECT || word(parcel.mBuf, pos + 4) != -1)
+                throw new IllegalArgumentException("Invalid Binder parcel reference");
+            Object value = readWireValue(in, importer, validateOnly, depth, count, false);
+            if (!validateOnly) {
+                int index = -1;
+                if (value != null) { index = parcel.mObjects.size(); parcel.mObjects.add(value); }
+                putWord(parcel.mBuf, pos + 4, index);
+                parcel.mObjectPositions.add(pos);
+            }
+            previous = pos;
+        }
+        if (in.available() != 0) throw new IllegalArgumentException("Trailing Binder parcel data");
+        return parcel;
+    }
+
     /** Whether what comes next is a reference into the table (else it is written out in place, as Android lays it out). */
     private boolean objectNext() {
         int a = mPos;
@@ -233,13 +642,13 @@ public final class Parcel {
     public void writePersistableBundle(PersistableBundle b) { writeObj(b); }
     public PersistableBundle readPersistableBundle() { return (PersistableBundle) readObj(); }
     public PersistableBundle readPersistableBundle(ClassLoader l) { return readPersistableBundle(); }
-    public void writeParcelable(Parcelable p, int flags) { writeObj(p); }
+    public void writeParcelable(Parcelable p, int flags) { writeParcelableObject(p, flags); }
     public <T extends Parcelable> T readParcelable(ClassLoader l) { return (T) (objectNext() ? adapt(readObj(), l) : readWrittenParcelable(l)); }
     public <T> T readParcelable(ClassLoader l, Class<T> c) { return (T) (objectNext() ? adapt(readObj(), l) : readWrittenParcelable(l)); }
     public Parcelable.Creator<?> readParcelableCreator(ClassLoader l) { return null; }
     public <T> Parcelable.Creator<T> readParcelableCreator(ClassLoader l, Class<T> c) { return null; }
     public void writeParcelableCreator(Parcelable p) { writeString(p == null ? null : p.getClass().getName()); }
-    public <T extends Parcelable> void writeTypedObject(T v, int flags) { writeObj(v); }
+    public <T extends Parcelable> void writeTypedObject(T v, int flags) { writeParcelableObject(v, flags); }
     public <T> T readTypedObject(Parcelable.Creator<T> c) {
         if (objectNext()) return (T) adapt(readObj(), c);
         return readInt() != 0 ? c.createFromParcel(this) : null;
@@ -256,18 +665,33 @@ public final class Parcel {
         o.clear();
         if (v != null) o.addAll((List<T>) adaptAll(v, c));
     }
-    public <T extends Parcelable> void writeTypedArray(T[] v, int flags) { writeObj(v); }
+    public <T extends Parcelable> void writeTypedArray(T[] v, int flags) {
+        writeObj(v == null || flags == 0 ? v : new ParcelableArrayWithFlags(v, flags));
+    }
     public <T> T[] createTypedArray(Parcelable.Creator<T> c) {
         if (!objectNext()) return writtenArray(c);
-        return (T[]) adaptArray((Object[]) readObj(), c);
+        return (T[]) adaptArray(arrayValue(readObj()), c);
     }
     public <T> void readTypedArray(T[] o, Parcelable.Creator<T> c) {
-        T[] v = objectNext() ? (T[]) adaptArray((Object[]) readObj(), c) : writtenArray(c);
+        T[] v = objectNext() ? (T[]) adaptArray(arrayValue(readObj()), c) : writtenArray(c);
         if (v != null) System.arraycopy(v, 0, o, 0, Math.min(v.length, o.length));
     }
-    public void writeParcelableArray(Parcelable[] v, int flags) { writeObj(v); }
-    public <T> T[] readParcelableArray(ClassLoader l, Class<T> c) { return (T[]) adaptArray((Object[]) readObj(), l); }
-    public Parcelable[] readParcelableArray(ClassLoader l) { return (Parcelable[]) adaptArray((Object[]) readObj(), l); }
+    public void writeParcelableArray(Parcelable[] v, int flags) {
+        writeObj(v == null || flags == 0 ? v : new ParcelableArrayWithFlags(v, flags));
+    }
+    public <T> T[] readParcelableArray(ClassLoader l, Class<T> c) {
+        Object value = readObj();
+        if (!(value instanceof WireParcelableArray)) return (T[]) adaptArray((Object[]) value, l);
+        Parcelable[] values = readWireParcelableArray(value, l);
+        T[] result = (T[]) java.lang.reflect.Array.newInstance(c, values.length);
+        System.arraycopy(values, 0, result, 0, values.length);
+        return result;
+    }
+    public Parcelable[] readParcelableArray(ClassLoader l) {
+        Object value = readObj();
+        return value instanceof WireParcelableArray ? readWireParcelableArray(value, l) :
+            (Parcelable[]) adaptArray((Object[]) value, l);
+    }
     public void writeParcelableList(List<? extends Parcelable> v, int flags) { writeObj(v == null ? null : new ArrayList<>(v)); }
     public <T extends Parcelable> List<T> readParcelableList(List<T> o, ClassLoader l) { List<T> v = (List<T>) readObj(); o.clear(); if (v != null) for (T t : v) o.add((T) adapt(t, l)); return o; }
     public List readParcelableList(List o, ClassLoader l, Class c) { return readParcelableList(o, l); }
@@ -275,7 +699,11 @@ public final class Parcel {
     public java.io.Serializable readSerializable() { return (java.io.Serializable) readObj(); }
     public Object readSerializable(ClassLoader l, Class c) { return readObj(); }
     public void writeValue(Object v) { writeObj(v); } public void writeValue(int type, Object v) { writeObj(v); }
-    public Object readValue(ClassLoader l) { Object v = readObj(); return v instanceof Parcelable[] ? adaptArray((Object[]) v, l) : adapt(v, l); }
+    public Object readValue(ClassLoader l) {
+        Object v = readObj();
+        if (v instanceof WireParcelableArray) return readWireParcelableArray(v, l);
+        return v instanceof Parcelable[] ? adaptArray((Object[]) v, l) : adapt(v, l);
+    }
     public void writeMap(Map v) { writeObj(v == null ? null : new java.util.HashMap(v)); }
     public void readMap(Map o, ClassLoader l) { Map v = (Map) readObj(); if (v != null) o.putAll(v); }
     public void readMap(Map o, ClassLoader l, Class k, Class v) { readMap(o, l); }
@@ -308,7 +736,7 @@ public final class Parcel {
 
     // ---- binder headers and exceptions, as AIDL code writes and reads them
     public void writeInterfaceToken(String t) { writeInt(0); writeInt(-1); writeInt(0x53595354 /* 'SYST' */); writeString(t); }
-    public void enforceInterface(String t) { readInt(); readInt(); readInt(); readString(); }
+    public void enforceInterface(String t) { readInt(); readInt(); readInt(); if (t == null || !t.equals(readString())) throw new SecurityException("Binder interface mismatch"); }
     public void enforceNoDataAvail() {}
     public void writeNoException() { writeInt(0); }
     public static int getExceptionCode(Throwable e) {
@@ -448,6 +876,15 @@ public final class Parcel {
 
     /** The object as the reader's creator makes it: itself when it is of the creator's class already. */
     private static Object adapt(Object o, Parcelable.Creator<?> c) {
+        if (o instanceof WireParcelable) {
+            WireParcelable value = (WireParcelable) o;
+            if (c == null) throw new BadParcelableException("Parcelable creator is required: " + value.name);
+            Class<?> expected = c.newArray(0).getClass().getComponentType();
+            if (expected == null || !expected.getName().equals(value.name))
+                throw new BadParcelableException("Parcelable type mismatch: " + value.name);
+            value.data.setDataPosition(0);
+            return c.createFromParcel(value.data);
+        }
         if (!(o instanceof Parcelable) || c == null) return o;
         Class<?> want = c.newArray(0).getClass().getComponentType();
         if (want == null || want.isInstance(o)) return o;
@@ -460,6 +897,16 @@ public final class Parcel {
     }
     /** The object as the class loader's class of its name makes it, when that is another class than its own. */
     private static Object adapt(Object o, ClassLoader l) {
+        if (o instanceof WireParcelable) {
+            WireParcelable value = (WireParcelable) o;
+            ClassLoader loader = l != null ? l : Parcel.class.getClassLoader();
+            Parcelable.Creator<?> c = creator(value.name, loader);
+            if (c == null) throw new BadParcelableException("Parcelable creator not found: " + value.name);
+            value.data.setDataPosition(0);
+            if (c instanceof Parcelable.ClassLoaderCreator)
+                return ((Parcelable.ClassLoaderCreator<?>) c).createFromParcel(value.data, loader);
+            return c.createFromParcel(value.data);
+        }
         if (!(o instanceof Parcelable) || l == null) return o;
         Class<?> have = o.getClass();
         ClassLoader own = have.getClassLoader();

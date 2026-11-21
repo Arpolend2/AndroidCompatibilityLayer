@@ -17,8 +17,15 @@
 
 #include "../src/bionic/mg_bionic.h"
 #include "../src/bionic/mg_fd.h"
+#include "../src/bionic/mg_net.h"
 #include "../src/mg_base.h"
 #include "../src/host/mg_host.h"
+
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 static int t_checks, t_failed;
 static mg_test_sink t_sink;
@@ -1564,6 +1571,97 @@ int mg_net_check_run(const char *public_host, const char *path, mg_test_sink sin
 
 /* ------------------------------------------------------------------- run */
 
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+static MG_HOSTCB void import_late_write(void *arg)
+{
+    int *fd = (int *)arg;
+    mg_sleep_ns(80000000ull);
+    write(*fd, "host", 4);
+}
+
+static void test_import_unix_stream(void)
+{
+    int pair[2], bad[2], guest, flags;
+    char buf[8];
+    mg_pollfd p;
+    mg_thread *writer;
+    say("network: imported host Unix stream");
+    CHECK_INT(mg_net_import_unix_stream(-1), -1);
+    CHECK_INT(err(), GE_BADF);
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, bad) == 0) {
+        CHECK_INT(mg_net_import_unix_stream(bad[0]), -1);
+        close(bad[0]);
+        close(bad[1]);
+    } else CHECK(false);
+    if (pipe(bad) == 0) {
+        CHECK_INT(mg_net_import_unix_stream(bad[0]), -1);
+        close(bad[0]);
+        close(bad[1]);
+    } else CHECK(false);
+    bad[0] = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(bad[0] >= 0);
+    if (bad[0] >= 0) {
+        CHECK_INT(mg_net_import_unix_stream(bad[0]), -1);
+        close(bad[0]);
+    }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        CHECK(false);
+        return;
+    }
+    flags = fcntl(pair[0], F_GETFL);
+    guest = mg_net_import_unix_stream(pair[0]);
+    CHECK(guest >= 0);
+    if (guest < 0) {
+        close(pair[0]);
+        close(pair[1]);
+        return;
+    }
+    CHECK(fcntl(pair[0], F_GETFD) >= 0);
+    CHECK_INT(fcntl(pair[0], F_GETFL), flags);
+    CHECK_INT(N.fcntl(guest, F_GETFD_, 0), 1);
+    close(pair[0]);
+    flags = N.fcntl(guest, F_GETFL_, 0);
+    CHECK_INT(N.fcntl(guest, F_SETFL_, flags | O_NONBLOCK_), 0);
+    CHECK_INT(N.read(guest, buf, sizeof(buf)), -1);
+    CHECK_INT(err(), GE_AGAIN);
+    p.fd = guest; p.events = POLLIN_; p.revents = 0;
+    writer = mg_thread_start(import_late_write, &pair[1], 128 * 1024, "net-import");
+    CHECK(writer != NULL);
+    if (!writer) {
+        N.close(guest);
+        close(pair[1]);
+        return;
+    }
+    CHECK_INT(N.poll(&p, 1, 2000), 1);
+    mg_thread_join(writer);
+    CHECK((p.revents & POLLIN_) != 0);
+    CHECK_INT(N.read(guest, buf, sizeof(buf)), 4);
+    CHECK(!memcmp(buf, "host", 4));
+    CHECK_INT(N.write(guest, "guest", 5), 5);
+    CHECK_INT(read(pair[1], buf, sizeof(buf)), 5);
+    CHECK(!memcmp(buf, "guest", 5));
+    CHECK_INT(N.shutdown(guest, SHUT_WR_), 0);
+    CHECK_INT(read(pair[1], buf, sizeof(buf)), 0);
+    close(pair[1]);
+    p.revents = 0;
+    CHECK_INT(N.poll(&p, 1, 2000), 1);
+    CHECK_INT(N.read(guest, buf, sizeof(buf)), 0);
+    CHECK_INT(N.close(guest), 0);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0) {
+        guest = mg_net_import_unix_stream(pair[0]);
+        CHECK(guest >= 0);
+        if (guest >= 0) {
+            CHECK_INT(N.close(guest), 0);
+            CHECK_INT(write(pair[0], "x", 1), 1);
+            CHECK_INT(read(pair[1], buf, sizeof(buf)), 1);
+            CHECK(buf[0] == 'x');
+        }
+        close(pair[0]);
+        close(pair[1]);
+    } else CHECK(false);
+}
+#endif
+
 int mg_net_tests_run(mg_test_sink sink, void *user, int *checks)
 {
     int was_checks = t_checks, was_failed = t_failed, refused = 0;
@@ -1576,6 +1674,9 @@ int mg_net_tests_run(mg_test_sink sink, void *user, int *checks)
         CHECK(libc_found());
         goto out;
     }
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+    test_import_unix_stream();
+#endif
     /*
      * A phone may refuse an app its own loopback. There it is said once, and
      * what needs loopback left out, rather than counted as this layer's

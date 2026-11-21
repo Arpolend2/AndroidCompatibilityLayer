@@ -7,6 +7,7 @@ nothing here runs during a build.
 
     python tools/media-test-streams.py [output folder]     (core/tests/app/data/assets unless told)
     python tools/media-test-streams.py --speed <folder>
+    python tools/media-test-streams.py --surface <folder>
 
   avc.mgau    H.264 Main, 168 x 94 (coded 176 x 96, so the decoder has a picture to crop), 30 pictures a second,
               24 pictures, two B-pictures between references (so decode order is not display order), an IDR every
@@ -30,6 +31,9 @@ win) and not kept in the repository:
   speed-avc-720p.mgau     H.264 High, 1280 x 720, 60 pictures, three B-pictures between references, an IDR a second
   speed-avc-1080p.mgau    the same at 1920 x 1080
   speed-hevc-1080p.mgau   H.265 Main at 1920 x 1080
+
+With --surface, a two-second moving 640 x 360 H.264 stream is made for the
+manual Surface playback APK.
 
 The file: "MGMEDIA1", the MIME type in 32 bytes (zero-padded), then little-endian u32 width, height, sample rate,
 channels and the number of records; then each record: u32 flags (MediaCodec's: 1 key frame, 2 codec-specific
@@ -160,9 +164,23 @@ def speed(folder):
           lambda u: (u[0] >> 1) & 0x3F, (32, 33, 34), (35, 39, 40), 1920, 1080, 60, "testsrc2=s=1920x1080:r=30")
 
 
+def surface(folder):
+    global OUT
+    OUT = folder
+    os.makedirs(OUT, exist_ok=True)
+    avc = lambda u: u[0] & 0x1F
+    x264 = ["-preset", "fast", "-profile:v", "main", "-crf", "24",
+            "-x264-params", "bframes=2:b-adapt=0:b-pyramid=none:keyint=30:min-keyint=30:scenecut=0"]
+    video("surface-avc.mgau", "video/avc", "libx264", x264, avc, (7, 8), (6, 9),
+          640, 360, 60, "testsrc2=s=640x360:r=30")
+
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--speed":
         speed(sys.argv[2])
+        return
+    if len(sys.argv) > 2 and sys.argv[1] == "--surface":
+        surface(sys.argv[2])
         return
     os.makedirs(OUT, exist_ok=True)
     x264 = ["-preset", "medium", "-profile:v", "main", "-x264-params", "bframes=2:b-adapt=0:b-pyramid=none:keyint=12:min-keyint=12:scenecut=0:open-gop=0"]

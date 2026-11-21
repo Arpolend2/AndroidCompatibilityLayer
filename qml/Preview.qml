@@ -84,6 +84,15 @@ ApplicationWindow {
             PreviewSurface {
                 anchors.fill: parent
                 player: preview
+                pageOrientation: {
+                    switch (guestPage.orientation) {
+                    case Orientation.Portrait: return Qt.PortraitOrientation
+                    case Orientation.Landscape: return Qt.LandscapeOrientation
+                    case Orientation.PortraitInverted: return Qt.InvertedPortraitOrientation
+                    case Orientation.LandscapeInverted: return Qt.InvertedLandscapeOrientation
+                    default: return Qt.PrimaryOrientation
+                    }
+                }
                 edgeZoneWidth: Theme.dp(preview.backGestureEdgeDp)
             }
             Label {

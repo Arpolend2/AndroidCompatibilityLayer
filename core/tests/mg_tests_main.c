@@ -130,6 +130,68 @@
 #include "mg_storage_tests.h"
 #include "mg_tests.h"
 
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+#include "../src/bionic/mg_net.h"
+#include <unistd.h>
+
+/* Test runner only: never expose arbitrary host descriptors to an app. */
+static volatile i32 binder_test_host_fd = -1;
+static bool binder_test_server;
+static bool binder_test_broker;
+static bool binder_test_real;
+static bool binder_test_self_hosted;
+static int binder_test_caller_uid = -1;
+static int binder_test_caller_pid = 0;
+
+static void binder_test_take_fd(mg_jcall *call)
+{
+    int host_fd = mg_atomic_xchg(&binder_test_host_fd, -1);
+    call->ret.i = host_fd < 0 ? -1 : mg_net_import_unix_stream(host_fd);
+    if (host_fd >= 0) close(host_fd);
+}
+
+static void binder_test_is_server(mg_jcall *call)
+{
+    call->ret.i = binder_test_server ? 1 : 0;
+}
+
+static void binder_test_is_broker(mg_jcall *call)
+{
+    call->ret.i = binder_test_broker ? 1 : 0;
+}
+
+static void binder_test_is_real(mg_jcall *call)
+{
+    call->ret.i = binder_test_real ? 1 : 0;
+}
+
+static void binder_test_is_self_hosted(mg_jcall *call)
+{
+    call->ret.i = binder_test_self_hosted ? 1 : 0;
+}
+
+static void binder_test_caller_uid_value(mg_jcall *call)
+{
+    call->ret.i = binder_test_caller_uid;
+}
+
+static void binder_test_caller_pid_value(mg_jcall *call)
+{
+    call->ret.i = binder_test_caller_pid;
+}
+
+static const mg_jhle binder_test_natives[] = {
+    { "megler/test/binderfd/Main", "takeTestStream", "()I", binder_test_take_fd },
+    { "megler/test/binderfd/Main", "isTestServer", "()Z", binder_test_is_server },
+    { "megler/test/binderfd/Main", "isTestBroker", "()Z", binder_test_is_broker },
+    { "megler/test/binderfd/Main", "isTestReal", "()Z", binder_test_is_real },
+    { "megler/test/binderfd/Main", "isTestSelfHosted", "()Z", binder_test_is_self_hosted },
+    { "megler/test/binderfd/Main", "testCallerUid", "()I", binder_test_caller_uid_value },
+    { "megler/test/binderfd/Main", "testCallerPid", "()I", binder_test_caller_pid_value },
+    { NULL, NULL, NULL, NULL }
+};
+#endif
+
 #if MG_GUEST_CODE
 static int load_mode(int argc, char **argv)
 {
@@ -1773,6 +1835,48 @@ int main(int argc, char **argv)
     }
     if (argc >= 6 && !strcmp(argv[1], "--java")) {
         megler_config config;
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+        const char *test_fd = getenv("MEGLER_TEST_BINDER_HOST_FD");
+        if (test_fd) {
+            char *end;
+            long fd = strtol(test_fd, &end, 10);
+            if (!*test_fd || *end || fd < 3 || fd > 2147483647L) {
+                fprintf(stderr, "Invalid test Binder host descriptor\n");
+                return 1;
+            }
+            binder_test_host_fd = (i32)fd;
+            const char *role = getenv("MEGLER_TEST_BINDER_ROLE");
+            if (role && strcmp(role, "server") && strcmp(role, "client")) {
+                fprintf(stderr, "Invalid test Binder role\n");
+                return 1;
+            }
+            binder_test_server = role && !strcmp(role, "server");
+            const char *broker = getenv("MEGLER_TEST_BINDER_BROKER");
+            binder_test_real = broker && !strcmp(broker, "real");
+            binder_test_broker = binder_test_real || (broker && !strcmp(broker, "1"));
+            binder_test_self_hosted = getenv("GUEST_HEADLESS_REAL_SERVER") != NULL;
+            const char *caller_uid = getenv("MEGLER_TEST_BINDER_CALLER_UID");
+            const char *caller_pid = getenv("MEGLER_TEST_BINDER_CALLER_PID");
+            if (caller_uid || caller_pid) {
+                char *uid_end, *pid_end;
+                long uid = caller_uid ? strtol(caller_uid, &uid_end, 10) : -1;
+                long pid = caller_pid ? strtol(caller_pid, &pid_end, 10) : -1;
+                if (!binder_test_server || !caller_uid || !caller_pid || !*caller_uid || !*caller_pid ||
+                    *uid_end || *pid_end || uid < 11000 || uid > 19999 || pid < 1 || pid > 2147483647L) {
+                    fprintf(stderr, "Invalid test Binder caller identity\n");
+                    return 1;
+                }
+                binder_test_caller_uid = (int)uid;
+                binder_test_caller_pid = (int)pid;
+            }
+            unsetenv("MEGLER_TEST_BINDER_HOST_FD");
+            unsetenv("MEGLER_TEST_BINDER_ROLE");
+            unsetenv("MEGLER_TEST_BINDER_BROKER");
+            unsetenv("MEGLER_TEST_BINDER_CALLER_UID");
+            unsetenv("MEGLER_TEST_BINDER_CALLER_PID");
+            mg_dvm_register(binder_test_natives);
+        }
+#endif
         memset(&config, 0, sizeof(config));
         config.data_dir = argv[4];
         config.package_dir = argv[4];

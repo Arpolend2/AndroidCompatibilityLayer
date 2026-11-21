@@ -11,6 +11,8 @@
 #include <QQuickPaintedItem>
 #include <QString>
 #include <QStringList>
+#include <memory>
+#include "shared_microg_client.h"
 
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
 #include <memory>
@@ -55,6 +57,7 @@ public:
     int exitStatus() const { return m_exitStatus; }
     void setCloseOnBackGesture(bool enabled) { m_closeOnBackGesture = enabled; }
     void setCloseOnExit(bool enabled) { m_closeOnExit = enabled; }
+    void setSharedMicrog(bool enabled) { m_sharedMicrogEnabled = enabled; }
     void setStandaloneSettings(const QString &locale, const QString &theme, const QString &location);
     void setDeniedPermissions(const QStringList &denied) { m_deniedPermissions = denied; }
     void setSystemTheme(bool dark, const QColor &accent);
@@ -79,6 +82,8 @@ public:
 #endif
     void setSurface(PreviewSurface *surface);
     virtual void setViewport(qreal width, qreal height, qreal pixelRatio);
+    virtual void setDisplayRotation(int rotation);
+    int displayRotation() const { return m_displayRotation; }
     virtual bool usesGpuSurface() const { return true; }
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     std::shared_ptr<PreviewGpuState> gpuState() const { return m_gpuState; }
@@ -141,6 +146,9 @@ private:
     bool m_awaitingGestureFrame = false;
     bool m_gestureFrameChanged = false;
     bool m_running = false;
+    bool m_starting = false;
+    bool m_sharedMicrogEnabled = false;
+    std::unique_ptr<SharedMicrogClientChannel> m_sharedMicrog;
     int m_exitStatus = 0;
     bool m_closing = false;
     bool m_closeOnExit = false;
@@ -158,6 +166,7 @@ private:
     int m_surfaceWidth = 480;
     int m_surfaceHeight = 800;
     int m_density = 160;
+    int m_displayRotation = 0;
     QPointer<PreviewKeyboard> m_keyboard;
     QPointer<PreviewSurface> m_surface;
     AuroraStorageHost m_storage;
@@ -181,12 +190,15 @@ class PreviewSurface : public QQuickPaintedItem
     Q_OBJECT
     Q_PROPERTY(QObject *player READ player WRITE setPlayer NOTIFY playerChanged)
     Q_PROPERTY(qreal edgeZoneWidth MEMBER m_edgeZoneWidth)
+    Q_PROPERTY(int pageOrientation READ pageOrientation WRITE setPageOrientation)
 
 public:
     explicit PreviewSurface(QQuickItem *parent = nullptr);
     ~PreviewSurface() override;
     QObject *player() const { return m_player; }
     void setPlayer(QObject *player);
+    int pageOrientation() const { return m_pageOrientation; }
+    void setPageOrientation(int orientation);
     void paint(QPainter *painter) override;
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     void requestGpuFrame();
@@ -210,7 +222,13 @@ private:
     void advanceWheelGesture();
     void cancelWheelGesture();
     void updateViewport();
+    void updateDisplayRotation();
     QPointer<PreviewPlayer> m_player;
+    int m_pageOrientation = 0;
+    int m_loggedNative = -2;
+    int m_loggedActual = -2;
+    int m_loggedPrimary = -2;
+    int m_loggedRotation = -2;
     bool m_pressed = false;
     bool m_backPressed = false;
     qreal m_edgeZoneWidth = 32;

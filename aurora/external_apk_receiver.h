@@ -31,10 +31,16 @@ public slots:
     Q_SCRIPTABLE QString storeResult(const QString &id);
     Q_SCRIPTABLE QString libraryApps();
     Q_SCRIPTABLE QString launchApp(const QString &package);
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+    Q_SCRIPTABLE QString DiagnosticPing();
+#endif
 
 signals:
     void requested(const QString &path);
     void rejected(const QString &message);
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+    void diagnosticRequested();
+#endif
 
 private:
     bool submitFrom(const QStringList &arguments, const char *source);
@@ -48,6 +54,9 @@ private:
     QString m_libraryApps;
     bool m_storePollReported = false;
     bool m_libraryPollReported = false;
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+    int m_diagnosticPending = 0;
+#endif
 };
 
 #endif

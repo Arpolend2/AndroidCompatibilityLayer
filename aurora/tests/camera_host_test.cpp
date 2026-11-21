@@ -49,6 +49,12 @@ void MEGLER_CB receiveBlocking(void *context, const megler_camera_frame *frame)
     state->cv.notify_all();
     state->cv.wait(lock, [state] { return state->released; });
 }
+
+void MEGLER_CB focusResult(void *context, bool focused)
+{
+    int *result = static_cast<int *>(context);
+    *result += focused ? 1 : 10;
+}
 }
 
 int main(int argc, char **argv)
@@ -198,6 +204,22 @@ int main(int argc, char **argv)
         cameraSurface = camera->surface;
         cameraWorker->addTestCamera(camera);
     }));
+    int focused = 0;
+    assert(!host.focus(host.user, camera, MEGLER_CAMERA_FOCUS_ONCE, focusResult, &focused));
+    assert(cameraWorker->call([&] {
+        camera->focusDone = focusResult;
+        camera->focusCore = &focused;
+        cameraWorker->testCompleteFocus(camera, true);
+        cameraWorker->testCompleteFocus(camera, false);
+    }));
+    assert(focused == 1);
+    assert(cameraWorker->call([&] {
+        camera->focusDone = focusResult;
+        camera->focusCore = &focused;
+    }));
+    assert(host.focus(host.user, camera, MEGLER_CAMERA_FOCUS_NONE, nullptr, nullptr));
+    assert(cameraWorker->call([&] { cameraWorker->testCompleteFocus(camera, true); }));
+    assert(focused == 1);
     Surface *surfacePointer = cameraSurface.data();
     std::thread delivering([&] { assert(surfacePointer->present(frame)); });
     {

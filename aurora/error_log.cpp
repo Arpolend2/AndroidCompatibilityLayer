@@ -66,10 +66,10 @@ const char ExportDirectoryName[] = "AndroidCompatibilityLayer-Error-Logs";
 const char SharedStandaloneDirectoryName[] = "AndroidCompatibilityLayer-Standalone-Logs";
 const char JournalTruncated[] = "[Earlier shared history was truncated.]\n";
 const char DetailedTruncated[] = "[Earlier detailed output was truncated.]\n";
-const char StandaloneTruncated[] = "[Earlier standalone snapshot entries were dropped.]\n";
 const int MaxStandaloneSnapshots = 32;
 const int MaxStandaloneSnapshotBytes = 256 * 1024;
 const int MaxStandaloneSnapshotEvents = 512;
+const int StandaloneStartupEvents = 32;
 const int MaxStandalonePendingBytes = 128 * 1024;
 const int MaxStandaloneMessageChars = 4096;
 const int MaxStandaloneExportCursors = 512;
@@ -299,23 +299,45 @@ bool openStandaloneDirectory(const QString &sharedRoot, bool create, QString *di
     return true;
 }
 
-QVector<QString> standaloneSnapshotNames(int directoryFd)
+bool standaloneSnapshotNames(int directoryFd, QVector<QString> *names, QString *error)
 {
-    QVector<QString> names;
+    names->clear();
+    if (error) error->clear();
     const int duplicate = ::dup(directoryFd);
-    if (duplicate < 0) return names;
+    if (duplicate < 0) {
+        if (error) *error = QString::fromLocal8Bit(std::strerror(errno));
+        return false;
+    }
     DIR *directory = ::fdopendir(duplicate);
     if (!directory) {
+        if (error) *error = QString::fromLocal8Bit(std::strerror(errno));
         ::close(duplicate);
-        return names;
+        return false;
     }
+    errno = 0;
     while (dirent *entry = ::readdir(directory)) {
         const QString name = QFile::decodeName(entry->d_name);
-        if (validStandaloneFileName(name, nullptr)) names.append(name);
+        if (validStandaloneFileName(name, nullptr)) names->append(name);
+        errno = 0;
     }
+    const int readError = errno;
     ::closedir(directory);
-    std::sort(names.begin(), names.end());
-    return names;
+    if (readError) {
+        names->clear();
+        if (error) *error = QString::fromLocal8Bit(std::strerror(readError));
+        return false;
+    }
+    std::sort(names->begin(), names->end());
+    return true;
+}
+
+StandaloneEvent dropStandaloneEvent(QVector<StandaloneEvent> *events)
+{
+    // Keep an initial startup window and prefer discarding non-errors thereafter.
+    const int firstCandidate = events->size() > StandaloneStartupEvents ? StandaloneStartupEvents : 0;
+    int index = firstCandidate;
+    while (index < events->size() && events->at(index).error) ++index;
+    return events->takeAt(index < events->size() ? index : firstCandidate);
 }
 
 int lockStandaloneSnapshot(int directoryFd, const QString &fileName, QString *error)
@@ -585,14 +607,25 @@ bool collectStandaloneSnapshots(bool holdLocks, QVector<StandaloneSnapshot> *sna
         if (!sharedStandaloneError.isEmpty() && omitted)
             omitted->append(sharedStandaloneError);
     }
-    if (path.isEmpty()) return true;
+    if (path.isEmpty()) {
+        if (omitted && omitted->isEmpty())
+            omitted->append(QStringLiteral("Organization snapshots are not configured."));
+        return true;
+    }
     int fd = ::open(QFile::encodeName(path).constData(),
                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
-        if (omitted) omitted->append(QStringLiteral("Organization snapshots unavailable."));
+        if (omitted) omitted->append(QStringLiteral("Organization snapshots unavailable: %1")
+                                     .arg(QString::fromLocal8Bit(std::strerror(errno))));
         return true;
     }
-    QVector<QString> names = standaloneSnapshotNames(fd);
+    QVector<QString> names;
+    QString directoryError;
+    if (!standaloneSnapshotNames(fd, &names, &directoryError)) {
+        if (omitted) omitted->append(QStringLiteral("Cannot list organization snapshots: %1").arg(directoryError));
+        ::close(fd);
+        return true;
+    }
     if (names.size() > MaxStandaloneSnapshots) {
         names.resize(MaxStandaloneSnapshots);
         if (omitted) omitted->append(QStringLiteral("Snapshot count limit reached; additional files were omitted."));
@@ -664,6 +697,9 @@ QString standaloneSnapshotText(const QVector<StandaloneSnapshot> &snapshots,
                               bool *partial)
 {
     QString text;
+    if (snapshots.isEmpty() && omitted.isEmpty())
+        text += QStringLiteral("\n[No standalone snapshots found in the configured organization directory; "
+                               "successfully exported snapshots may already have been removed.]\n");
     if (!omitted.isEmpty()) {
         if (partial) *partial = true;
         text += QStringLiteral("\n[Standalone export partial: %1 snapshot(s) omitted or unavailable.]\n")
@@ -677,7 +713,7 @@ QString standaloneSnapshotText(const QVector<StandaloneSnapshot> &snapshots,
                     .arg(snapshot.applicationId, snapshot.instance);
         if (snapshot.dropped) {
             if (partial) *partial = true;
-            text += QStringLiteral("[Standalone snapshot entries dropped before publication: %1]\n")
+            text += QStringLiteral("[Standalone snapshot entries dropped due to limits: %1]\n")
                         .arg(snapshot.dropped);
         }
         for (const StandaloneEvent &event : snapshot.events) {
@@ -762,8 +798,11 @@ bool flushStandaloneWriter()
     StandaloneSnapshot snapshot;
     bool ok = readStandaloneFile(directoryFd, fileName, &existingBytes, &exists, &error);
     if (ok && exists) {
-        ok = parseStandaloneSnapshot(existingBytes, fileName, &snapshot, &error) &&
-             snapshot.applicationId == applicationId;
+        ok = parseStandaloneSnapshot(existingBytes, fileName, &snapshot, &error);
+        if (ok && snapshot.applicationId != applicationId) {
+            ok = false;
+            error = QStringLiteral("Standalone snapshot application identity does not match.");
+        }
         if (ok && !snapshot.events.isEmpty() && !pending.isEmpty() &&
             pending.first().sequence <= snapshot.events.last().sequence) {
             ok = false;
@@ -773,7 +812,10 @@ bool flushStandaloneWriter()
         snapshot.fileName = fileName;
         snapshot.instance = instance;
         snapshot.applicationId = applicationId;
-        if (standaloneSnapshotNames(directoryFd).size() >= MaxStandaloneSnapshots) {
+        QVector<QString> names;
+        if (!standaloneSnapshotNames(directoryFd, &names, &error)) {
+            ok = false;
+        } else if (names.size() >= MaxStandaloneSnapshots) {
             ok = false;
             error = QStringLiteral("Standalone snapshot limit reached.");
         }
@@ -792,7 +834,7 @@ bool flushStandaloneWriter()
                 error = QStringLiteral("Standalone snapshot metadata exceeds its safe limits.");
                 break;
             }
-            snapshot.events.removeFirst();
+            dropStandaloneEvent(&snapshot.events);
             if (snapshot.dropped != std::numeric_limits<quint64>::max()) ++snapshot.dropped;
         }
         if (ok) ok = writeStandaloneFile(directoryFd, fileName, contents, &error);
@@ -1185,7 +1227,7 @@ void ErrorLog::record(const QString &source, const QString &message, bool error)
         while (!standaloneWriter.pending.isEmpty() &&
                (bytes > MaxStandalonePendingBytes ||
                 standaloneWriter.pending.size() > MaxStandaloneSnapshotEvents)) {
-            const StandaloneEvent removed = standaloneWriter.pending.takeFirst();
+            const StandaloneEvent removed = dropStandaloneEvent(&standaloneWriter.pending);
             bytes -= removed.source.toUtf8().size() + removed.message.toUtf8().size() + 128;
             if (standaloneWriter.dropped != std::numeric_limits<quint64>::max())
                 ++standaloneWriter.dropped;
@@ -1499,7 +1541,9 @@ bool ErrorLog::clearSavedLogs(int &removed)
         const int sharedFd = ::open(QFile::encodeName(sharedPath).constData(),
                                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (sharedFd >= 0) {
-            QVector<QString> snapshots = standaloneSnapshotNames(sharedFd);
+            QVector<QString> snapshots;
+            QString listError;
+            if (!standaloneSnapshotNames(sharedFd, &snapshots, &listError)) ok = false;
             if (snapshots.size() > MaxStandaloneSnapshots) {
                 snapshots.resize(MaxStandaloneSnapshots);
                 ok = false;

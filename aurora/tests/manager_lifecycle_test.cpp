@@ -1,19 +1,30 @@
 #include "../manager_lifecycle.h"
+#include "../single_instance_lock.h"
+#include "../standalone_diagnostic_registry.h"
+#include "../standalone_microg_diagnostic.h"
 
 #include <QCoreApplication>
 #include <QDBusMessage>
 #include <QDBusConnectionInterface>
 #include <QDBusPendingCallWatcher>
+#include <QDir>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
 #include <QProcess>
 #include <QSettings>
+#include <QSocketNotifier>
+#include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimer>
 
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace {
 class IdentityFixture : public QDBusVirtualObject
@@ -29,11 +40,12 @@ public:
             return true;
         }
         sender = message.arguments().first().toString();
-        connection.send(message.createReply(QVariantList() << QStringLiteral("/test/client")
-                                                           << QStringLiteral("test-key")));
+        connection.send(message.createReply(QVariantList() << executable << key));
         return true;
     }
     QString sender;
+    QString executable = QStringLiteral("/test/client");
+    QString key = QStringLiteral("test-key");
 };
 
 void check(bool value, const char *description)
@@ -65,7 +77,7 @@ void captureDiagnostics(QtMsgType, const QMessageLogContext &, const QString &me
         append(diagnosticFile, message.toUtf8() + '\n');
 }
 
-QDBusPendingCall waitFor(const QDBusPendingCall &call)
+QDBusPendingCall waitFor(const QDBusPendingCall &call, int timeoutMilliseconds = 5000)
 {
     QDBusPendingCallWatcher watcher(call);
     if (!watcher.isFinished()) {
@@ -74,7 +86,7 @@ QDBusPendingCall waitFor(const QDBusPendingCall &call)
         timer.setSingleShot(true);
         QObject::connect(&watcher, &QDBusPendingCallWatcher::finished, &loop, &QEventLoop::quit);
         QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-        timer.start(5000);
+        timer.start(timeoutMilliseconds);
         loop.exec();
     }
     check(watcher.isFinished(), "D-Bus call completed");
@@ -173,12 +185,45 @@ int activationClient(const QString &eventFile)
     settings.setValue(QStringLiteral("googleServices/provider"), QStringLiteral("microg"));
     settings.sync();
     check(settings.status() == QSettings::NoError, "save activation test settings");
-    const QDBusConnection bus = QDBusConnection::sessionBus();
+    QDBusConnection bus = QDBusConnection::sessionBus();
     check(waitForOwner(bus, false), "activation starts without a manager");
     QString provider, error;
     check(ManagerLifecycle::forwardToRunningManager(QStringList(), &error) == ManagerLifecycle::NoOwner,
           "normal launch does not auto-activate even with an installed service");
     check(waitForOwner(bus, false), "normal launch left service inactive");
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+    {
+        const QString root = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        const QString id = QStringLiteral("ru.androidcompatibilitylayer.Android0123456789abcdef01234567");
+        QTemporaryDir rpmDirectory;
+        check(rpmDirectory.isValid() && QDir().mkpath(root), "create activation diagnostic registry");
+        QFile rpm(rpmDirectory.path() + QLatin1Char('/') + id + QStringLiteral("-1.0.0-1.x86_64.rpm"));
+        check(rpm.open(QIODevice::WriteOnly), "create activation exported RPM");
+        rpm.close();
+        check(StandaloneDiagnosticRegistry::save(root, rpm.fileName(), QStringLiteral("org.example.app")),
+              "register activation client");
+        IdentityFixture identity;
+        identity.executable = QStringLiteral("/usr/bin/") + id;
+        check(bus.registerVirtualObject(QStringLiteral("/ru/omp/am"), &identity), "register activation identity");
+        check(bus.registerService(QStringLiteral("ru.omp.am")), "register activation identity service");
+        QDBusMessage ping = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/androidcompatibilitylayer/appmanager"),
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"), QStringLiteral("DiagnosticPing"));
+        const QDBusMessage pingReply = QDBusPendingCallWatcher(waitFor(bus.asyncCall(ping))).reply();
+        check(pingReply.type() == QDBusMessage::ReplyMessage &&
+              pingReply.arguments().value(0).toString() == QLatin1String("synthetic-ok") &&
+              identity.sender == bus.baseService(), "diagnostic cold-activates manager for known sender");
+        check(read(eventFile).isEmpty(), "diagnostic activation does not open a window");
+        bus.unregisterService(QStringLiteral("ru.omp.am"));
+        bus.unregisterObject(QStringLiteral("/ru/omp/am"));
+        check(QFile::remove(QDir(StandaloneDiagnosticRegistry::directory(root)).filePath(id)),
+              "remove activation test registry entry");
+        check(QDir().rmdir(StandaloneDiagnosticRegistry::directory(root)), "remove activation registry");
+        check(QDir().rmdir(root), "remove activation app data directory");
+        check(QDir().rmdir(QFileInfo(root).absolutePath()), "remove activation organization data directory");
+    }
+#endif
     QDBusPendingReply<QString> reply(waitFor(requestSharedMicrogProvider(bus)));
     check(readSharedMicrogProvider(reply, &provider, &error) && provider == QLatin1String("microg"),
           "D-Bus auto-activates the background provider");
@@ -203,13 +248,15 @@ int activationClient(const QString &eventFile)
     return 0;
 }
 
-int actualManager(const QString &binary)
+int actualManager(const QString &binary, bool transition)
 {
     QTemporaryDir directory;
     check(directory.isValid(), "create isolated actual manager configuration");
     QProcess process;
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
-    environment.insert(QStringLiteral("QT_QPA_PLATFORM"), QStringLiteral("minimal"));
+    const QString platform = QString::fromLocal8Bit(qgetenv("ACL_MANAGER_TEST_PLATFORM"));
+    environment.insert(QStringLiteral("QT_QPA_PLATFORM"),
+                       transition && !platform.isEmpty() ? platform : QStringLiteral("minimal"));
     environment.insert(QStringLiteral("XDG_CONFIG_HOME"), directory.path());
     environment.insert(QStringLiteral("XDG_DATA_HOME"), directory.path());
     process.setProcessEnvironment(environment);
@@ -241,7 +288,83 @@ int actualManager(const QString &binary)
           identified.value() == (QStringList() << bus.baseService()
                                  << QStringLiteral("/test/client") << QStringLiteral("test-key")) &&
           identity.sender == bus.baseService(), "actual manager identifies the requesting bus connection");
+    const QString id = QStringLiteral("ru.androidcompatibilitylayer.Android0123456789abcdef01234567");
+    const QString root = QDir(directory.path()).filePath(QStringLiteral("ru.androidcompatibilitylayer/appmanager"));
+    check(QDir().mkpath(root), "create actual manager registry directory");
+    QFile rpm(QDir(directory.path()).filePath(id + QStringLiteral("-1.0.0-1.x86_64.rpm")));
+    check(rpm.open(QIODevice::WriteOnly), "create actual manager exported RPM");
+    rpm.close();
+    check(StandaloneDiagnosticRegistry::save(root, rpm.fileName(), QStringLiteral("org.example.app")),
+          "register actual manager diagnostic client");
+    identity.executable = QStringLiteral("/usr/bin/") + id;
+    QDBusMessage resolve = QDBusMessage::createMethodCall(
+        QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+        QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+        QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"), QStringLiteral("ResolveCaller"));
+    QDBusPendingReply<QStringList> resolved(waitFor(bus.asyncCall(resolve)));
+    check(resolved.isError() && resolved.error().type() == QDBusError::AccessDenied,
+          "manager refuses registry-only identity mapping");
+    QDBusMessage open = QDBusMessage::createMethodCall(
+        QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+        QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+        QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"), QStringLiteral("OpenChannel"));
+    QDBusPendingReply<QDBusUnixFileDescriptor> unavailable(waitFor(bus.asyncCall(open)));
+    check(unavailable.isError() && unavailable.error().type() == QDBusError::NotSupported,
+          "manager without a microG backend rejects channel requests");
+    QDBusMessage openClient = QDBusMessage::createMethodCall(
+        QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+        QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+        QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"), QStringLiteral("OpenClientChannel"));
+    QDBusPendingReply<> clientUnavailable(waitFor(bus.asyncCall(openClient)));
+    check(clientUnavailable.isError() && clientUnavailable.error().type() == QDBusError::NotSupported,
+          "manager without a microG backend rejects identity channel requests");
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+    QDBusMessage ping = QDBusMessage::createMethodCall(
+        QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+        QStringLiteral("/ru/androidcompatibilitylayer/appmanager"),
+        QStringLiteral("ru.androidcompatibilitylayer.appmanager"), QStringLiteral("DiagnosticPing"));
+    const QDBusMessage response = QDBusPendingCallWatcher(waitFor(bus.asyncCall(ping))).reply();
+    check(response.type() == QDBusMessage::ReplyMessage &&
+          response.arguments().value(0).toString() == QLatin1String("synthetic-ok"),
+          "actual manager serves diagnostic for registered sender");
+#endif
     check(process.state() == QProcess::Running, "actual manager stays running without a window");
+    if (transition) {
+        const QDBusReply<uint> originalPid = bus.interface()->servicePid(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"));
+        bool ok = originalPid.isValid();
+        for (int attempt = 0; attempt < 2 && ok; ++attempt) {
+            QProcess launch;
+            launch.setProcessEnvironment(environment);
+            launch.start(binary, QStringList());
+            const bool finished = launch.waitForFinished(15000);
+            if (!finished) {
+                launch.kill();
+                launch.waitForFinished(5000);
+            }
+            const bool managerExited = process.waitForFinished(500);
+            const QDBusReply<uint> owner = bus.interface()->servicePid(
+                QStringLiteral("ru.androidcompatibilitylayer.appmanager"));
+            ok = finished && launch.exitStatus() == QProcess::NormalExit && launch.exitCode() == 0 &&
+                 !managerExited && owner.isValid() && owner.value() == originalPid.value();
+            if (!ok) {
+                std::fprintf(stderr, "Manager transition attempt %d failed: launcher exit=%d status=%d; "
+                             "manager exited=%d exit=%d status=%d\nlauncher stderr:\n%s\nmanager stderr:\n%s\n",
+                             attempt + 1, launch.exitCode(), int(launch.exitStatus()), managerExited,
+                             process.exitCode(), int(process.exitStatus()),
+                             launch.readAllStandardError().constData(), process.readAllStandardError().constData());
+            }
+        }
+        if (!ok) {
+            if (process.state() != QProcess::NotRunning) {
+                process.terminate();
+                process.waitForFinished(5000);
+            }
+            bus.unregisterService(QStringLiteral("ru.omp.am"));
+            bus.unregisterObject(QStringLiteral("/ru/omp/am"));
+            return 1;
+        }
+    }
     process.terminate();
     check(process.waitForFinished(5000), "stop actual test manager");
     bus.unregisterService(QStringLiteral("ru.omp.am"));
@@ -249,8 +372,349 @@ int actualManager(const QString &binary)
     std::puts("Actual manager background startup test passed");
     return 0;
 }
+
+int sharedMicrogWorkerIntegration(const QString &workerExecutable, const QString &apk,
+                                 const QString &androidRoot)
+{
+    QTemporaryDir directory;
+    check(directory.isValid(), "create isolated shared microG integration directory");
+    qputenv("XDG_CONFIG_HOME", directory.path().toLocal8Bit());
+    qputenv("XDG_DATA_HOME", directory.path().toLocal8Bit());
+    QSettings settings;
+    settings.setValue(QStringLiteral("googleServices/provider"), QStringLiteral("none"));
+    settings.sync();
+    check(settings.status() == QSettings::NoError, "select integration microG provider");
+
+    const QString identityDirectory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    check(QDir().mkpath(identityDirectory), "create isolated caller registry");
+    const QString appId = QStringLiteral("ru.androidcompatibilitylayer.Android0123456789abcdef01234567");
+    const QString rpmPath = QDir(directory.path()).filePath(appId + QStringLiteral("-1.0.0-1.x86_64.rpm"));
+    QFile rpm(rpmPath);
+    check(rpm.open(QIODevice::WriteOnly), "create exported caller fixture");
+    rpm.close();
+    check(StandaloneDiagnosticRegistry::save(identityDirectory, rpmPath, QStringLiteral("example.client1")),
+          "register exported caller package");
+
+    const QString dataDirectory = QDir(directory.path()).filePath(QStringLiteral("worker-data"));
+    const QString appsDirectory = QDir(directory.path()).filePath(QStringLiteral("worker-apps"));
+    check(QDir().mkpath(dataDirectory) && QDir().mkpath(appsDirectory),
+          "create isolated worker directories");
+    QFile apps(QDir(appsDirectory).filePath(QStringLiteral("apps.txt")));
+    check(apps.open(QIODevice::WriteOnly | QIODevice::Text), "create worker package list");
+    const QByteArray appList = "example.client1\t\tClient\t1.0\t1\n";
+    check(apps.write(appList) == appList.size(), "write worker package list");
+    apps.close();
+
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    IdentityFixture identity;
+    identity.executable = QStringLiteral("/usr/bin/") + appId;
+    check(bus.registerVirtualObject(QStringLiteral("/ru/omp/am"), &identity),
+          "register fixture identity object");
+    check(bus.registerService(QStringLiteral("ru.omp.am")), "register fixture identity service");
+
+    ManagerLifecycle lifecycle([]() { return false; });
+    const QStringList workerArguments = QStringList()
+        << QStringLiteral("--apk=") + QFileInfo(apk).absoluteFilePath()
+        << QStringLiteral("--data-dir=") + dataDirectory
+        << QStringLiteral("--android-root=") + QFileInfo(androidRoot).absoluteFilePath()
+        << QStringLiteral("--apps-dir=") + appsDirectory;
+    QString error;
+    check(lifecycle.start(true, &error), "start manager integration service before opt-in");
+    settings.setValue(QStringLiteral("googleServices/provider"), QStringLiteral("microg"));
+    settings.sync();
+    check(settings.status() == QSettings::NoError, "opt in to microG after manager startup");
+    lifecycle.refreshSharedMicrogProvider();
+    check(lifecycle.configureSharedMicrogWorker(
+              QFileInfo(workerExecutable).absoluteFilePath(), workerArguments,
+              ManagerLifecycle::registryPackageResolver(identityDirectory), &error),
+          "configure manager-derived resolver and production worker after opt-in");
+
+    int stream = -1;
+    const QString clientName = QStringLiteral("shared-microg-worker-integration-client");
+    {
+        QDBusConnection client = QDBusConnection::connectToBus(QDBusConnection::SessionBus, clientName);
+        check(client.isConnected(), "connect dedicated integration client");
+        QDBusMessage resolve = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"), QStringLiteral("ResolveCaller"));
+        QDBusPendingReply<QStringList> identityReply(waitFor(client.asyncCall(resolve, 120000), 120000));
+        check(!identityReply.isError() && identityReply.value().size() == 4 &&
+              identityReply.value().at(0) == client.baseService() &&
+              identityReply.value().at(1) == QLatin1String("example.client1") &&
+              identityReply.value().at(2).toInt() >= 11000 &&
+              identityReply.value().at(3).toInt() >= 50000,
+              "resolve fixture caller through IdentifyByBusName and export registry");
+
+        QDBusMessage open = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"), QStringLiteral("OpenClientChannel"));
+        const QDBusMessage opened = QDBusPendingCallWatcher(
+            waitFor(client.asyncCall(open, 120000), 120000)).reply();
+        const QList<QVariant> values = opened.arguments();
+        check(opened.type() == QDBusMessage::ReplyMessage && values.size() == 4 &&
+              values.at(0).canConvert<QDBusUnixFileDescriptor>(),
+              "manager returns channel only after production worker ACK");
+        check(values.at(1).type() == QVariant::Int &&
+              values.at(1).toInt() == identityReply.value().at(2).toInt() &&
+              values.at(2).type() == QVariant::Int &&
+              values.at(2).toInt() == identityReply.value().at(3).toInt() &&
+              values.at(3).toString() == identityReply.value().at(1),
+              "channel reply carries the manager-resolved identity sent to the worker");
+        QDBusUnixFileDescriptor descriptor = values.at(0).value<QDBusUnixFileDescriptor>();
+        stream = takeSharedMicrogStream(&descriptor, &error);
+        check(stream >= 0, "take manager-issued stream descriptor");
+        QDBusConnection::disconnectFromBus(clientName);
+    }
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    bool eof = false;
+    while (!eof && elapsed.elapsed() < 15000) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+        struct pollfd streamEvent = { stream, POLLIN | POLLHUP, 0 };
+        if (::poll(&streamEvent, 1, 25) > 0) {
+            char byte = 0;
+            const ssize_t count = ::read(stream, &byte, 1);
+            if (count == 0) eof = true;
+            else check(count < 0, "discard no unexpected stream payload during teardown");
+        }
+    }
+    ::close(stream);
+    check(eof, "client disconnect revokes channel and stops worker bridge");
+    bus.unregisterService(QStringLiteral("ru.omp.am"));
+    bus.unregisterObject(QStringLiteral("/ru/omp/am"));
+    std::puts("Manager→supervisor→production self-spawn→microG worker integration passed");
+    return 0;
+}
+// Test-only stand-in for Aurora's identification service: reports the sender's real executable.
+class ProcessIdentityFixture : public QDBusVirtualObject
+{
+public:
+    QString introspect(const QString &) const override { return QString(); }
+    bool handleMessage(const QDBusMessage &message, const QDBusConnection &connection) override
+    {
+        if (message.interface() != QLatin1String("ru.omp.am.Identify") ||
+            message.member() != QLatin1String("IdentifyByBusName")) return false;
+        const QString sender = message.arguments().value(0).toString();
+        const QDBusReply<uint> pid = connection.interface()->servicePid(sender);
+        const QString executable = pid.isValid()
+            ? QFile::symLinkTarget(QStringLiteral("/proc/%1/exe").arg(pid.value())) : QString();
+        if (message.arguments().size() != 1 || executable.isEmpty()) {
+            connection.send(message.createErrorReply(QDBusError::Failed, QStringLiteral("unknown sender")));
+            return true;
+        }
+        connection.send(message.createReply(QVariantList() << executable << QStringLiteral("test-key")));
+        return true;
+    }
+};
+
+// Test-only manager: argv = apk android-root data-dir apps-dir appId=package...
+// Runs until stdin closes. Settings, registry and UID allocation use a fresh temporary directory.
+int sharedMicrogManagerFixture(QCoreApplication &app, const QStringList &args)
+{
+    const QString workerExecutable =
+        QString::fromLocal8Bit(qgetenv("ACL_SHARED_MICROG_MANAGER_EXECUTABLE"));
+    check(args.size() >= 5 && QFileInfo(workerExecutable).isExecutable(),
+          "fixture arguments: apk android-root data-dir apps-dir appId=package...; "
+          "ACL_SHARED_MICROG_MANAGER_EXECUTABLE set");
+    QTemporaryDir directory;
+    check(directory.isValid(), "create fixture configuration directory");
+    qputenv("XDG_CONFIG_HOME", directory.path().toLocal8Bit());
+    qputenv("XDG_DATA_HOME", directory.path().toLocal8Bit());
+    QSettings settings;
+    settings.setValue(QStringLiteral("googleServices/provider"), QStringLiteral("microg"));
+    settings.sync();
+    check(settings.status() == QSettings::NoError, "select fixture microG provider");
+    const QString identityDirectory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    check(QDir().mkpath(identityDirectory), "create fixture registry");
+    for (int i = 4; i < args.size(); ++i) {
+        const int separator = args.at(i).indexOf(QLatin1Char('='));
+        check(separator > 0, "fixture mapping is appId=package");
+        const QString rpmPath = QDir(directory.path()).filePath(
+            args.at(i).left(separator) + QStringLiteral("-1.0.0-1.x86_64.rpm"));
+        QFile rpm(rpmPath);
+        check(rpm.open(QIODevice::WriteOnly), "create fixture exported RPM");
+        rpm.close();
+        check(StandaloneDiagnosticRegistry::save(identityDirectory, rpmPath, args.at(i).mid(separator + 1)),
+              "register fixture caller package");
+    }
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    ProcessIdentityFixture identity;
+    check(bus.registerVirtualObject(QStringLiteral("/ru/omp/am"), &identity), "register fixture identity object");
+    check(bus.registerService(QStringLiteral("ru.omp.am")), "register fixture identity service");
+    ManagerLifecycle lifecycle([]() { return false; });
+    QString error;
+    check(lifecycle.start(true, &error), "start fixture manager service");
+    const QStringList workerArguments = QStringList()
+        << QStringLiteral("--apk=") + QFileInfo(args.at(0)).absoluteFilePath()
+        << QStringLiteral("--android-root=") + QFileInfo(args.at(1)).absoluteFilePath()
+        << QStringLiteral("--data-dir=") + QFileInfo(args.at(2)).absoluteFilePath()
+        << QStringLiteral("--apps-dir=") + QFileInfo(args.at(3)).absoluteFilePath();
+    check(lifecycle.configureSharedMicrogWorker(
+              QFileInfo(workerExecutable).absoluteFilePath(), workerArguments,
+              ManagerLifecycle::registryPackageResolver(identityDirectory), &error),
+          "configure fixture worker backend");
+    QSocketNotifier input(STDIN_FILENO, QSocketNotifier::Read);
+    QObject::connect(&input, &QSocketNotifier::activated, &app, [&app, &input]() {
+        char buffer[64];
+        if (::read(STDIN_FILENO, buffer, sizeof(buffer)) <= 0) {
+            input.setEnabled(false);
+            app.quit();
+        }
+    });
+    std::puts("SHARED_MICROG_MANAGER_FIXTURE_READY");
+    std::fflush(stdout);
+    const int result = app.exec();
+    lifecycle.disableSharedMicrogWorker();
+    bus.unregisterService(QStringLiteral("ru.omp.am"));
+    bus.unregisterObject(QStringLiteral("/ru/omp/am"));
+    return result;
+}
 }
 
+int lockFile(const QString &path)
+{
+    const int fd = ::open(QFile::encodeName(path).constData(), O_WRONLY | O_CREAT, 0666);
+    if (fd < 0) return -1;
+    struct flock lock = {};
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_len = 1;
+    if (fcntl(fd, F_SETLK, &lock) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+bool otherProcessCanLock(const QString &path)
+{
+    const int fd = lockFile(path);
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
+}
+
+void step(const char *line)
+{
+    std::puts(line);
+    std::fflush(stdout);
+    char buffer[16];
+    if (!std::fgets(buffer, sizeof(buffer), stdin)) std::exit(1);
+}
+
+// Every descriptor this process has open on path must be close-on-exec, so QProcess children
+// (adb, guests) never keep the launcher lock file open.
+bool descriptorsCloseOnExec(const QString &path)
+{
+    const QDir fds(QStringLiteral("/proc/self/fd"));
+    int found = 0;
+    for (const QString &name : fds.entryList(QDir::Files | QDir::System | QDir::NoDotAndDotDot)) {
+        if (QDir::cleanPath(QFile::symLinkTarget(fds.filePath(name))) != QDir::cleanPath(path)) continue;
+        const int flags = fcntl(name.toInt(), F_GETFD);
+        if (flags < 0 || !(flags & FD_CLOEXEC)) return false;
+        ++found;
+    }
+    return found > 0;
+}
+
+bool waitHeld(QCoreApplication &app, SingleInstanceLock &lock, int milliseconds)
+{
+    QElapsedTimer timer;
+    timer.start();
+    while (!lock.held() && timer.elapsed() < milliseconds) {
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(10);
+    }
+    return lock.held();
+}
+
+// Mirrors mapplauncherd: the booster locks inside the process that becomes the app and forgets the fd.
+// Driven by the parent: adopt, windowless release, show while a forwarding launch holds the lock,
+// hide -> show, show while the lock stays busy past the retry budget, then a later show.
+int singleInstanceHolder(QCoreApplication &app, const QString &path)
+{
+    if (lockFile(path) < 0) return 1;
+    SingleInstanceLock lock(nullptr, 50, 20);
+    if (!lock.adoptInherited() || lock.path() != QDir::cleanPath(path) || !lock.held()) return 1;
+    step(descriptorsCloseOnExec(path) ? "ADOPTED" : "ADOPTED-INHERITABLE");
+    lock.setHeld(false);
+    step(lock.held() ? "STILL-HELD" : "RELEASED");
+    lock.setHeld(true);
+    const bool held = waitHeld(app, lock, 5000);
+    step(!held ? "NOT-HELD" : descriptorsCloseOnExec(path) ? "HELD" : "HELD-INHERITABLE");
+    lock.setHeld(false); // window hidden
+    step(lock.held() ? "STILL-HELD" : "HIDDEN");
+    lock.setHeld(true); // window shown again
+    step(lock.held() ? "SHOWN" : "NOT-HELD");
+    lock.setHeld(false);
+    step(lock.held() ? "STILL-HELD" : "HIDDEN");
+    lock.setHeld(true);
+    lock.setHeld(true); // repeated show while retrying must not restart the budget
+    const bool exhausted = !waitHeld(app, lock, 3000) && !lock.retrying();
+    step(exhausted ? "EXHAUSTED" : "UNEXPECTED");
+    lock.setHeld(true);
+    step(waitHeld(app, lock, 2000) ? "RECOVERED" : "NOT-HELD");
+    return 0;
+}
+
+QByteArray readLine(QProcess &process)
+{
+    if (!process.canReadLine()) process.waitForReadyRead(6000);
+    return process.readLine().trimmed();
+}
+
+void advance(QProcess &process)
+{
+    process.write("\n");
+    check(process.waitForBytesWritten(5000), "advance single-instance holder");
+}
+
+void testSingleInstanceLock(const QString &root)
+{
+    const QString lockDir = root + QStringLiteral("/single-instance-locks/usr/bin/ru.androidcompatibilitylayer.appmanager");
+    check(QDir().mkpath(lockDir), "create single-instance lock directory");
+    const QString path = lockDir + QStringLiteral("/instance.lock");
+    QProcess holder;
+    holder.setProcessChannelMode(QProcess::ForwardedErrorChannel);
+    holder.start(QCoreApplication::applicationFilePath(),
+                 QStringList() << QStringLiteral("--single-instance-holder") << path);
+    check(holder.waitForStarted(5000), "start single-instance holder");
+    check(readLine(holder) == "ADOPTED", "manager adopts the launcher lock and marks it close-on-exec");
+    check(!otherProcessCanLock(path), "adopted lock still blocks other launches");
+    advance(holder);
+    check(readLine(holder) == "RELEASED", "windowless manager releases the lock");
+    check(otherProcessCanLock(path), "a launch can reach a forwarding process while no window exists");
+    int forwarder = lockFile(path);
+    check(forwarder >= 0, "forwarding launch holds the lock");
+    advance(holder);
+    check(!holder.waitForReadyRead(300), "manager waits while the forwarding launch holds the lock");
+    ::close(forwarder);
+    check(readLine(holder) == "HELD", "manager reacquires a close-on-exec lock once its window is shown");
+    check(!otherProcessCanLock(path), "shown manager blocks duplicate launches again");
+    advance(holder);
+    check(readLine(holder) == "HIDDEN", "hiding the window releases the lock");
+    check(otherProcessCanLock(path), "launch reaches a forwarding process after hide");
+    advance(holder);
+    check(readLine(holder) == "SHOWN", "showing the window again reacquires the lock");
+    check(!otherProcessCanLock(path), "lock blocks duplicate launches after hide -> show");
+    advance(holder);
+    check(readLine(holder) == "HIDDEN", "second hide releases the lock");
+    forwarder = lockFile(path);
+    check(forwarder >= 0, "long forwarding launch holds the lock");
+    advance(holder);
+    check(readLine(holder) == "EXHAUSTED", "busy lock stops retrying after the retry budget");
+    ::close(forwarder);
+    advance(holder);
+    check(readLine(holder) == "RECOVERED", "a later show reacquires after exhausted retries");
+    check(!otherProcessCanLock(path), "recovered lock blocks duplicate launches");
+    advance(holder);
+    check(holder.waitForFinished(5000) && holder.exitCode() == 0, "single-instance holder exits");
+    check(otherProcessCanLock(path), "lock is released on exit");
+    std::puts("Single-instance lock handover OK");
+}
 int main(int argc, char **argv)
 {
     qputenv("AURORA_APP_ID", "ru.androidcompatibilitylayer.appmanager");
@@ -258,18 +722,37 @@ int main(int argc, char **argv)
     QCoreApplication app(argc, argv);
     app.setOrganizationName(QStringLiteral("ru.androidcompatibilitylayer"));
     app.setApplicationName(QStringLiteral("appmanager"));
+    if (argc == 3 && QByteArray(argv[1]) == "--single-instance-holder")
+        return singleInstanceHolder(app, QString::fromLocal8Bit(argv[2]));
     if (argc == 4 && QByteArray(argv[1]) == "--server")
         return server(app, QString::fromLocal8Bit(argv[2]), QByteArray(argv[3]) == "fail",
                       QByteArray(argv[3]) == "auto", QByteArray(argv[3]) == "keep");
     if (argc == 3 && QByteArray(argv[1]) == "--activation-client")
         return activationClient(QString::fromLocal8Bit(argv[2]));
-    if (argc == 3 && QByteArray(argv[1]) == "--actual-manager")
-        return actualManager(QString::fromLocal8Bit(argv[2]));
+    if (argc == 3 && (QByteArray(argv[1]) == "--actual-manager" ||
+                      QByteArray(argv[1]) == "--actual-manager-transition"))
+        return actualManager(QString::fromLocal8Bit(argv[2]), QByteArray(argv[1]) == "--actual-manager-transition");
+    if (argc == 2 && QByteArray(argv[1]) == "--shared-microg-worker-integration")
+        return sharedMicrogWorkerIntegration(
+            QString::fromLocal8Bit(qgetenv("ACL_SHARED_MICROG_MANAGER_EXECUTABLE")),
+            QString::fromLocal8Bit(qgetenv("ACL_SHARED_MICROG_TEST_APK")),
+            QString::fromLocal8Bit(qgetenv("ACL_SHARED_MICROG_TEST_ANDROID_ROOT")));
+    if (argc >= 7 && QByteArray(argv[1]) == "--shared-microg-manager-fixture") {
+        QStringList args;
+        for (int i = 2; i < argc; ++i) args << QString::fromLocal8Bit(argv[i]);
+        return sharedMicrogManagerFixture(app, args);
+    }
+    if (argc == 2 && QByteArray(argv[1]) == "--diagnostic-client") {
+        const auto result = StandaloneMicrogDiagnostic::run(QDBusConnection::sessionBus());
+        std::printf("owner=%s\nreply=%s\n", qPrintable(result.owner), qPrintable(result.response));
+        return 0;
+    }
     if (argc == 3 && QByteArray(argv[1]) == "--desktop") {
         QFile desktop(QString::fromLocal8Bit(argv[2]));
         check(desktop.open(QIODevice::ReadOnly), "open manager desktop");
         bool applicationSection = false;
         bool allowsMultipleInstances = false;
+        bool singleCover = false;
         QByteArray exported, exec;
         while (!desktop.atEnd()) {
             const QByteArray line = desktop.readLine().trimmed();
@@ -280,19 +763,25 @@ int main(int argc, char **argv)
                 exec = line.mid(int(sizeof("ExecDBus=") - 1));
             else if (!applicationSection && line == "X-Nemo-Single-Instance=no")
                 allowsMultipleInstances = true;
+            else if (!applicationSection && line == "X-Aurora-Single-Cover=yes")
+                singleCover = true;
         }
         const QList<QByteArray> exports = exported.split(';');
         check(exports.contains(QByteArray("ru.androidcompatibilitylayer.appmanager.log")),
               "manager desktop exports log D-Bus interface");
         check(exec == QByteArray("/usr/bin/ru.androidcompatibilitylayer.appmanager --microg-service"),
               "manager desktop activates background manager");
-        check(!allowsMultipleInstances, "manager desktop does not allow multiple instances");
+        // A window-less --microg-service instance cannot answer the launcher's activation, so each
+        // tap starts a short-lived instance that forwards to it; one cover keeps a single switcher entry.
+        check(allowsMultipleInstances && singleCover,
+              "manager desktop starts forwarding instances with a single cover");
         std::puts("Manager desktop contract OK");
         return 0;
     }
 
     QTemporaryDir directory;
     check(directory.isValid(), "create test directory");
+    testSingleInstanceLock(directory.path());
     const QStringList uri{QStringLiteral("file:///tmp/sample.apk")};
     const QStringList malformed{QStringLiteral("file:///tmp/sample%u.apk")};
     const QStringList extra{QStringLiteral("%u"), uri.first()};
@@ -301,6 +790,7 @@ int main(int argc, char **argv)
           ManagerLifecycle::launchFileArguments(extra) == extra,
           "startup only ignores the sole unexpanded desktop field code");
     qputenv("XDG_CONFIG_HOME", directory.path().toLocal8Bit());
+    qputenv("XDG_DATA_HOME", directory.path().toLocal8Bit());
     QSettings settings;
     settings.setValue(QStringLiteral("googleServices/provider"), QStringLiteral("microg"));
     settings.sync();
@@ -311,6 +801,122 @@ int main(int argc, char **argv)
     QString error;
     check(ManagerLifecycle::forwardToRunningManager(QStringList(), &error) == ManagerLifecycle::NoOwner,
           "normal launch does not auto-activate an absent manager");
+    {
+        const QDBusConnection invalid = QDBusConnection::connectToBus(
+            QStringLiteral("unix:path=/nonexistent-acl-diagnostic-bus"), QStringLiteral("invalid-test-bus"));
+        const auto result = StandaloneMicrogDiagnostic::run(invalid);
+        check(result.owner.startsWith(QLatin1String("error:")) &&
+              result.response == QLatin1String("not sent"), "bus failure is distinct from absent owner");
+        QDBusConnection::disconnectFromBus(QStringLiteral("invalid-test-bus"));
+    }
+    {
+        QProcess client;
+        client.start(app.applicationFilePath(), QStringList() << QStringLiteral("--diagnostic-client"));
+        check(client.waitForFinished(20000), "finish absent-owner diagnostic client");
+        const QByteArray output = client.readAllStandardOutput();
+        check(output.contains("owner=absent\n") && output.contains("reply=error:"),
+              "client reports absent owner and activation failure separately");
+    }
+
+    {
+        const QString root = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        const QString id = QStringLiteral("ru.androidcompatibilitylayer.Android0123456789abcdef01234567");
+        const QString second = QStringLiteral("ru.androidcompatibilitylayer.Android1123456789abcdef01234567");
+        check(QDir().mkpath(root), "create private registry root");
+        const QString rpm = directory.path() + QLatin1Char('/') + id + QStringLiteral("-1.0.0-1.x86_64.rpm");
+        QFile fixture(rpm);
+        check(fixture.open(QIODevice::WriteOnly), "create exported RPM fixture");
+        fixture.close();
+        check(StandaloneDiagnosticRegistry::save(root, rpm, QStringLiteral("org.example.app")),
+              "save exported mapping");
+        check(StandaloneDiagnosticRegistry::save(root, rpm, QStringLiteral("org.example.app")),
+              "repeat cached export");
+        check(!StandaloneDiagnosticRegistry::save(root, rpm, QStringLiteral("org.example.other")),
+              "reject conflicting mapping");
+        check(StandaloneDiagnosticRegistry::lookup(root, id) == QLatin1String("org.example.app") &&
+              StandaloneDiagnosticRegistry::lookup(root, second).isEmpty(), "lookup exact exported ID");
+        check(StandaloneDiagnosticRegistry::appIdFromExecutable(QStringLiteral("/usr/bin/") + id) == id &&
+              StandaloneDiagnosticRegistry::appIdFromExecutable(
+                  QStringLiteral("/opt/app/") + id + QStringLiteral("/1.0/bin/") + id) == id &&
+              StandaloneDiagnosticRegistry::appIdFromExecutable(
+                  QStringLiteral("/opt/app/") + id + QStringLiteral("/1.0/bin/") + second).isEmpty(),
+              "validate identity executable path");
+        IdentityFixture identity;
+        identity.executable = QStringLiteral("/usr/bin/") + id;
+        check(bus.registerVirtualObject(QStringLiteral("/ru/omp/am"), &identity), "register diagnostic identity");
+        check(bus.registerService(QStringLiteral("ru.omp.am")), "register diagnostic identity service");
+        QProcess process;
+        startServer(process, eventFile);
+        QDBusMessage resolve = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"), QStringLiteral("ResolveCaller"));
+        QDBusPendingReply<QStringList> resolved(waitFor(bus.asyncCall(resolve)));
+        check(resolved.isError() && resolved.error().type() == QDBusError::AccessDenied,
+              "background manager refuses registry-only identity mapping");
+        identity.executable = QStringLiteral("/usr/bin/") + second;
+        QDBusPendingReply<QStringList> unknown(waitFor(bus.asyncCall(resolve)));
+        check(unknown.isError() && unknown.error().type() == QDBusError::AccessDenied,
+              "background manager rejects unknown standalone");
+        identity.executable = QStringLiteral("/usr/bin/") + id;
+        QDBusMessage ping = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/androidcompatibilitylayer/appmanager"),
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"), QStringLiteral("DiagnosticPing"));
+        QDBusMessage reply = QDBusPendingCallWatcher(waitFor(bus.asyncCall(ping))).reply();
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+        check(reply.type() == QDBusMessage::ReplyMessage && reply.arguments().size() == 1 &&
+              reply.arguments().first().toString() == QLatin1String("synthetic-ok") &&
+              identity.sender == bus.baseService(), "registered actual sender gets synthetic response");
+        QProcess client;
+        QEventLoop clientLoop;
+        QTimer clientTimer;
+        clientTimer.setSingleShot(true);
+        QObject::connect(&client, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+                         &clientLoop, &QEventLoop::quit);
+        QObject::connect(&clientTimer, &QTimer::timeout, &clientLoop, &QEventLoop::quit);
+        client.start(app.applicationFilePath(), QStringList() << QStringLiteral("--diagnostic-client"));
+        check(client.waitForStarted(5000), "start separate diagnostic client");
+        clientTimer.start(20000);
+        clientLoop.exec();
+        check(client.state() == QProcess::NotRunning && client.exitCode() == 0,
+              "separate diagnostic client completed");
+        const QByteArray clientOutput = client.readAllStandardOutput();
+        check(clientOutput.contains("owner=present\n") && clientOutput.contains("reply=synthetic-ok\n") &&
+              identity.sender.startsWith(QLatin1Char(':')) && identity.sender != bus.baseService(),
+              "separate client gets response using its own sender");
+        identity.executable = QStringLiteral("/usr/bin/") + second;
+        reply = QDBusPendingCallWatcher(waitFor(bus.asyncCall(ping))).reply();
+        check(reply.type() == QDBusMessage::ErrorMessage &&
+              reply.errorName() == QLatin1String("org.freedesktop.DBus.Error.AccessDenied"),
+              "unknown sender is refused");
+        identity.executable = QStringLiteral("/usr/bin/") + id;
+        identity.key.clear();
+        reply = QDBusPendingCallWatcher(waitFor(bus.asyncCall(ping))).reply();
+        check(reply.type() == QDBusMessage::ErrorMessage &&
+              reply.errorName() == QLatin1String("org.freedesktop.DBus.Error.AccessDenied"),
+              "unverified identity is refused");
+        ping << id;
+        reply = QDBusPendingCallWatcher(waitFor(bus.asyncCall(ping))).reply();
+        check(reply.type() == QDBusMessage::ErrorMessage, "identity arguments are rejected");
+#else
+        check(reply.type() == QDBusMessage::ErrorMessage &&
+              reply.errorName() == QLatin1String("org.freedesktop.DBus.Error.UnknownMethod"),
+              "diagnostic method unavailable by default");
+#endif
+        check(read(eventFile).isEmpty(), "diagnostic did not open manager window");
+        process.terminate();
+        check(process.waitForFinished(5000), "stop diagnostic manager");
+        QProcess restarted;
+        startServer(restarted, eventFile);
+        QDBusPendingReply<QStringList> afterRestart(waitFor(bus.asyncCall(resolve)));
+        check(afterRestart.isError() && afterRestart.error().type() == QDBusError::AccessDenied,
+              "manager continues refusing registry-only identity across restart");
+        restarted.terminate();
+        check(restarted.waitForFinished(5000), "stop restarted manager");
+        bus.unregisterService(QStringLiteral("ru.omp.am"));
+        bus.unregisterObject(QStringLiteral("/ru/omp/am"));
+    }
 
     {
         QProcess process;
@@ -322,6 +928,22 @@ int main(int argc, char **argv)
         check(process.state() == QProcess::Running, "retained background manager survives idle timeout");
         process.terminate();
         check(process.waitForFinished(5000), "stop retained background manager");
+    }
+    {
+        QProcess process;
+        startServer(process, eventFile);
+        QDBusMessage start = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/omp/RuntimeManager/IntentHandler1"),
+            QStringLiteral("ru.omp.RuntimeManager.IntentHandler1"), QStringLiteral("HandleIntent"));
+        start << QStringLiteral("Start") << QVariantMap();
+        check(QDBusPendingCallWatcher(waitFor(bus.asyncCall(start))).reply().type() == QDBusMessage::ReplyMessage,
+              "RuntimeManager Start intent is answered");
+        waitEvents(eventFile, "GUI\n");
+        check(read(eventFile).count("GUI\n") == 1, "Start intent opens the background manager window once");
+        process.terminate();
+        check(process.waitForFinished(5000), "stop started background manager");
+        QFile::remove(eventFile);
     }
     {
         QProcess process;

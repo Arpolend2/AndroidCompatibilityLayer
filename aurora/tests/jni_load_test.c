@@ -13,6 +13,7 @@
 typedef void *(*static_id_fn)(void *, mg_jobj *, const char *, const char *);
 typedef void (*static_void_fn)(void *, mg_jobj *, void *, const mg_jvalue *);
 typedef unsigned char (*call_boolean_fn)(void *, mg_jobj *, void *, const mg_jvalue *);
+typedef void *(*call_object_fn)(void *, mg_jobj *, void *, const mg_jvalue *);
 typedef unsigned char (*exception_check_fn)(void *);
 
 static void *method;
@@ -52,6 +53,17 @@ static int call_unity_load(const char *path)
     return result;
 }
 
+static mg_jobj *call_firebase_registrar(void)
+{
+    void *env = mg_jni_env();
+    void **table = *(void ***)env;
+    mg_jobj *cls = mg_jni_class_object("com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar");
+    void *method = ((static_id_fn)table[113])(env, cls,
+        "getInstance", "()Lcom/google/firebase/platforminfo/GlobalLibraryVersionRegistrar;");
+    if (!method) return NULL;
+    return ((call_object_fn)table[114])(env, cls, method, NULL);
+}
+
 typedef struct load_call {
     const char *path;
     int done, exception;
@@ -74,6 +86,7 @@ int main(int argc, char **argv)
     const char *unity_name = "FirebaseCppApp-13_6_0";
     const char *unity_file = "libFirebaseCppApp-13_6_0.so";
     void *env, **table;
+    mg_jobj *activity;
     mg_lib *lib, *failed_lib, *unity_lib;
     int (*entered)(void), (*calls)(void), (*failed_calls)(void);
     int (*unity_calls)(void);
@@ -86,8 +99,15 @@ int main(int argc, char **argv)
     int i;
     if (argc != 2 || !mg_core_init()) return 1;
     mg_ld_add_search_dir(argv[1]);
-    mg_jni_android_setup("android/app/Activity", "test", "/nonexistent.apk", 480, 800, 160);
+    activity = mg_jni_android_setup("android/app/Activity", "test", "/nonexistent.apk", 480, 800, 160);
     mg_unity_register_jni();
+    mg_jni_class("com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar", "java/lang/Object");
+    {
+        mg_jvalue v;
+        v.j = 0;
+        v.l = activity;
+        mg_jni_set_static("com/unity3d/player/UnityPlayer", "currentActivity", 'L', v);
+    }
     env = mg_jni_env();
     table = *(void ***)env;
     system_class = mg_jni_class_object("java/lang/System");
@@ -136,5 +156,12 @@ int main(int argc, char **argv)
     CHECK(call_unity_load(unity_name) && unity_calls() == 1);
     CHECK(call_unity_load("/data/app/test-1/lib/arm/libFirebaseCppApp-13_6_0.so") && unity_calls() == 1);
     CHECK(call_unity_load(unity_file) && unity_calls() == 1);
+    {
+        mg_jobj *unity_class = mg_jni_class_object("com/unity3d/player/UnityPlayer");
+        void *field = ((static_id_fn)table[144])(env, unity_class, "currentActivity", "Landroid/app/Activity;");
+        mg_jobj *current = field ? ((mg_jobj *(*)(void *, mg_jobj *, void *))table[145])(env, unity_class, field) : NULL;
+        CHECK(field && current == activity);
+    }
+    CHECK(call_firebase_registrar() != NULL);
     return errors ? 1 : 0;
 }

@@ -20,6 +20,7 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSet>
+#include <QSettings>
 #include <QUuid>
 
 namespace {
@@ -133,14 +134,15 @@ QString cachePath(const QString &directory)
 
 QByteArray RpmStandalone::cacheFingerprint(const QString &package, const QString &label, const QImage &icon,
                                            const QString &storeRoot, const QString &runtimeRoot,
-                                           const QString &qmlRoot, const QString &executable, bool fileDiagnostics)
+                                           const QString &qmlRoot, const QString &executable, bool fileDiagnostics,
+                                           const QString &managerVersion)
 {
     const ApkStore store(storeRoot);
     const QString apk = store.apkPath(package);
     const QFileInfo appDir(QFileInfo(apk).absolutePath());
     const QString abi = SharedRuntime::version(runtimeRoot);
     if (apk.isEmpty() || appDir.isSymLink() || !appDir.isDir() ||
-        abi != QLatin1String(STANDALONE_RUNTIME_ABI) || icon.isNull()) return {};
+        abi != QLatin1String(STANDALONE_RUNTIME_ABI) || icon.isNull() || managerVersion.isEmpty()) return {};
     QStringList denied;
     QString error;
     if (!PermissionSettings::read(appDir.filePath(), &denied, &error)) return {};
@@ -150,9 +152,11 @@ QByteArray RpmStandalone::cacheFingerprint(const QString &package, const QString
     if (privateData.isEmpty())
         privateData = QDir(appDir.canonicalFilePath()).filePath(QStringLiteral("data"));
     QCryptographicHash hash(QCryptographicHash::Sha256);
-    for (const QByteArray &value : {QByteArray("standalone-rpm-cache-v1"), package.toUtf8(), label.toUtf8(),
+    for (const QByteArray &value : {QByteArray("standalone-rpm-cache-v3"), managerVersion.toUtf8(),
+         package.toUtf8(), label.toUtf8(),
          abi.toUtf8(), RuntimeSettings::selectedLocale().toUtf8(), RuntimeSettings::theme().toUtf8(),
          RuntimeSettings::location().toUtf8(), QJsonDocument(QJsonArray::fromStringList(denied)).toJson(QJsonDocument::Compact),
+         QSettings().value(QStringLiteral("googleServices/provider"), QStringLiteral("none")).toString().toUtf8(),
          QByteArray(fileDiagnostics ? "1" : "0")})
         hashValue(&hash, value);
     QByteArray image;
@@ -311,11 +315,15 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     title.replace(QRegularExpression(QStringLiteral("[\\r\\n\\t]+")), QStringLiteral(" "));
     if (title.isEmpty()) title = package;
     title = title.left(512);
+    const bool sharedMicrog = package != QLatin1String("com.google.android.gms") &&
+        QSettings().value(QStringLiteral("googleServices/provider"), QStringLiteral("none")).toString() ==
+            QLatin1String("microg");
     QJsonObject metadata;
     metadata.insert(QStringLiteral("appId"), appId);
     metadata.insert(QStringLiteral("sharedRuntimeAbi"), runtimeVersion);
     metadata.insert(QStringLiteral("standaloneSnapshots"), true);
     metadata.insert(QStringLiteral("fileDiagnostics"), fileDiagnostics);
+    metadata.insert(QStringLiteral("sharedMicrog"), sharedMicrog);
     metadata.insert(QStringLiteral("package"), package);
     metadata.insert(QStringLiteral("displayName"), title);
     metadata.insert(QStringLiteral("locale"), RuntimeSettings::selectedLocale());
@@ -338,6 +346,10 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     osPermissions << QStringLiteral("Audio");
     osPermissions << QStringLiteral("ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager");
     osPermissions << QStringLiteral("ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager");
+    if (sharedMicrog) {
+        osPermissions << QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg@ru.androidcompatibilitylayer.appmanager");
+        osPermissions << QStringLiteral("ru.omp.am.Identify@ru.omp.am");
+    }
     if (allowedGroups.contains(QStringLiteral("camera"))) osPermissions << QStringLiteral("Camera");
     if (allowedGroups.contains(QStringLiteral("nearby_devices")) &&
         (requests("BLUETOOTH") || requests("BLUETOOTH_ADMIN") || requests("BLUETOOTH_SCAN") ||

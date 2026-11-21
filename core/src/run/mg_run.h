@@ -10,6 +10,8 @@ extern "C" {
 #endif
 
 bool mg_run_start(const megler_run_config *config);
+bool mg_run_start_headless(const megler_run_config *config);
+bool mg_run_is_headless(void);
 bool mg_run_active(void);
 const char *mg_run_last_error(void);
 void mg_run_set_error(const char *fmt, ...) MG_PRINTF(1, 2);

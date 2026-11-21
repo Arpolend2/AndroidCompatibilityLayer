@@ -433,6 +433,13 @@ public class PackageManager {
      * for its Google Drive backup failed until it said it took too long; Play Store said the same of it.
      */
     public String[] getPackagesForUid(int uid) {
+        if (megler.SharedMicrogIdentity.isClient() && uid == android.os.Process.myUid())
+            return new String[] { megler.Native.packageName() };
+        if (megler.SharedMicrogIdentity.isWorker() && uid != android.os.Process.myUid() &&
+                uid != megler.GooglePackages.SHARED_UID) {
+            String pkg = megler.SharedMicrogIdentity.packageForUid(uid);
+            return pkg == null ? null : new String[] { pkg };
+        }
         // Google Play services' and Google Services Framework's own uid (megler.GooglePackages.sharedUid): theirs alone.
         if (uid == megler.GooglePackages.SHARED_UID && uid != android.os.Process.myUid()) {
             java.util.ArrayList<String> google = new java.util.ArrayList<>();
@@ -440,8 +447,10 @@ public class PackageManager {
             if (megler.Gsf.packageInfo(megler.GooglePackages.GSF) != null) google.add(megler.GooglePackages.GSF);
             return google.isEmpty() ? null : google.toArray(new String[0]);
         }
+        if (megler.SharedMicrogIdentity.isClient()) return null;
         String other = otherOfUid(uid);
         if (other != null) return new String[] { other };
+        if (uid != android.os.Process.myUid()) return null;
         java.util.ArrayList<String> out = new java.util.ArrayList<>();
         out.add(megler.Native.packageName());
         if (uid == android.os.Process.myUid()) {
@@ -451,8 +460,15 @@ public class PackageManager {
         return out.toArray(new String[0]);
     }
     public String getNameForUid(int uid) {
+        if (megler.SharedMicrogIdentity.isClient() && uid == android.os.Process.myUid())
+            return megler.Native.packageName();
+        if (megler.SharedMicrogIdentity.isWorker() && uid != android.os.Process.myUid() &&
+                uid != megler.GooglePackages.SHARED_UID)
+            return megler.SharedMicrogIdentity.packageForUid(uid);
         if (uid == megler.GooglePackages.SHARED_UID && uid != android.os.Process.myUid()) return "com.google.uid.shared:" + uid;   /* a shared uid's name, as Android's */
-        String other = otherOfUid(uid); return other != null ? other : megler.Native.packageName();
+        if (megler.SharedMicrogIdentity.isClient()) return null;
+        String other = otherOfUid(uid);
+        return other != null ? other : uid == android.os.Process.myUid() ? megler.Native.packageName() : null;
     }
     /* Another app the phone has by its uid (megler.PhoneApps gives each one of its own), else null: the running app's. */
     private static String otherOfUid(int uid) {
@@ -460,7 +476,20 @@ public class PackageManager {
         for (megler.PhoneApps.App a : megler.PhoneApps.all()) if (a.uid == uid) return a.packageName;
         return null;
     }
-    public int getPackageUid(String pkg, int flags) throws NameNotFoundException { if (!mine(pkg) && megler.GooglePackages.is(pkg)) return megler.GooglePackages.applicationInfo(pkg).uid; if (!mine(pkg)) { megler.PhoneApps.App a = megler.PhoneApps.find(pkg); if (a != null) return a.uid; throw new NameNotFoundException(pkg); } return android.os.Process.myUid(); }
+    public int getPackageUid(String pkg, int flags) throws NameNotFoundException {
+        if (!mine(pkg) && megler.GooglePackages.is(pkg)) return megler.GooglePackages.applicationInfo(pkg).uid;
+        if (!mine(pkg)) {
+            if (megler.SharedMicrogIdentity.isWorker()) {
+                int uid = megler.SharedMicrogIdentity.uidForPackage(pkg);
+                if (uid >= 0) return uid;
+            } else if (!megler.SharedMicrogIdentity.isClient()) {
+                megler.PhoneApps.App a = megler.PhoneApps.find(pkg);
+                if (a != null) return a.uid;
+            }
+            throw new NameNotFoundException(pkg);
+        }
+        return android.os.Process.myUid();
+    }
     public int getPackageUid(String pkg, PackageInfoFlags flags) throws NameNotFoundException { return getPackageUid(pkg, (int) flags.getValue()); }
     /* components the app enabled or disabled (Instagram turns its own on in stages and checks each took), kept across launches */
     private static java.util.Properties sStates;

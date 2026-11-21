@@ -14,7 +14,9 @@
 #include <QProcess>
 #include <QTimer>
 #include <QtEndian>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
@@ -69,7 +71,46 @@ void EmbeddedChannel::reset()
         m_socket.clear();
     }
     m_input.clear();
+    m_sharedReader.reset();
+    m_sharedDirectory.reset();
+    m_sharedWriter.close();
     m_failed = false;
+}
+
+QString EmbeddedChannel::createSharedFrames()
+{
+    m_sharedDirectory.reset(new QTemporaryDir(QStringLiteral("/dev/shm/acl-preview-XXXXXX")));
+    if (m_sharedDirectory->isValid()) {
+        m_sharedReader.reset(new QTemporaryFile(m_sharedDirectory->path() + QStringLiteral("/frame-XXXXXX")));
+        if (m_sharedReader->open()) return m_sharedReader->fileName();
+    }
+    qWarning("Cannot create shared preview storage; using socket pixels.");
+    m_sharedReader.reset();
+    m_sharedDirectory.reset();
+    return QString();
+}
+
+void EmbeddedChannel::useSharedFrames(const QString &path)
+{
+    disableSharedFrames();
+    const QByteArray name = QFile::encodeName(path);
+    const int fd = ::open(name.constData(), O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        qWarning("Cannot open shared preview storage; using socket pixels.");
+        return;
+    }
+    struct stat status = {};
+    if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) || status.st_uid != geteuid() ||
+        (status.st_mode & (S_IRWXG | S_IRWXO)) ||
+        !m_sharedWriter.open(fd, QIODevice::ReadWrite | QIODevice::Unbuffered, QFileDevice::AutoCloseHandle)) {
+        ::close(fd);
+        qWarning("Cannot use shared preview storage; using socket pixels.");
+    }
+}
+
+void EmbeddedChannel::disableSharedFrames()
+{
+    m_sharedWriter.close();
 }
 
 bool EmbeddedChannel::connected() const
@@ -102,6 +143,19 @@ bool EmbeddedChannel::sendFrame(const QImage &frame)
     body[0] = 'F';
     qToBigEndian<quint32>(quint32(frame.width()), reinterpret_cast<uchar *>(body.data() + 1));
     qToBigEndian<quint32>(quint32(frame.height()), reinterpret_cast<uchar *>(body.data() + 5));
+    if (m_sharedWriter.isOpen()) {
+        if (m_sharedWriter.resize(bytes) && m_sharedWriter.seek(0) &&
+            m_sharedWriter.write(reinterpret_cast<const char *>(frame.constBits()), bytes) == bytes &&
+            m_sharedWriter.flush()) {
+            body[0] = 'S';
+            const QByteArray output = packet(body);
+            if (m_socket->write(output) == output.size()) return true;
+            fail(tr("Cannot send shared preview frame notice."));
+            return false;
+        }
+        qWarning("Cannot write the shared preview frame; using socket pixels.");
+        disableSharedFrames();
+    }
     body.append(reinterpret_cast<const char *>(frame.constBits()), int(bytes));
     const QByteArray output = packet(body);
     if (m_socket->write(output) != output.size()) {
@@ -130,12 +184,32 @@ void EmbeddedChannel::read()
                     fail(tr("Invalid preview control message.")); return;
                 }
                 emit message(doc.object());
-            } else if (body[0] == 'F' && size >= 9) {
+            } else if ((body[0] == 'F' && size >= 9) || (body[0] == 'S' && size == 9)) {
                 const uchar *data = reinterpret_cast<const uchar *>(body.constData());
                 const quint32 w = qFromBigEndian<quint32>(data + 1);
                 const quint32 h = qFromBigEndian<quint32>(data + 5);
-                if (!w || !h || w > 4096 || h > 4096 || quint64(w) * h * 4 != size - 9) {
+                const bool shared = body[0] == 'S';
+                const quint64 bytes = quint64(w) * h * 4;
+                if (!w || !h || w > 4096 || h > 4096 || bytes > maxFrameBytes - 9 ||
+                    (!shared && bytes != size - 9)) {
                     fail(tr("Invalid preview frame size.")); return;
+                }
+                if (shared) {
+                    if (!m_sharedReader || !m_sharedReader->isOpen()) {
+                        fail(tr("Shared preview frame was not negotiated."));
+                        return;
+                    }
+                    QImage image(int(w), int(h), QImage::Format_RGB32);
+                    // Copy into owned pixels before ACK. Do not mmap a file the peer could truncate.
+                    const ssize_t count = image.isNull() ? -1 :
+                        ::pread(m_sharedReader->handle(), image.bits(), size_t(bytes), 0);
+                    if (count != qint64(bytes)) {
+                        qWarning("Cannot read the shared preview frame; requesting socket pixels.");
+                        send(QJsonObject{{QStringLiteral("type"), QStringLiteral("retryFrameInline")}});
+                    } else {
+                        emit frame(image);
+                    }
+                    continue;
                 }
                 const QImage image(data + 9, int(w), int(h), int(w * 4), QImage::Format_RGB32);
                 emit frame(image.copy());
@@ -217,7 +291,7 @@ bool EmbeddedPreview::listen(QProcess *process, QString *error)
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
     m_gpuTransport.close();
     m_gpuEndpoint.clear();
-    if (!m_cpuFrameTransportOnly) {
+    if (!m_cpuFrameTransportOnly || m_verifyGpuImport) {
         m_gpuEndpoint = m_directory.path() + QStringLiteral("/gpu");
         QString gpuError;
         if (!m_gpuTransport.listen(m_gpuEndpoint, -1, &gpuError)) {
@@ -281,6 +355,11 @@ bool EmbeddedPreview::listen(QProcess *process, QString *error)
 void EmbeddedPreview::receiveGpuFrame(AuroraDmaBufFrame &&frame)
 {
     const quint64 id = frame.id;
+    if (m_cpuFrameTransportOnly && !frame.probeOnly) {
+        qWarning("Embedded GPU probe channel rejected a live frame; CPU output is unchanged.");
+        m_gpuTransport.sendReply(id, false);
+        return;
+    }
     const bool probeOnly = frame.probeOnly;
     if (probeOnly) {
         QPointer<EmbeddedPreview> self(this);
@@ -327,9 +406,17 @@ void EmbeddedPreview::acceptPending()
         m_channel.attach(socket);
         m_connectionTimer.stop();
         m_server.close();
+        if (qgetenv("ACL_EMBEDDED_CPU_SHARED_FRAMES") == "1") {
+            const QString sharedPath = m_channel.createSharedFrames();
+            if (!sharedPath.isEmpty())
+                command(QStringLiteral("sharedFrames"), QJsonObject{{QStringLiteral("path"), sharedPath}});
+        }
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
         if (!m_gpuEndpoint.isEmpty())
-            command(QStringLiteral("gpuConnect"), QJsonObject{{QStringLiteral("endpoint"), m_gpuEndpoint}});
+            command(QStringLiteral("gpuConnect"), QJsonObject{
+                {QStringLiteral("endpoint"), m_gpuEndpoint},
+                {QStringLiteral("probeOnly"), m_verifyGpuImport}
+            });
 #endif
         if (m_stopping) {
             command(QStringLiteral("stop"));
@@ -337,7 +424,7 @@ void EmbeddedPreview::acceptPending()
         }
         setRemoteTheme(m_dark, m_accent);
         if (m_width > 0 && m_height > 0) setViewport(m_width, m_height, m_ratio);
-        command(QStringLiteral("uiReady"), QJsonObject{{QStringLiteral("ready"), m_ready}});
+        setUiReady(m_ready);
     }
 }
 
@@ -394,7 +481,19 @@ void EmbeddedPreview::setViewport(qreal width, qreal height, qreal ratio)
     PreviewPlayer::setViewport(width, height, ratio);
     m_width = width; m_height = height; m_ratio = ratio;
     command(QStringLiteral("viewport"), QJsonObject{{QStringLiteral("width"), width},
-            {QStringLiteral("height"), height}, {QStringLiteral("ratio"), ratio}});
+            {QStringLiteral("height"), height}, {QStringLiteral("ratio"), ratio},
+            {QStringLiteral("rotation"), displayRotation()}});
+}
+
+void EmbeddedPreview::setDisplayRotation(int rotation)
+{
+    if (rotation < 0 || rotation > 3) {
+        PreviewPlayer::setDisplayRotation(rotation);
+        return;
+    }
+    if (rotation == displayRotation()) return;
+    PreviewPlayer::setDisplayRotation(rotation);
+    if (m_width > 0 && m_height > 0) setViewport(m_width, m_height, m_ratio);
 }
 
 void EmbeddedPreview::stop()
@@ -435,12 +534,27 @@ void EmbeddedPreview::closeToManager()
 void EmbeddedPreview::setUiReady(bool ready)
 {
     m_ready = ready;
-    command(QStringLiteral("uiReady"), QJsonObject{{QStringLiteral("ready"), ready}});
+    command(QStringLiteral("uiReady"), QJsonObject{{QStringLiteral("ready"), ready},
+            {QStringLiteral("pickerMultiple"), true}, {QStringLiteral("pickerPhoto"), true}});
 }
 
 void EmbeddedPreview::selected(const QString &token, const QString &path)
 {
     command(QStringLiteral("selected"), QJsonObject{{QStringLiteral("token"), token}, {QStringLiteral("path"), path}});
+}
+void EmbeddedPreview::selectedMany(const QString &token, const QStringList &paths)
+{
+    command(QStringLiteral("selectedMany"), QJsonObject{{QStringLiteral("token"), token},
+            {QStringLiteral("paths"), QJsonArray::fromStringList(paths)}});
+}
+void EmbeddedPreview::validatePhoto(const QString &token, const QString &path)
+{
+    command(QStringLiteral("validatePhoto"), QJsonObject{{QStringLiteral("token"), token},
+            {QStringLiteral("path"), path}});
+}
+void EmbeddedPreview::confirmPhoto(const QString &token)
+{
+    command(QStringLiteral("confirmPhoto"), QJsonObject{{QStringLiteral("token"), token}});
 }
 void EmbeddedPreview::canceled(const QString &token)
 {
@@ -471,11 +585,24 @@ void EmbeddedPreview::receive(const QJsonObject &message)
         const QJsonArray array = message.value(QStringLiteral("filters")).toArray();
         QStringList filters;
         for (const QJsonValue &value : array) if (value.isString()) filters << value.toString();
-        if (!token.isEmpty() && !filters.isEmpty()) emit showPicker(token, filters);
+        if (!token.isEmpty() && !filters.isEmpty())
+            emit showPicker(token, filters, message.value(QStringLiteral("multiple")).toBool(false));
         else {
             qWarning("Invalid embedded preview picker request.");
             if (!token.isEmpty()) showFailed(token);
         }
+    } else if (type == QLatin1String("photo")) {
+        const QString token = message.value(QStringLiteral("token")).toString();
+        const QString path = message.value(QStringLiteral("path")).toString();
+        if (!token.isEmpty() && !path.isEmpty()) emit showPhoto(token, path);
+        else if (!token.isEmpty()) showFailed(token);
+    } else if (type == QLatin1String("closePhoto")) {
+        emit closePhoto(message.value(QStringLiteral("token")).toString());
+    } else if (type == QLatin1String("photoValidated")) {
+        const QJsonValue valid = message.value(QStringLiteral("valid"));
+        const QString token = message.value(QStringLiteral("token")).toString();
+        if (!token.isEmpty() && valid.isBool()) emit photoValidated(token, valid.toBool());
+        else qWarning("Invalid embedded preview photo validation.");
     } else {
         qWarning("Unknown embedded preview message.");
     }
@@ -498,9 +625,20 @@ EmbeddedPreviewChild::EmbeddedPreviewChild(PreviewPlayer *player, AuroraPickerHo
 #endif
         sendStatus();
     });
-    connect(picker, &AuroraPickerHost::showPicker, this, [this](const QString &token, const QStringList &filters) {
+    connect(picker, &AuroraPickerHost::showPicker, this, [this](const QString &token, const QStringList &filters, bool multiple) {
         command(QStringLiteral("picker"), QJsonObject{{QStringLiteral("token"), token},
-                {QStringLiteral("filters"), QJsonArray::fromStringList(filters)}});
+                {QStringLiteral("filters"), QJsonArray::fromStringList(filters)},
+                {QStringLiteral("multiple"), multiple}});
+    });
+    connect(picker, &AuroraPickerHost::showPhoto, this, [this](const QString &token, const QString &path) {
+        command(QStringLiteral("photo"), QJsonObject{{QStringLiteral("token"), token}, {QStringLiteral("path"), path}});
+    });
+    connect(picker, &AuroraPickerHost::closePhoto, this, [this](const QString &token) {
+        command(QStringLiteral("closePhoto"), QJsonObject{{QStringLiteral("token"), token}});
+    });
+    connect(picker, &AuroraPickerHost::photoValidated, this, [this](const QString &token, bool valid) {
+        command(QStringLiteral("photoValidated"), QJsonObject{{QStringLiteral("token"), token},
+                {QStringLiteral("valid"), valid}});
     });
 }
 
@@ -631,13 +769,24 @@ void EmbeddedPreviewChild::receive(const QJsonObject &message)
             qWarning().noquote() << "Embedded GPU channel unavailable; using CPU presentation:"
                                  << (error.isEmpty() ? QStringLiteral("missing endpoint") : error);
         } else {
-            m_player->setRemoteGpuCanvasPresentation(presentGpuCanvas, this, &m_gpuTransport);
+            const bool probeOnly = message.value(QStringLiteral("probeOnly")).toBool();
+            m_player->setRemoteGpuCanvasPresentation(probeOnly ? nullptr : presentGpuCanvas,
+                                                      this, &m_gpuTransport);
             qInfo("Embedded worker authenticated a GPU channel to its parent");
         }
         maybeStart();
     } else
 #endif
-    if (type == QLatin1String("frameAck")) {
+    if (type == QLatin1String("sharedFrames")) {
+        m_channel.useSharedFrames(message.value(QStringLiteral("path")).toString());
+    } else if (type == QLatin1String("retryFrameInline")) {
+        if (m_frameOutstanding) {
+            m_channel.disableSharedFrames();
+            m_frameOutstanding = false;
+            m_framePending = true;
+            sendFrame();
+        }
+    } else if (type == QLatin1String("frameAck")) {
         m_frameOutstanding = false;
         sendFrame();
     } else if (type == QLatin1String("theme")) {
@@ -646,6 +795,13 @@ void EmbeddedPreviewChild::receive(const QJsonObject &message)
     } else if (type == QLatin1String("viewport") &&
                number(message, "width", 1, 8192, &a) && number(message, "height", 1, 8192, &b) &&
                number(message, "ratio", 0.1, 8, &c)) {
+        if (message.contains(QStringLiteral("rotation"))) {
+            double rotation;
+            if (number(message, "rotation", 0, 3, &rotation) && rotation == int(rotation))
+                m_player->setDisplayRotation(int(rotation));
+            else
+                qWarning() << "Invalid embedded viewport rotation";
+        }
         m_player->setViewport(a, b, c);
         m_haveViewport = true;
         maybeStart();
@@ -660,10 +816,31 @@ void EmbeddedPreviewChild::receive(const QJsonObject &message)
         m_player->close();
     } else if (type == QLatin1String("uiReady")) {
         m_uiReady = message.value(QStringLiteral("ready")).toBool();
+        m_picker->setPickerCapabilities(message.value(QStringLiteral("pickerMultiple")).toBool(false),
+                                        message.value(QStringLiteral("pickerPhoto")).toBool(false));
         m_picker->setUiReady(m_uiReady);
         maybeStart();
     } else if (type == QLatin1String("selected")) {
         m_picker->selected(message.value(QStringLiteral("token")).toString(), message.value(QStringLiteral("path")).toString());
+    } else if (type == QLatin1String("selectedMany")) {
+        const QJsonValue pathsValue = message.value(QStringLiteral("paths"));
+        QStringList paths;
+        if (!pathsValue.isArray()) {
+            m_picker->showFailed(message.value(QStringLiteral("token")).toString());
+            return;
+        }
+        for (const QJsonValue &value : pathsValue.toArray()) {
+            if (!value.isString()) {
+                m_picker->showFailed(message.value(QStringLiteral("token")).toString());
+                return;
+            }
+            paths << value.toString();
+        }
+        m_picker->selectedMany(message.value(QStringLiteral("token")).toString(), paths);
+    } else if (type == QLatin1String("validatePhoto")) {
+        m_picker->validatePhoto(message.value(QStringLiteral("token")).toString(), message.value(QStringLiteral("path")).toString());
+    } else if (type == QLatin1String("confirmPhoto")) {
+        m_picker->confirmPhoto(message.value(QStringLiteral("token")).toString());
     } else if (type == QLatin1String("canceled")) {
         m_picker->canceled(message.value(QStringLiteral("token")).toString());
     } else if (type == QLatin1String("pickerFailed")) {

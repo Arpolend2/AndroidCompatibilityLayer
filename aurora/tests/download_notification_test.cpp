@@ -5,6 +5,7 @@
 #include <QProcess>
 #include <QQmlComponent>
 #include <QQmlEngine>
+#include <QThread>
 #include <QTimer>
 
 #include <cstdio>
@@ -27,10 +28,25 @@ public slots:
         record.insert(QStringLiteral("progress"), hints.value(QStringLiteral("x-nemo-progress")).toDouble());
         std::puts(QJsonDocument(record).toJson(QJsonDocument::Compact).constData());
         std::fflush(stdout);
+        if (summary.contains(QStringLiteral("org.example.delayed"))) QThread::msleep(350);
         static uint nextId = 42;
         return replacesId ? replacesId : nextId++;
     }
+    void CloseNotification(uint id)
+    {
+        QJsonObject record;
+        record.insert(QStringLiteral("closed"), int(id));
+        std::puts(QJsonDocument(record).toJson(QJsonDocument::Compact).constData());
+        std::fflush(stdout);
+    }
 };
+
+static void settle()
+{
+    QEventLoop wait;
+    QTimer::singleShot(150, &wait, &QEventLoop::quit);
+    wait.exec();
+}
 
 static QJsonObject readRecord(QProcess &service)
 {
@@ -53,7 +69,7 @@ int main(int argc, char **argv)
         std::fflush(stdout);
         return app.exec();
     }
-    if (argc != 2) return 2;
+    if (argc != 2 && !(argc == 3 && QByteArray(argv[2]) == "--rpm")) return 2;
     QProcess service;
     service.start(QCoreApplication::applicationFilePath(), {QStringLiteral("--service")});
     if (!service.waitForStarted() || !service.waitForReadyRead(5000) ||
@@ -66,6 +82,79 @@ int main(int argc, char **argv)
         for (const QQmlError &error : component.errors())
             std::fprintf(stderr, "%s\n", qPrintable(error.toString()));
         return 1;
+    }
+    if (argc == 3) {
+        notification->setProperty("appPackage", QStringLiteral("org.example.app"));
+        notification->setProperty("status", QStringLiteral("Inspecting"));
+        notification->setProperty("detailsVisible", true);
+        notification->setProperty("busy", true);
+        settle();
+        if (service.canReadLine()) return 1;
+        notification->setProperty("detailsVisible", false);
+        settle();
+        QJsonObject first = readRecord(service);
+        if (first.value(QStringLiteral("replaces")).toInt(-1) != 0 ||
+            first.value(QStringLiteral("summary")).toString() != QStringLiteral("Creating RPM for org.example.app") ||
+            first.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Inspecting") ||
+            !first.value(QStringLiteral("hasProgress")).toBool() ||
+            first.value(QStringLiteral("progress")).toDouble() != -1) return 1;
+        notification->setProperty("status", QStringLiteral("Building"));
+        settle();
+        QJsonObject building = readRecord(service);
+        if (building.value(QStringLiteral("replaces")).toInt() != 42 ||
+            building.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Building") ||
+            building.value(QStringLiteral("progress")).toDouble() != -1) return 1;
+        notification->setProperty("status", QStringLiteral("Signing"));
+        settle();
+        QJsonObject signing = readRecord(service);
+        if (signing.value(QStringLiteral("replaces")).toInt() != 42 ||
+            signing.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Signing")) return 1;
+        notification->setProperty("status", QStringLiteral("Saving"));
+        settle();
+        QJsonObject saving = readRecord(service);
+        if (saving.value(QStringLiteral("replaces")).toInt() != 42 ||
+            saving.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Saving")) return 1;
+        notification->setProperty("detailsVisible", true);
+        settle();
+        if (readRecord(service).value(QStringLiteral("closed")).toInt() != 42) return 1;
+        notification->setProperty("detailsVisible", false);
+        settle();
+        QJsonObject returned = readRecord(service);
+        if (returned.value(QStringLiteral("replaces")).toInt(-1) != 0 ||
+            returned.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Saving")) return 1;
+        notification->setProperty("busy", false);
+        notification->setProperty("status", QStringLiteral("Failed"));
+        settle();
+        if (readRecord(service).value(QStringLiteral("closed")).toInt() != 43) return 1;
+        notification->setProperty("appPackage", QStringLiteral("org.example.next"));
+        notification->setProperty("status", QStringLiteral("Inspecting again"));
+        notification->setProperty("busy", true);
+        settle();
+        QJsonObject next = readRecord(service);
+        if (next.value(QStringLiteral("replaces")).toInt(-1) != 0 ||
+            next.value(QStringLiteral("summary")).toString() != QStringLiteral("Creating RPM for org.example.next")) return 1;
+        notification.reset();
+        settle();
+        if (readRecord(service).value(QStringLiteral("closed")).toInt() != 44) return 1;
+        notification.reset(component.create());
+        if (!notification) return 1;
+        notification->setProperty("appPackage", QStringLiteral("org.example.delayed"));
+        notification->setProperty("status", QStringLiteral("Inspecting"));
+        notification->setProperty("busy", true);
+        QEventLoop briefWait;
+        QTimer::singleShot(50, &briefWait, &QEventLoop::quit);
+        briefWait.exec();
+        notification->setProperty("busy", false);
+        QEventLoop delayedWait;
+        QTimer::singleShot(600, &delayedWait, &QEventLoop::quit);
+        delayedWait.exec();
+        if (readRecord(service).value(QStringLiteral("replaces")).toInt(-1) != 0 ||
+            readRecord(service).value(QStringLiteral("closed")).toInt() != 45) return 1;
+        notification.reset();
+        service.terminate();
+        service.waitForFinished();
+        std::puts("Standalone RPM notification OK");
+        return 0;
     }
     notification->setProperty("title", QStringLiteral("microG"));
     auto publish = [&](const QString &message, int percent, bool complete) {

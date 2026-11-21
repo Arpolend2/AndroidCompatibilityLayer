@@ -1,4 +1,5 @@
 #include "../preview.h"
+#include "../preview_orientation.h"
 #include "../audio_output.h"
 #include "../camera_host.h"
 #include "../bluetooth_host.h"
@@ -28,6 +29,10 @@ static uint32_t themeAccent;
 static bool themeDark;
 static double fixedLatitude;
 static double fixedLongitude;
+static int surfaceCalls;
+static int surfaceRotation;
+static int surfaceWidth;
+static int surfaceHeight;
 
 class TestSurface : public PreviewSurface
 {
@@ -62,7 +67,13 @@ extern "C" bool megler_run(const megler_run_config *config)
 extern "C" const char *megler_last_error() { return ""; }
 extern "C" void megler_touch(int, int, float, float) {}
 extern "C" void megler_key(int code, bool down) { keys.push_back(down ? code : -code); }
-extern "C" void megler_set_surface(int, int, int, int) {}
+extern "C" void megler_set_surface(int width, int height, int, int rotation)
+{
+    ++surfaceCalls;
+    surfaceWidth = width;
+    surfaceHeight = height;
+    surfaceRotation = rotation;
+}
 extern "C" void megler_stop() { ++stops; }
 megler_gfx_host previewGraphics() { return {}; }
 megler_camera_host auroraCameraHost() { return {}; }
@@ -133,17 +144,39 @@ int main(int argc, char **argv)
         if (finished != 0 || !preview.status().contains(QStringLiteral("ended"))) return 1;
     }
     PreviewPlayer player(QStringLiteral("."), QStringLiteral("."));
+    const Qt::ScreenOrientation directions[] = { Qt::PortraitOrientation, Qt::LandscapeOrientation,
+        Qt::InvertedPortraitOrientation, Qt::InvertedLandscapeOrientation };
+    for (int n = 0; n < 4; ++n)
+        for (int a = 0; a < 4; ++a)
+            if (previewDisplayRotation(directions[n], directions[a]) != (a - n + 4) % 4) return 1;
+    if (previewDisplayRotation(Qt::PrimaryOrientation, Qt::LandscapeOrientation) != -1 ||
+        previewDisplayRotation(Qt::PortraitOrientation, Qt::PrimaryOrientation) != -1) return 1;
+    const Qt::ScreenOrientation waylandNative = previewNativeOrientation(Qt::PrimaryOrientation, true);
+    for (int a = 0; a < 4; ++a)
+        if (previewDisplayRotation(waylandNative, directions[a]) != a) return 1;
+    if (previewNativeOrientation(Qt::PrimaryOrientation, false) != Qt::PrimaryOrientation ||
+        previewNativeOrientation(Qt::LandscapeOrientation, true) != Qt::LandscapeOrientation ||
+        previewDisplayRotation(waylandNative, Qt::PrimaryOrientation) != -1) return 1;
     player.setStandaloneSettings(QStringLiteral("de-DE"), QStringLiteral("light"), QStringLiteral("55.5,37.5"));
     player.setSystemTheme(true, QColor(0x12, 0x34, 0x56));
     player.setViewport(1080, 2340, 1);
+    player.setDisplayRotation(1);
     player.start();
     app.processEvents();
     if (localeSet != "de-DE" || themeDark || themeAccent != 0xff123456 ||
         fixedLatitude != 55.5 || fixedLongitude != 37.5 ||
-        runConfig.width != 443 || runConfig.height != 960 || runConfig.density_dpi != 148) {
+        runConfig.width != 443 || runConfig.height != 960 || runConfig.density_dpi != 148 ||
+        runConfig.rotation != 1) {
         std::fprintf(stderr, "Runtime settings were not passed to Megler\n");
         return 1;
     }
+    const int previousSurfaceCalls = surfaceCalls;
+    player.setDisplayRotation(3);
+    if (surfaceCalls != previousSurfaceCalls + 1 || surfaceWidth != 443 ||
+        surfaceHeight != 960 || surfaceRotation != 3) return 1;
+    player.setDisplayRotation(3);
+    player.setDisplayRotation(4);
+    if (surfaceCalls != previousSurfaceCalls + 1 || player.displayRotation() != 3) return 1;
     if (!log.text().contains(QStringLiteral("core integration test"))) {
         std::fprintf(stderr, "Core messages were not delivered to the Log page\n");
         return 1;

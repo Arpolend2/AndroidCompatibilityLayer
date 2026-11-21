@@ -1,4 +1,5 @@
 #include "../preview_gpu.h"
+#include "../../core/include/megler.h"
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
@@ -41,10 +42,149 @@ static bool waitUntil(const std::atomic<bool> &done, int timeout)
     return done.load();
 }
 
+static bool checkLayerComposition()
+{
+    QQuickWindow window;
+    window.setGeometry(0, 0, 64, 64);
+    std::shared_ptr<PreviewGpuState> holder = std::make_shared<PreviewGpuState>();
+    PreviewGpuState &state = *holder;
+    PreviewGpuItem *item = new PreviewGpuItem(holder, window.contentItem());
+    item->setSize(QSizeF(64, 64));
+    FrameNotifier notifier;
+    notifier.item = item;
+    window.show();
+    item->update();
+    QElapsedTimer startup;
+    startup.start();
+    while (!state.qtContext() && startup.elapsed() < 3000) {
+        QCoreApplication::processEvents();
+        QThread::msleep(1);
+    }
+    QOpenGLContext *share = state.qtContext();
+    if (!share || !share->isOpenGLES()) return false;
+    QOffscreenSurface surface;
+    surface.setFormat(share->format());
+    surface.create();
+    if (!surface.isValid()) return false;
+    std::atomic<int> requested{1}, completed{0};
+    std::atomic<bool> ok{true};
+    std::thread producer([&]() {
+        QOpenGLContext context;
+        context.setFormat(share->format());
+        context.setShareContext(share);
+        if (!context.create() || !context.makeCurrent(&surface)) {
+            ok.store(false);
+            completed.store(5);
+            return;
+        }
+        QOpenGLFunctions *gl = context.functions();
+        gl->initializeOpenGLFunctions();
+        QByteArray pixels(64 * 64 * 4, char(0));
+        for (int y = 0; y < 64; ++y)
+            for (int x = 32; x < 64; ++x) {
+                pixels[(y * 64 + x) * 4 + 1] = char(255);
+                pixels[(y * 64 + x) * 4 + 3] = char(255);
+            }
+        GLuint canvas = 0;
+        gl->glGenTextures(1, &canvas);
+        gl->glBindTexture(GL_TEXTURE_2D, canvas);
+        gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 64, 64, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.constData());
+        gl->glFinish();
+        EGLDisplay display = eglGetCurrentDisplay();
+        const EGLint configAttrs[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                     EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
+        const EGLint surfaceAttrs[] = {EGL_WIDTH, 8, EGL_HEIGHT, 8, EGL_NONE};
+        const EGLint contextAttrs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+        EGLConfig config = nullptr;
+        EGLint count = 0;
+        bool available = display != EGL_NO_DISPLAY && eglChooseConfig(display, configAttrs, &config, 1, &count) && count;
+        EGLSurface eglSurface = available ? eglCreatePbufferSurface(display, config, surfaceAttrs) : EGL_NO_SURFACE;
+        EGLContext guest = eglSurface != EGL_NO_SURFACE
+            ? eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttrs) : EGL_NO_CONTEXT;
+        available = guest != EGL_NO_CONTEXT && eglMakeCurrent(display, eglSurface, eglSurface, guest);
+        if (available) {
+            gl->glClearColor(1, 0, 0, 1);
+            gl->glClear(GL_COLOR_BUFFER_BIT);
+            gl->glFinish();
+        }
+        unsigned char pixel[4] = {};
+        if (available) gl->glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+        const bool canvasReady = available && canvas && gl->glGetError() == GL_NO_ERROR &&
+            pixel[0] >= 240 && pixel[1] <= 15 && pixel[2] <= 15 &&
+            state.presentCanvas(canvas, 64, 64, &notifier);
+        state.place(0, 0, 0, 64, 64, 0, &notifier);
+        ok.store(canvasReady && state.submit(display, eglSurface, 8, 8, &notifier, 0) == 1);
+        if (!context.makeCurrent(&surface)) ok.store(false);
+        if (guest != EGL_NO_CONTEXT) eglDestroyContext(display, guest);
+        if (eglSurface != EGL_NO_SURFACE) eglDestroySurface(display, eglSurface);
+        completed.store(1);
+        while (requested.load() < 2) QThread::msleep(1);
+        QImage views(64, 64, QImage::Format_ARGB32_Premultiplied);
+        views.fill(Qt::transparent);
+        for (int y = 0; y < 64; ++y)
+            for (int x = 32; x < 64; ++x)
+                views.setPixel(x, y, qRgba(0, 0, 255, 255));
+        ok.store(ok.load() && state.setViews(views.constBits(), 64, 64, views.bytesPerLine(), &notifier));
+        completed.store(2);
+        while (requested.load() < 3) QThread::msleep(1);
+        ok.store(ok.load() && state.presentCanvas(canvas, 64, 64, &notifier));
+        completed.store(3);
+        while (requested.load() < 4) QThread::msleep(1);
+        state.place(0, 0, 0, 64, 64, MEGLER_GL_ABOVE, &notifier);
+        ok.store(ok.load() && state.presentCanvas(canvas, 64, 64, &notifier));
+        completed.store(4);
+        while (requested.load() < 5) QThread::msleep(1);
+        if (!state.releaseCanvasTexture(canvas, &notifier)) ok.store(false);
+        else gl->glDeleteTextures(1, &canvas);
+        completed.store(5);
+        context.doneCurrent();
+    });
+
+    auto waitStep = [&](int step) {
+        QElapsedTimer timer;
+        timer.start();
+        while (completed.load() < step && timer.elapsed() < 4000) {
+            QCoreApplication::processEvents();
+            QThread::msleep(1);
+        }
+        if (completed.load() < step || !ok.load())
+            std::fprintf(stderr, "FAIL: composition step %d: %s\n", step, qPrintable(state.lastFailure()));
+        return completed.load() >= step && ok.load();
+    };
+    auto checkPixels = [&](const QColor &left, const QColor &right) {
+        const QImage frame = window.grabWindow();
+        if (frame.isNull()) return false;
+        const QColor a = frame.pixelColor(frame.width() / 4, frame.height() / 2);
+        const QColor b = frame.pixelColor(frame.width() * 3 / 4, frame.height() / 2);
+        auto close = [](const QColor &p, const QColor &expected) {
+            return qAbs(p.red() - expected.red()) < 16 && qAbs(p.green() - expected.green()) < 16 &&
+                   qAbs(p.blue() - expected.blue()) < 16;
+        };
+        const bool matches = close(a, left) && close(b, right);
+        if (!matches)
+            std::fprintf(stderr, "FAIL: composition pixels left=%s right=%s expected=%s,%s\n",
+                         qPrintable(a.name()), qPrintable(b.name()), qPrintable(left.name()), qPrintable(right.name()));
+        return matches;
+    };
+    bool passed = waitStep(1) && checkPixels(Qt::red, Qt::green);
+    requested.store(2);
+    passed = waitStep(2) && checkPixels(Qt::red, Qt::blue) && passed;
+    requested.store(3);
+    passed = waitStep(3) && checkPixels(Qt::red, Qt::green) && passed;
+    requested.store(4);
+    passed = waitStep(4) && checkPixels(Qt::red, Qt::red) && passed;
+    requested.store(5);
+    passed = waitStep(5) && passed;
+    producer.join();
+    return passed;
+}
+
 int main(int argc, char **argv)
 {
     QSurfaceFormat format;
     format.setRenderableType(QSurfaceFormat::OpenGLES);
+    format.setSamples(0);
+    format.setAlphaBufferSize(8);
     QSurfaceFormat::setDefaultFormat(format);
     QGuiApplication app(argc, argv);
     QQuickWindow window;
@@ -173,6 +313,10 @@ int main(int argc, char **argv)
         !resizedCenter.isValid() || resizedCenter.red() > 15 || resizedCenter.green() > 15 || resizedCenter.blue() < 240) {
         std::fprintf(stderr, "FAIL: frame must be independent and acknowledged before Qt renders it (wait %lld ms)\n",
                      static_cast<long long>(renderWaitMs.load()));
+        return 1;
+    }
+    if (!checkLayerComposition()) {
+        std::fprintf(stderr, "FAIL: SurfaceView must be below Canvas/views, except when placed above\n");
         return 1;
     }
     std::printf("GPU Canvas acknowledgment and redraw checks passed (wait %lld ms)\n",

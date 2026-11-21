@@ -208,6 +208,7 @@ static int gerr(int e)
 {
     switch (e) {
     case MG_NE_OK: return 0;
+    case MG_NE_BADF: return GE_BADF;
     case MG_NE_AGAIN: return GE_AGAIN;
     case MG_NE_INPROGRESS: return GE_INPROGRESS;
     case MG_NE_ALREADY: return GE_ALREADY;
@@ -554,6 +555,22 @@ static int sock_register(gsock *s, int flags)
     if (fd < 0) sock_close(s);
     return fd;
 }
+
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+int mg_net_import_unix_stream(int host_fd)
+{
+    int err = 0;
+    mg_sock *host;
+    gsock *s;
+    net_start();
+    host = mg_sock_dup_unix_stream(host_fd, &err);
+    if (!host) return fail(gerr(err));
+    s = sock_new(G_AF_UNIX, G_SOCK_STREAM, 0);
+    s->host = host;
+    s->state = S_CONNECTED;
+    return sock_register(s, G_SOCK_CLOEXEC);
+}
+#endif
 
 /* ------------------------------------------------- addresses, Android's way */
 
@@ -1630,6 +1647,8 @@ static int name_of(int fd, void *addr, u32 *len, bool peer)
         mg_fd_unlock();
     } else if (!mg_sock_name(s->host, peer, &a, &err)) {
         e = gerr(err);
+    } else if (s->family == G_AF_UNIX) {
+        give_local_name(NULL, 0, addr, len);
     } else {
         give_addr(s, &a, addr, len);
     }

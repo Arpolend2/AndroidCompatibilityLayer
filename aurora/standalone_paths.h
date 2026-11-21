@@ -16,6 +16,7 @@ struct StandalonePaths {
     QStringList deniedPermissions;
     bool standaloneSnapshots = false;
     bool fileDiagnostics = false;
+    bool sharedMicrog = false;
 };
 
 enum class StandaloneRuntimeError { None, Unavailable, Incompatible };

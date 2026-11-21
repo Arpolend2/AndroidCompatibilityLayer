@@ -86,6 +86,7 @@
 #include "../src/drivers/mg_java_gfx.h"
 #include "../src/drivers/mg_java_gl.h"
 #include "../src/dvm/mg_dvm.h"
+#include "../src/dvm/mg_dvm_internal.h"
 #include "../src/mg_base.h"
 #include "../src/host/mg_host.h"
 #include "../src/ndk/mg_egl.h"
@@ -804,6 +805,10 @@ void mg_tests_java_set_screen(int width, int height, int dpi)
 static bool g_portrait;
 /* Not one of the test apps: nothing is known of what its manifest says. */
 static bool g_any_app;
+static bool g_headless_app;
+static bool g_headless_real;
+static bool g_headless_real_server;
+static bool g_headless_activity;
 static bool g_crash_app;
 static bool g_microg_app;
 /* The camera app: it alone has cameras (the stand-in), so that the others still see a phone without one. */
@@ -1527,6 +1532,8 @@ static const char *phone_apps_fixture(void)
     f = fopen(path, "wb");
     if (f) {
         fputs("com.example.other\tcom.example.other.Main\tOther\t1.0\t3\n", f);
+        if (g_headless_real_server)
+            fputs("megler.test.binderfd\tmegler.test.binderfd.Main\tBinder test\t1.0\t1\n", f);
         fclose(f);
     }
     free(path);
@@ -1708,7 +1715,8 @@ static bool start(const char *apk, const char *android_root)
          * its start asks the library: run_natives.)
          */
         char *report = g_splits_dir ? megler_apk_report_splits(apk, g_splits_dir) : megler_apk_report(apk);
-        CHECK(report && strstr(report, g_entry_at_start ? "\"engine\":\"native-activity\"" : "\"engine\":\"java\"") && strstr(report, "\"runnable\":true"));
+        if (g_headless_app && !g_headless_real) CHECK(report && strstr(report, "\"runnable\":false"));
+        else CHECK(report && strstr(report, g_entry_at_start ? "\"engine\":\"native-activity\"" : "\"engine\":\"java\"") && strstr(report, "\"runnable\":true"));
         /* The app whose launcher entries are aliases, the first one disabled: what is started is what the enabled one stands for. */
         if (g_crash_app) CHECK(report && strstr(report, "\"activity\":\"megler.test.crash.First\""));
         if (!g_any_app) CHECK(report && strstr(report, g_portrait ? "\"orientation\":\"portrait\"" : "\"orientation\":\"unspecified\""));
@@ -1750,7 +1758,8 @@ static bool start(const char *apk, const char *android_root)
         bytes = mg_file_read_all(path, &size);
         if (bytes && (json = (char *)realloc(bytes, size + 1)) != NULL) json[size] = 0;
         else free(bytes);
-        CHECK(json && strstr(json, "\"activities\":[{\"name\":"));
+        if (g_headless_app && !g_headless_real && !g_headless_activity) CHECK(json && strstr(json, "\"activities\":[]"));
+        else CHECK(json && strstr(json, "\"activities\":[{\"name\":"));
         /* (The test apps are not signed: their certificates are none. A real app's are its own.) */
         if (!g_any_app) CHECK(json && strstr(json, "],\"certificates\":[]}"));
         if (g_crash_app) {
@@ -1769,7 +1778,27 @@ static bool start(const char *apk, const char *android_root)
     /* MG_JAVA_START_ACTIVITY: an activity of the app another app asks for, as the shell hands it over (Play Store asking
        microG for its sign-in): started once the app's first activity is up. */
     if (getenv("MG_JAVA_START_ACTIVITY")) megler_start_activity(getenv("MG_JAVA_START_ACTIVITY"));
-    if (megler_run(&cfg)) return true;
+    if (g_headless_app && !g_headless_real) {
+        static const char *const invalid[] = {
+            "GUEST_HEADLESS_NO_DEX", "GUEST_HEADLESS_WRONG_ABI", "GUEST_HEADLESS_SPLIT"
+        };
+        size_t i;
+        bool started = megler_run(&cfg);
+        CHECK(!started);
+        if (started) { megler_stop(); return false; }
+        for (i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+            const char *path = getenv(invalid[i]);
+            CHECK(path && path[0]);
+            if (!path || !path[0]) return false;
+            cfg.apk_path = path;
+            started = megler_run_headless(&cfg);
+            CHECK(!started && strstr(megler_last_error(), "complete Java APK"));
+            if (started) { megler_stop(); return false; }
+        }
+        cfg.apk_path = apk;
+        say("  PASS headless APK validation and ordinary launch refusal");
+    }
+    if (g_headless_app ? megler_run_headless(&cfg) : megler_run(&cfg)) return true;
 #if !MG_HOST_ARM32
     {
         /*
@@ -1778,7 +1807,7 @@ static bool start(const char *apk, const char *android_root)
          */
         static mg_apk_info info;
         say("  (megler_run: %s -- the Java driver is started directly)", megler_last_error());
-        if (mg_apk_read_info(apk, &info) && !strcmp(info.engine, "java")) {
+        if (!g_headless_app && mg_apk_read_info(apk, &info) && !strcmp(info.engine, "java")) {
             mg_run_files(megler_data_dir(), megler_storage_dir(), info.package, &cfg.storage);
             g_direct = mg_driver_java.start(&cfg, &info);
             if (g_direct) return true;
@@ -5250,7 +5279,11 @@ int mg_tests_java_run(const char *which, const char *apk, const char *android_ro
     W.dir = picture_dir;
     if (picture_dir) mg_path_mkdirs(picture_dir);
     g_portrait = !strcmp(which, "demos");
-    g_any_app = !strcmp(which, "app");
+    g_headless_real_server = !strcmp(which, "headless-real-server");
+    g_headless_real = !strcmp(which, "headless-real") || g_headless_real_server;
+    g_headless_activity = !strcmp(which, "headless-activity");
+    g_headless_app = !strcmp(which, "headless") || g_headless_real || g_headless_activity;
+    g_any_app = !strcmp(which, "app") || g_headless_app;
     /* MG_JAVA_SPLITS: for an app that is not a test's, the folder of its splits (as the library keeps an app's beside its base). */
     if (g_any_app && getenv("MG_JAVA_SPLITS")) g_splits_dir = mg_strdup(getenv("MG_JAVA_SPLITS"));
     g_crash_app = !strcmp(which, "crash");
@@ -5382,6 +5415,49 @@ int mg_tests_java_run(const char *which, const char *apk, const char *android_ro
         else if (!strcmp(which, "bluetooth")) run_bluetooth();
         else if (!strcmp(which, "wifi")) run_wifi();
         else if (!strcmp(which, "pickers")) run_pickers();
+        else if (g_headless_app) {
+            int tries;
+            if (g_headless_real) {
+                CHECK(wait_line("I/Megler: headless application started", 0, 60) >= 0);
+                if (g_headless_real_server && running()) {
+                    static mg_jobj *headless_app;
+                    mg_jvalue app;
+                    bool attached = mg_dvm_thread_attach("headless-test", NULL, true);
+                    bool started = false;
+                    CHECK(attached);
+                    if (attached) {
+                        memset(&app, 0, sizeof(app));
+                        if (mg_dvm_call_static("megler/AppRunner", "application", "()Landroid/app/Application;", NULL, &app) && app.l) {
+                            headless_app = app.l;
+                            mg_dvm_add_root(&headless_app);
+                            started = mg_dvm_call_static("megler/test/binderfd/Main", "startHeadless",
+                                                         "(Landroid/content/Context;)V", &app, NULL);
+                            headless_app = NULL;
+                        }
+                        if (!started && mg_dvm_pending()) {
+                            char error[512];
+                            if (mg_dvm_describe_pending(error, sizeof(error))) say("  headless test setup failed: %s", error);
+                            mg_dvm_clear_pending();
+                        }
+                        mg_dvm_thread_detach();
+                    }
+                    CHECK(started);
+                    CHECK(wait_line("I/BinderGuestTest: PASS headless application started", 0, 30) >= 0);
+                    CHECK(wait_line("I/BinderGuestTest: PASS guest server closed", 0, 60) >= 0);
+                }
+            } else {
+                CHECK(wait_line("I/BinderGuestTest: PASS headless application started", 0, 30) >= 0);
+                if (g_headless_activity)
+                    CHECK(wait_line("I/BinderGuestTest: PASS headless activity destroyed", 0, 30) >= 0);
+                CHECK(wait_line("I/BinderGuestTest: PASS guest server closed", 0, 60) >= 0);
+            }
+            CHECK(running() && (g_headless_activity || W.pictures == 0));
+            megler_stop();
+            for (tries = 0; tries < 500 && running(); tries++) mg_sleep_ns(10000000ull);
+            CHECK(!running() && g_exited && g_status == 0);
+            if (!running() && g_exited && g_status == 0)
+                say("  PASS headless runtime stopped without an activity");
+        }
         else if (g_any_app) run_app();
         else run_hello();
         if (running()) {

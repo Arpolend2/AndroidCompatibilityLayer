@@ -6,6 +6,8 @@ option(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION "Enable experime
 option(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS "Enable experimental GPU rendering for Android Canvas" OFF)
 option(ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS "Generate optional test targets" ON)
 option(ANDROID_COMPATIBILITY_LAYER_BUILD_WEBVIEW_PROBE "Build the native Aurora WebView diagnostic" OFF)
+option(ANDROID_COMPATIBILITY_LAYER_BUILD_SHARED_MICROG_PROBE "Build the standalone shared microG IPC experiment (not installed)" OFF)
+option(ANDROID_COMPATIBILITY_LAYER_STANDALONE_MICROG_DIAGNOSTIC "Enable synthetic standalone microG IPC diagnostics" OFF)
 if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION AND NOT ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL)
     message(FATAL_ERROR "GPU composition requires ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL")
 endif()
@@ -14,6 +16,17 @@ if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS AND NOT ANDROID_COMPATIBI
 endif()
 
 set(APP_ID ru.androidcompatibilitylayer.appmanager)
+set(MANAGER_SPEC "${CMAKE_CURRENT_SOURCE_DIR}/rpm/ru.androidcompatibilitylayer.appmanager.spec")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MANAGER_SPEC}")
+foreach(field Version Release)
+    file(STRINGS "${MANAGER_SPEC}" manager_field REGEX "^${field}:[ \t]*")
+    if(NOT manager_field MATCHES "^${field}:[ \t]*([0-9][A-Za-z0-9._+~^]*)[ \t]*$")
+        message(FATAL_ERROR "The manager RPM spec must contain a literal ${field}")
+    endif()
+    set(MANAGER_${field} "${CMAKE_MATCH_1}")
+endforeach()
+set_source_files_properties(aurora/main.cpp PROPERTIES COMPILE_DEFINITIONS
+    "ACL_MANAGER_BUILD_VERSION=\"${MANAGER_Version}-${MANAGER_Release}\"")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/aurora/standalone-runtime-abi")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/aurora/standalone-runtime-abi" STANDALONE_RUNTIME_ABI)
@@ -34,6 +47,9 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(ANDROID_COMPATIBILITY_LAYER_BUILD_SHARED_MICROG_PROBE)
+    add_subdirectory(aurora/tests/shared_microg_headless)
+endif()
 qt5_add_translation(ANDROID_COMPATIBILITY_LAYER_TRANSLATIONS translations/androidcompatibilitylayer_ru.ts)
 add_custom_target(android_compatibility_layer_translations ALL DEPENDS ${ANDROID_COMPATIBILITY_LAYER_TRANSLATIONS})
 
@@ -146,8 +162,14 @@ add_library(acl_runtime_objects OBJECT
     aurora/external_apk_receiver.h
     aurora/manager_lifecycle.cpp
     aurora/manager_lifecycle.h
+    aurora/single_instance_lock.cpp
+    aurora/single_instance_lock.h
     aurora/shared_microg_ipc.cpp
     aurora/shared_microg_ipc.h
+    aurora/shared_microg_supervisor.cpp
+    aurora/shared_microg_supervisor.h
+    aurora/shared_microg_worker.c
+    aurora/shared_microg_worker.h
     aurora/preview.cpp
     aurora/preview.h
     aurora/embedded_preview.cpp
@@ -176,6 +198,48 @@ add_library(acl_runtime_objects OBJECT
     core/tests/mg_gfx_standin.c
     ${ZLIB_SOURCES}
 )
+if(ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR)
+    foreach(header
+            libavcodec/avcodec.h
+            libavcodec/version_major.h
+            libavutil/avconfig.h
+            libavutil/version.h)
+        if(NOT EXISTS "${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}/${header}")
+            message(FATAL_ERROR
+                "FFmpeg 7 include directory is incomplete: missing ${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}/${header}. "
+                "Run tools/prepare-ffmpeg7-headers.py --arch aarch64.")
+        endif()
+    endforeach()
+    file(STRINGS "${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}/libavcodec/version_major.h"
+        FFMPEG7_CODEC_VERSION_LINE REGEX "^#define LIBAVCODEC_VERSION_MAJOR")
+    file(STRINGS "${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}/libavutil/version.h"
+        FFMPEG7_UTIL_VERSION_LINE REGEX "^#define LIBAVUTIL_VERSION_MAJOR")
+    string(REGEX MATCH "[0-9]+" FFMPEG7_CODEC_MAJOR "${FFMPEG7_CODEC_VERSION_LINE}")
+    string(REGEX MATCH "[0-9]+" FFMPEG7_UTIL_MAJOR "${FFMPEG7_UTIL_VERSION_LINE}")
+    if(NOT FFMPEG7_CODEC_MAJOR STREQUAL "61" OR NOT FFMPEG7_UTIL_MAJOR STREQUAL "59")
+        message(FATAL_ERROR "FFmpeg bridge requires libavcodec 61 and libavutil 59 headers.")
+    endif()
+    set(FFMPEG7_EXPECTED_ARCH "")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        set(FFMPEG7_EXPECTED_ARCH "aarch64")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+        set(FFMPEG7_EXPECTED_ARCH "x86_64")
+    endif()
+    if(FFMPEG7_EXPECTED_ARCH AND EXISTS
+            "${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}/FFmpeg-HEADERS.txt")
+        file(STRINGS "${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}/FFmpeg-HEADERS.txt"
+            FFMPEG7_ARCH_LINE REGEX "^architecture=")
+        if(NOT FFMPEG7_ARCH_LINE STREQUAL "architecture=${FFMPEG7_EXPECTED_ARCH}")
+            message(FATAL_ERROR
+                "FFmpeg headers were prepared for '${FFMPEG7_ARCH_LINE}', but this build targets '${FFMPEG7_EXPECTED_ARCH}'.")
+        endif()
+    endif()
+    target_sources(acl_runtime_objects PRIVATE
+        aurora/codec_audio.cpp aurora/codec_audio.h aurora/codec_media_host.cpp)
+    target_include_directories(acl_runtime_objects PRIVATE
+        "${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}")
+    target_compile_definitions(acl_runtime_objects PRIVATE ACL_WITH_FFMPEG7_MEDIA)
+endif()
 add_executable(${APP_ID} aurora/application_entry.cpp aurora/report_webview.cpp)
 add_executable(acl-runtime aurora/application_entry.cpp)
 set_target_properties(acl-runtime PROPERTIES OUTPUT_NAME "${APP_ID}.runtime")
@@ -210,6 +274,9 @@ target_include_directories(acl_runtime_objects PRIVATE
     core/third_party/zlib
 )
 target_compile_definitions(acl_runtime_objects PRIVATE _GNU_SOURCE MEGLER_NO_EMBEDDED_TESTS)
+if(ANDROID_COMPATIBILITY_LAYER_STANDALONE_MICROG_DIAGNOSTIC)
+    target_compile_definitions(acl_runtime_objects PRIVATE ACL_STANDALONE_MICROG_DIAGNOSTIC)
+endif()
 target_compile_definitions(acl_runtime_objects PRIVATE STANDALONE_RUNTIME_ABI="${STANDALONE_RUNTIME_ABI}")
 if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL)
     target_compile_definitions(acl_runtime_objects PRIVATE MG_EXPERIMENTAL_NATIVE_EGL)
@@ -278,6 +345,7 @@ add_executable(android_compatibility_layer_preview_gpu_order_test EXCLUDE_FROM_A
 if(ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION)
     add_executable(android_compatibility_layer_preview_gpu_state_test EXCLUDE_FROM_ALL
         aurora/tests/preview_gpu_state_test.cpp aurora/preview_gpu.cpp aurora/preview_gpu.h
+        aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h
         aurora/egl_frame_transport.c)
     target_include_directories(android_compatibility_layer_preview_gpu_state_test PRIVATE ${EGL_INCLUDE_DIRS} ${GLES2_INCLUDE_DIRS})
     target_link_libraries(android_compatibility_layer_preview_gpu_state_test PRIVATE Qt5::Quick ${EGL_LDFLAGS} ${GLES2_LDFLAGS} pthread)
@@ -407,10 +475,32 @@ add_executable(android_compatibility_layer_google_services_runtime_test EXCLUDE_
 add_executable(android_compatibility_layer_manager_lifecycle_test EXCLUDE_FROM_ALL
     aurora/tests/manager_lifecycle_test.cpp
     aurora/manager_lifecycle.cpp aurora/manager_lifecycle.h
+    aurora/shared_microg_supervisor.cpp aurora/shared_microg_supervisor.h
+    aurora/single_instance_lock.cpp aurora/single_instance_lock.h
     aurora/external_apk_receiver.cpp aurora/external_apk_receiver.h
     aurora/external_apk_path.cpp aurora/shared_microg_ipc.cpp)
 target_include_directories(android_compatibility_layer_manager_lifecycle_test PRIVATE ${RUNTIME_MANAGER_INCLUDE_DIRS})
 target_link_libraries(android_compatibility_layer_manager_lifecycle_test PRIVATE Qt5::Core Qt5::DBus ${RUNTIME_MANAGER_LDFLAGS})
+add_executable(android_compatibility_layer_shared_microg_supervisor_test EXCLUDE_FROM_ALL
+    aurora/tests/shared_microg_supervisor_test.cpp
+    aurora/shared_microg_supervisor.cpp aurora/shared_microg_supervisor.h)
+target_link_libraries(android_compatibility_layer_shared_microg_supervisor_test PRIVATE Qt5::Core)
+
+add_executable(android_compatibility_layer_shared_microg_startup_client EXCLUDE_FROM_ALL
+    tools/shared-microg-startup-client.cpp aurora/shared_microg_ipc.cpp
+    ${CORE_SOURCES} ${TEST_SOURCES} ${ZLIB_SOURCES})
+target_include_directories(android_compatibility_layer_shared_microg_startup_client PRIVATE
+    core/third_party/zlib aurora/sqlite)
+target_compile_definitions(android_compatibility_layer_shared_microg_startup_client PRIVATE
+    _GNU_SOURCE MG_HAVE_SQLITE=1)
+target_link_libraries(android_compatibility_layer_shared_microg_startup_client PRIVATE Qt5::Core Qt5::DBus m pthread dl)
+if(ANDROID_COMPATIBILITY_LAYER_STANDALONE_MICROG_DIAGNOSTIC)
+    target_compile_definitions(android_compatibility_layer_manager_lifecycle_test PRIVATE ACL_STANDALONE_MICROG_DIAGNOSTIC)
+    add_executable(android_compatibility_layer_standalone_microg_diagnostic_page_test EXCLUDE_FROM_ALL
+        aurora/tests/standalone_microg_diagnostic_page_test.cpp)
+    target_link_libraries(android_compatibility_layer_standalone_microg_diagnostic_page_test
+        PRIVATE Qt5::Quick Qt5::DBus)
+endif()
 target_link_libraries(android_compatibility_layer_google_services_runtime_test PRIVATE Qt5::Core)
 
 add_executable(android_compatibility_layer_official_store_release_test EXCLUDE_FROM_ALL
@@ -460,6 +550,20 @@ add_executable(android_compatibility_layer_audio_output_test EXCLUDE_FROM_ALL
     aurora/audio_output.cpp
 )
 target_link_libraries(android_compatibility_layer_audio_output_test PRIVATE Qt5::Multimedia pthread)
+
+set(ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR "" CACHE PATH
+    "Directory containing matching FFmpeg 7 libavcodec and libavutil headers")
+add_executable(android_compatibility_layer_codec_media_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_audio_test.cpp
+    aurora/codec_audio.cpp
+    aurora/codec_media_host.cpp
+    aurora/audio_mp3_codec.cpp
+)
+if(ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR)
+    target_include_directories(android_compatibility_layer_codec_media_test PRIVATE
+        "${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}")
+endif()
+target_link_libraries(android_compatibility_layer_codec_media_test PRIVATE Qt5::Core)
 
 add_executable(android_compatibility_layer_audio_resampling_test EXCLUDE_FROM_ALL aurora/tests/audio_resampling_test.c)
 target_compile_options(android_compatibility_layer_audio_resampling_test PRIVATE -ffunction-sections -fdata-sections)
@@ -672,7 +776,8 @@ install(TARGETS ${APP_ID} RUNTIME DESTINATION bin)
 # Sailjail's private-bin instead of executing another binary.
 install(FILES "$<TARGET_FILE:acl-runtime>" DESTINATION share/${APP_ID}
     PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
-set(ANDROID_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/aurora/android-runtime")
+set(ANDROID_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/aurora/android-runtime"
+    CACHE PATH "ABI-matched Android runtime to install")
 foreach(file framework/megler-libcore.dex framework/core-oj.dex framework/core-libart.dex
              framework/conscrypt.dex framework/okhttp.dex framework/bouncycastle.dex framework/apache-xml.dex
              framework/megler-framework.dex framework/megler-framework-classes2.dex
@@ -683,6 +788,18 @@ foreach(file framework/megler-libcore.dex framework/core-oj.dex framework/core-l
         message(FATAL_ERROR "Android runtime is incomplete: ${ANDROID_ROOT}/${file}. See aurora/README.md.")
     endif()
 endforeach()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv7.*|arm)$")
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        set(ANDROID_RUNTIME_ARCH aarch64)
+    else()
+        set(ANDROID_RUNTIME_ARCH armv7hl)
+    endif()
+    configure_file(tools/aurora/check_runtime.cmake.in
+        "${CMAKE_CURRENT_BINARY_DIR}/check_android_runtime.cmake" @ONLY)
+    include("${CMAKE_CURRENT_BINARY_DIR}/check_android_runtime.cmake")
+    install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/check_android_runtime.cmake")
+endif()
 set(SHARED_ANDROID_RUNTIME share/common/ru.androidcompatibilitylayer/appmanager/android-runtime)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     set(WEBVIEW_PROVIDER "${CMAKE_CURRENT_SOURCE_DIR}/build/webview/arm64-v8a/webview.apk")

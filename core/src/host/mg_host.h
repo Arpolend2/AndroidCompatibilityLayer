@@ -712,7 +712,7 @@ enum {
     MG_NE_OK = 0, MG_NE_AGAIN, MG_NE_INPROGRESS, MG_NE_ALREADY, MG_NE_ISCONN, MG_NE_NOTCONN, MG_NE_CONNREFUSED, MG_NE_CONNRESET,
     MG_NE_CONNABORTED, MG_NE_TIMEDOUT, MG_NE_NETUNREACH, MG_NE_HOSTUNREACH, MG_NE_NETDOWN, MG_NE_NETRESET, MG_NE_ADDRINUSE,
     MG_NE_ADDRNOTAVAIL, MG_NE_AFNOSUPPORT, MG_NE_PROTONOSUPPORT, MG_NE_SOCKTNOSUPPORT, MG_NE_OPNOTSUPP, MG_NE_NOPROTOOPT, MG_NE_INVAL,
-    MG_NE_ACCES, MG_NE_MSGSIZE, MG_NE_NOBUFS, MG_NE_MFILE, MG_NE_SHUTDOWN, MG_NE_PIPE, MG_NE_DESTADDRREQ, MG_NE_FAULT, MG_NE_IO
+    MG_NE_ACCES, MG_NE_MSGSIZE, MG_NE_NOBUFS, MG_NE_MFILE, MG_NE_SHUTDOWN, MG_NE_PIPE, MG_NE_DESTADDRREQ, MG_NE_FAULT, MG_NE_IO, MG_NE_BADF
 };
 
 /* What mg_sock_ready says. MG_SOCK_RDHUP: the other side will send no more (its FIN, or a reset). */
@@ -740,6 +740,10 @@ enum {
  * default and not Windows'. NULL with *err set.
  */
 MG_HOSTAPI mg_sock *mg_sock_open(int family, int type, int protocol, int *err);
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+/* Duplicate a connected Unix stream for the guest; the caller retains fd. */
+mg_sock *mg_sock_dup_unix_stream(int fd, int *err);
+#endif
 MG_HOSTAPI void mg_sock_close(mg_sock *s);
 MG_HOSTAPI bool mg_sock_bind(mg_sock *s, const mg_sockaddr *a, int *err);
 MG_HOSTAPI bool mg_sock_listen(mg_sock *s, int backlog, int *err);

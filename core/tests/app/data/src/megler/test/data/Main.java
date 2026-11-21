@@ -5992,7 +5992,9 @@ public class Main extends Activity {
                     && java.util.Arrays.equals(signing.signingInfo.getApkContentsSigners()[0].toByteArray(), want);
             int uid = plain.applicationInfo.uid;
             detail = "plain=" + java.util.Arrays.toString(plain.signatures) + " sigs=" + got + " signing=" + signed + " uid=" + uid + " named=" + pm.getNameForUid(uid);
-            return plain.signatures == null && got && signed && uid != android.os.Process.myUid() && "com.example.other".equals(pm.getNameForUid(uid));
+            return plain.signatures == null && got && signed && uid != android.os.Process.myUid()
+                    && "com.example.other".equals(pm.getNameForUid(uid))
+                    && pm.getPackagesForUid(-1) == null && pm.getNameForUid(-1) == null;
         });
         // Packages compared by their signers: those the phone has match (the app's own, the platform's, another app's); one it does
         // not have is SIGNATURE_UNKNOWN_PACKAGE, as Android answers -- Google Play services took a match of a Pixel's system

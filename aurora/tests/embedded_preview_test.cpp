@@ -29,6 +29,68 @@ extern "C" {
 
 static megler_run_config config;
 static void output(const char *text) { std::printf("%s\n", text); std::fflush(stdout); }
+
+static bool testSharedFrames()
+{
+    QTemporaryDir directory;
+    QLocalServer server;
+    if (!directory.isValid() || !server.listen(directory.path() + QStringLiteral("/channel")))
+        return false;
+    auto *senderSocket = new QLocalSocket(&server);
+    senderSocket->connectToServer(server.fullServerName());
+    if (!senderSocket->waitForConnected(1000) || !server.waitForNewConnection(1000))
+        return false;
+    auto *receiverSocket = server.nextPendingConnection();
+    EmbeddedChannel sender, receiver;
+    sender.attach(senderSocket);
+    receiver.attach(receiverSocket);
+    const QString path = receiver.createSharedFrames();
+    if (path.isEmpty()) return false;
+    sender.useSharedFrames(path);
+
+    QImage received;
+    bool retry = false;
+    bool failed = false;
+    QEventLoop loop;
+    QObject::connect(&receiver, &EmbeddedChannel::frame, &loop, [&](const QImage &frame) {
+        received = frame;
+        loop.quit();
+    });
+    QObject::connect(&sender, &EmbeddedChannel::message, &loop, [&](const QJsonObject &message) {
+        retry = message.value(QStringLiteral("type")).toString() == QLatin1String("retryFrameInline");
+        loop.quit();
+    });
+    QObject::connect(&receiver, &EmbeddedChannel::failed, &loop, [&]() { failed = true; loop.quit(); });
+    QTimer timeout;
+    timeout.setSingleShot(true);
+    QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+    auto receive = [&]() {
+        timeout.start(1000);
+        loop.exec();
+        timeout.stop();
+    };
+
+    for (const QSize &size : {QSize(3, 5), QSize(9, 2)}) {
+        QImage pixels(size, QImage::Format_RGB32);
+        pixels.fill(qRgb(size.width(), 2, 3));
+        if (!sender.sendFrame(pixels) || QFile(path).size() != pixels.byteCount()) return false;
+        receive();
+        if (failed || received != pixels) return false;
+    }
+
+    QImage pixels(5, 5, QImage::Format_RGB32);
+    pixels.fill(qRgb(4, 5, 6));
+    received = QImage();
+    if (!sender.sendFrame(pixels) || !QFile(path).resize(0)) return false;
+    receive();
+    if (failed || !retry || !received.isNull()) return false;
+
+    sender.disableSharedFrames();
+    if (!sender.sendFrame(pixels)) return false;
+    receive();
+    return !failed && received == pixels && QFile(path).size() == 0;
+}
+
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
 struct TestCanvas {
     void *pixels;
@@ -90,6 +152,7 @@ extern "C" void megler_set_theme(uint32_t, bool) {}
 extern "C" bool megler_run(const megler_run_config *run)
 {
     config = *run;
+    if (run->rotation == 1) output("initialRotation1");
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
     testPixels.resize(size_t(run->width) * run->height);
     testCanvas = config.gfx.canvas_new(config.gfx.user, testPixels.data(), run->width, run->height, run->width * 4);
@@ -114,7 +177,10 @@ extern "C" bool megler_run(const megler_run_config *run)
 extern "C" const char *megler_last_error() { return ""; }
 extern "C" void megler_touch(int phase, int, float, float) { if (phase == 0) output("touch"); }
 extern "C" void megler_key(int, bool) {}
-extern "C" void megler_set_surface(int, int, int, int) {}
+extern "C" void megler_set_surface(int, int, int, int rotation)
+{
+    if (rotation == 3) output("rotation3");
+}
 extern "C" void megler_stop() {
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
     if (testCanvas) {
@@ -128,9 +194,32 @@ extern "C" void megler_text_commit(const char *text) { if (QByteArray(text) == "
 extern "C" void megler_text_key(int) {}
 extern "C" void megler_keyboard_closed() { output("keyboardClosed"); }
 extern "C" void megler_keyboard_height(int) {}
-extern "C" void megler_pick_done(unsigned, int status, int count, const char *const *names)
+static AuroraPickerHost *testPicker = nullptr;
+static QByteArray testFolder;
+static void issuePickerRequest(unsigned id)
 {
-    if (status == MEGLER_PICK_OK && count == 1 && names && QByteArray(names[0]) == "picked.txt") output("picked");
+    megler_pick_request request = {};
+    request.id = id;
+    request.kind = id < 44 ? MEGLER_PICK_FILES : MEGLER_PICK_PHOTO;
+    request.multiple = id == 43;
+    request.folder = testFolder.constData();
+    request.types = "text/plain";
+    if (!testPicker->host().pick(testPicker->host().user, &request)) output("pickerFailed");
+}
+
+extern "C" void megler_pick_done(unsigned id, int status, int count, const char *const *names)
+{
+    if (id == 42 && status == MEGLER_PICK_OK && count == 1 && names && QByteArray(names[0]) == "picked.txt")
+        output("picked");
+    else if (id == 43 && status == MEGLER_PICK_OK && count == 2 && names &&
+             QByteArray(names[0]) == "1_picked.txt" && QByteArray(names[1]) == "2_picked.txt")
+        output("pickedMultiple");
+    else if (id == 44 && status == MEGLER_PICK_OK && count == 1 && names && QByteArray(names[0]) == "photo.jpg")
+        output("pickedPhoto");
+    else if (id == 45 && status == MEGLER_PICK_CANCELED && count == 0)
+        output("photoCanceled");
+    else { output("pickerBadReply"); return; }
+    if (id < 45) QTimer::singleShot(0, [id]() { issuePickerRequest(id + 1); });
 }
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
 megler_gfx_host previewGraphics() { return *mg_gfx_standin(); }
@@ -157,6 +246,13 @@ int main(int argc, char **argv)
     QGuiApplication app(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("EmbeddedPreviewTest"));
     QCoreApplication::setApplicationName(QStringLiteral("EmbeddedPreviewTest"));
+    if (argc == 2 && QByteArray(argv[1]) == "--shared-frames-test") {
+        if (!testSharedFrames()) {
+            std::fprintf(stderr, "Shared CPU preview frame transport failed.\n");
+            return 1;
+        }
+        return 0;
+    }
     if (argc == 5 && QByteArray(argv[1]) == "--store-child") {
         const QByteArray mode(argv[2]);
         QFile count(QString::fromLocal8Bit(argv[3]));
@@ -207,6 +303,7 @@ int main(int argc, char **argv)
     if (argc == 2 && QByteArray(argv[1]) == "--supervisor-test") {
         QTemporaryDir directory;
         if (!directory.isValid()) return 1;
+        const bool verifyGpuImport = qEnvironmentVariableIntValue("ACL_EMBEDDED_GPU_GBM_VERIFY_PARENT") == 1;
         const QByteArray modes[] = {"restart", "hang", "hang-close", "hang-preview-close",
                                     "stale-watchdog", "normal", "error", "crash",
                                     "requested-crash", "close", "rate", "other", "frames",
@@ -215,7 +312,7 @@ int main(int argc, char **argv)
         for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
             const QString countName = directory.path() + QLatin1Char('/') + QString::fromLatin1(modes[i]);
             EmbeddedPreview preview;
-            preview.setCpuFrameTransportOnly();
+            preview.setCpuFrameTransportOnly(verifyGpuImport);
             preview.setViewport(540, 960, 1);
             preview.setUiReady(true);
             StorePreviewSupervisor supervisor(&preview, QCoreApplication::applicationFilePath(),
@@ -225,6 +322,7 @@ int main(int argc, char **argv)
             int frames = 0;
             bool sawFirstCpuFrame = false;
             bool sawSecondCpuFrame = false;
+            bool sawUnexpectedFrame = false;
             qint64 lastFrameKey = 0;
             QObject::connect(&preview, &EmbeddedPreview::frameChanged, &loop, [&]() {
                 const QImage frame = preview.frame();
@@ -233,6 +331,7 @@ int main(int argc, char **argv)
                     ++frames;
                     sawFirstCpuFrame |= frame.pixel(0, 0) == 0xff010203;
                     sawSecondCpuFrame |= frame.pixel(0, 0) == 0xff040506;
+                    sawUnexpectedFrame |= frame.pixel(0, 0) != 0xff010203 && frame.pixel(0, 0) != 0xff040506;
                 }
             });
             int code = -1;
@@ -256,8 +355,9 @@ int main(int argc, char **argv)
             elapsed.start();
             if (!supervisor.start(&error)) { std::fprintf(stderr, "%s\n", qPrintable(error)); return 1; }
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
-            if (QFileInfo(QFileInfo(preview.endpoint()).dir().filePath(QStringLiteral("gpu"))).exists()) {
-                std::fprintf(stderr, "CPU-only Store unexpectedly opened a GPU endpoint\n");
+            if (QFileInfo(QFileInfo(preview.endpoint()).dir().filePath(QStringLiteral("gpu"))).exists() != verifyGpuImport ||
+                preview.usesGpuSurface() != verifyGpuImport) {
+                std::fprintf(stderr, "Store did not configure its probe-only GPU endpoint as requested\n");
                 return 1;
             }
 #endif
@@ -283,7 +383,7 @@ int main(int argc, char **argv)
             if (!count.open(QIODevice::ReadOnly)) return 1;
             const int runs = count.readAll().toInt();
             if (!done || runs != expected[i] ||
-                    (modes[i] == "frames" && (frames < 2 || !sawFirstCpuFrame || !sawSecondCpuFrame)) ||
+                    (modes[i] == "frames" && (frames < 2 || !sawFirstCpuFrame || !sawSecondCpuFrame || sawUnexpectedFrame)) ||
                     (modes[i] == "error" && code != 7) ||
                     ((modes[i] == "crash" || modes[i] == "requested-crash" ||
                       modes[i] == "hang-close" || modes[i] == "hang-preview-close" ||
@@ -299,6 +399,8 @@ int main(int argc, char **argv)
         PreviewPlayer player(QStringLiteral("."), QStringLiteral("."));
         player.setCpuPresentationOnly(true);
         AuroraPickerHost picker;
+        testPicker = &picker;
+        testFolder = argv[3];
         player.setPicker(&picker);
         EmbeddedPreviewChild bridge(&player, &picker);
         player.setRemoteKeyboard(bridge.keyboardHost());
@@ -307,12 +409,7 @@ int main(int argc, char **argv)
         QObject::connect(&bridge, &EmbeddedPreviewChild::failed, &app, [&app](const QString &) { app.exit(3); });
         QObject::connect(&player, &PreviewPlayer::finished, &app, &QCoreApplication::quit);
         QTimer::singleShot(200, &player, [&]() {
-            megler_pick_request request = {};
-            request.id = 42;
-            request.kind = MEGLER_PICK_FILES;
-            request.folder = argv[3];
-            request.types = "text/plain";
-            if (!picker.host().pick(picker.host().user, &request)) output("pickerFailed");
+            issuePickerRequest(42);
         });
         return app.exec();
     }
@@ -347,9 +444,42 @@ int main(int argc, char **argv)
         ++frames;
         preview.touch(0, 1, 1);
     });
-    QObject::connect(&preview, &EmbeddedPreview::showPicker, [&](const QString &token, const QStringList &) {
+    QObject::connect(&preview, &EmbeddedPreview::showPicker, [&](const QString &token, const QStringList &, bool multiple) {
         ++picks;
-        preview.selected(token, fileName);
+        if (multiple) preview.selectedMany(token, QStringList() << fileName << fileName);
+        else preview.selected(token, fileName);
+    });
+    QString photoToken, photoPath;
+    bool invalidPhotoChecked = false;
+    int photos = 0;
+    QObject::connect(&preview, &EmbeddedPreview::showPhoto, [&](const QString &token, const QString &path) {
+        ++photos;
+        photoToken = token;
+        photoPath = path;
+        if (photos % 2 == 0) {
+            preview.canceled(token);
+            preview.validatePhoto(token, path);
+            return;
+        }
+        QFile photo(path);
+        if (!photo.open(QIODevice::WriteOnly) || photo.write(QByteArray::fromHex("ffd8ff0102")) != 5) {
+            failed = true;
+            return;
+        }
+        photo.close();
+        invalidPhotoChecked = false;
+        preview.validatePhoto(token, fileName);
+    });
+    QObject::connect(&preview, &EmbeddedPreview::photoValidated, [&](const QString &token, bool valid) {
+        if (token != photoToken) { failed = true; return; }
+        if (!invalidPhotoChecked) {
+            if (valid) { failed = true; return; }
+            invalidPhotoChecked = true;
+            preview.validatePhoto(token, photoPath);
+        } else {
+            if (!valid) { failed = true; return; }
+            preview.confirmPhoto(token);
+        }
     });
     QObject::connect(&process, &QProcess::readyReadStandardOutput, [&]() {
         outputText += process.readAllStandardOutput();
@@ -363,6 +493,7 @@ int main(int argc, char **argv)
         QString error;
         if (!preview.listen(&process, &error)) { std::fprintf(stderr, "%s\n", qPrintable(error)); failed = true; return; }
         if (preview.stopping()) failed = true;
+        preview.setDisplayRotation(1);
         preview.setViewport(540, 960, 1);
         preview.setUiReady(true);
         if (runs == 0) {
@@ -377,7 +508,10 @@ int main(int argc, char **argv)
                      [&](int code, QProcess::ExitStatus status) {
         outputText += process.readAllStandardOutput();
         const bool normalRun = outputText.contains("started\n") && outputText.contains("touch\n") &&
-                outputText.contains("text\n") && outputText.contains("picked\n") && outputText.contains("stopped\n");
+                outputText.contains("text\n") && outputText.contains("picked\n") &&
+                outputText.contains("pickedMultiple\n") && outputText.contains("pickedPhoto\n") &&
+                outputText.contains("photoCanceled\n") && outputText.contains("stopped\n") &&
+                outputText.contains("initialRotation1\n") && outputText.contains("rotation3\n");
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
         const QByteArray expectedRenderer = qgetenv("ACL_TEST_EXPECT_GPU") == "1" ? "gpu\n" : "cpu-canvas\n";
         if (runs < 2 && !outputText.contains(expectedRenderer)) {
@@ -393,6 +527,9 @@ int main(int argc, char **argv)
         ++runs;
         if (runs < 3) {
             QFile::remove(directory.path() + QStringLiteral("/output/picked.txt"));
+            QFile::remove(directory.path() + QStringLiteral("/output/1_picked.txt"));
+            QFile::remove(directory.path() + QStringLiteral("/output/2_picked.txt"));
+            QFile::remove(directory.path() + QStringLiteral("/output/photo.jpg"));
             outputText.clear();
             QTimer::singleShot(0, [&]() {
                 start();
@@ -401,16 +538,19 @@ int main(int argc, char **argv)
                     if (!preview.stopping()) failed = true;
                 }
             });
-        } else app.exit(failed || !rogueRejected || frames != 4 || picks != 2 ? 1 : 0);
+        } else app.exit(failed || !rogueRejected || frames != 4 || picks != 4 || photos != 4 ? 1 : 0);
     });
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, [&]() {
+        if (outputText.contains("initialRotation1\n") && preview.displayRotation() == 1)
+            preview.setDisplayRotation(3);
         if (keyboard.inputMethodQuery(Qt::ImEnabled).toBool() &&
             outputText.contains("started\n") && outputText.contains("touch\n") && picks > runs) {
             QInputMethodEvent event;
             event.setCommitString(QStringLiteral("hello"));
             QCoreApplication::sendEvent(&keyboard, &event);
-            if (outputText.contains("picked\n") && outputText.contains("text\n") && frames >= (runs + 1) * 2)
+            if (outputText.contains("photoCanceled\n") && outputText.contains("text\n") &&
+                outputText.contains("rotation3\n") && frames >= (runs + 1) * 2)
                 preview.stop();
         }
     });

@@ -2169,6 +2169,12 @@ typedef struct megler_run_config {
  */
 MEGLER_API bool megler_run(const megler_run_config *config);
 /*
+ * Starts a Java APK's Application and main looper without launching an
+ * Activity. The process remains running until megler_stop or a fatal error.
+ * This does not start a service or expose an IPC endpoint by itself.
+ */
+MEGLER_API bool megler_run_headless(const megler_run_config *config);
+/*
  * Whether the app runs. When it ends this turns false first and on_exit is
  * called second, in that order always: inside on_exit and after it, this is
  * false. So a shell that is told by on_exit may act on "no app runs" at once

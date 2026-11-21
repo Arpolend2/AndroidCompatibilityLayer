@@ -1,0 +1,9 @@
+execute_process(
+    COMMAND "@Python3_EXECUTABLE@" "@CMAKE_CURRENT_SOURCE_DIR@/tools/aurora/verify.py"
+        runtime "@ANDROID_RUNTIME_ARCH@" "@ANDROID_ROOT@"
+    RESULT_VARIABLE android_runtime_result
+    ERROR_VARIABLE android_runtime_error)
+if(NOT android_runtime_result STREQUAL "0")
+    message(FATAL_ERROR
+        "${android_runtime_error}\nSet ANDROID_ROOT to a complete ABI-matched runtime. See tools/aurora/README.md.")
+endif()

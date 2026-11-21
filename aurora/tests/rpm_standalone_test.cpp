@@ -38,7 +38,8 @@ static bool write(const QString &path, const QByteArray &bytes)
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
-    if (argc != 2) return 2;
+    const bool fingerprintOnly = argc == 3 && QByteArray(argv[2]) == "--fingerprint-only";
+    if (argc != 2 && !fingerprintOnly) return 2;
     const QDir root(QString::fromLocal8Bit(argv[1]));
     QCoreApplication::setOrganizationName(QStringLiteral("AndroidCompatibilityLayerTest"));
     QCoreApplication::setApplicationName(QStringLiteral("StandaloneRpm"));
@@ -96,18 +97,33 @@ int main(int argc, char **argv)
     const QString binary = root.filePath(QStringLiteral("binary"));
     const QString runtimeLink = root.filePath(QStringLiteral("runtime-link"));
     const QString qmlLink = root.filePath(QStringLiteral("qml-link"));
+    if (fingerprintOnly) {
+        const auto fingerprint = [&]() {
+            return RpmStandalone::cacheFingerprint(QStringLiteral("org.example.app"), QStringLiteral("Example"),
+                icon, store, runtimeLink, qmlLink, binary, false, QStringLiteral("1.2.3-1"));
+        };
+        const QByteArray local = fingerprint();
+        settings.setValue(QStringLiteral("googleServices/provider"), QStringLiteral("microg"));
+        settings.sync();
+        const QByteArray shared = fingerprint();
+        settings.setValue(QStringLiteral("googleServices/provider"), QStringLiteral("none"));
+        settings.sync();
+        return local.isEmpty() || shared.isEmpty() || local == shared || fingerprint() != local ? 1 : 0;
+    }
     if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error) || output.isEmpty()) return 1;
     const QString cacheDir = appDir + QStringLiteral("/standalone-rpm");
     if (!QDir().mkpath(cacheDir)) return 1;
     const QString cached = QDir(cacheDir).filePath(QFileInfo(output).fileName());
     if (!QFile::copy(output, cached) || !StandaloneAppMapping::save(cacheDir, cached)) return 1;
-    const auto fingerprint = [&]() {
+    const auto fingerprintForVersion = [&](const QString &version) {
         return RpmStandalone::cacheFingerprint(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
-                                                store, runtimeLink, qmlLink, binary, false);
+                                                store, runtimeLink, qmlLink, binary, false, version);
     };
+    const auto fingerprint = [&]() { return fingerprintForVersion(QStringLiteral("1.2.3-1")); };
     const QByteArray original = fingerprint();
-    if (original.isEmpty() || !RpmStandalone::saveCache(cacheDir, cached, original) ||
+    if (original.isEmpty() || !RpmStandalone::cachedRpm(cacheDir, original).isEmpty() ||
+        !RpmStandalone::saveCache(cacheDir, cached, original) ||
         RpmStandalone::cachedRpm(cacheDir, fingerprint()) != cached) return 1;
     int generated = 0;
     QString resolved;
@@ -122,6 +138,22 @@ int main(int argc, char **argv)
                                                generate, &resolved, &hit);
     };
     if (!resolve() || !hit || generated != 0 || resolved != cached) return 1;
+    const QByteArray oldVersion = fingerprintForVersion(QStringLiteral("1.2.2-1"));
+    const QByteArray oldRelease = fingerprintForVersion(QStringLiteral("1.2.3-0"));
+    const QByteArray newerVersion = fingerprintForVersion(QStringLiteral("1.2.4-1"));
+    if (oldVersion.isEmpty() || oldVersion == original || oldRelease.isEmpty() || oldRelease == original ||
+        newerVersion.isEmpty() || newerVersion == original ||
+        !fingerprintForVersion(QString()).isEmpty() ||
+        !RpmStandalone::saveCache(cacheDir, cached, oldVersion) ||
+        !resolve() || hit || generated != 1 || resolved != QLatin1String("generated.rpm") ||
+        !RpmStandalone::saveCache(cacheDir, cached, oldRelease) ||
+        !resolve() || hit || generated != 2 ||
+        !RpmStandalone::saveCache(cacheDir, cached, newerVersion) ||
+        !resolve() || hit || generated != 3 ||
+        !RpmStandalone::saveCache(cacheDir, cached, QByteArray(64, 'a')) ||
+        !resolve() || hit || generated != 4 ||
+        !RpmStandalone::saveCache(cacheDir, cached, original) ||
+        !resolve() || !hit || generated != 4 || resolved != cached) return 1;
     if (!PermissionSettings::save(appDir, QStringList() << QStringLiteral("location") << QStringLiteral("camera"), &error) ||
         fingerprint() != original ||
         !PermissionSettings::save(appDir, QStringList() << QStringLiteral("camera"), &error) ||
@@ -139,7 +171,7 @@ int main(int argc, char **argv)
         !RpmStandalone::saveCache(cacheDir, cached, original)) return 1;
     if (!write(root.filePath(QStringLiteral("source.apk")), "apk contenT") ||
         RpmStandalone::cachedRpm(cacheDir, fingerprint()) == cached ||
-        !resolve() || hit || generated != 1 || resolved != QLatin1String("generated.rpm") ||
+        !resolve() || hit || generated != 5 || resolved != QLatin1String("generated.rpm") ||
         !write(root.filePath(QStringLiteral("source.apk")), "apk content") ||
         !write(root.filePath(QStringLiteral("binary-source")), "binary contenT") ||
         RpmStandalone::cachedRpm(cacheDir, fingerprint()) == cached ||

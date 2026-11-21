@@ -1434,6 +1434,7 @@ static int net_err(int e)
 {
     switch (e) {
     case 0: return MG_NE_OK;
+    case EBADF: return MG_NE_BADF;
     case EAGAIN: return MG_NE_AGAIN;
     case EINPROGRESS: return MG_NE_INPROGRESS;
     case EALREADY: return MG_NE_ALREADY;
@@ -1540,6 +1541,48 @@ mg_sock *mg_sock_open(int family, int type, int protocol, int *err)
         setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
     }
     return sock_wrap(fd, family, type);
+}
+
+mg_sock *mg_sock_dup_unix_stream(int fd, int *err)
+{
+    struct sockaddr_storage local, peer;
+    socklen_t local_len = sizeof(local), peer_len = sizeof(peer), type_len;
+    struct epoll_event ev;
+    mg_sock *k;
+    int copy, type;
+
+    copy = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0) {
+        *err = net_err(errno);
+        return NULL;
+    }
+    type_len = sizeof(type);
+    if (getsockopt(copy, SOL_SOCKET, SO_TYPE, &type, &type_len) != 0 ||
+        getsockname(copy, (struct sockaddr *)&local, &local_len) != 0 ||
+        getpeername(copy, (struct sockaddr *)&peer, &peer_len) != 0 ||
+        type != SOCK_STREAM || local.ss_family != AF_UNIX || peer.ss_family != AF_UNIX) {
+        close(copy);
+        *err = MG_NE_INVAL;
+        return NULL;
+    }
+    pthread_once(&g_watch_once, watch_start);
+    if (g_watch_fd < 0) {
+        close(copy);
+        *err = MG_NE_IO;
+        return NULL;
+    }
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLPRI | EPOLLRDHUP | EPOLLET;
+    if (epoll_ctl(g_watch_fd, EPOLL_CTL_ADD, copy, &ev) != 0) {
+        *err = net_err(errno);
+        close(copy);
+        return NULL;
+    }
+    k = (mg_sock *)mg_alloc(sizeof(*k));
+    k->fd = copy;
+    k->family = 0;
+    k->type = MG_SOCK_STREAM;
+    return k;
 }
 
 void mg_sock_close(mg_sock *k)

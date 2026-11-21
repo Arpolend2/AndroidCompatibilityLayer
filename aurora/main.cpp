@@ -10,6 +10,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QLockFile>
+#include <QPointer>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQuickView>
@@ -40,6 +41,7 @@
 #include "error_log.h"
 #include "external_apk_receiver.h"
 #include "manager_lifecycle.h"
+#include "single_instance_lock.h"
 #include "library_app_index.h"
 #include "sensor_host.h"
 #include "location_host.h"
@@ -54,12 +56,23 @@
 #include "apk_store.h"
 #include "preview.h"
 #include "embedded_preview.h"
+#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
+#include <QOffscreenSurface>
+#include <QOpenGLContext>
+#include <QSurfaceFormat>
+#endif
 #include "store_preview_supervisor.h"
 #include "store_worker_teardown.h"
 #include "preview_activation_channel.h"
 #include "preview_keyboard.h"
 #include "probe.h"
 #include "standalone_paths.h"
+#include "standalone_diagnostic_registry.h"
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+#include "standalone_microg_diagnostic.h"
+#include "standalone_microg_diagnostic_page.h"
+#include <QEventLoop>
+#endif
 #include "shared_runtime.h"
 #include "rpm_standalone.h"
 #include "rpm_signers.h"
@@ -80,6 +93,69 @@ static void loadTranslations(QCoreApplication *app, QTranslator *translator)
         qWarning().noquote() << "Could not load Russian translations:" << path;
     else
         app->installTranslator(translator);
+}
+
+static bool prepareSharedMicrogWorker(QString *program, QStringList *arguments,
+                                      QString *identityDirectory, QString *error)
+{
+    if (error) error->clear();
+    const QString appData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    const QString androidRoot = Aurora::Application::organizationPathTo(SharedRuntime::location()).toLocalFile();
+    if (appData.isEmpty() || androidRoot.isEmpty() || !QFileInfo(androidRoot).isDir()) {
+        if (error) *error = QStringLiteral("The shared Android runtime or manager storage is unavailable.");
+        return false;
+    }
+
+    QSettings settings;
+    QString apk = settings.value(QStringLiteral("googleServices/gmsApkPath")).toString();
+    if (apk.isEmpty()) apk = QDir(androidRoot).filePath(QStringLiteral("services/GmsCore.apk"));
+    const QFileInfo apkInfo(apk);
+    if (!apkInfo.isAbsolute() || !apkInfo.isFile() || !apkInfo.isReadable() || apkInfo.isSymLink()) {
+        if (error) *error = QStringLiteral("The selected microG APK is unavailable.");
+        return false;
+    }
+    const QByteArray apkBytes = QFile::encodeName(apk);
+    mg_apk_info info = {};
+    if (!mg_apk_read_info(apkBytes.constData(), &info)) {
+        const QString detail = QString::fromUtf8(info.error);
+        mg_apk_info_free(&info);
+        if (error) *error = detail.isEmpty() ? QStringLiteral("The selected microG APK is invalid.") : detail;
+        return false;
+    }
+    const bool supportedApk = std::strcmp(info.package, "com.google.android.gms") == 0 &&
+        mg_apk_is_microg(apkBytes.constData()) && !info.split[0] && !info.config_for_split[0] &&
+        !info.feature_split && !info.split_required && !info.required_split_types[0];
+    mg_apk_info_free(&info);
+    if (!supportedApk) {
+        if (error) *error = QStringLiteral("The worker requires a standalone com.google.android.gms microG APK.");
+        return false;
+    }
+
+    const QString servicesDirectory = QDir(appData).filePath(QStringLiteral("services"));
+    const QString dataDirectory = QDir(servicesDirectory).filePath(QStringLiteral("shared-microg-worker"));
+    const QString appsDirectory = QDir(appData).filePath(QStringLiteral("apps"));
+    if (!QDir().mkpath(dataDirectory) || !QDir().mkpath(appsDirectory) ||
+        QFileInfo(appData).isSymLink() || QFileInfo(servicesDirectory).isSymLink() ||
+        QFileInfo(dataDirectory).isSymLink() || QFileInfo(appsDirectory).isSymLink()) {
+        if (error) *error = QStringLiteral("The shared microG storage directories are unavailable or unsafe.");
+        return false;
+    }
+
+    const QString executable = ApplicationExecutables::worker();
+    const QFileInfo executableInfo(executable);
+    if (!executableInfo.isAbsolute() || !executableInfo.isFile() || !executableInfo.isExecutable() ||
+        executableInfo.isSymLink()) {
+        if (error) *error = QStringLiteral("The manager worker executable is unavailable.");
+        return false;
+    }
+    *program = executableInfo.absoluteFilePath();
+    *arguments = QStringList()
+        << QStringLiteral("--apk=") + apkInfo.absoluteFilePath()
+        << QStringLiteral("--data-dir=") + QDir(dataDirectory).absolutePath()
+        << QStringLiteral("--android-root=") + QFileInfo(androidRoot).absoluteFilePath()
+        << QStringLiteral("--apps-dir=") + QDir(appsDirectory).absolutePath();
+    *identityDirectory = appData;
+    return true;
 }
 
 static bool validateStoreBundle(const QString &path, int *splitCount, QString *error)
@@ -499,7 +575,8 @@ static int buildStandaloneRpm(const QString &package, bool fileDiagnostics)
             lock.setStaleLockTime(0);
             if (!lock.tryLock(0)) return QString();
             fingerprint = RpmStandalone::cacheFingerprint(package, label, icon, storeRoot, runtimeRoot,
-                                                            qmlRoot, executable, fileDiagnostics);
+                                                            qmlRoot, executable, fileDiagnostics,
+                                                            QStringLiteral(ACL_MANAGER_BUILD_VERSION));
             return RpmStandalone::cachedRpm(publishedDir, fingerprint);
         }, [&](QString *path) {
             std::fputs("ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:build\n", stderr);
@@ -560,7 +637,8 @@ static int buildStandaloneRpm(const QString &package, bool fileDiagnostics)
                 } else if (!fingerprint.isEmpty() &&
                            fingerprint == RpmStandalone::cacheFingerprint(package, label, icon, storeRoot,
                                                                            runtimeRoot, qmlRoot, executable,
-                                                                           fileDiagnostics) &&
+                                                                           fileDiagnostics,
+                                                                           QStringLiteral(ACL_MANAGER_BUILD_VERSION)) &&
                            !RpmStandalone::saveCache(publishedDir, published, fingerprint)) {
                     qWarning("Standalone RPM: could not save cache metadata");
                 }
@@ -579,6 +657,8 @@ static int buildStandaloneRpm(const QString &package, bool fileDiagnostics)
             qWarning("Could not remove the temporary signed RPM: %s", qPrintable(output));
         if (ok) output = published;
     }
+    if (ok && !StandaloneDiagnosticRegistry::save(base, output, package))
+        qWarning("Standalone identity: could not register exported app; caller identification will be denied.");
     QJsonObject result;
     result.insert(QStringLiteral("ok"), ok);
     if (ok) result.insert(QStringLiteral("path"), output);
@@ -605,6 +685,38 @@ struct StoreWorkerTeardownMarker {
 int runApplication(int argc, char *argv[], void (*initReportWebView)())
 {
     const QByteArray mode = argc > 1 ? QByteArray(argv[1]) : QByteArray();
+    if (mode == "--gpu-probe") {
+        if (argc != 2) {
+            std::fprintf(stderr, "Usage: %s --gpu-probe\n", argv[0]);
+            return 2;
+        }
+#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
+        QScopedPointer<QGuiApplication> probeApp(Aurora::Application::application(argc, argv));
+        QOpenGLContext context;
+        QSurfaceFormat format = QSurfaceFormat::defaultFormat();
+        format.setRenderableType(QSurfaceFormat::OpenGLES);
+        format.setVersion(2, 0);
+        context.setFormat(format);
+        if (!context.create() || !context.isOpenGLES()) {
+            std::fprintf(stderr, "GPU probe: could not create a Qt GLES context.\n");
+            return 1;
+        }
+        QOffscreenSurface surface(context.screen());
+        surface.setFormat(context.format());
+        surface.create();
+        if (!surface.isValid() || !context.makeCurrent(&surface)) {
+            std::fprintf(stderr, "GPU probe: could not bind the Qt GLES context.\n");
+            return 1;
+        }
+        for (const QString &line : EmbeddedGpuTransport::currentGpuCapabilities())
+            std::puts(qPrintable(line));
+        context.doneCurrent();
+        return 0;
+#else
+        std::puts("GPU probe unavailable: build has no experimental GPU composition. Aurora Store uses CPU Canvas.");
+        return 1;
+#endif
+    }
     if (mode == "--unpack-bundle" || mode == "--unpack-store-bundle" || mode == "--unpack-store-xapk") {
         if (argc != 10) {
             std::fprintf(stderr, "Invalid APK bundle importer arguments.\n");
@@ -619,7 +731,8 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
         std::fprintf(stderr, "Invalid background manager arguments.\n");
         return 2;
     }
-    if (!child && !backgroundManager)
+    // A D-Bus-started manager can later show the same UI, including the WebView report form.
+    if (!child)
         QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
     bool traceStoreWorkerExit = false;
     const StoreWorkerTeardownMarker appDestroyed{traceStoreWorkerExit, "Qt application destroyed; leaving main"};
@@ -650,11 +763,6 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
             : QStringLiteral("Android App Manager");
         if (!ErrorLog::initialize(label, &errorLogError))
             qWarning().noquote() << "Error log unavailable:" << errorLogError;
-    }
-    if (!child && !backgroundManager) {
-        QString snapshotError;
-        if (!ErrorLog::setStandaloneSnapshotRoot(sharedLogRoot, &snapshotError))
-            qWarning().noquote() << "Standalone log snapshots unavailable:" << snapshotError;
     }
     StandalonePaths standalonePathsValue;
     QString standaloneFilePath;
@@ -691,6 +799,27 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
             if (!ErrorLog::startStandaloneDiagnosticFile(&standaloneFilePath, &error))
                 qWarning().noquote() << "Standalone diagnostic file unavailable:" << error;
         }
+#ifdef ACL_STANDALONE_MICROG_DIAGNOSTIC
+        const StandaloneMicrogDiagnostic::Result diagnostic =
+            StandaloneMicrogDiagnostic::run(QDBusConnection::sessionBus());
+        app->setQuitOnLastWindowClosed(false);
+        QScopedPointer<QQuickView> diagnosticView(Aurora::Application::createView());
+        diagnosticView->setResizeMode(QQuickView::SizeRootObjectToView);
+        diagnosticView->rootContext()->setContextProperty(QStringLiteral("ownerStatus"), diagnostic.owner);
+        diagnosticView->rootContext()->setContextProperty(QStringLiteral("replyStatus"), diagnostic.response);
+        QQmlComponent *diagnosticPage = StandaloneMicrogDiagnostic::createPage(diagnosticView.data());
+        QObject *page = diagnosticPage->create(diagnosticView->rootContext());
+        if (!page) {
+            qWarning("Standalone diagnostic page could not be created: %s", qPrintable(diagnosticPage->errorString()));
+        } else {
+            diagnosticView->setContent(QUrl(), diagnosticPage, page);
+            QEventLoop diagnosticLoop;
+            QObject::connect(page, SIGNAL(continueRequested()), &diagnosticLoop, SLOT(quit()));
+            QObject::connect(app.data(), &QGuiApplication::lastWindowClosed, &diagnosticLoop, &QEventLoop::quit);
+            diagnosticView->showFullScreen();
+            diagnosticLoop.exec();
+        }
+#endif
     }
     if (standalone || mode == "--preview") {
         QString error;
@@ -786,7 +915,7 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
         if (storePreview && !embedded) {
             qmlRegisterType<PreviewSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
             EmbeddedPreview remote;
-            remote.setCpuFrameTransportOnly();
+            remote.setCpuFrameTransportOnly(qEnvironmentVariableIntValue("ACL_EMBEDDED_GPU_GBM_VERIFY_PARENT") == 1);
             QScopedPointer<QQuickView> view(Aurora::Application::createView());
             view->setTitle(QStringLiteral("Aurora Store"));
             view->setResizeMode(QQuickView::SizeRootObjectToView);
@@ -928,6 +1057,7 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
             });
         }
         if (standalone) {
+            preview.setSharedMicrog(standalonePathsValue.sharedMicrog);
             preview.setStandaloneSettings(standalonePathsValue.locale, standalonePathsValue.theme,
                                           standalonePathsValue.location);
             preview.setDeniedPermissions(standalonePathsValue.deniedPermissions);
@@ -1001,6 +1131,11 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
     }
 
     const QStringList arguments = ManagerLifecycle::launchFileArguments(app->arguments().mid(1));
+    SingleInstanceLock instanceLock;
+    if (instanceLock.adoptInherited()) {
+        qInfo().noquote() << "Launcher single-instance lock adopted:" << instanceLock.path();
+        if (backgroundManager) instanceLock.setHeld(false);
+    }
     if (!backgroundManager) {
         QString error;
         const ManagerLifecycle::ForwardResult forwarded = ManagerLifecycle::forwardToRunningManager(arguments, &error);
@@ -1016,6 +1151,7 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
     qmlRegisterType<SideMouseButtons>("AndroidCompatibilityLayer.Navigation", 1, 0, "SideMouseButtons");
     qmlRegisterType<PreviewSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
     app->setQuitOnLastWindowClosed(false);
+    QPointer<ManagerLifecycle> activeLifecycle;
     QScopedPointer<Probe> probe;
     QScopedPointer<EmbeddedPreview> embeddedPreview;
     QScopedPointer<QQuickView> view;
@@ -1023,11 +1159,18 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
         if (embeddedPreview) embeddedPreview->stop();
     });
     std::function<bool()> showManager;
+    std::function<void()> configureSharedMicrog;
     const auto ensureProbe = [&]() {
         if (probe) return;
         probe.reset(new Probe(Aurora::Application::organizationPathTo(SharedRuntime::location()).toLocalFile(),
                               nullptr, &diagnosticLog));
         probe->setReportWebViewInitializer(initReportWebView);
+        QObject::connect(probe.data(), &Probe::runtimeSettingsChanged, probe.data(), [&]() {
+            if (activeLifecycle) {
+                activeLifecycle->refreshSharedMicrogProvider();
+                if (configureSharedMicrog) configureSharedMicrog();
+            }
+        });
         QObject::connect(probe.data(), &Probe::standaloneRpmError, probe.data(),
                          [&](const QString &, const QString &message) {
             if (view && view->isVisible()) return;
@@ -1040,8 +1183,12 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
             view->show();
             view->raise();
             view->requestActivate();
+            instanceLock.setHeld(true);
             return true;
         }
+        QString snapshotError;
+        if (!ErrorLog::setStandaloneSnapshotRoot(sharedLogRoot, &snapshotError))
+            qWarning().noquote() << "Standalone log snapshots unavailable:" << snapshotError;
         ensureProbe();
         embeddedPreview.reset(new EmbeddedPreview);
         probe->setEmbeddedMicrog(embeddedPreview.data());
@@ -1063,11 +1210,58 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
         }
         embeddedPreview->setRemoteTheme(view->rootObject()->property("systemDark").toBool(),
                                        view->rootObject()->property("systemAccent").value<QColor>());
+        // Hold the launcher lock only while a window exists to raise; without one the next launch
+        // must start a forwarding process instead.
+        QObject::connect(view.data(), &QWindow::visibleChanged, &instanceLock, &SingleInstanceLock::setHeld);
         view->show();
+        instanceLock.setHeld(true);
         return true;
     };
     ManagerLifecycle lifecycle(showManager);
+    activeLifecycle = &lifecycle;
     lifecycle.setKeepAlive(true);
+    QString configuredWorkerProgram;
+    QStringList configuredWorkerArguments;
+    QString configuredIdentityDirectory;
+    bool sharedMicrogConfigured = false;
+    configureSharedMicrog = [&]() {
+        QSettings settings;
+        if (settings.value(QStringLiteral("googleServices/provider"),
+                           QStringLiteral("none")).toString() != QLatin1String("microg"))
+            return;
+
+        QString program, identityDirectory, error;
+        QStringList arguments;
+        if (!prepareSharedMicrogWorker(&program, &arguments, &identityDirectory, &error)) {
+            if (sharedMicrogConfigured) {
+                lifecycle.disableSharedMicrogWorker();
+                sharedMicrogConfigured = false;
+                configuredWorkerProgram.clear();
+                configuredWorkerArguments.clear();
+                configuredIdentityDirectory.clear();
+            }
+            qWarning().noquote() << "Shared microG backend unavailable:" << error;
+            return;
+        }
+        if (sharedMicrogConfigured && configuredWorkerProgram == program &&
+            configuredWorkerArguments == arguments &&
+            configuredIdentityDirectory == identityDirectory) return;
+        if (sharedMicrogConfigured) {
+            lifecycle.disableSharedMicrogWorker();
+            sharedMicrogConfigured = false;
+        }
+        if (!lifecycle.configureSharedMicrogWorker(
+                program, arguments, ManagerLifecycle::registryPackageResolver(identityDirectory), &error)) {
+            lifecycle.disableSharedMicrogWorker();
+            qWarning().noquote() << "Shared microG backend unavailable:" << error;
+            return;
+        }
+        configuredWorkerProgram = program;
+        configuredWorkerArguments = arguments;
+        configuredIdentityDirectory = identityDirectory;
+        sharedMicrogConfigured = true;
+    };
+    configureSharedMicrog();
     QObject::connect(&lifecycle, &ManagerLifecycle::standaloneLaunchFailed, &lifecycle,
                      [&](const QString &package, const QString &message) {
         if (showManager() && probe) probe->offerStandaloneInstall(package, message);

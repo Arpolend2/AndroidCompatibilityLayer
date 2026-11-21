@@ -4,7 +4,7 @@
 // of the same binder taking the earlier one's place, a broadcast over the callbacks as they were when it began
 // (beginBroadcast, getBroadcastItem, getBroadcastCookie, finishBroadcast -- and Android's IllegalStateException for a
 // broadcast begun inside one, or finished outside one), kill, the counts, and Android 16's Builder with what it was told.
-// Nothing dies here: every binder is of this process, so onCallbackDied is never called.
+// Remote BinderBridge proxies can die when their connection closes.
 //
 // Why. androidx's MediaSessionCompat keeps its controllers' callbacks in one, and tells them of a playback state through
 // it (MediaSessionImplApi21.setPlaybackState: beginBroadcast, getBroadcastItem(i).onPlaybackStateChanged, finishBroadcast).
@@ -32,7 +32,11 @@ public class RemoteCallbackList<E extends IInterface> {
         final Object mCookie;
         Entry(E callbackInterface, Object cookie) { mInterface = callbackInterface; mCookie = cookie; }
         public void binderDied() {
-            synchronized (mInterfaces) { mInterfaces.remove(mInterface.asBinder()); }
+            synchronized (mInterfaces) {
+                IBinder binder = mInterface.asBinder();
+                if (mInterfaces.get(binder) != this) return;
+                mInterfaces.remove(binder);
+            }
             onCallbackDied(mInterface, mCookie);
         }
     }

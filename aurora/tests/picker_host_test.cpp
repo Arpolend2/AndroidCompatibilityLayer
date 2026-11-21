@@ -17,6 +17,7 @@ int replies = 0;
 unsigned replyId;
 int replyStatus;
 QByteArray replyName;
+QList<QByteArray> replyNames;
 
 void check(bool value, const char *message)
 {
@@ -44,6 +45,8 @@ extern "C" void megler_pick_done(unsigned id, int status, int count, const char 
     replyId = id;
     replyStatus = status;
     replyName = count == 1 && names ? QByteArray(names[0]) : QByteArray();
+    replyNames.clear();
+    for (int i = 0; i < count; ++i) replyNames.append(QByteArray(names[i]));
 }
 
 int main(int argc, char **argv)
@@ -81,12 +84,9 @@ int main(int argc, char **argv)
     QStringList filters;
     int shown = 0;
     QObject::connect(&picker, &AuroraPickerHost::showPicker,
-                     [&](const QString &t, const QStringList &f) { token = t; filters = f; ++shown; });
+                     [&](const QString &t, const QStringList &f, bool) { token = t; filters = f; ++shown; });
     check(!host.pick(host.user, &request), "accepted without UI");
     picker.setUiReady(true);
-    request.multiple = true;
-    check(!host.pick(host.user, &request), "accepted multiple");
-    request.multiple = false;
     request.kind = MEGLER_PICK_PHOTO;
     check(!host.pick(host.user, &request), "accepted camera");
     request.kind = MEGLER_PICK_FILES;
@@ -149,6 +149,105 @@ int main(int argc, char **argv)
     QCoreApplication::processEvents();
     check(replies == 8 && replyStatus == MEGLER_PICK_CANCELED, "stop during copy answered twice");
     check(!QFileInfo::exists(folder + QStringLiteral("/2_selected.txt")), "canceled copy remained");
+    picker.setUiReady(true);
+    request.multiple = true;
+    request.max = 2;
+    check(host.pick(host.user, &request), "multiple request rejected");
+    QCoreApplication::processEvents();
+    picker.selectedMany(token, QStringList() << source << source);
+    check(waitForReply(9) && replyStatus == MEGLER_PICK_OK && replyNames.size() == 2 &&
+          replyNames[0] == "2_selected.txt" && replyNames[1] == "3_selected.txt",
+          "multiple selection or unique names failed");
+    check(host.pick(host.user, &request), "limited request rejected");
+    QCoreApplication::processEvents();
+    picker.selectedMany(token, QStringList() << source << source << source);
+    check(replies == 10 && replyStatus == MEGLER_PICK_FAILED, "selection limit ignored");
+    request.types = "text/plain\n";
+    check(host.pick(host.user, &request), "partial failure request rejected");
+    QCoreApplication::processEvents();
+    picker.selectedMany(token, QStringList() << source << wrongType);
+    check(waitForReply(11) && replyStatus == MEGLER_PICK_FAILED &&
+          !QFileInfo::exists(folder + QStringLiteral("/4_selected.txt")), "partial copy not rolled back");
+
+    request.kind = MEGLER_PICK_VIDEO;
+    check(!host.pick(host.user, &request), "video capture unexpectedly accepted");
+    picker.setDeniedPermissions(QStringList());
+    request.kind = MEGLER_PICK_PHOTO;
+    QString photoPath;
+    QObject::connect(&picker, &AuroraPickerHost::showPhoto,
+                     [&](const QString &t, const QString &path) { token = t; photoPath = path; });
+    bool validPhoto = false;
+    int validations = 0;
+    QObject::connect(&picker, &AuroraPickerHost::photoValidated,
+                     [&](const QString &, bool valid) { validPhoto = valid; ++validations; });
+    check(host.pick(host.user, &request), "photo request rejected");
+    QCoreApplication::processEvents();
+    check(!photoPath.isEmpty() && !QFileInfo::exists(photoPath), "private photo path missing");
+    picker.confirmPhoto(token);
+    check(replies == 11, "unconfirmed photo was returned");
+    QFile photo(photoPath);
+    check(photo.open(QIODevice::WriteOnly), "photo file open failed");
+    check(photo.write(QByteArray::fromHex("ffd8ff0102")) == 5, "photo write failed");
+    photo.close();
+    picker.validatePhoto(token, source);
+    picker.validatePhoto(QStringLiteral("stale"), photoPath);
+    check(validations == 1 && !validPhoto, "untrusted photo path or stale token accepted");
+    picker.validatePhoto(token, photoPath);
+    check(validations == 2 && validPhoto, "saved photo rejected");
+    check(!QFileInfo::exists(folder + QStringLiteral("/photo.jpg")), "photo copied before confirmation");
+    const QString canceledPhoto = photoPath;
+    const QString canceledToken = token;
+    picker.canceled(token);
+    check(replies == 12 && replyStatus == MEGLER_PICK_CANCELED && !QFileInfo::exists(canceledPhoto),
+          "photo cancellation failed");
+    picker.validatePhoto(canceledToken, canceledPhoto);
+    check(validations == 2, "late photo callback accepted");
+
+    check(host.pick(host.user, &request), "second photo request rejected");
+    QCoreApplication::processEvents();
+    picker.validatePhoto(canceledToken, photoPath);
+    check(token != canceledToken && validations == 2, "stale photo affected new request");
+    QFile invalidPhoto(photoPath);
+    check(invalidPhoto.open(QIODevice::WriteOnly), "invalid photo open failed");
+    invalidPhoto.write("not jpeg");
+    invalidPhoto.close();
+    picker.validatePhoto(token, photoPath);
+    check(validations == 3 && !validPhoto, "invalid photo accepted");
+    check(invalidPhoto.open(QIODevice::WriteOnly | QIODevice::Truncate), "photo rewrite failed");
+    invalidPhoto.write(QByteArray::fromHex("ffd8ff0304"));
+    invalidPhoto.close();
+    picker.validatePhoto(token, photoPath);
+    check(validations == 4 && validPhoto, "valid photo not accepted");
+    picker.confirmPhoto(token);
+    check(waitForReply(13) && replyStatus == MEGLER_PICK_OK && replyName == "photo.jpg",
+          "confirmed photo not returned");
+    QFile result(folder + QStringLiteral("/photo.jpg"));
+    check(result.open(QIODevice::ReadOnly) && result.readAll() == QByteArray::fromHex("ffd8ff0304"),
+          "confirmed photo contents incorrect");
+    result.close();
+    check(!QFileInfo::exists(photoPath), "private photo was not removed");
+    check(host.pick(host.user, &request), "photo before shutdown rejected");
+    QCoreApplication::processEvents();
+    int closed = 0;
+    QObject::connect(&picker, &AuroraPickerHost::closePhoto, [&](const QString &t) {
+        if (t == token) ++closed;
+    });
+    picker.stop();
+    check(closed == 1 && replies == 14 && replyStatus == MEGLER_PICK_CANCELED,
+          "shutdown did not close and cancel camera");
+    picker.confirmPhoto(token);
+    check(replies == 14, "late confirmation produced a reply");
+    QObject::disconnect(&picker, nullptr, nullptr, nullptr);
+    picker.setUiReady(true);
+    check(host.pick(host.user, &request), "unconnected photo request rejected prematurely");
+    QCoreApplication::processEvents();
+    check(replies == 15 && replyStatus == MEGLER_PICK_FAILED,
+          "unconnected photo UI did not fail explicitly");
+    picker.setPickerCapabilities(false, false);
+    check(!host.pick(host.user, &request), "legacy remote accepted unsupported photo");
+    request.kind = MEGLER_PICK_FILES;
+    request.multiple = true;
+    check(!host.pick(host.user, &request), "legacy remote accepted unsupported multiple selection");
     std::puts("Picker host OK");
     return 0;
 }

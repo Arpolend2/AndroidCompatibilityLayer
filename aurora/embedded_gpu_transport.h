@@ -6,6 +6,7 @@
 #include <GLES2/gl2.h>
 
 #include <QObject>
+#include <QStringList>
 #include <QString>
 #include <QSocketNotifier>
 #include <QMutex>
@@ -52,6 +53,7 @@ public:
     bool sendFrame(const AuroraDmaBufFrame &frame, QString *error);
     bool presentTexture(GLuint texture, int width, int height, QString *error);
     static bool canExportDmaBuf(QString *error);
+    static QStringList currentGpuCapabilities();
     static QString probeGbmRenderTarget(int width, int height,
         const std::function<bool(const AuroraDmaBufFrame &, QString *)> &verifyParent = {});
     static bool sendFramePacket(int socket, const AuroraDmaBufFrame &frame);

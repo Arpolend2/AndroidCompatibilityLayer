@@ -39,7 +39,7 @@
 static const char *const k_players[] = { PLAYER, "com/unity3d/player/UnityPlayerForActivityOrService", "com/unity3d/player/UnityPlayerForGameActivity" };
 
 static struct {
-    mg_jobj *activity, *player, *surface;
+    mg_jobj *activity, *player, *surface, *firebase_registrar;
     mg_nwindow *window;
     mg_thread *thread;
     volatile i32 started;              /* 0 starting, 1 running, -1 failed */
@@ -440,6 +440,23 @@ static void player_load_library(mg_jcall *c)
     free(file);
 }
 
+static void firebase_registrar_get_instance(mg_jcall *c)
+{
+    if (!U.firebase_registrar) {
+        U.firebase_registrar = mg_jni_new_object("com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar");
+        U.firebase_registrar->permanent = true;
+    }
+    c->ret.l = mg_jni_ref(U.firebase_registrar);
+}
+
+static void firebase_registrar_register_version(mg_jcall *c)
+{
+    const char *library = c->args ? mg_jni_string(c->args[0].l) : NULL;
+    const char *version = c->args ? mg_jni_string(c->args[1].l) : NULL;
+    if (library && version)
+        mg_info("firebase: library %s version %s registered", library, version);
+}
+
 static const mg_jhle g_unity[] = {
     /* What the engine asks the player object itself. */
     { PLAYER, "getContext", NULL, player_getContext },
@@ -481,6 +498,10 @@ static const mg_jhle g_unity[] = {
     { "android/app/AlertDialog$Builder", "setCancelable", NULL, ret_self },
     { "android/app/AlertDialog$Builder", "create", NULL, ret_self },
     { "android/app/AlertDialog$Builder", "show", NULL, ret_self },
+    { "com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar", "getInstance",
+      "()Lcom/google/firebase/platforminfo/GlobalLibraryVersionRegistrar;", firebase_registrar_get_instance },
+    { "com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar", "registerVersion",
+      "(Ljava/lang/String;Ljava/lang/String;)V", firebase_registrar_register_version },
     { NULL, NULL, NULL, NULL },
 };
 
@@ -1254,6 +1275,7 @@ static const mg_jhle g_unity_input[] = {
 static bool un_start(const megler_run_config *config, const mg_apk_info *info)
 {
     char cls[220], *p;
+    mg_jvalue v;
     memset(&U, 0, sizeof(U));
     U.focused = 1;
 
@@ -1261,6 +1283,9 @@ static bool un_start(const megler_run_config *config, const mg_apk_info *info)
     for (p = cls; *p; p++)
         if (*p == '.') *p = '/';
     U.activity = mg_jni_android_setup(cls, info->package, config->apk_path, config->width, config->height, config->density_dpi);
+    v.j = 0;
+    v.l = U.activity;
+    mg_jni_set_static(PLAYER, "currentActivity", 'L', v);
 
     mg_jni_class("android/view/View", "java/lang/Object");
     mg_jni_class("android/view/ViewGroup", "android/view/View");
@@ -1269,6 +1294,8 @@ static bool un_start(const megler_run_config *config, const mg_apk_info *info)
     mg_jni_class(k_players[1], PLAYER);
     mg_jni_class(k_players[2], PLAYER);
     mg_unity_register_jni();
+    mg_jni_class("com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar", "java/lang/Object");
+    U.firebase_registrar = keep(mg_jni_new_object("com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar"));
     mg_jni_class("android/view/InputEvent", "java/lang/Object");
     mg_jni_class(MOTION, "android/view/InputEvent");
     mg_jni_class(KEY, "android/view/InputEvent");

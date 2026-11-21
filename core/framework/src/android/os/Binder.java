@@ -6,12 +6,35 @@ public class Binder implements IBinder {
     private String mDescriptor;
     public Binder() {}
     public Binder(String descriptor) { mDescriptor = descriptor; }
-    public static final int getCallingPid() { return android.os.Process.myPid(); }
-    public static final int getCallingUid() { return android.os.Process.myUid(); }
+    private static final ThreadLocal<Caller> sCaller = new ThreadLocal<>();
+    private static final class Caller {
+        final int uid, pid;
+        Caller(int uid, int pid) { this.uid = uid; this.pid = pid; }
+    }
+    public static final int getCallingPid() { Caller caller = sCaller.get(); return caller == null ? Process.myPid() : caller.pid; }
+    public static final int getCallingUid() { Caller caller = sCaller.get(); return caller == null ? Process.myUid() : caller.uid; }
     public static final int getCallingUidOrThrow() { return getCallingUid(); }
     public static final UserHandle getCallingUserHandle() { return UserHandle.getUserHandleForUid(getCallingUid()); }
-    public static final long clearCallingIdentity() { return 0; }
-    public static final void restoreCallingIdentity(long token) {}
+    public static final long clearCallingIdentity() {
+        long token = ((long) getCallingUid() << 32) | (getCallingPid() & 0xffffffffL);
+        sCaller.remove();
+        return token;
+    }
+    public static final void restoreCallingIdentity(long token) {
+        sCaller.set(new Caller((int) (token >>> 32), (int) token));
+    }
+    /** Dispatch a call using identity supplied by the owner of the authenticated transport. */
+    public static boolean meglerTransactWithCaller(IBinder binder, int code, Parcel data, Parcel reply,
+                                                    int flags, int uid, int pid) throws RemoteException {
+        if (binder == null || uid < 0 || pid <= 0) throw new IllegalArgumentException("Invalid caller");
+        Caller previous = sCaller.get();
+        sCaller.set(new Caller(uid, pid));
+        try { return binder.transact(code, data, reply, flags); }
+        finally {
+            if (previous == null) sCaller.remove();
+            else sCaller.set(previous);
+        }
+    }
     public static final int getThreadStrictModePolicy() { return 0; }
     public static final void setThreadStrictModePolicy(int policyMask) {}
     public static final void flushPendingCommands() {}

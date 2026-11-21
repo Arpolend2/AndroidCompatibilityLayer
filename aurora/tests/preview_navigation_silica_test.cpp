@@ -11,11 +11,13 @@ class TestSurface : public QQuickItem {
     Q_OBJECT
     Q_PROPERTY(QObject *player MEMBER player)
     Q_PROPERTY(qreal edgeZoneWidth MEMBER edgeZoneWidth)
+    Q_PROPERTY(int pageOrientation MEMBER pageOrientation)
 public:
     TestSurface(QQuickItem *parent = nullptr) : QQuickItem(parent) { ++created; }
     ~TestSurface() { ++destroyed; }
     QObject *player = nullptr;
     qreal edgeZoneWidth = 0;
+    int pageOrientation = 0;
     static int created;
     static int destroyed;
 };
@@ -72,14 +74,16 @@ int main(int argc, char **argv)
 {
     QGuiApplication app(argc, argv);
     const bool diagnosticTest = argc == 3 && QByteArray(argv[2]) == "--diagnostic";
-    if (argc != 2 && !(argc == 3 && QByteArray(argv[2]) == "--microg") && !diagnosticTest) {
+    const bool orientationTest = argc == 3 && QByteArray(argv[2]) == "--orientation";
+    if (argc != 2 && !(argc == 3 && QByteArray(argv[2]) == "--microg") &&
+        !diagnosticTest && !orientationTest) {
         std::fprintf(stderr, "Expected the absolute path to Preview.qml\n");
         return 1;
     }
 
     qmlRegisterType<TestSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
     TestPlayer player;
-    player.closeOnBackGesture = argc == 3 && !diagnosticTest;
+    player.closeOnBackGesture = argc == 3 && !diagnosticTest && !orientationTest;
     TestPicker picker;
     TestDiagnostics diagnostics;
     QQuickView view;
@@ -121,6 +125,27 @@ int main(int argc, char **argv)
         }
         return result;
     };
+    if (orientationTest) {
+        QTimer::singleShot(500, [&]() {
+            TestSurface *surface = view.rootObject()->findChild<TestSurface *>();
+            const char *names[] = { "Portrait", "Landscape", "PortraitInverted", "LandscapeInverted" };
+            const int expected[] = { Qt::PortraitOrientation, Qt::LandscapeOrientation,
+                Qt::InvertedPortraitOrientation, Qt::InvertedLandscapeOrientation };
+            if (!surface) failed = true;
+            for (int i = 0; surface && i < 4; ++i) {
+                const QByteArray expression = QByteArray("pageStack.currentPage.orientation = Orientation.") + names[i];
+                action(expression.constData());
+                QCoreApplication::processEvents();
+                if (surface->pageOrientation != expected[i]) {
+                    std::fprintf(stderr, "page orientation mapping failed for %s: %d\n",
+                                 names[i], surface->pageOrientation);
+                    failed = true;
+                }
+            }
+            app.exit(failed ? 1 : 0);
+        });
+        return app.exec();
+    }
     if (player.closeOnBackGesture) {
         QTimer::singleShot(700, [&]() {
             picker.request();

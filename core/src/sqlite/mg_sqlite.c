@@ -11,6 +11,7 @@
 
 #include "sqlite3.h"
 
+#include "../bionic/mg_bionic.h"
 #include "../bionic/mg_fd.h"
 #include "../host/mg_host.h"
 
@@ -417,6 +418,17 @@ static int vfs_full_path(sqlite3_vfs *vfs, const char *name, int n, char *out)
     return rc;
 }
 
+static int vfs_guest_path(sqlite3_vfs *vfs, const char *name, int n, char *out)
+{
+    char *host = mg_fs_host_path(name);
+    int rc = SQLITE_OK;
+    (void)vfs;
+    if (!host || (int)strlen(host) >= n) rc = SQLITE_CANTOPEN;
+    else memcpy(out, host, strlen(host) + 1);
+    free(host);
+    return rc;
+}
+
 static int vfs_randomness(sqlite3_vfs *vfs, int n, char *out) { (void)vfs; mg_random(out, (size_t)n); return n; }
 static int vfs_sleep(sqlite3_vfs *vfs, int microseconds) { (void)vfs; mg_sleep_ns((u64)microseconds * 1000u); return microseconds; }
 
@@ -440,9 +452,15 @@ static int vfs_last_error(sqlite3_vfs *vfs, int n, char *out) { (void)vfs; if (n
 
 static sqlite3_vfs g_vfs = { 2, (int)sizeof(sq_file), 1024, NULL, "megler", NULL, vfs_open, vfs_delete, vfs_access, vfs_full_path, NULL, NULL, NULL, NULL,
                              vfs_randomness, vfs_sleep, vfs_time, vfs_last_error, vfs_time64, NULL, NULL, NULL };
+static sqlite3_vfs g_guest_vfs = { 2, (int)sizeof(sq_file), 1024, NULL, "megler-guest", NULL, vfs_open, vfs_delete, vfs_access, vfs_guest_path, NULL, NULL, NULL, NULL,
+                                   vfs_randomness, vfs_sleep, vfs_time, vfs_last_error, vfs_time64, NULL, NULL, NULL };
 
 /* What SQLite calls where it has no operating system of its own (SQLITE_OS_OTHER). */
-int sqlite3_os_init(void) { return sqlite3_vfs_register(&g_vfs, 1); }
+int sqlite3_os_init(void)
+{
+    int rc = sqlite3_vfs_register(&g_vfs, 1);
+    return rc == SQLITE_OK ? sqlite3_vfs_register(&g_guest_vfs, 0) : rc;
+}
 int sqlite3_os_end(void) { return SQLITE_OK; }
 
 bool mg_sqlite_available(void) { return true; }

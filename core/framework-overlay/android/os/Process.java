@@ -8,7 +8,7 @@
 // the code that asks, as Application.getProcessName does (overlaid). And in setThreadPriority, which sets the calling
 // thread's priority (megler.Native.threadNice) where the original did nothing. And in killProcess, which ends nothing when
 // Google Play services' own code asks it or the pid is not the process's, and says who ended the app. Everything else is
-// the original's, unchanged.
+// the original's, unchanged except that an opt-in shared microG client uses its manager-assigned UID.
 package android.os;
 
 public class Process {
@@ -17,7 +17,10 @@ public class Process {
     public static int myPid() { return 4242; }
     /** the calling thread id: one per thread, as gettid() gives (the main thread is the process id) */
     public static int myTid() { long id = Thread.currentThread().getId(); return id == 1 ? 4242 : 4242 + (int) id; }
-    public static int myUid() { return 10100; }
+    public static int myUid() {
+        int uid = megler.SharedMicrogIdentity.clientUid();
+        return uid >= 0 ? uid : 10100;
+    }
     /* The calling thread's priority, as the host's after it (megler.Native.threadNice): an app's audio thread above the
        shell's, as Android's. Another thread's is not set: a thread's id here is not the host's to find it by. */
     public static void setThreadPriority(int p) { megler.Native.threadNice(p); }

@@ -16,6 +16,13 @@ typedef struct mg_java_stats {
     volatile i32 polls;
 } mg_java_stats;
 void mg_java_get_stats(mg_java_stats *out);
+/* Only the dedicated shared-microG launcher enables its guest control thread. */
+void mg_java_enable_shared_microg_worker(void);
+/* Trusted host bootstrap, before guest startup. Takes host_fd ownership only on success.
+ * UID/PID/package must come from the verified manager's atomic OpenClientChannel reply. */
+bool mg_java_set_shared_microg_client(int host_fd, int uid, int pid, const char *package);
+void mg_java_close_shared_microg_client(void);
+const mg_jhle *mg_java_shared_microg_client_natives(void);
 /*
  * For the tests: every frame a window draws in part (its dirty region) is checked against the same frame drawn whole, and a
  * difference is a line in the log ("ViewRoot: ... drawn in part missed"). Set before the app starts. Costs a second drawing

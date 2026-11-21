@@ -842,12 +842,16 @@ int main(int argc, char **argv)
         QCoreApplication::processEvents();
         QObject *rpmStatus = root->findChild<QObject *>(QStringLiteral("detailRpmStatus"));
         QObject *rpmProgress = root->findChild<QObject *>(QStringLiteral("detailRpmProgress"));
+        view.resize(854, 480);
+        QTest::qWait(100);
         if (rpmItem->property("enabled").toBool() || remove->property("enabled").toBool() || !rpmStatus ||
             !rpmStatus->property("visible").toBool() || !rpmProgress ||
-            !rpmProgress->property("visible").toBool() || !rpmProgress->property("indeterminate").toBool()) {
+            !rpmProgress->property("visible").toBool() || !rpmProgress->property("indeterminate").toBool() ||
+            rpmProgress->property("width").toReal() > view.width()) {
             std::fprintf(stderr, "RPM creation status is not visible or the button remains enabled\n");
             return 1;
         }
+        view.resize(480, 854);
         probe.setRpmState(false, QStringLiteral("Could not create RPM"));
         QCoreApplication::processEvents();
         if (!rpmStatus->property("visible").toBool() ||
@@ -857,10 +861,37 @@ int main(int argc, char **argv)
         }
         QObject *rpmBanner = root->findChild<QObject *>(QStringLiteral("rpmErrorBanner"));
         if (!rpmBanner) return 1;
+        QQmlExpression rpmVisibility(qmlContext(root), root,
+            QStringLiteral("rpmDetailsAreVisible(pageStack.currentPage, true, 'org.example.other')"));
+        QQmlExpression rpmInactive(qmlContext(root), root,
+            QStringLiteral("rpmDetailsAreVisible(pageStack.currentPage, false, 'org.example.other')"));
+        QQmlExpression rpmDifferent(qmlContext(root), root,
+            QStringLiteral("rpmDetailsAreVisible(pageStack.currentPage, true, 'org.example.different')"));
+        QQmlExpression rpmLibrary(qmlContext(root), root,
+            QStringLiteral("rpmDetailsAreVisible(launcherPage, true, 'org.example.other')"));
+        if (!rpmVisibility.evaluate().toBool() || rpmInactive.evaluate().toBool() ||
+            rpmDifferent.evaluate().toBool() || rpmLibrary.evaluate().toBool() ||
+            rpmVisibility.hasError() || rpmInactive.hasError() ||
+            rpmDifferent.hasError() || rpmLibrary.hasError()) {
+            std::fprintf(stderr, "RPM visibility did not distinguish the app page, background and another app\n");
+            return 1;
+        }
+        probe.setVisible(true);
+        if (rpmVisibility.evaluate().toBool()) {
+            std::fprintf(stderr, "RPM details treated as visible under the install confirmation\n");
+            return 1;
+        }
+        probe.setVisible(false);
         const QString originalBanner = rpmBanner->property("previewBody").toString();
         emit probe.standaloneRpmError(QStringLiteral("org.example.other"), QStringLiteral("Visible on app page"));
-        if (rpmBanner->property("previewBody").toString() != originalBanner) {
+        if (QGuiApplication::applicationState() == Qt::ApplicationActive &&
+            rpmBanner->property("previewBody").toString() != originalBanner) {
             std::fprintf(stderr, "RPM banner shown on the matching app page\n");
+            return 1;
+        }
+        if (QGuiApplication::applicationState() != Qt::ApplicationActive &&
+            rpmBanner->property("previewBody").toString() != QStringLiteral("Visible on app page")) {
+            std::fprintf(stderr, "RPM error missing while the manager is in the background\n");
             return 1;
         }
         emit probe.standaloneRpmError(QStringLiteral("org.example.different"), QStringLiteral("Different app error"));

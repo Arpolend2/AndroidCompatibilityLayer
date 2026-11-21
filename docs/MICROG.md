@@ -24,6 +24,87 @@ stopped and live cross-client provider state remain unfinished. A successful Goo
 verdict is not established. Opt-in compatibility profiles, synthetic error
 callbacks and external-keybox attestation are described in the progress report.
 
+## Experimental headless runtime
+
+The core exposes `megler_run_headless` to start a Java APK's Application and
+main looper without a launcher Activity. It remains alive without an Activity
+until `megler_stop`; an Activity opened later does not end it when closed. The
+normal launcher and APK report are unchanged. Headless startup requires a base
+APK with `classes.dex`, Java code enabled and a compatible native ABI; an APK
+that is itself a split or lacks its required ABI split is rejected.
+
+An isolated two-guest test runs a no-Activity test Application as a Binder
+server, hosts real microG services there, and exercises binding, callbacks and
+shutdown. A separate isolated test starts and stops the real microG APK itself
+without a launcher Activity. An additional test adds test-only code to a copy of
+that APK and binds its own Advertising ID service across processes. The common
+service broker also accepts the test client and invokes its callback when the
+test fixture binds that client's UID to the connection; it rejects a request
+naming another package. The fixture supplies this identity, not Aurora.
+It uses the test client's existing hash-derived UID and a synthetic PID;
+the new UID allocator is not involved in that run.
+Another isolated run exercises the manager-owned `OpenChannel`: the manager
+identifies the D-Bus sender, passes the server socket and its UID/PID to a
+trusted test backend, and sends the other socket to the client. A separate
+headless process running a modified test copy of the real microG APK receives
+that identity; its Binder broker accepts the client and rejects another package.
+The test substitutes Aurora's identity service and pre-seeds the UID registry
+with the client's legacy hash-derived UID so the existing guest package manager
+can resolve it. It does not test a production identity handoff or an unmodified
+APK.
+This is not a production shared microG daemon: the Aurora manager,
+transport handoff and client routing do not yet start or use this runtime.
+An experimental worker entry point now starts the unmodified microG APK
+headlessly and accepts manager-owned channels over a private Unix
+`SOCK_SEQPACKET` control socket. Each channel has its own Binder bridge and
+service router; caller package, UID and PID come from the manager, not from
+the client stream. Its guest package manager uses those channel-bound
+identities instead of hash-derived UIDs. The worker reports bridge disconnects
+and closes its channels on stop or control-socket loss. The manager must not
+reuse a channel ID during the worker's lifetime, including
+after a rejected or closed channel. An isolated x86_64
+test exercised two clients, package-spoof rejection and cleanup against the
+original APK. The production manager must still establish a trustworthy
+app-to-package mapping before enabling the backend; the embedded worker mode
+and Sailjail have not been verified on a device.
+The experimental Binder bridge can apply a connection owner's UID and PID to
+incoming calls, with thread-local restoration for nested calls and cleared
+identities. It does not derive or authenticate those values from the stream.
+A persistent, collision-free UID allocator is available to the manager but is
+not yet connected to app launches or `PackageManager`. The manager's
+`ResolveCaller` can map the actual D-Bus sender, identified by Aurora, to a
+previously exported standalone and allocate its UID and a connection-scoped
+virtual PID. A standalone export now records that mapping even without the
+diagnostic build option. Isolated tests cover the built background manager,
+unknown standalone IDs, a corrupt UID registry, client disconnect during
+identification, and reconnect with the same UID and a new virtual PID. Aurora's
+identity service is simulated in these tests; this has not been verified on a
+device. UIDs survive manager restarts; virtual PIDs do not. This is not yet a
+transport authorization decision:
+the export registry is not an installation or APK-signature attestation, and
+the virtual PID is not an OS PID. `OpenChannel` accepts no identity arguments
+and is available only with an explicitly installed trusted backend. The backend
+receives the server socket and the manager-resolved identity together; the
+manager rejects new channels unless microG is selected, and revokes the socket
+on D-Bus disconnect, backend release, or when microG is deselected. Manager UI
+changes are applied immediately; other settings changes are checked once per
+second while channels are open, so a brief external change may be missed. Invalid
+or unreadable settings also revoke channels. One channel
+per D-Bus connection is supported; the backend must report bridge termination
+with its channel ID on the provider's thread. The production manager has no
+such backend yet, and rejects channel requests. Clients must keep their D-Bus
+connection alive while using the socket. Ordinary per-process mode still uses a
+constant `Process.myUid()` and hash-derived UIDs that can collide. An opt-in
+shared client uses its manager-assigned UID for `Process.myUid()` and its own
+package; UIDs of other ordinary apps are unknown rather than hash-derived in
+that mode. This does not authenticate the guest: the worker accepts caller
+identities only from the manager. Production needs a trusted app-to-package
+mapping and integration verified on device. The client still uses a virtual PID
+from the manager for worker calls while `Process.myPid()` retains its legacy
+value; when the APK is not locally mounted, existing synthetic GMS package
+metadata does not establish the worker APK's version or signing identity.
+An APK-supplied package name and the current UID mapping do not prove identity.
+
 ## Shared state
 
 The core mounts `/data/megler-services` on `<storage>/services/data`, beside the
@@ -1625,6 +1706,400 @@ others, which it refused ("Unexpected service id: 343" to `GoogleAuth.API`, and
 40, 41, 270... about a hundred a minute). Google Play services' own sign-in did
 not connect, and WhatsApp's search for its Google Drive backup failed until it
 said it took too long (package 486). The microG test checks the keys.
+
+## Aurora compatibility inventory
+
+This inventory uses microG v0.3.17.252432, commit
+`32bc8954ff872d0e1a05ddfae81561b6dbecef69`, as a reference. Its
+`settings.gradle` and `play-services-core/build.gradle` describe source modules
+and build dependencies, not proof that a particular downloaded APK contains a
+feature or that it works on Aurora. The manager may install a later release.
+The provider remains optional and disabled by default.
+
+| Area in the reference source | Aurora status and remaining dependency |
+| --- | --- |
+| Base/basement, tasks, Chimera, Conscrypt, Cronet, common broker and OSS licenses | Local service routing and Binder callbacks work with the synthetic guest fixture below. Actual APIs, dynamic modules and native libraries require separate tests with the installed microG APK. Cross-process Android Binder is absent. |
+| Advertising/identifier, ads APIs, app set, app invite | Source modules exist; no Aurora API result has been verified. Advertising and app-set identifiers must not be invented by the bridge. |
+| Account authentication, sign-in, Firebase auth, credentials, blockstore, work account and FIDO | The user reported completing microG sign-in on an Aurora tablet. That does not establish app token access, account visibility, passkeys or per-app consent. These require real-device, permission and upstream verification; no account or token is used in the fixture. |
+| Check-in, GServices, phenotype, clearcut, measurement, Firebase dynamic links, compliance | Source and provider/receiver routing exist; these functions and their network or persisted state are not confirmed by the synthetic fixture. Server-dependent behavior depends on upstream services. |
+| GCM/FCM and instance ID | Source includes a persistent MCS network connection. Delivery when a client is stopped needs an authenticated shared service and lifecycle support; the current per-client service instances do not supply this. Registration and message delivery are not verified on Aurora. |
+| Location, places, place reports, maps and panorama | Source modules exist; location, map rendering and geocoding are not verified on Aurora. Do not feed real location or scan data to microG without reliable per-app authorization and user consent; maps and places can also require external providers or network access. |
+| Cast, Nearby, wearable, Thread networking, fitness, vision and ML Kit barcode/face detection | Source modules exist; actual availability varies by build flavor, upstream implementation, hardware, permissions and native libraries. No Aurora end-to-end support is established. |
+| Drive, games, payments/tap-and-pay, identity credentials and Google account features | Modules or client APIs exist, but service implementations, backend authorization and device capabilities vary. No Aurora end-to-end support is established. |
+| reCAPTCHA, SafetyNet and DroidGuard | Source modules exist, but trusted attestation or Play Integrity verdicts cannot be supplied by a compatibility shim. They are outside this work and are not emulated. |
+
+For cross-process functions, a future service boundary must authenticate the
+actual OS caller and bind it to a verified installed app and its launch
+session, authorize each requested operation and permission, and account for
+service death, revocation and delivery to stopped apps. A caller-supplied
+package name, a shared socket alone, or the manager's provider-status D-Bus
+method is not that boundary. Its IPC and ABI are not implemented here.
+
+The build-only `ANDROID_COMPATIBILITY_LAYER_BUILD_SHARED_MICROG_PROBE` fixture
+is off by default and is not installed. Its fixed, typed test response uses
+the actual D-Bus sender, but does not identify or authorize the caller. Run
+`aurora/tests/shared_microg_headless/test.py` with the fixture and client
+paths to test separately started and D-Bus-activated processes on private
+local buses. The fixture impersonates the manager name on that isolated bus;
+never run it on the device session bus. This does not test the installed
+manager, Aurora activation, an exported Android standalone, or microG.
+The installed manager's existing `GetProvider` and `InspectCaller` are
+separate diagnostic methods; the native `dbus-identity` client can check them.
+Aurora's single application `ExecDBus` already launches the manager, and a
+separately activated executable in the same RPM is not yet established.
+On an ARM64 tablet, the native `dbus-identity` client observed no manager
+name owner before `GetProvider`, then received `microg` without a manager
+window. This does not verify a generated Android standalone or a Google API.
+
+Generated standalones declare the manager's main interface, not its `microg`
+interface. The optional `ANDROID_COMPATIBILITY_LAYER_STANDALONE_MICROG_DIAGNOSTIC`
+build enables a no-argument `DiagnosticPing` on that main interface and a
+diagnostic screen in newly exported standalones. The manager records each
+successfully exported RPM's app ID and Android package in its private registry,
+including on cache reuse. It looks up the executable identified for the actual
+D-Bus sender, and returns only `synthetic-ok` for known IDs. Unknown or
+unidentified callers are refused; the client cannot supply an ID. The option
+is off by default and changes neither microG nor its login.
+
+The registry records what the manager exported, not installation, APK integrity,
+or authorization to use an account or Google API. `IdentifyByBusName` provides
+an executable and key, but standalones share launcher code and a test signing
+key. There is still no trusted installed app ID-to-APK attestation or
+cross-process Binder boundary. The standalone screen reports owner-before-call
+and ping separately; neither a successful ping nor the native client test
+demonstrates a Google service. On an ARM64 tablet, the user reported
+`Owner before request: absent` and `DiagnosticPing: synthetic-ok` from the
+installed standalone launcher. This confirms a response and a sender match in
+the export registry after no owner was observed. The user also confirmed that
+the manager window did not appear, demonstrating cold activation without a
+window in this run. Google APIs and a shared GmsCore were not tested.
+The user subsequently reported that the selected Android app crashed after
+Continue, followed by manager crashes on later normal launches; after a reboot,
+the manager opened when that standalone had not been launched. The user also
+reported crashes with previously working APKs. A separate diagnostic-page
+component lifetime defect has since been corrected and tested locally, but its
+connection to either device crash is unconfirmed. Both failures remain under
+investigation; the overall device lifecycle test is not complete.
+In a later cold run without Continue, the manager crashed when opened while
+the standalone diagnostic screen was still visible, so neither Continue nor a
+guest crash is required for the manager failure. A run with the manager
+started under the Aurora IDE C++ debugger with `--microg-service` (QML
+debugging disabled, because its extra argument makes the service mode exit
+with code 2) showed only a blank splash; a manual interrupt showed an idle Qt
+event loop, not a fatal signal, and the UI appeared once the debugging session
+ended. That behaviour is attributed to the debugger session and is not
+evidence about the cold-device crash, whose cause is still unknown.
+The code shows a common path independent of microG: standalone and preview
+processes start the log client (in the diagnostic build only after Continue;
+before that, `DiagnosticPing` itself starts the manager), and the client calls
+`StartServiceByName` for the manager when no owner exists. Unless activation
+is denied or forwarding is unavailable, a standalone launch therefore starts a
+windowless `--microg-service` manager that `setKeepAlive(true)` keeps until
+reboot. Aurora documents that `ExecDBus` runs under
+`invoker ... --id=<app> --single-instance`. In upstream mapplauncherd, a
+second single-instance launch whose lock is already held only asks lipstick
+to `raiseProcessWindow` and does not start the binary. If Aurora behaves the
+same, tapping the icon would deliver no `activate` request to the windowless
+process and leave only the launcher splash, which may look like a crash. This
+matches the IDE observation but remains unconfirmed on the device; a PID check
+before and after the tap alone cannot exclude a short-lived new process.
+Upstream mapplauncherd sources confirm the lock mechanics: the booster takes an
+fcntl lock on `$XDG_RUNTIME_DIR/single-instance-locks/<binary>/instance.lock`
+inside the process that becomes the application and keeps it until that
+process exits; the lock is keyed by the binary, so icon launches and
+`ExecDBus` activation share it. The manager therefore adopts that inherited
+lock and holds it only while its window is shown: a `--microg-service`
+manager releases it at startup, and the window's `visibleChanged` drives the
+lock, so every hide releases it and every show, including a later re-show of
+the same window, reacquires it. Reacquiring uses the upstream range
+(`F_WRLCK`, `SEEK_SET`, start 0, length 1) and retries every 500 ms for at
+most 60 s while a forwarding launch still holds it. The adopted and
+reacquired descriptors are close-on-exec; upstream leaves the booster's fd
+inheritable, which would keep the lock file open in `adb` or guest children.
+The journal gets at most one line per episode: `Launcher single-instance lock
+adopted`, `No inherited single-instance lock` (IDE or non-launcher start), a
+warning if a lock descriptor exists but is not owned by this process,
+`Single-instance lock busy, retrying`, `reacquired after N retries`, or the
+warning `not reacquired after N retries`. After exhausted retries a launch
+still reaches the manager through a forwarding process; the next show retries
+again. With the lock free, a tap starts a normal manager process that
+forwards `activate` over D-Bus to the running manager, which shows its window.
+The D-Bus-started manager now also sets `AA_ShareOpenGLContexts`, because it
+can show the same UI, including the WebView report form. The lock handover is
+covered by `manager_lifecycle_test` with real cross-process fcntl locks,
+including hide -> show, retry exhaustion and recovery, and the close-on-exec
+flag. Those checks ran on the x86_64 build host; the ARM64 binary was only
+compiled, not run. The sysroot's `libapplauncherd` exports the same
+`SingleInstance`/`activateExistingInstance` plugin interface and the
+`invoker --single-instance` option, but the device plugin's lock path and
+range were not inspected on the tablet. Whether
+Aurora's mapplauncherd fork behaves exactly like upstream, and therefore
+whether this resolves the device failure, still needs one tablet check. A
+crash of the standalone itself after Continue is a separate issue.
+
+A tablet run of that build still showed a long splash that then vanished. The
+Aurora 5.2 home-screen sources in the SDK sysroot point to a path the lock never
+reaches. RuntimeManager reports `ApplicationAlreadyRunning`, and
+`RuntimeManagerIntegration.qml` exposes `launchProcess(appId)` for
+RuntimeManager/mapplauncherd to bring a running application forward.
+`compositor.qml` ignores `Started` with `StartReason` 6 (D-Bus) and the
+`file:///no-gui` URI. `ToplevelManager.activateToplevel(null, appId)` adds a
+splash-only toplevel when the app has no window. The splash's
+`StartupWatcher` then calls `windowLowered` on `startupFailed`. The `.desktop`
+guide says a second icon tap opens the window of the running single instance. A
+manager started by `ExecDBus` has no window, and no process is started. The
+vanishing splash would then be a startup timeout rather than a crash. This
+matches the older report that the manager "crashed" after any standalone crash,
+since the standalone log channel also D-Bus-activates the manager. This is
+inferred from system sources and was not observed on the tablet. Running
+`pgrep -af ru.androidcompatibilitylayer.appmanager` right after the splash
+vanishes distinguishes the cases without privileges: the same
+`--microg-service` PID still alive means activation without a window, while no
+process means an exit or a crash.
+
+On the tablet the `--microg-service` process was still alive after the splash
+vanished, and killing it let the icon open the manager normally. The
+RuntimeManager client API documents the fix path: when an application
+explicitly registers `Start`, a `Start` call reaches it over D-Bus (an `invoker`
+spawn plus `Start`), in the same way a running instance handles `OpenURI`. The
+manager now declares `Intents=OpenURI;Start` and registers a `Start` handler
+that replies at once and then shows (or raises) the manager window. The
+`manager_lifecycle_test` sends `HandleIntent("Start")` to a window-less
+background manager and expects exactly one window. Whether RuntimeManager on
+the tablet routes the icon tap to that handler for an instance started by
+`ExecDBus` still needs one device check.
+
+A tablet run of the build with the `Start` handler still showed the splash
+hang and vanish, so it did not fix the failure; whether the handler was called
+is not known. The 5.2 home sources show why it may never be reached: an icon
+tap emits `requestStart`, `RuntimeManagerIntegration.launch` invokes `Start`
+with `preferredHandler`, and `local.Lipstick.WindowModel.launchProcess`, which
+RuntimeManager and mapplauncherd use to bring a running application forward,
+only calls `activateToplevel` in the compositor and sends nothing to the
+application. A window-less instance cannot answer that, so every fix that
+keeps a window-less application instance alive leaves the icon broken while
+it runs. The remaining options are: let the window-less manager exit when it
+has no clients (no visible change, but the icon still fails while a standalone
+keeps it running), declare `X-Nemo-Single-Instance=no` so that a tap starts a
+new instance that forwards `activate` (the home screen supports `.instance_`
+app ids and an undocumented `X-Aurora-Single-Cover`; this changes how launches
+are handled and is unverified), or move the service out of the application
+instance.
+
+The manager now uses the second option: its desktop entry declares
+`X-Nemo-Single-Instance=no` and `X-Aurora-Single-Cover=yes`. Each icon tap
+starts a new process; when the manager service is already registered, that
+process calls `activate` on the running manager (window-less or not) and exits,
+and the running manager shows or raises its window. With the single-cover key
+the 5.2 compositor identifies the manager window by the application, not by
+the launched instance, so the switcher keeps one manager entry. The key is
+undocumented and only verified in the home-screen QML sources; if it is
+ignored, a second cover or entry may briefly appear. Every tap now costs one
+short process start, and the invoker single-instance lock is no longer used
+for icon launches (`SingleInstanceLock` stays as a harmless fallback). On the
+host, `manager_lifecycle_test --desktop` checks both keys and
+`--actual-manager-transition` shows the forwarding launch exiting 0 after the
+window-less manager accepted `activate`; the manager window itself cannot be
+created on the host `minimal` platform (it crashes there even without a
+background manager), so the visible result needed one tablet run: launch
+a standalone (Owner absent, `synthetic-ok`), then tap the manager icon. Tablet
+observation after this change: launching a standalone starts the background
+process; tapping the manager icon while it runs opens the manager window; after
+the manager window is closed, the background process is no longer listed. The
+manager has no exit path on window close (`setQuitOnLastWindowClosed(false)`,
+keep-alive, no `Qt.quit` in the manager QML), and the earlier observation that a
+normally launched manager also left no process after its window was closed
+points to the system closing the application process; the signal or reason was
+not recorded. Later standalone requests re-activate the service over D-Bus
+(provider requests auto-start, the log client calls `StartServiceByName`), but
+requests in flight at that moment fail. The number of covers or switcher
+entries and other launch scenarios were not checked.
+
+For a tablet test, add
+`--extra-options " -DANDROID_COMPATIBILITY_LAYER_STANDALONE_MICROG_DIAGNOSTIC:BOOL=ON"`
+to the Aurora IDE `apptool build` step for the ARM64 manager and rebuild/deploy
+it. The leading space inside the quotes is required by apptool. Import an
+offline test APK, export and install a fresh standalone from this manager, then
+restart the tablet without opening the manager. Closing its window or waiting
+60 seconds does not guarantee that the background process has exited. Launch the installed
+standalone before opening the manager again. The diagnostic screen should show
+`Owner before request: absent` and `DiagnosticPing: synthetic-ok`; the manager
+window must not appear. `present` means the run was not cold. An error is a
+failed test, not an absent owner; `AccessDenied` means the sender could not be
+matched to the export registry. Continue dismisses the diagnostic and starts
+the Android app. This test uses no account or network.
+
+After testing, configure the same IDE step once with `BOOL=OFF`, rebuild and
+deploy, then remove the extra option. Merely removing it can leave `ON` in the
+CMake cache. A standalone exported by the diagnostic build retains its
+diagnostic launcher until it is recreated and reinstalled from an OFF build.
+
+The local service router checks whether a service is exported, but does not
+enforce its declared `android:permission`; the current permission model does
+not reliably distinguish signature/system permissions from ordinary ones.
+It also does not match manifest `<data>` constraints when selecting a service
+or receiver. Consequently the synthetic test's hidden-service rejection is
+not evidence of complete component authorization or intent matching. These
+are blockers for safely exposing permission-protected and data-filtered APIs.
+
+The local synthetic guest test (`core/tests/microg-guest-broker/run.ps1`)
+builds the current framework and two test APKs in a new output directory. With
+an existing x86_64 `mg_tests` runner and Android root, it runs the guest with
+networking disabled and requires its PASS marker. It exercises service
+resolution, rejection of a hidden service, a nested Parcel carrying a callback,
+intent-specific bind/unbind/rebind, and a retained system binding. It tests a
+stand-in, not the real microG APK, device permissions or push. The separate
+`core/tests/microg-binder-boundary/run.ps1` tests local Parcel/Binder behavior
+and confirms that ordinary Parcel marshalling does not transport Binder
+references between host JVMs.
+Neither test proves a feature works on an Aurora device.
+
+The framework overlay has an experimental, opt-in `BinderBridge` for private
+duplex streams. Its bounded wire encoding carries primitive Parcel bytes,
+Binder handles and nested Bundles containing strings, integers, longs,
+booleans, byte arrays, Binders and Bundles. It also serializes standalone
+Parcelables through `writeToParcel` and recreates them with the reader's
+`CREATOR`; their nested Parcel data is subject to the same limits and type
+restrictions. Arrays of Parcelables, including null elements, are supported.
+Parcelables inside Bundles, file descriptors, lists and other arrays of objects
+are not supported. The transport accepts only zero Parcelable write flags and
+rejects nonzero flags instead of discarding them.
+Two host JVMs exercise a synchronous transaction, a nested callback, a
+Bundle, a Parcelable containing a Bundle, and returning the callback to its
+owner. The Bundle test requires
+compiled framework classes and the boundary test's `-FrameworkClasses`
+option. The bridge can apply a UID and PID supplied by its connection owner,
+but does not authenticate peers or establish their identity. It has no handle
+release, per-object death, file
+descriptors or arbitrary Parcelables. Handles are kept until the
+connection closes. Do not use it for accounts or other real data until those
+gaps and Aurora integration are addressed.
+
+`FLAG_ONEWAY` sends without waiting for a response, and the receiver invokes
+the target with a null reply. Calls to the same target are dispatched in
+arrival order; other targets and synchronous calls can run concurrently.
+Successful sending does not guarantee delivery or execution, and receiver
+exceptions cannot be returned to the caller. Both peers must support one-way
+frames. Each bridge bounds outstanding one-way calls to 128 and 4 MiB of
+serialized payloads, with eight dispatch workers and 32 queued target workers.
+Exceeding a limit or failing to schedule a target closes the connection rather
+than silently dropping a request; closing can discard queued calls. Host tests
+cover asynchronous return, ordering, independent targets, receiver exceptions,
+and count and byte limits.
+
+Remote proxies also support `linkToDeath` and `unlinkToDeath` for connection
+loss. Closing the bridge or losing the peer marks all proxies dead and sends
+one notification per remaining registration, asynchronously outside the
+bridge lock. Registrations are limited to 4096 per bridge; unlinking before
+closure prevents that registration's notification, while unlinking after
+closure returns false. Callbacks run sequentially on one daemon thread, so a
+blocked callback delays later callbacks. A new connection creates new proxies;
+automatic reconnection and per-object death independent of the connection are
+not implemented. Host tests cover unlink, duplicate registration, peer death,
+explicit close, callback failure, registration races and a fresh connection.
+`RemoteCallbackList` removes a dead proxy and ignores a stale death notification
+after a callback has been replaced or unregistered.
+
+For an owned socket transport, provide the `shutdownTransport` constructor
+callback and have it call `shutdown(SHUT_RDWR)` before the bridge closes its
+streams. Closing a descriptor alone need not interrupt a read already in
+progress, so without shutdown the peer may not observe disconnection. Shutdown
+affects all duplicates of that socket and is appropriate only when the bridge
+owns the entire connection. The three-argument constructor provides no such
+socket shutdown. Callback errors are logged; callers must not assume a failed
+shutdown interrupted the peer. This is a transport responsibility, not a
+change to general guest descriptor or duplicate-descriptor semantics.
+
+The Aurora-side transport groundwork can create a Unix stream socket pair and
+transfer one end as a D-Bus file descriptor. The receiving helper accepts only
+connected Unix stream sockets and sets close-on-exec. An isolated D-Bus
+fixture passes a descriptor to a separate Linux JVM; two JVMs use that socket
+with `BinderBridge` for a synthetic transaction and nested callback. The
+fixture also checks that a pending call fails when the peer exits. The
+optional `-LinuxJre` argument to `core/tests/microg-binder-boundary/run.ps1`
+runs this fixture in the Aurora build-tools Docker image. The test inherits
+host descriptors and does not run Megler's guest runtime. Guest descriptors
+are managed by Megler's own descriptor table, so a host socket number cannot
+simply be used as a guest descriptor. On POSIX, `mg_net_import_unix_stream`
+validates and duplicates a connected host Unix stream into that table; the
+caller retains the host descriptor. The guest socket owns the duplicate and
+uses the existing host socket readiness and shutdown machinery. The network
+tests cover invalid descriptors, transfer, wakeup, shutdown, EOF and ownership.
+`tools/shared-microg-guest-fd-test.sh` also exercises D-Bus handoff into that
+table with a synthetic byte exchange, not Java or BinderBridge.
+Run it from the repository root on Linux with Qt 5 D-Bus development files,
+GCC and `dbus-run-session`, setting `WORK_DIR` to an empty output directory.
+
+`core/tests/microg-binder-boundary/guest.ps1` builds an x86_64 Linux runner
+and a synthetic landscape Android Activity. The isolated D-Bus fixture passes
+its socket to the runner, where a test-only native imports it into the guest
+descriptor table. The guest uses `ParcelFileDescriptor` and `BinderBridge` to
+exchange a transaction, nested callback and one-way callback with a host JVM,
+then verify the death notification when the host process exits. It also runs
+two separate guest runtimes, checks both PASS markers, and verifies that the
+server's explicit socket shutdown delivers a death notification to the client.
+Another two-guest run binds a synthetic GMS broker APK through the server's
+normal service router, sends its Binder handle to the client and exercises a
+broker transaction with a nested callback. With `-MicrogApk`, an additional
+isolated run binds real microG's advertising ID service and common service
+broker, including a request containing a `Feature` array and a nested callback.
+The experimental `SharedMicrogServiceRouter` binds requested GMS actions or
+components rather than selecting pre-bound services, and releases a connection's
+bindings when closed. Its synchronous protocol currently carries only an action
+and component: data, types, categories and extras are not implemented. Caller
+identity is an optional connection property, not part of this protocol. The
+router reports an unavailable service as a failed bind rather than a transport
+exception; actual transport and protocol failures remain errors. The client
+releases the server's binding record even when no service was returned. This
+router also handles production shared-service binds.
+The fixture checks process exits and disconnect, without network or account
+access. It requires JDK 8, Android SDK 29, an x86_64 Android root, a Linux JRE,
+the local Aurora build-tools Docker image and framework classes compiled from
+the current checkout, supplied via `-FrameworkClasses`. Output is written to
+the new directory given by `-Output`; `guest-binder.log`, `two-guests.log` and
+`broker-guests.log` contain the runs; the optional real microG run writes
+`real-guests.log`. The real run requires the SQLite amalgamation in
+`build/sqlite` and the build image's system SQLite development files for its
+WAL fixture. It checks guest `/tmp` paths, SQL `ATTACH`, in-memory and read-only
+databases, and recovery of a committed row from a WAL created by system SQLite.
+The guest VFS converts guest paths once; the existing native VFS remains the
+default. These isolated runs do not test an Aurora device, accounts or network.
+
+The manager's shared microG backend is opt-in: it is configured only when the
+provider setting is `microg`, the supported APK and runtime are available, and
+the app/data directories can be prepared. It launches the current manager
+executable in its early `--shared-microg-worker` mode, keeps worker data in a
+separate persistent directory, and returns an `OpenChannel` descriptor only
+after the worker has sent `READY` and acknowledged `OPEN`. Startup, resolver,
+or worker failures leave the channel unavailable and close the local stream.
+
+For caller mapping, the manager obtains the actual D-Bus sender's executable
+and signing-key ID from Aurora's
+[identification service](https://developer.auroraos.ru/doc/5.2.1/software_development/reference/security_and_management/identification_service)
+and matches the executable's exported app ID to the manager's export registry;
+caller-supplied identity fields are not accepted. The key ID is required to be
+present but is not checked against an installed-package signing policy. The
+registry records an export, not proof of installation or identity, so this is
+a limited manager-derived mapping, not APK attestation or full authorization.
+The isolated original-APK test covers the self-spawn dispatch and
+manager-to-supervisor-to-worker handshake, but does not verify Sailjail access,
+the device's identification service, the guest client-router startup wiring,
+accounts, or network behavior.
+
+For the guest test on Windows, with an existing Linux x86_64 runner, Android
+root, JDK 8 and Android SDK 29, and the local `aurora-build-tools:5.2.1.200`
+Docker image:
+
+```powershell
+.\core\tests\microg-guest-broker\run.ps1 -Jdk C:\path\to\jdk8 `
+  -AndroidSdk C:\path\to\sdk -AndroidRoot C:\path\to\root-x86_64 `
+  -Runner C:\path\to\mg_tests -Output C:\path\to\new-test-output
+```
+
+The script requires a new output directory, compiles the framework there,
+and does not pull an image or use a network. Its `guest.log` contains the
+runtime output. A prebuilt matching framework can instead be supplied with
+`-FrameworkDexDirectory`.
 
 ## Verification
 

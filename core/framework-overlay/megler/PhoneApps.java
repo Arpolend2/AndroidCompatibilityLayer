@@ -16,7 +16,7 @@
 // Their signatures are the certificates of their APKs, from the same description (getPackageInfo with GET_SIGNATURES or
 // GET_SIGNING_CERTIFICATES); a PackageInfo's are otherwise the running app's own, and Google Play, which compares an app's
 // with its record, took every app it had installed for one "installed but certificate mismatch": not installed from it.
-// Each has a uid of its own, from its package name (the first one listed had the running app's, 10100). And the app is
+// Outside shared microG mode each has a uid derived from its package name. And the app is
 // told as Android tells it when the list changes (an app installed, updated or removed in Megler): ACTION_PACKAGE_ADDED,
 // ACTION_PACKAGE_REPLACED, ACTION_PACKAGE_REMOVED and ACTION_PACKAGE_FULLY_REMOVED, the list being read again every three
 // seconds once the app has asked for it; Google Play went on showing a removed app as installed.
@@ -129,6 +129,7 @@ public final class PhoneApps {
 
     /* A uid of the app's own, the same at each start: 10200 and up (the running app's is 10100). */
     private static int uidOf(String packageName) {
+        if (SharedMicrogIdentity.isWorker() || SharedMicrogIdentity.isClient()) return -1;
         return 10200 + (packageName.hashCode() & 0x7fffffff) % 9000;
     }
 
@@ -182,7 +183,7 @@ public final class PhoneApps {
 
     private static Intent packageIntent(String action, App a, boolean replacing) {
         Intent i = new Intent(action, android.net.Uri.fromParts("package", a.packageName, null));
-        i.putExtra(Intent.EXTRA_UID, a.uid);
+        i.putExtra(Intent.EXTRA_UID, exposedUid(a));
         i.putExtra(Intent.EXTRA_REPLACING, replacing);
         return i;
     }
@@ -300,10 +301,15 @@ public final class PhoneApps {
         i.className = null;
         i.nonLocalizedLabel = a.label;
         i.enabled = true;
-        i.uid = a.uid;
+        i.uid = exposedUid(a);
         i.flags = ApplicationInfo.FLAG_INSTALLED | ApplicationInfo.FLAG_HAS_CODE;
         i.targetSdkVersion = i.minSdkVersion = android.os.Build.VERSION.SDK_INT;
         return i;
+    }
+
+    private static int exposedUid(App a) {
+        return SharedMicrogIdentity.isWorker() ? SharedMicrogIdentity.uidForPackage(a.packageName)
+            : SharedMicrogIdentity.isClient() ? -1 : a.uid;
     }
 
     public static ActivityInfo activityInfo(App a, String activity) {

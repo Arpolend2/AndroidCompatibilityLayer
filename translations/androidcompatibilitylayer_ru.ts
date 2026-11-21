@@ -2,6 +2,11 @@
 <!DOCTYPE TS>
 <TS version="2.1" language="ru_RU">
 <context>
+    <name>StandaloneRpmNotification</name>
+    <message><source>Android App Manager</source><translation>Менеджер приложений Android</translation></message>
+    <message><source>Creating RPM for %1</source><translation>Создание RPM для %1</translation></message>
+</context>
+<context>
     <name>EmbeddedChannel</name>
     <message><source>Preview channel disconnected.</source><translation>Канал предварительного просмотра отключён.</translation></message>
     <message><source>Cannot send preview control message.</source><translation>Не удалось отправить команду предварительного просмотра.</translation></message>
@@ -496,16 +501,8 @@
         <translation>2. В менеджере выберите «Сохранить в файл». Журнал менеджера и доступные журналы отдельных приложений сохранятся в одном файле .txt в папке «Документы».</translation>
     </message>
     <message>
-        <source>3. Check the saved file for private data. Select “Send to developer” to open the Yandex form, then attach the checked file and select “Submit”.</source>
-        <translation>3. Проверьте сохранённый файл на наличие личных данных. Выберите «Передать разработчику», чтобы открыть Яндекс Форму, затем прикрепите проверенный файл и нажмите «Отправить».</translation>
-    </message>
-    <message>
-        <source>&lt;b&gt;Note:&lt;/b&gt; New standalone packages record only when logging is enabled in the manager. Other apps in the organization can access the shared log folder. After a successful save, the manager removes only the standalone snapshots included in the file that have not changed during export. The manager warns if the report is incomplete or cleanup fails.</source>
-        <translation>&lt;b&gt;Примечание:&lt;/b&gt; Новые отдельные приложения ведут журнал только при включённой записи в менеджере. Общая папка журналов доступна другим приложениям организации. После успешного сохранения менеджер удаляет только те снимки журналов отдельных приложений, которые вошли в файл и не изменились во время экспорта. Если отчёт неполный или очистка не удалась, менеджер предупредит об этом.</translation>
-    </message>
-    <message>
-        <source>Older standalone packages keep their previous logging behavior. To switch them to shared logs, recreate and install them once. You do not need to recreate packages each time you collect a log.</source>
-        <translation>Старые пакеты отдельных приложений ведут журналы по прежней схеме. Чтобы перейти на общую папку журналов, один раз пересоздайте и установите эти пакеты. При каждом сборе журналов пересоздавать их не нужно.</translation>
+        <source>3. Select “Send to developer” to open the Yandex form, then attach the saved file and select “Submit”.</source>
+        <translation>3. Выберите «Передать разработчику», чтобы открыть Яндекс Форму, затем прикрепите сохранённый файл и нажмите «Отправить».</translation>
     </message>
     <message>
         <source>Detailed logs may contain passwords, tokens, app data, paths and network addresses. The manager stores its log in private storage; standalone snapshots are in a shared organization folder accessible to other apps in the organization. Standalone apps record only while the manager's confirmed detailed state is enabled. Save to file combines available sections and removes included snapshots only after a successful atomic save. Turning logging off stops new entries but does not delete saved files. If saving the cleared manager history fails, old logs may reappear. Remote events and shared snapshots are untrusted and not cryptographically authenticated. Review logs before sharing.</source>

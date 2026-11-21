@@ -74,7 +74,8 @@ public:
 
 int main(int argc, char **argv)
 {
-    if (argc == 3 && QByteArray(argv[1]) == "--standalone-snapshot") {
+    if (argc == 3 && (QByteArray(argv[1]) == "--standalone-snapshot" ||
+                      QByteArray(argv[1]) == "--standalone-snapshot-stress")) {
         QCoreApplication app(argc, argv);
         QString error;
         const QString appId = QStringLiteral(
@@ -90,7 +91,19 @@ int main(int argc, char **argv)
             QThread::msleep(5);
         }
         check(MemoryLogBus::clientDetailedEnabled(), "wait for confirmed logging State");
-        ErrorLog::record(QStringLiteral("Android"), QStringLiteral("snapshot-only private event"), false);
+        if (QByteArray(argv[1]) == "--standalone-snapshot-stress") {
+            ErrorLog::record(QStringLiteral("Android"), QStringLiteral("startup retained"), false);
+            for (int i = 0; i < 700; ++i) {
+                ErrorLog::record(QStringLiteral("Android"),
+                                 i == 100 ? QStringLiteral("important retained error")
+                                          : QStringLiteral("verbose event %1").arg(i),
+                                 i == 100);
+                if (i % 100 == 99)
+                    check(ErrorLog::flushStandaloneSnapshots(), "publish bounded snapshot batch");
+            }
+        } else {
+            ErrorLog::record(QStringLiteral("Android"), QStringLiteral("snapshot-only private event"), false);
+        }
         check(ErrorLog::flushStandaloneSnapshots(), "publish standalone snapshot");
         return 0;
     }
@@ -393,9 +406,14 @@ int main(int argc, char **argv)
     QDBusConnection bus = QDBusConnection::sessionBus();
     Identity identity;
     QTemporaryDir sharedLogRoot;
-    check(sharedLogRoot.isValid() &&
-          ErrorLog::setStandaloneSnapshotRoot(sharedLogRoot.path(), &error),
-          "configure organization snapshot directory");
+    check(sharedLogRoot.isValid(), "create organization snapshot root");
+    check(ErrorLog::detailedReport(&detailed, &error) &&
+          detailed.contains(QStringLiteral("Organization snapshots are not configured.")),
+          "uninitialized snapshot root is reported");
+    check(!ErrorLog::setStandaloneSnapshotRoot(sharedLogRoot.path() + QStringLiteral("/missing"), &error) &&
+          !error.isEmpty() && ErrorLog::detailedReport(&detailed, &error) &&
+          detailed.contains(QStringLiteral("Organization files directory is unavailable.")),
+          "snapshot root failure is reported without exposing its path");
     check(bus.registerService(QStringLiteral("ru.omp.am")) &&
           bus.registerVirtualObject(QStringLiteral("/ru/omp/am"), &identity) &&
           bus.registerService(QStringLiteral("ru.androidcompatibilitylayer.appmanager")) &&
@@ -432,6 +450,8 @@ int main(int argc, char **argv)
     check(snapshotFile.open(QIODevice::ReadOnly) &&
           snapshotFile.readAll().count("snapshot-only private event") == 1,
           "snapshot contains the standalone event once");
+    check(ErrorLog::setStandaloneSnapshotRoot(sharedLogRoot.path(), &error),
+          "configure snapshot root when background manager opens");
     check(ErrorLog::detailedReport(&detailed, &error) &&
           detailed.count(QStringLiteral("snapshot-only private event")) == 1 &&
           detailed.contains(QStringLiteral("untrusted shared file")) &&
@@ -524,6 +544,32 @@ int main(int argc, char **argv)
     check(secondExport.open(QIODevice::ReadOnly) &&
           secondExport.readAll().count("snapshot-only private event") == 0,
           "exported standalone lines do not reappear in the next file");
+    check(ErrorLog::detailedReport(&detailed, &error) &&
+          detailed.contains(QStringLiteral("No standalone snapshots found")),
+          "empty configured snapshot directory is reported");
+    const QString offlineDirectory = snapshotDirectory + QStringLiteral("-offline");
+    check(QDir().rename(snapshotDirectory, offlineDirectory) &&
+          ErrorLog::detailedReport(&detailed, &error) &&
+          detailed.contains(QStringLiteral("Organization snapshots unavailable:")) &&
+          !detailed.contains(sharedLogRoot.path()) &&
+          QDir().rename(offlineDirectory, snapshotDirectory),
+          "unavailable snapshot directory is reported without exposing its path");
+    child.start(app.applicationFilePath(), QStringList() << QStringLiteral("--standalone-snapshot-stress")
+                << sharedLogRoot.path());
+    timeout.start(10000);
+    loop.exec();
+    check(child.state() == QProcess::NotRunning && child.exitCode() == 0,
+          "bounded standalone snapshot writer completed");
+    check(ErrorLog::detailedReport(&detailed, &error) &&
+          detailed.contains(QStringLiteral("startup retained")) &&
+          detailed.contains(QStringLiteral("important retained error")) &&
+          detailed.contains(QStringLiteral("verbose event 699")) &&
+          detailed.contains(QStringLiteral("Standalone snapshot entries dropped due to limits:")),
+          "bounded snapshots retain startup, errors and recent events while reporting loss");
+    QString stressPath;
+    check(ErrorLog::saveDetailedReport(&stressPath, &error, &partialExport, &cleanupWarning) &&
+          partialExport && QFile::remove(stressPath),
+          "truncated standalone snapshot exports as partial and is cleaned up");
     const QString largeManagerEntry(60000, QLatin1Char('m'));
     for (int i = 0; i < 140; ++i)
         ErrorLog::record(QStringLiteral("test"), largeManagerEntry, false);

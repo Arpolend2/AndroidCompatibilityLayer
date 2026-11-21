@@ -13,6 +13,12 @@ The manager and standalone app interface use Russian when the device language
 is Russian and otherwise use English. Android apps choose their own language;
 the Android language setting is independent of the manager interface.
 
+While a standalone RPM is being prepared, the matching app page shows the
+current phase and an indeterminate progress indicator. Away from that page,
+including when the manager is minimized, a system notification shows the
+package and phase without inventing a percentage. It is removed when the page
+becomes visible again or the build ends; errors are reported separately.
+
 Native EGL/GLES rendering is experimental and disabled by default in CMake. In the
 Aurora IDE, set the CMake option `ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL=ON` to try it.
 Android GL frames use system EGL pbuffers and CPU readback for preview; this
@@ -50,14 +56,30 @@ existing timeout may be used instead.
 For the experimental Android Canvas path, also set
 `ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS=ON`. It requires both
 options above. If the shared graphics context or presentation is unavailable,
-the Canvas path falls back to CPU rendering. This path has not been validated
-on an Aurora device. All three CMake options are off by default.
+the Canvas path falls back to CPU rendering. When combined with SurfaceView,
+the Canvas texture occupies the same composition position as the CPU views:
+above ordinary SurfaceView layers and below layers placed on top. This path
+has not been validated on an Aurora device. All three CMake options are off
+by default.
 
 microG settings open as a page in the manager, where the back gesture can start
 anywhere on the page. The Android runtime remains in a separate process and
 continues to use the bounded CPU frame channel.
 
 Aurora Store uses CPU Canvas and the bounded CPU frame channel on all builds.
+For IPC testing, `ACL_EMBEDDED_CPU_SHARED_FRAMES=1` lets embedded previews
+exchange CPU pixels through a private file in `/dev/shm`. The authenticated
+socket still carries the frame notice and ACK; the reader copies the pixels
+before acknowledging them. If shared storage cannot be used, frames travel
+over the socket as before. This does not enable GPU rendering in the Store.
+
+Run the manager executable with `--gpu-probe` in its normal GUI environment
+to check Qt GLES context creation, EGL DMA-BUF capabilities and a local GBM
+render target. It reports whether the optional Hybris gralloc library and
+native-buffer import entry points are available, but does not initialize
+gralloc or use it for frames: the platform ABI and peer import are unverified.
+The probe does not test Qt scene-graph presentation or prove GPU screen output.
+
 Other embedded workers can attempt GPU Canvas presentation when both
 experimental GPU options are enabled. They probe the current EGL context for
 DMA-BUF export support before selecting the GPU transport. If direct export
@@ -65,7 +87,10 @@ is unavailable, the one-time `Embedded GPU GBM probe` log
 checks whether the worker can allocate a buffer at the current preview size on
 a visible DRM render node and render to it after EGL import.
 For device testing, launch the manager with `ACL_EMBEDDED_GPU_GBM_VERIFY_PARENT=1`
-in the Aurora IDE run environment. The same probe line shows the flag as seen
+in the Aurora IDE run environment. In Store this opens a probe-only channel:
+its worker tests GBM even when texture export is advertised, and the manager
+rejects live GPU frames. Store still renders and presents its normal CPU frames.
+The same probe line shows the flag as seen
 by the worker (`verify_parent`), the connection state before the test
 (`gpu_channel`), and the probe result or why it was skipped, including when
 the GPU channel was never negotiated. With the flag enabled, a channel
@@ -163,6 +188,13 @@ are validated as bounded ordinary files, but their contents and claimed
 application identity are not cryptographically authenticated. The manager
 refreshes these snapshots in the Log view. Built-in preview/Store logging
 retains its existing D-Bus transport.
+
+The detailed report identifies an unconfigured or unavailable snapshot directory
+and an empty directory; an empty directory can also mean that snapshots were
+already exported. Bounded snapshots retain an initial startup window and prefer
+keeping errors when dropping older entries, with a loss count in the report.
+Events produced before the standalone process receives the manager's confirmed
+logging state are not retained, even if logging is subsequently enabled.
 
 **Save to file** atomically writes one combined
 `AndroidCompatibilityLayer-*.txt` report under
@@ -337,8 +369,9 @@ free space; its signature and standalone launch require device verification.
 Older shortcut RPMs may share app data with the main app.
 
 On a repeat request, the manager reuses its last signed RPM only if its contents
-and generation inputs still match, including APK and splits, launcher, runtime
-ABI, QML, settings and app permissions. Otherwise it builds a new package and
+and generation inputs still match, including the manager RPM version and release,
+APK and splits, launcher, runtime ABI, QML, settings and app permissions. Cache
+entries created before manager-version tracking are rebuilt once. Otherwise it builds a new package and
 removes the previous internal RPM after publishing the replacement. Importing
 an identical single APK retains the cache; an approved different APK for the
 same package replaces the library copy and invalidates that cache. Existing
@@ -419,10 +452,19 @@ future video decoder; this does not add a decoder or verify device playback.
 ARM64 builds include Android System WebView in the shared runtime. It is
 separate from Aurora's native WebView, which handles the manager's feedback form.
 The experimental camera bridge supports CPU-accessible NV12/NV21 preview
-frames; focus, torch and other camera formats are not yet supported.
-An experimental sensor bridge exposes supported physical sensors. Android
-file requests can select one file through the Aurora picker; multiple files
-and camera capture requests are not supported.
+frames. Autofocus, macro focus and torch are available only when the Qt camera
+backend reports the required capabilities. Android Camera and camera2 JPEG
+captures are encoded from preview frames, not full-resolution sensor stills.
+When Wayland does not report a native screen orientation, the Android display
+uses a portrait reference, consistent with the camera bridge's existing fallback.
+This is an assumption and may be incorrect on a landscape-native device.
+An experimental sensor bridge exposes supported physical sensors. Android file
+requests support single and multiple selection through the Aurora picker.
+Image capture requests open a QtMultimedia camera screen with explicit capture,
+confirmation and cancellation; its still-image quality depends on the device
+backend. Video capture requests are not supported. The camera screen requires
+the QtMultimedia 5.6 QML plugin at runtime. Camera controls, the capture
+screen and multiple selection require verification on a device.
 The experimental Bluetooth LE bridge reads adapter state and discovery results
 from BlueZ over system D-Bus. Aurora's `Bluetooth` permission is required.
 BlueZ's exposed device properties are converted into approximate advertising
@@ -491,9 +533,9 @@ is selected. Updates can download the release or select a local
 APK. Downloads are checked against GitHub release metadata; local updates work
 offline after explicit confirmation. APK signatures are not verified. Updates preserve app data and
 require all running Android apps to be closed. The downloaded microG APK is
-used by subsequently opened apps. The runtime attempts to open its settings,
-but microG, Google account authentication, Play Integrity, and individual
-Google APIs have not been verified on Aurora. No Aurora Wi-Fi scan host is
+used by subsequently opened apps. Google account sign-in through microG has
+been confirmed on an Aurora ARM64 tablet; that does not confirm individual
+Google APIs or Play Integrity. No Aurora Wi-Fi scan host is
 connected for Android apps. In microG settings, a completed Aurora back
 gesture returns to the manager and closes the settings instead of sending
 Android Back. A canceled gesture leaves the settings running.
@@ -510,11 +552,36 @@ D-Bus activation, sandbox permissions, simultaneous clients and APK handling
 still need device verification. Closing the window exits the manager; a later
 request may activate it again.
 
-This is not a shared Android service, Binder bridge, authenticated client
-interface or shared Google login. It does not expose account credentials.
-Standalone APKs do not yet use this interface or share the manager's microG
-state. The separate `dbus-identity` test clients provide a device check without
-accounts or secrets.
+New standalone exports made while `microg` is selected opt into the shared
+worker using `sharedMicrog: true` in their metadata (except the microG app itself).
+Old exports without that field and exports made with `none` retain their previous
+behaviour. Changing the provider invalidates the export cache; re-export an old
+standalone app to obtain the new D-Bus permissions and startup contract.
+
+`OpenClientChannel()` takes no arguments and returns one Unix stream FD plus the
+manager-resolved UID, virtual PID and package, only after the worker accepts that
+same identity. The standalone verifies the reply's unique D-Bus sender through
+Aurora `IdentifyByBusName` and holds its dedicated connection until guest teardown.
+The host transfers the bootstrap directly into the core, not through guest
+arguments or environment. The guest installs its UID before ApplicationInfo is
+cached and its Binder router before Application construction or provider startup.
+Shared GMS binds fail explicitly on unsupported intents or disconnect; they do not
+silently start a local microG. Outside this opt-in, the local path is unchanged.
+
+The optional CMake target `android_compatibility_layer_shared_microg_startup_client`
+opens the same verified channel and runs a real guest APK through
+`megler_run_headless`, without BinderGuestTest-specific expectations. Its arguments
+are `APK DATA ANDROID_ROOT PICTURES WAIT_MS`; `PICTURES` is reserved for fixture
+compatibility and unused. It logs the manager's UID/PID/package and guest output,
+stops after `WAIT_MS`, and waits up to another 15 seconds for guest teardown before
+failing. `--bootstrap-check` checks native FD validation and ownership separately.
+
+The export registry is a package mapping, not APK attestation. PackageManager's
+synthetic GMS version/signature are not verified metadata of the worker APK.
+This is not proof that Google login, arbitrary Google APIs or Play Integrity work.
+The real Aurora/Sailjail identity, D-Bus FD forwarding and sandbox permissions
+still require device verification. The separate `dbus-identity` test clients
+provide an identity check without accounts or secrets.
 
 The experimental `InspectCaller` method resolves the actual D-Bus sender using
 Aurora's `IdentifyByBusName` and returns that sender, executable and key ID only

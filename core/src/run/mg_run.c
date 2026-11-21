@@ -18,6 +18,7 @@
 #include "../host/mg_host.h"
 #include "../ld/mg_ld.h"
 #include "../ndk/mg_sensors.h"
+#include "../zip/mg_zip.h"
 #include "mg_bluetooth.h"
 
 static megler_run_config g_config;
@@ -29,6 +30,8 @@ static char g_error[400];
 static volatile i32 g_active, g_ended, g_frames;
 static const mg_driver *g_driver;
 static bool g_started_once;
+static bool g_headless;
+bool mg_run_is_headless(void) { return g_headless; }
 
 void mg_run_set_error(const char *fmt, ...)
 {
@@ -713,7 +716,7 @@ static void gather_splits(const megler_run_config *config)
     }
 }
 
-bool mg_run_start(const megler_run_config *config)
+static bool start_run(const megler_run_config *config, bool headless)
 {
     static mg_apk_info info;
     int i;
@@ -736,18 +739,37 @@ bool mg_run_start(const megler_run_config *config)
         mg_run_set_error("%s", info.error[0] ? info.error : "the APK cannot be read");
         return false;
     }
-    if (!info.runnable) {
+    if (headless) {
+        mg_zip zip;
+        char error[200];
+        bool has_dex;
+        if (!mg_zip_open(&zip, config->apk_path, error, sizeof(error))) {
+            mg_run_set_error("cannot open the APK: %s", error);
+            mg_apk_info_free(&info);
+            return false;
+        }
+        has_dex = mg_zip_find(&zip, "classes.dex") != NULL;
+        mg_zip_close(&zip);
+        if (!info.has_code || !has_dex || info.split[0] ||
+            (info.nabis && !info.abi[0]) ||
+            (!info.nabis && strstr(info.required_split_types, "__abi"))) {
+            mg_run_set_error("headless mode requires a complete Java APK with a compatible ABI");
+            mg_apk_info_free(&info);
+            return false;
+        }
+    } else if (!info.runnable) {
         mg_run_set_error("%s", info.reason);
         mg_apk_info_free(&info);
         return false;
     }
-    g_driver = mg_driver_find(info.engine);
+    g_driver = mg_driver_find(headless ? "java" : info.engine);
     if (!g_driver) {
         mg_run_set_error("no driver yet for this kind of app (%s)", info.engine);
         mg_apk_info_free(&info);
         return false;
     }
     g_started_once = true;
+    g_headless = headless;
     g_config = *config;
     g_apk_path = mg_strdup(config->apk_path);
     g_config.apk_path = g_apk_path;
@@ -818,7 +840,7 @@ bool mg_run_start(const megler_run_config *config)
      * Without one, the activity loads the library through JNI itself, as Qt's QtActivity does, and the app is a Java one: the
      * Java driver starts it, where the NativeActivity driver would end at once ("has no ANativeActivity_onCreate", 2GIS).
      */
-    if (!strcmp(info.engine, "native-activity") && info.native_entry == -1) {
+    if (!headless && !strcmp(info.engine, "native-activity") && info.native_entry == -1) {
         const char *entry = info.func_name[0] ? info.func_name : "ANativeActivity_onCreate";
         const mg_driver *java = mg_driver_find("java");
         char name[160];
@@ -852,6 +874,9 @@ bool mg_run_start(const megler_run_config *config)
     mg_apk_info_free(&info);
     return true;
 }
+
+bool mg_run_start(const megler_run_config *config) { return start_run(config, false); }
+bool mg_run_start_headless(const megler_run_config *config) { return start_run(config, true); }
 
 void mg_run_touch(int phase, int pointer_id, float x, float y)
 {

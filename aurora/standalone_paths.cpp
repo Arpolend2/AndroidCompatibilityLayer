@@ -49,6 +49,7 @@ bool standalonePaths(const QString &appId, const QString &executableName,
     const QJsonValue permissionsValue = object.value(QStringLiteral("deniedPermissions"));
     const QJsonValue snapshotsValue = object.value(QStringLiteral("standaloneSnapshots"));
     const QJsonValue diagnosticsValue = object.value(QStringLiteral("fileDiagnostics"));
+    const QJsonValue sharedMicrogValue = object.value(QStringLiteral("sharedMicrog"));
     QStringList deniedPermissions;
     const ApkStore store(QDir(privateRoot).filePath(QStringLiteral("apps")));
     const QString data = store.dataPath(package);
@@ -62,6 +63,7 @@ bool standalonePaths(const QString &appId, const QString &executableName,
         (!locationValue.isUndefined() && !locationValue.isString()) ||
         (!snapshotsValue.isUndefined() && !snapshotsValue.isBool()) ||
         (!diagnosticsValue.isUndefined() && !diagnosticsValue.isBool()) ||
+        (!sharedMicrogValue.isUndefined() && !sharedMicrogValue.isBool()) ||
         (!permissionsValue.isUndefined() && !PermissionSettings::parse(permissionsValue, &deniedPermissions)) ||
         (!locale.isEmpty() && !RuntimeSettings::validLocale(locale)) ||
         !RuntimeSettings::validTheme(theme) ||
@@ -97,5 +99,6 @@ bool standalonePaths(const QString &appId, const QString &executableName,
     paths->deniedPermissions = deniedPermissions;
     paths->standaloneSnapshots = snapshotsValue.toBool(false);
     paths->fileDiagnostics = diagnosticsValue.toBool(false);
+    paths->sharedMicrog = sharedMicrogValue.toBool(false);
     return true;
 }

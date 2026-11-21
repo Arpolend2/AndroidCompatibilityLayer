@@ -1,5 +1,6 @@
 #include "preview.h"
 #include "google_services_runtime.h"
+#include "../core/src/drivers/mg_java.h"
 
 #include <QCoreApplication>
 #include <QAtomicInt>
@@ -13,16 +14,20 @@
 #include <QPainter>
 #include <QQuickWindow>
 #include <QScreen>
+#include <QGuiApplication>
+#include "preview_orientation.h"
 #include <QTimer>
 #include <QWheelEvent>
 
 #include <cstdlib>
+#include <unistd.h>
 
 #include "preview_text.h"
 #include "preview_frame.h"
 #include "preview_keyboard.h"
 #include "audio_output.h"
 #include "audio_mp3_codec.h"
+#include "codec_audio.h"
 #include "media_mp3_host.h"
 #include "camera_host.h"
 #include "bluetooth_host.h"
@@ -48,6 +53,19 @@
 #endif
 
 namespace {
+struct StartupChannelGuard {
+    bool &starting;
+    const bool &running;
+    std::unique_ptr<SharedMicrogClientChannel> &channel;
+    ~StartupChannelGuard()
+    {
+        starting = false;
+        if (!running) {
+            mg_java_close_shared_microg_client();
+            channel.reset();
+        }
+    }
+};
 void MEGLER_CB coreLog(int level, const char *line, void *user)
 {
     const int fd = *static_cast<const int *>(user);
@@ -110,7 +128,7 @@ void PreviewPlayer::setStatus(const QString &status)
 
 void PreviewPlayer::start()
 {
-    if (m_closing) return;
+    if (m_closing || m_running || m_starting) return;
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     const EGLDisplay qtDisplay = m_cpuPresentationOnly ? EGL_NO_DISPLAY : m_gpuState->qtDisplay();
     if (qtDisplay != EGL_NO_DISPLAY) {
@@ -123,6 +141,8 @@ void PreviewPlayer::start()
         return;
     }
 #endif
+    m_starting = true;
+    const StartupChannelGuard startupGuard{m_starting, m_running, m_sharedMicrog};
     const QByteArray data = m_data.toUtf8();
     megler_config config = {};
     config.data_dir = data.constData();
@@ -149,7 +169,23 @@ void PreviewPlayer::start()
     megler_run_config run = {};
     GoogleServicesRuntime googleServices(QString::fromUtf8(m_rootUtf8));
     QString googleError;
-    if (!googleServices.apply(run, &googleError)) {
+    if (m_sharedMicrogEnabled) {
+        mg_apk_info info = {};
+        if (!mg_apk_read_info(m_apkUtf8.constData(), &info)) {
+            setStatus(tr("Could not inspect the shared microG client APK."));
+            ErrorLog::record(QStringLiteral("Android"), m_status, true);
+            return;
+        }
+        const QString package = QString::fromUtf8(info.package);
+        mg_apk_info_free(&info);
+        m_sharedMicrog.reset(new SharedMicrogClientChannel);
+        if (!m_sharedMicrog->openClient(package, &googleError)) {
+            setStatus(tr("Shared microG: %1").arg(googleError));
+            ErrorLog::record(QStringLiteral("Android"), m_status, true);
+            return;
+        }
+        if (m_closing) return;
+    } else if (!googleServices.apply(run, &googleError)) {
         qWarning().noquote() << "Google services:" << googleError;
         setStatus(tr("Google services: %1").arg(googleError));
         return;
@@ -160,15 +196,17 @@ void PreviewPlayer::start()
     run.width = m_surfaceWidth;
     run.height = m_surfaceHeight;
     run.density_dpi = m_density;
+    run.rotation = m_displayRotation;
     run.gfx = previewGraphics();
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
     bool gpuCanvasReady = false;
     bool remoteGpuCanvasReady = false;
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
     constexpr char verifyParentVariable[] = "ACL_EMBEDDED_GPU_GBM_VERIFY_PARENT";
-    const bool verifyParentEnabled = m_cpuPresentationOnly &&
-                                     qEnvironmentVariableIntValue(verifyParentVariable) == 1;
     const bool gpuChannelConnected = m_remoteGpuTransport && m_remoteGpuTransport->connected();
+    const bool probeOnly = gpuChannelConnected && !m_remoteGpuCanvasPresent;
+    const bool verifyParentEnabled = m_cpuPresentationOnly &&
+        (probeOnly || qEnvironmentVariableIntValue(verifyParentVariable) == 1);
     const auto logGbmProbe = [&](const QString &result) {
         const char *flag = verifyParentEnabled ? "enabled" :
                            (qEnvironmentVariableIsSet(verifyParentVariable) ? "disabled" : "unset");
@@ -177,7 +215,7 @@ void PreviewPlayer::start()
                                       QLatin1String(gpuChannelConnected ? "connected" : "unavailable"),
                                       result);
     };
-    if (m_cpuPresentationOnly && m_remoteGpuCanvasPresent) {
+    if (m_cpuPresentationOnly && (m_remoteGpuCanvasPresent || probeOnly)) {
         QOpenGLContext *context = new QOpenGLContext(this);
         QSurfaceFormat format = QSurfaceFormat::defaultFormat();
         format.setRenderableType(QSurfaceFormat::OpenGLES);
@@ -190,7 +228,7 @@ void PreviewPlayer::start()
             probeSurface.setFormat(context->format());
             probeSurface.create();
             if (probeSurface.isValid() && context->makeCurrent(&probeSurface)) {
-                exportAvailable = EmbeddedGpuTransport::canExportDmaBuf(&exportError);
+                exportAvailable = !probeOnly && EmbeddedGpuTransport::canExportDmaBuf(&exportError);
                 if (!exportAvailable) {
                     std::function<bool(const AuroraDmaBufFrame &, QString *)> verifyParent;
                     if (m_remoteGpuTransport && verifyParentEnabled) {
@@ -221,11 +259,13 @@ void PreviewPlayer::start()
         }
         if (!gpuCanvasReady) {
             delete context;
-            if (exportError.isEmpty())
-                exportError = tr("The DMA-BUF GPU Canvas could not be initialized.");
-            // GPU readback still needs a working EGL binding on the drawing thread.
-            qWarning().noquote() << "Embedded GPU DMA-BUF presentation unavailable; using CPU Canvas:"
-                                 << exportError;
+            if (!probeOnly) {
+                if (exportError.isEmpty())
+                    exportError = tr("The DMA-BUF GPU Canvas could not be initialized.");
+                // GPU readback still needs a working EGL binding on the drawing thread.
+                qWarning().noquote() << "Embedded GPU DMA-BUF presentation unavailable; using CPU Canvas:"
+                                     << exportError;
+            }
         }
     } else if (m_cpuPresentationOnly) {
         logGbmProbe(QStringLiteral("skipped: GPU channel was not negotiated"));
@@ -245,7 +285,11 @@ void PreviewPlayer::start()
     }
 #endif
     if (m_audio) run.audio = m_audio->callbacks();
+#ifdef ACL_WITH_FFMPEG7_MEDIA
+    run.codec = auroraMediaCodecCallbacks();
+#else
     run.codec = auroraMp3CodecCallbacks();
+#endif
     run.media = auroraMp3MediaCallbacks();
     if (!m_deniedPermissions.contains(QStringLiteral("camera"))) run.camera = auroraCameraHost();
     run.sensors = auroraSensorHost();
@@ -292,6 +336,19 @@ void PreviewPlayer::start()
 #endif
     run.on_exit = appExited;
     run.user = this;
+    if (m_sharedMicrogEnabled) {
+        QString error;
+        const int fd = m_sharedMicrog->takeStream(&error);
+        const QByteArray package = m_sharedMicrog->package().toUtf8();
+        if (fd < 0 || !mg_java_set_shared_microg_client(fd, m_sharedMicrog->uid(),
+                                                      m_sharedMicrog->pid(), package.constData())) {
+            if (fd >= 0) ::close(fd);
+            setStatus(tr("Could not hand the shared microG channel to Android: %1").arg(
+                error.isEmpty() ? QStringLiteral("Invalid client bootstrap.") : error));
+            ErrorLog::record(QStringLiteral("Android"), m_status, true);
+            return;
+        }
+    }
     if (!megler_run(&run)) {
         if (m_keyboard) m_keyboard->stop();
         setStatus(tr("Could not start Android app: %1").arg(QString::fromUtf8(megler_last_error())));
@@ -355,7 +412,19 @@ void PreviewPlayer::setViewport(qreal width, qreal height, qreal pixelRatio)
     m_surfaceHeight = surfaceHeight;
     m_density = density;
     if (m_keyboard) m_keyboard->setSurface(m_surface, QSize(surfaceWidth, surfaceHeight));
-    if (m_running && !m_closing) megler_set_surface(surfaceWidth, surfaceHeight, density, 0);
+    if (m_running && !m_closing) megler_set_surface(surfaceWidth, surfaceHeight, density, m_displayRotation);
+}
+
+void PreviewPlayer::setDisplayRotation(int rotation)
+{
+    if (rotation < 0 || rotation > 3) {
+        qWarning() << "Invalid Android display rotation:" << rotation;
+        return;
+    }
+    if (m_displayRotation == rotation) return;
+    m_displayRotation = rotation;
+    if (m_running && !m_closing)
+        megler_set_surface(m_surfaceWidth, m_surfaceHeight, m_density, rotation);
 }
 
 void MEGLER_CB PreviewPlayer::presentPixels(void *user, const void *pixels, int width, int height, int stride)
@@ -585,6 +654,8 @@ void MEGLER_CB PreviewPlayer::appExited(void *user, int status, const char *reas
 void PreviewPlayer::ended(int status, const QString &reason)
 {
     m_running = false;
+    // AppRunner's finally has closed the guest session before the exit callback.
+    m_sharedMicrog.reset();
     m_exitStatus = status;
     if (m_picker) m_picker->stop();
     if (m_keyboard) m_keyboard->stop();
@@ -653,6 +724,7 @@ void PreviewPlayer::close()
 {
     if (m_closing) return;
     m_closing = true;
+    if (m_starting && m_sharedMicrog) m_sharedMicrog->close();
     if (m_picker) m_picker->stop();
     if (m_keyboard) m_keyboard->stop();
     if (!m_running) {
@@ -729,8 +801,47 @@ void PreviewSurface::geometryChanged(const QRectF &newGeometry, const QRectF &ol
     updateViewport();
 }
 
+void PreviewSurface::setPageOrientation(int orientation)
+{
+    if (m_pageOrientation == orientation) return;
+    m_pageOrientation = orientation;
+    updateDisplayRotation();
+}
+
+void PreviewSurface::updateDisplayRotation()
+{
+    QScreen *screen = window() ? window()->screen() : nullptr;
+    if (!screen || !m_player) return;
+    const Qt::ScreenOrientation native = screen->nativeOrientation();
+    const Qt::ScreenOrientation actual = static_cast<Qt::ScreenOrientation>(m_pageOrientation);
+    const Qt::ScreenOrientation effectiveNative =
+        previewNativeOrientation(native, QGuiApplication::platformName().startsWith(QLatin1String("wayland")));
+    const int rotation = previewDisplayRotation(effectiveNative, actual);
+    if (m_loggedNative != int(native) || m_loggedActual != int(actual) ||
+        m_loggedPrimary != int(screen->primaryOrientation()) || m_loggedRotation != rotation) {
+        m_loggedNative = int(native);
+        m_loggedActual = int(actual);
+        m_loggedPrimary = int(screen->primaryOrientation());
+        m_loggedRotation = rotation;
+        if (rotation < 0)
+            qWarning() << "Android display orientation unavailable; retaining previous rotation:"
+                       << "native" << m_loggedNative << "primary" << m_loggedPrimary
+                       << "page" << m_loggedActual << "rotation" << m_player->displayRotation();
+        else if (native != effectiveNative)
+            qWarning() << "Android display orientation: native unavailable; assuming portrait on Wayland:"
+                       << "primary" << m_loggedPrimary << "page" << m_loggedActual
+                       << "rotation" << rotation;
+        else
+            qInfo() << "Android display orientation: native" << m_loggedNative
+                    << "primary" << m_loggedPrimary << "page" << m_loggedActual
+                    << "rotation" << rotation;
+    }
+    if (rotation >= 0) m_player->setDisplayRotation(rotation);
+}
+
 void PreviewSurface::updateViewport()
 {
+    updateDisplayRotation();
     if (width() <= 0 || height() <= 0) return;
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     if (m_gpuItem) {

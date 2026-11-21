@@ -119,6 +119,7 @@ const char *megler_version(void) { return "0.1"; }
 void megler_free(void *p) { free(p); }
 
 bool megler_run(const megler_run_config *config) { return mg_run_start(config); }
+bool megler_run_headless(const megler_run_config *config) { return mg_run_start_headless(config); }
 bool megler_running(void) { return mg_run_active(); }
 const char *megler_last_error(void) { return mg_run_last_error(); }
 void megler_touch(int phase, int pointer_id, float x, float y) { mg_run_touch(phase, pointer_id, x, y); }

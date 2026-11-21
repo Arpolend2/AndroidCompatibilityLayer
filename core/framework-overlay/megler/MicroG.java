@@ -49,11 +49,18 @@ public final class MicroG {
         Service service;
         int starts, clients;
         boolean started;
-        HashMap<String, IBinder> binders = new HashMap<>();
+        HashMap<String, Bound> binders = new HashMap<>();
+    }
+    private static final class Bound {
+        IBinder binder;
+        int clients;
+        boolean rebind, system;
+        Bound(IBinder binder) { this.binder = binder; }
     }
     private static final class Binding {
         Running running;
         Intent intent;
+        String key;
         Binding(Running r, Intent i) { running = r; intent = i; }
     }
     /*
@@ -574,11 +581,6 @@ public final class MicroG {
         MicroG g = get();
         return g != null && g.find(intent, true) != null && bind(g.context, intent, conn);
     }
-    /*
-     * The services the system keeps bound (bindAsSystemNow), by service and binding key: each counted as one client of its
-     * service once, so that it is never destroyed while the process lives, as the system's binding of it never ends.
-     */
-    private final Set<String> systemBindings = new HashSet<>();
     /**
      * A binding the system makes and keeps, as Android's location manager keeps Google Play services' geocode provider bound
      * (its GeocoderProxy): the binder of their service whose filter takes the intent, exported or not, made and bound on the
@@ -595,12 +597,16 @@ public final class MicroG {
         java.util.concurrent.Callable<IBinder> bind = () -> {
             Running r = g.create(e);
             String key = bindKey(copy);
-            if (!r.binders.containsKey(key)) {
-                r.binders.put(key, r.service.onBind(copy));
-                android.util.Log.i("MicroG", "bound " + e.info.name + " for " + key + ", as the system binds it");
+            Bound b = r.binders.get(key);
+            if (b == null) {
+                r.binders.put(key, b = new Bound(r.service.onBind(copy)));
+                android.util.Log.i("MicroG", "bound " + e.info.name + " for " + copy + ", as the system binds it");
+            } else if (b.rebind) {
+                r.service.onRebind(copy);
+                b.rebind = false;
             }
-            if (g.systemBindings.add(e.info.name + "\n" + key)) r.clients++;
-            return r.binders.get(key);
+            if (!b.system) { b.system = true; b.clients++; r.clients++; }
+            return b.binder;
         };
         try {
             if (Looper.myLooper() == Looper.getMainLooper()) return bind.call();
@@ -923,14 +929,27 @@ public final class MicroG {
             try {
                 Running r = g.create(e);
                 String key = bindKey(copy);
-                if (!r.binders.containsKey(key)) {
-                    r.binders.put(key, r.service.onBind(copy));
-                    android.util.Log.i("MicroG", "bound " + e.info.name + " for " + key);
+                Bound bound = r.binders.get(key);
+                if (bound == null) {
+                    r.binders.put(key, bound = new Bound(r.service.onBind(copy)));
+                    android.util.Log.i("MicroG", "bound " + e.info.name + " for " + copy);
+                } else if (bound.rebind) {
+                    r.service.onRebind(copy);
+                    bound.rebind = false;
                 }
-                IBinder binder = r.binders.get(key);
+                IBinder binder = bound.binder;
+                boolean accepted;
                 synchronized (g.bindings) {
-                    if (g.bindings.get(conn) != pending) { g.destroyIfUnused(r); return; }
-                    r.clients++; pending.running = r;
+                    accepted = g.bindings.get(conn) == pending;
+                    if (accepted) { r.clients++; bound.clients++; pending.running = r; pending.key = key; }
+                }
+                if (!accepted) {
+                    if (bound.clients == 0) {
+                        if (r.service.onUnbind(copy)) bound.rebind = true;
+                        else r.binders.remove(key);
+                    }
+                    g.destroyIfUnused(r);
+                    return;
                 }
                 if (binder == null) conn.onNullBinding(name); else conn.onServiceConnected(name, binder);
             } catch (Throwable t) {
@@ -943,7 +962,7 @@ public final class MicroG {
     }
     /*
      * Which bindings of a service share one binder: those whose intents are the same as Android's Intent.filterEquals has it
-     * (its action, data, type, identifier and categories; not its extras), for each of which Android calls onBind once. They
+     * (its action, data, type, identifier, package, component and categories; not its extras), for each of which Android calls onBind once. They
      * were told apart by the action alone. GmsCore's container services (GmsApiService, the bound brokers) serve every API of
      * the modules they hold, one broker each, and the intent a client is given for an API (the chimera provider's dynamic
      * lookup) is told from another's by more than its action: a broker made for one API was handed to clients of others, and
@@ -952,16 +971,25 @@ public final class MicroG {
      */
     public static String bindKey(Intent i) {
         StringBuilder k = new StringBuilder();
-        k.append(i.getAction() == null ? "" : i.getAction());
-        if (i.getData() != null) k.append(" data=").append(i.getData());
-        if (i.getType() != null) k.append(" type=").append(i.getType());
-        String id = identifierOf(i);
-        if (id != null) k.append(" id=").append(id);
-        if (i.getCategories() != null && !i.getCategories().isEmpty()) {
-            java.util.TreeSet<String> c = new java.util.TreeSet<>(i.getCategories());
-            k.append(" categories=").append(c);
+        keyPart(k, i.getAction());
+        keyPart(k, i.getData() == null ? null : i.getData().toString());
+        keyPart(k, i.getType());
+        keyPart(k, identifierOf(i));
+        keyPart(k, i.getPackage());
+        ComponentName c = i.getComponent();
+        keyPart(k, c == null ? null : c.getPackageName());
+        keyPart(k, c == null ? null : c.getClassName());
+        Set<String> categories = i.getCategories();
+        if (categories == null) k.append("-1:");
+        else {
+            k.append(categories.size()).append(':');
+            for (String category : new java.util.TreeSet<>(categories)) keyPart(k, category);
         }
         return k.toString();
+    }
+    private static void keyPart(StringBuilder key, String part) {
+        if (part == null) key.append("-1:");
+        else key.append(part.length()).append(':').append(part);
     }
     private static String identifierOf(Intent i) {
         try { return (String) Intent.class.getMethod("getIdentifier").invoke(i); } catch (Throwable t) { return null; }
@@ -975,10 +1003,14 @@ public final class MicroG {
         if (b == null) return false;
         new Handler(Looper.getMainLooper()).post(() -> {
             if (b.running == null) return;
-            if (--b.running.clients == 0) {
-                b.running.service.onUnbind(b.intent); b.running.binders.clear();
-                g.destroyIfUnused(b.running);
+            Running r = b.running;
+            Bound bound = r.binders.get(b.key);
+            r.clients--;
+            if (--bound.clients == 0) {
+                if (r.service.onUnbind(b.intent)) bound.rebind = true;
+                else r.binders.remove(b.key);
             }
+            g.destroyIfUnused(r);
         });
         return true;
     }
