@@ -54,6 +54,7 @@ public abstract class JobScheduler {
             synchronized (sJobs) { old = sJobs.put(j.getId(), run); }
             if (old != null) stop(old, 1 /* STOP_REASON_CANCELLED_BY_APP */);
             plan(run, j.getMinLatencyMillis());
+            megler.AppRunner.backgroundWorkChanged();
             return RESULT_SUCCESS;
         }
         public int enqueue(JobInfo j, JobWorkItem w) {
@@ -76,11 +77,17 @@ public abstract class JobScheduler {
             plan(run, 0);
             return RESULT_SUCCESS;
         }
-        public void cancel(int id) { Run run; synchronized (sJobs) { run = sJobs.remove(id); } if (run != null) stop(run, 1); }
+        public void cancel(int id) {
+            Run run;
+            synchronized (sJobs) { run = sJobs.remove(id); }
+            if (run != null) stop(run, 1);
+            megler.AppRunner.backgroundWorkChanged();
+        }
         public void cancelAll() {
             java.util.ArrayList<Run> all;
             synchronized (sJobs) { all = new java.util.ArrayList<>(sJobs.values()); sJobs.clear(); }
             for (Run run : all) stop(run, 1);
+            megler.AppRunner.backgroundWorkChanged();
         }
         public java.util.List<JobInfo> getAllPendingJobs() {
             java.util.ArrayList<JobInfo> l = new java.util.ArrayList<>();
@@ -88,6 +95,7 @@ public abstract class JobScheduler {
             return l;
         }
         public JobInfo getPendingJob(int id) { synchronized (sJobs) { Run run = sJobs.get(id); return run != null ? run.info : null; } }
+        public static boolean hasPendingJobs() { synchronized (sJobs) { return !sJobs.isEmpty(); } }
 
         private static void plan(Run run, long delay) {
             Runnable r = () -> start(run);
@@ -113,6 +121,7 @@ public abstract class JobScheduler {
                 if (!(s instanceof JobService) && engine == null) {
                     android.util.Log.w("Megler", "job " + run.info.getId() + ": " + run.info.getService().getClassName() + " is no job service of the app's");
                     synchronized (sJobs) { run.running = false; if (sJobs.get(run.info.getId()) == run) sJobs.remove(run.info.getId()); }
+                    megler.AppRunner.backgroundWorkChanged();
                     return;
                 }
                 if (engine == null) run.service = (JobService) s;
@@ -123,7 +132,10 @@ public abstract class JobScheduler {
             } catch (Throwable t) {
                 android.util.Log.e("Megler", "job " + run.info.getId() + " failed", t);
                 if (run.params != null) finished(run.params, false);
-                else synchronized (sJobs) { run.running = false; if (sJobs.get(run.info.getId()) == run) sJobs.remove(run.info.getId()); }
+                else {
+                    synchronized (sJobs) { run.running = false; if (sJobs.get(run.info.getId()) == run) sJobs.remove(run.info.getId()); }
+                    megler.AppRunner.backgroundWorkChanged();
+                }
             }
         }
 
@@ -151,6 +163,7 @@ public abstract class JobScheduler {
                 }
             }
             if (again >= 0) plan(run, again);
+            megler.AppRunner.backgroundWorkChanged();
         }
 
         static JobWorkItem dequeue(JobParameters p) {

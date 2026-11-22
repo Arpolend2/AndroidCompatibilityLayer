@@ -1144,6 +1144,10 @@ public final class MicroG {
         }
         @Override public String getPackageName() { return GooglePackages.GMS; }
         @Override public String getOpPackageName() { return getPackageName(); }
+        @Override public Object getSystemService(String name) {
+            return Context.NOTIFICATION_SERVICE.equals(name) ? new android.app.NotificationManager(this)
+                    : super.getSystemService(name);
+        }
         /*
          * Google Play services' own location requests must carry an attribution tag of their own on Android 11 and later
          * (GmsCore's gerz.h: "internal location usage has a forbidden attribution tag", null among the forbidden), and the

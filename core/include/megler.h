@@ -1678,6 +1678,16 @@ typedef struct megler_system_host {
     bool (MEGLER_CB *pick)(void *user, const megler_pick_request *request);
 } megler_system_host;
 
+enum { MEGLER_NOTIFICATION_POST = 1, MEGLER_NOTIFICATION_CANCEL = 2, MEGLER_NOTIFICATION_CANCEL_ALL = 3 };
+typedef struct megler_notification_host {
+    void *user;
+    bool (MEGLER_CB *send)(void *user, int operation, const char *package,
+                           const char *tag, int id, const char *title, const char *body);
+    bool (MEGLER_CB *send_detailed)(void *user, const char *package, const char *tag, int id,
+                                    const char *title, const char *body, int flags, int max,
+                                    int progress, bool indeterminate);
+} megler_notification_host;
+
 /*
  * A Java app's media session (android.media.session.MediaSession, which androidx's MediaSessionCompat stands on): what
  * the app says it plays and how, for the phone's own media controls (Windows' system media transport controls: the lock
@@ -2161,6 +2171,7 @@ typedef struct megler_run_config {
     bool (MEGLER_CB *present_egl_views)(void *user, const void *pixels, int width, int height, int stride);
     int (MEGLER_CB *present_egl_layer)(void *user, int layer, void *display, void *surface, int width, int height);
     void (MEGLER_CB *place_egl_layer)(void *user, int layer, int x, int y, int width, int height, int flags);
+    megler_notification_host notifications;
 } megler_run_config;
 
 /*
@@ -2237,6 +2248,8 @@ MEGLER_API void megler_set_insets(int left, int top, int right, int bottom);
 MEGLER_API void megler_set_surface(int width, int height, int density_dpi, int rotation);
 /* The app went to the background or came back; lost or gained input focus. */
 MEGLER_API void megler_set_paused(bool paused);
+/* Whether the Java app has process-local services, jobs, or alarms that need background execution. */
+MEGLER_API bool megler_background_work_active(void);
 /*
  * Waits up to `ms` milliseconds until the app holds no lock on a database: Windows freezes a suspended app as it is, and a
  * lock it held would keep the other apps waiting on that database (Google Play services' are every app's). The shell calls

@@ -96,7 +96,7 @@ bool SharedMicrogSupervisor::configure(const QString &program, const QStringList
 
 bool SharedMicrogSupervisor::start(QString *error)
 {
-    if (m_pid > 0 && m_ready) return true;
+    if (m_pid > 0 && m_ready && checkChild(true)) return true;
     if (!isConfigured()) {
         setError(error, QStringLiteral("The shared microG worker is not configured."));
         return false;
@@ -170,6 +170,19 @@ bool SharedMicrogSupervisor::start(QString *error)
             [this](int) { readUnsolicited(); });
     m_reaper.start();
     return true;
+}
+
+bool SharedMicrogSupervisor::startRetained(QString *error)
+{
+    m_retainWithoutClients = true;
+    return start(error);
+}
+
+void SharedMicrogSupervisor::releaseRetention()
+{
+    m_retainWithoutClients = false;
+    if (m_channels.isEmpty() && m_openingChannels.isEmpty() && m_closingChannels.isEmpty())
+        stop();
 }
 
 bool SharedMicrogSupervisor::sendMessage(MessageType type, quint64 channelId, quint32 uid, quint32 pid,
@@ -357,7 +370,7 @@ bool SharedMicrogSupervisor::openChannel(const QString &package, int uid, int pi
     if (!waitForReply(Ack, channelId, error, &rejected, &disconnected)) {
         m_openingChannels.remove(channelId);
         if (rejected || disconnected) {
-            if (m_channels.isEmpty() && m_openingChannels.isEmpty()) stop();
+            if (!m_retainWithoutClients && m_channels.isEmpty() && m_openingChannels.isEmpty()) stop();
             return false;
         }
         failWorker();
@@ -366,7 +379,7 @@ bool SharedMicrogSupervisor::openChannel(const QString &package, int uid, int pi
     m_openingChannels.remove(channelId);
     if (m_disconnectedChannels.remove(channelId)) {
         setError(error, QStringLiteral("The shared microG bridge disconnected during startup."));
-        if (m_channels.isEmpty() && m_openingChannels.isEmpty()) stop();
+        if (!m_retainWithoutClients && m_channels.isEmpty() && m_openingChannels.isEmpty()) stop();
         return false;
     }
     m_channels.insert(channelId);
@@ -388,7 +401,7 @@ void SharedMicrogSupervisor::closeChannel(quint64 channelId)
     }
     m_channels.remove(channelId);
     m_closingChannels.remove(channelId);
-    if (m_channels.isEmpty()) stop();
+    if (!m_retainWithoutClients && m_channels.isEmpty()) stop();
 }
 
 void SharedMicrogSupervisor::stop()
@@ -558,9 +571,9 @@ void SharedMicrogSupervisor::handleDisconnected(quint64 channelId)
         m_disconnectedChannels.insert(channelId);
     if (!m_closingChannels.contains(channelId))
         emit channelDisconnected(channelId);
-    if (m_channels.isEmpty() && m_openingChannels.isEmpty() && m_closingChannels.isEmpty()) {
+    if (!m_retainWithoutClients && m_channels.isEmpty() && m_openingChannels.isEmpty() && m_closingChannels.isEmpty()) {
         QTimer::singleShot(0, this, [this]() {
-            if (m_channels.isEmpty() && m_openingChannels.isEmpty() && m_closingChannels.isEmpty())
+            if (!m_retainWithoutClients && m_channels.isEmpty() && m_openingChannels.isEmpty() && m_closingChannels.isEmpty())
                 stop();
         });
     }

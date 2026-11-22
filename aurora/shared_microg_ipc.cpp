@@ -172,6 +172,8 @@ QString SharedMicrogProviderObject::introspect(const QString &path) const
     QString result = QStringLiteral("<interface name=\"ru.androidcompatibilitylayer.appmanager.microg\">"
                           "<method name=\"GetProvider\"><arg type=\"s\" direction=\"out\"/>"
                           "</method>"
+                          "<method name=\"EnsureWorker\"><arg type=\"b\" direction=\"out\"/>"
+                          "</method>"
                           "<method name=\"InspectCaller\"><arg type=\"as\" direction=\"out\"/>"
                           "</method>"
                           "<method name=\"ResolveCaller\"><arg type=\"as\" direction=\"out\"/>"
@@ -298,6 +300,7 @@ bool SharedMicrogProviderObject::handleMessage(const QDBusMessage &message, cons
         message.path() != QLatin1String(objectPath) ||
         message.interface() != QLatin1String(interfaceName) ||
         (message.member() != QLatin1String("GetProvider") &&
+         message.member() != QLatin1String("EnsureWorker") &&
          message.member() != QLatin1String("InspectCaller") &&
          message.member() != QLatin1String("ResolveCaller") &&
          message.member() != QLatin1String("OpenChannel") &&
@@ -334,6 +337,17 @@ bool SharedMicrogProviderObject::handleMessage(const QDBusMessage &message, cons
     }
     if (open && !message.isReplyRequired()) {
         qWarning("Shared microG: channel requests require a reply.");
+        return true;
+    }
+    if (message.member() == QLatin1String("EnsureWorker")) {
+        QString provider, error;
+        if (!readProviderSetting(&provider, &error) || provider != QLatin1String("microg") ||
+            !m_workerCheckHandler || !m_workerCheckHandler(&error)) {
+            if (error.isEmpty()) error = QStringLiteral("The shared microG worker is unavailable.");
+            connection.send(message.createErrorReply(QDBusError::Failed, error));
+        } else {
+            connection.send(message.createReply(QVariantList() << true));
+        }
         return true;
     }
     if (message.member() == QLatin1String("InspectCaller") ||

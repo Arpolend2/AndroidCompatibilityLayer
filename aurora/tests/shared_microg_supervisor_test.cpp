@@ -58,7 +58,7 @@ bool sendReply(int fd, quint32 type, quint64 channelId)
     return ::send(fd, packet, sizeof(packet), MSG_NOSIGNAL) == sizeof(packet);
 }
 
-int fakeWorker(bool rejectOpen, bool disconnectOpen, bool disconnectOnClose)
+int fakeWorker(bool rejectOpen, bool disconnectOpen, bool disconnectOnClose, bool exitAfterReady)
 {
     struct Channel {
         quint64 id;
@@ -67,6 +67,10 @@ int fakeWorker(bool rejectOpen, bool disconnectOpen, bool disconnectOnClose)
     Channel channels[32];
     int channelCount = 0;
     if (!sendReply(3, Ready, 0)) return 21;
+    if (exitAfterReady) {
+        usleep(200000);
+        return 0;
+    }
     for (;;) {
         char packet[HeaderSize + 255];
         char control[CMSG_SPACE(sizeof(int) * 8)];
@@ -161,13 +165,15 @@ bool check(bool value, const char *description)
 int main(int argc, char **argv)
 {
     bool workerMode = false, rejectOpen = false, disconnectOpen = false, disconnectOnClose = false;
+    bool exitAfterReady = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shared-microg-worker") == 0) workerMode = true;
         else if (std::strcmp(argv[i], "--fake-worker-reject") == 0) rejectOpen = true;
         else if (std::strcmp(argv[i], "--fake-worker-disconnect") == 0) disconnectOpen = true;
         else if (std::strcmp(argv[i], "--fake-worker-disconnect-on-close") == 0) disconnectOnClose = true;
+        else if (std::strcmp(argv[i], "--fake-worker-exit-after-ready") == 0) exitAfterReady = true;
     }
-    if (workerMode) return fakeWorker(rejectOpen, disconnectOpen, disconnectOnClose);
+    if (workerMode) return fakeWorker(rejectOpen, disconnectOpen, disconnectOnClose, exitAfterReady);
 
     QCoreApplication app(argc, argv);
     const QString realWorker = QString::fromLocal8Bit(qgetenv("MEGLER_SHARED_MICROG_TEST_WORKER"));
@@ -217,6 +223,54 @@ int main(int argc, char **argv)
     QString error;
     bool ok = true;
     int clientFd = -1;
+    {
+        SharedMicrogSupervisor supervisor;
+        ok &= check(supervisor.configure(program, QStringList(), &error), "configure retained worker");
+        ok &= check(supervisor.startRetained(&error), "start worker without clients");
+        ok &= check(openTestChannel(&supervisor, 17, &clientFd, &error), "open retained worker channel");
+        if (clientFd >= 0) {
+            supervisor.closeChannel(17);
+            ::close(clientFd);
+            clientFd = -1;
+            ok &= check(!openTestChannel(&supervisor, 17, &clientFd, &error),
+                        "worker survives last channel and remembers its ID");
+            ok &= check(openTestChannel(&supervisor, 18, &clientFd, &error),
+                        "retained worker accepts another client");
+            if (clientFd >= 0) {
+                supervisor.closeChannel(18);
+                ::close(clientFd);
+                clientFd = -1;
+            }
+            supervisor.releaseRetention();
+            ok &= check(openTestChannel(&supervisor, 17, &clientFd, &error),
+                        "released worker stops and starts afresh");
+            if (clientFd >= 0) {
+                supervisor.closeChannel(17);
+                ::close(clientFd);
+                clientFd = -1;
+            }
+        }
+    }
+    {
+        SharedMicrogSupervisor supervisor;
+        ok &= check(supervisor.configure(program, QStringList() << QStringLiteral("--fake-worker-exit-after-ready"),
+                                         &error), "configure exiting retained worker");
+        bool died = false;
+        QEventLoop loop;
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::workerDied, &loop, [&]() {
+            died = true;
+            loop.quit();
+        });
+        const bool started = supervisor.startRetained(&error);
+        ok &= check(started, "start exiting retained worker");
+        if (started) {
+            QTimer::singleShot(3000, &loop, &QEventLoop::quit);
+            loop.exec();
+            ok &= check(died, "detect retained worker exit without clients");
+            if (died)
+                ok &= check(supervisor.startRetained(&error), "restart an exited retained worker");
+        }
+    }
     {
         SharedMicrogSupervisor supervisor;
         ok &= check(supervisor.configure(program, QStringList() << QStringLiteral("--fake-worker-reject"),

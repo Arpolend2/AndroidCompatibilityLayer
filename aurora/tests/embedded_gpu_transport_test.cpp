@@ -18,10 +18,20 @@ int main(int argc, char **argv)
     QString exportError;
     if (EmbeddedGpuTransport::canExportDmaBuf(&exportError) || exportError.isEmpty())
         return 15;
-    if (!EmbeddedGpuTransport::probeGbmRenderTarget(720, 1520).contains(QStringLiteral("no current worker EGL context")))
+    bool available = true;
+    if (!EmbeddedGpuTransport::probeGbmRenderTarget(720, 1520, {}, &available).contains(
+            QStringLiteral("no current worker EGL context")) || available)
         return 20;
     if (!EmbeddedGpuTransport::probeGbmRenderTarget(8192, 8192).contains(QStringLiteral("transport limits")))
         return 21;
+    EmbeddedGpuTransport unavailable;
+    QString gbmError;
+    if (unavailable.presentGbmTexture(0, 1, 1, &gbmError) || gbmError.isEmpty())
+        return 22;
+    gbmError.clear();
+    if (unavailable.presentGbmTexture(1, 1, 1, &gbmError) ||
+        !gbmError.contains(QStringLiteral("no current worker EGL context")))
+        return 23;
 
     int sockets[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0)
@@ -127,6 +137,23 @@ int main(int argc, char **argv)
     frameLoop.exec();
     sender.join();
     if (!frameReceived || !sent.load()) return 13;
+
+    channelFrame.id = 100;
+    channelFrame.probeOnly = false;
+    bool liveReceived = false;
+    QEventLoop rejectionLoop;
+    server.setFrameHandler([&](AuroraDmaBufFrame &&frame) {
+        liveReceived = frame.id == 100 && !frame.probeOnly && frame.fds[0] >= 0;
+        if (!server.sendReply(frame.id, false)) liveReceived = false;
+        rejectionLoop.quit();
+    });
+    error.clear();
+    sent.store(true);
+    std::thread rejectedSender([&]() { sent.store(client.sendFrame(channelFrame, &error)); });
+    QTimer::singleShot(1500, &rejectionLoop, &QEventLoop::quit);
+    rejectionLoop.exec();
+    rejectedSender.join();
+    if (!liveReceived || sent.load() || error.isEmpty()) return 24;
 
     bool reportedFailure = false;
     bool disconnected = false;

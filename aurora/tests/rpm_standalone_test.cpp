@@ -203,6 +203,7 @@ int main(int argc, char **argv)
         !contents.contains("translation catalog content") ||
         !contents.contains("\"standaloneSnapshots\":true") ||
         !contents.contains("\"fileDiagnostics\":false") ||
+        !contents.contains("Intents=Start\n") ||
         contents.contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;Documents\n") ||
         !contents.contains("OrganizationName=ru.androidcompatibilitylayer\nApplicationName=Android") ||
         !contents.contains("\"deniedPermissions\":[\"camera\",\"location\"]") ||

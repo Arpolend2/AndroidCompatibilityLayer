@@ -34,8 +34,14 @@ public class AlarmManager {
                     if (interval <= 0) sAlarms.remove(op);
                 }
                 said(what(op), false, 0, 0, null);
-                try { op.send(); } catch (PendingIntent.CanceledException e) { synchronized (sAlarms) { if (sAlarms.get(op) == this) sAlarms.remove(op); } return; }
+                try { op.send(); }
+                catch (PendingIntent.CanceledException e) {
+                    synchronized (sAlarms) { if (sAlarms.get(op) == this) sAlarms.remove(op); }
+                    megler.AppRunner.backgroundWorkChanged();
+                    return;
+                }
                 synchronized (sAlarms) { if (interval > 0 && sAlarms.get(op) == this) sAlarmHandler.postDelayed(this, op, interval); }
+                megler.AppRunner.backgroundWorkChanged();
             }
         };
         synchronized (sAlarms) {
@@ -44,6 +50,7 @@ public class AlarmManager {
             sAlarms.put(op, fire);
             sAlarmHandler.postDelayed(fire, op, delay);
         }
+        megler.AppRunner.backgroundWorkChanged();
         said(what(op), true, delay, interval, "a PendingIntent's");
     }
     /** PendingIntent.cancel: its alarm, if it has one, goes. */
@@ -51,6 +58,11 @@ public class AlarmManager {
         synchronized (sAlarms) {
             if (sAlarms.remove(op) != null && sAlarmHandler != null) sAlarmHandler.removeCallbacksAndMessages(op);
         }
+        megler.AppRunner.backgroundWorkChanged();
+    }
+    public static boolean hasPendingAlarms() {
+        synchronized (sAlarms) { if (!sAlarms.isEmpty()) return true; }
+        synchronized (sListened) { return !sListened.isEmpty() || !sTelling.isEmpty(); }
     }
     private static String what(PendingIntent op) {
         android.content.Intent i = op.meglerIntent();
@@ -98,7 +110,8 @@ public class AlarmManager {
                         sTelling.remove(listener);
                     }
                 }
-                listener.onAlarm();
+                try { listener.onAlarm(); }
+                finally { megler.AppRunner.backgroundWorkChanged(); }
             };
             if (executor != null) executor.execute(tell);
             else (handler != null ? handler : main()).post(tell);
@@ -123,6 +136,7 @@ public class AlarmManager {
             if (before != null) sTimer.removeCallbacks(before);
             sTimer.postDelayed(a, d);
         }
+        megler.AppRunner.backgroundWorkChanged();
         said(a.tag, true, d, interval, e != null ? "a listener's, told through an Executor" : "a listener's, told on " + (h != null ? "its Handler" : "the main thread"));
     }
 
@@ -174,6 +188,7 @@ public class AlarmManager {
             if (a != null && sTimer != null) sTimer.removeCallbacks(a);
             sTelling.remove(l);
         }
+        megler.AppRunner.backgroundWorkChanged();
     }
     /** Android 14's: every alarm of this app's goes. */
     public void cancelAll() {
@@ -187,6 +202,7 @@ public class AlarmManager {
             sListened.clear();
             sTelling.clear();
         }
+        megler.AppRunner.backgroundWorkChanged();
     }
     public boolean canScheduleExactAlarms() { return true; }
     public AlarmClockInfo getNextAlarmClock() {

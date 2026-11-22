@@ -133,6 +133,7 @@ static struct {
     /* The surface's change (mg_surface.seq) the app was last told of, by an EV_SURFACE event; and the orientation it last asked the shell for (-2: none yet). */
     u32 surface_seq;
     volatile i32 orientation;
+    volatile i32 background_work;
 } J;
 
 static i32 bits_of(float f)
@@ -1252,6 +1253,29 @@ N(Native_permission)
     c->ret.i = answer;
 }
 
+N(Native_notification)
+{
+    const megler_notification_host *host = &J.config->notifications;
+    c->ret.z = host->send && host->send(host->user, c->args[0].i, J.package,
+        c->args[1].l ? text_of(c->args[1].l) : NULL, c->args[2].i,
+        c->args[3].l ? text_of(c->args[3].l) : NULL,
+        c->args[4].l ? text_of(c->args[4].l) : NULL);
+}
+
+N(Native_notificationDetailed)
+{
+    const megler_notification_host *host = &J.config->notifications;
+    const char *tag = c->args[0].l ? text_of(c->args[0].l) : NULL;
+    const char *title = c->args[2].l ? text_of(c->args[2].l) : NULL;
+    const char *body = c->args[3].l ? text_of(c->args[3].l) : NULL;
+    if (host->send_detailed)
+        c->ret.z = host->send_detailed(host->user, J.package, tag, c->args[1].i, title, body,
+                                       c->args[4].i, c->args[5].i, c->args[6].i, c->args[7].i != 0);
+    else
+        c->ret.z = host->send && host->send(host->user, MEGLER_NOTIFICATION_POST, J.package,
+                                             tag, c->args[1].i, title, body);
+}
+
 /* What a file's name says of it in the log: its extension alone (".jpg"), never the name the user gave it. */
 static const char *extension_of(const char *name)
 {
@@ -1472,6 +1496,11 @@ N(Native_exit)
     if (mg_dvm_call_static("android/os/Looper", "getMainLooper", "()Landroid/os/Looper;", NULL, &looper) && looper.l) mg_dvm_call_virtual(looper.l, "quit", "()V", NULL, NULL);
 }
 
+N(Native_backgroundWorkChanged)
+{
+    mg_atomic_xchg(&J.background_work, c->args[0].i ? 1 : 0);
+}
+
 /*
  * The phone's Back and what the app did with it (megler_back). The shell's Back waits for the main thread's answer:
  * AppRunner.back says, once the key has been through the app, whether the app went to the back (moveTaskToBack, and
@@ -1599,6 +1628,8 @@ static const mg_jhle k_native[] = {
     { "megler/Native", "launchApp", NULL, Native_launchApp },
     { "megler/Native", "uninstallApp", NULL, Native_uninstallApp },
     { "megler/Native", "permission", NULL, Native_permission },
+    { "megler/Native", "notification", NULL, Native_notification },
+    { "megler/Native", "notificationDetailed", NULL, Native_notificationDetailed },
     { "megler/Native", "pick", NULL, Native_pick },
     { "megler/Native", "pickAnswer", NULL, Native_pickAnswer },
     { "megler/Native", "appsList", NULL, Native_appsList },
@@ -1620,6 +1651,7 @@ static const mg_jhle k_native[] = {
     { "megler/Native", "openUrl", NULL, Native_openUrl },
     { "megler/Native", "storeRestart", NULL, Native_storeRestart },
     { "megler/Native", "exit", NULL, Native_exit },
+    { "megler/Native", "backgroundWorkChangedNative", "(Z)V", Native_backgroundWorkChanged },
     { "megler/Native", "backDone", NULL, Native_backDone },
     { "megler/Native", "toBack", NULL, Native_toBack },
     { "megler/Native", "threadNice", NULL, Native_threadNice },
@@ -2810,6 +2842,11 @@ bool mg_java_ended(int *status, const char **reason)
     if (status) *status = J.end_status;
     if (reason) *reason = J.end_reason;
     return true;
+}
+
+bool mg_java_background_work_active(void)
+{
+    return mg_atomic_cas(&J.background_work, 0, 0) != 0;
 }
 
 /*

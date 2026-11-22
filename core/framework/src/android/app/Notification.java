@@ -29,10 +29,11 @@ public class Notification implements android.os.Parcelable {
     public android.graphics.Bitmap largeIcon;
     public android.widget.RemoteViews contentView, bigContentView, headsUpContentView;
     public Notification publicVersion;
+    private String channelId;
     public Notification() {}
     public Notification(int icon, CharSequence ticker, long when) { this.icon = icon; tickerText = ticker; this.when = when; }
     public String meglerText() { if (extras == null) return tickerText != null ? tickerText.toString() : ""; CharSequence t = extras.getCharSequence(EXTRA_TITLE), x = extras.getCharSequence(EXTRA_TEXT); return (t != null ? t : "") + (x != null ? ": " + x : ""); }
-    public String getChannelId() { return null; } public String getGroup() { return null; } public String getSortKey() { return null; } public Icon getSmallIcon() { return null; } public Icon getLargeIcon() { return null; }
+    public String getChannelId() { return channelId; } public String getGroup() { return null; } public String getSortKey() { return null; } public Icon getSmallIcon() { return null; } public Icon getLargeIcon() { return null; }
     public long getTimeoutAfter() { return 0; } public int getBadgeIconType() { return 0; } public String getShortcutId() { return null; } public int getGroupAlertBehavior() { return 0; }
     public boolean getAllowSystemGeneratedContextualActions() { return true; } public BubbleMetadata getBubbleMetadata() { return null; } public android.content.LocusId getLocusId() { return null; }
     public int describeContents() { return 0; }
@@ -245,26 +246,26 @@ public class Notification implements android.os.Parcelable {
     }
     public static class Builder {
         private final Notification n = new Notification();
-        public Builder(android.content.Context c) {} public Builder(android.content.Context c, String channel) {}
+        public Builder(android.content.Context c) {} public Builder(android.content.Context c, String channel) { n.channelId = channel; }
         public Builder setWhen(long w) { n.when = w; return this; } public Builder setShowWhen(boolean s) { return this; } public Builder setUsesChronometer(boolean b) { return this; } public Builder setChronometerCountDown(boolean b) { return this; }
         public Builder setSmallIcon(int i) { n.icon = i; return this; } public Builder setSmallIcon(int i, int l) { n.icon = i; return this; } public Builder setSmallIcon(Icon i) { return this; }
         public Builder setContentTitle(CharSequence t) { n.extras.putCharSequence(EXTRA_TITLE, t); return this; } public Builder setContentText(CharSequence t) { n.extras.putCharSequence(EXTRA_TEXT, t); return this; }
         public Builder setSubText(CharSequence t) { return this; } public Builder setNumber(int x) { n.number = x; return this; } public Builder setContentInfo(CharSequence i) { return this; }
-        public Builder setProgress(int max, int p, boolean ind) { return this; } public Builder setContent(android.widget.RemoteViews v) { return this; } public Builder setCustomContentView(android.widget.RemoteViews v) { return this; }
+        public Builder setProgress(int max, int p, boolean ind) { n.extras.putInt(EXTRA_PROGRESS_MAX, max); n.extras.putInt(EXTRA_PROGRESS, p); n.extras.putBoolean(EXTRA_PROGRESS_INDETERMINATE, ind); return this; } public Builder setContent(android.widget.RemoteViews v) { return this; } public Builder setCustomContentView(android.widget.RemoteViews v) { return this; }
         public Builder setCustomBigContentView(android.widget.RemoteViews v) { return this; } public Builder setCustomHeadsUpContentView(android.widget.RemoteViews v) { return this; }
         public Builder setContentIntent(PendingIntent i) { n.contentIntent = i; return this; } public Builder setDeleteIntent(PendingIntent i) { return this; } public Builder setFullScreenIntent(PendingIntent i, boolean h) { return this; }
         public Builder setTicker(CharSequence t) { return this; } public Builder setLargeIcon(android.graphics.Bitmap b) { return this; } public Builder setLargeIcon(Icon i) { return this; }
         public Builder setSound(android.net.Uri u) { return this; } public Builder setSound(android.net.Uri u, int s) { return this; } public Builder setSound(android.net.Uri u, android.media.AudioAttributes a) { return this; }
         public Builder setVibrate(long[] p) { return this; } public Builder setLights(int a, int on, int off) { return this; } public Builder setOngoing(boolean o) { return this; } public Builder setColorized(boolean c) { return this; }
-        public Builder setOnlyAlertOnce(boolean o) { return this; } public Builder setAutoCancel(boolean a) { return this; } public Builder setLocalOnly(boolean l) { return this; } public Builder setDefaults(int d) { return this; }
+        public Builder setOnlyAlertOnce(boolean o) { return setFlag(FLAG_ONLY_ALERT_ONCE, o); } public Builder setAutoCancel(boolean a) { return this; } public Builder setLocalOnly(boolean l) { return this; } public Builder setDefaults(int d) { return this; }
         public Builder setPriority(int p) { return this; } public Builder setCategory(String c) { n.category = c; return this; } public Builder addPerson(String p) { return this; } public Builder addPerson(Person p) { return this; }
         public Builder setGroup(String g) { return this; } public Builder setGroupSummary(boolean s) { return this; } public Builder setSortKey(String k) { return this; } public Builder addExtras(Bundle b) { n.extras.putAll(b); return this; }
         public Builder setExtras(Bundle b) { n.extras = b; return this; } public Bundle getExtras() { return n.extras; } public Builder addAction(int i, CharSequence t, PendingIntent p) { return this; } public Builder addAction(Action a) { return this; }
         public Builder setActions(Action... a) { return this; } public Builder setStyle(Style s) { return this; } public Builder setVisibility(int v) { return this; } public Builder setPublicVersion(Notification p) { return this; }
-        public Builder extend(Extender e) { return e != null ? e.extend(this) : this; } public Builder setColor(int c) { return this; } public Builder setChannelId(String c) { return this; } public Builder setTimeoutAfter(long t) { return this; }
+        public Builder extend(Extender e) { return e != null ? e.extend(this) : this; } public Builder setColor(int c) { return this; } public Builder setChannelId(String c) { n.channelId = c; return this; } public Builder setTimeoutAfter(long t) { return this; }
         public Builder setShortcutId(String s) { return this; } public Builder setLocusId(android.content.LocusId l) { return this; } public Builder setBadgeIconType(int t) { return this; } public Builder setGroupAlertBehavior(int b) { return this; }
         public Builder setBubbleMetadata(BubbleMetadata d) { return this; } public Builder setAllowSystemGeneratedContextualActions(boolean b) { return this; } public Builder setForegroundServiceBehavior(int b) { return this; }
-        public Builder setRemoteInputHistory(CharSequence[] h) { return this; } public Builder setSettingsText(CharSequence t) { return this; } public Builder setFlag(int m, boolean v) { return this; }
+        public Builder setRemoteInputHistory(CharSequence[] h) { return this; } public Builder setSettingsText(CharSequence t) { return this; } public Builder setFlag(int m, boolean v) { if (v) n.flags |= m; else n.flags &= ~m; return this; }
         public Notification build() { return n; } @Deprecated public Notification getNotification() { return n; }
         // ---- generated by tools/compat/fillmembers.py (Builder): the platform's members this class does not write (signatures only)
         public static final java.lang.String EXTRA_REBUILD_BIG_CONTENT_VIEW_ACTION_COUNT = "android.rebuild.bigViewActionCount";

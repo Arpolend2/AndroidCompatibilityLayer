@@ -30,7 +30,7 @@ const quint16 wireVersion = 1;
 const int maxPlanes = 4;
 const int maxDimension = 4096;
 const quint64 maxFramePixels = (32 * 1024 * 1024) / 4;
-const quint64 invalidModifier = ~quint64(0);
+const quint64 invalidModifier = 0x00ffffffffffffffULL;
 
 enum WireType {
     FramePacket = 1,
@@ -723,6 +723,15 @@ QStringList EmbeddedGpuTransport::currentGpuCapabilities()
         hasExtension(extensions, "EGL_KHR_image_base") && hasGlExtension("GL_OES_EGL_image") &&
         eglGetProcAddress("eglCreateImageKHR") && eglGetProcAddress("eglDestroyImageKHR") &&
         eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    const char *hybrisEntries[] = {
+        "eglHybrisCreateNativeBuffer", "eglHybrisGetNativeBufferInfo",
+        "eglHybrisSerializeNativeBuffer", "eglHybrisCreateRemoteBuffer",
+        "eglHybrisReleaseNativeBuffer"
+    };
+    QStringList missingHybrisEntries;
+    for (const char *entry : hybrisEntries) {
+        if (!eglGetProcAddress(entry)) missingHybrisEntries.append(QString::fromLatin1(entry));
+    }
     QLibrary gralloc(QStringLiteral("libgralloc.so.1"));
     QString grallocStatus = QStringLiteral("unavailable: libgralloc.so.1 not loaded");
     if (gralloc.load()) {
@@ -739,15 +748,62 @@ QStringList EmbeddedGpuTransport::currentGpuCapabilities()
         QStringLiteral("DMA-BUF import: %1; modifiers: %2")
             .arg(hasExtension(extensions, "EGL_EXT_image_dma_buf_import") ? QStringLiteral("advertised") : QStringLiteral("absent"),
                  hasExtension(extensions, "EGL_EXT_image_dma_buf_import_modifiers") ? QStringLiteral("advertised") : QStringLiteral("absent")),
+        QStringLiteral("Native-buffer EGL/GLES import: %1").arg(nativeImport ? QStringLiteral("advertised") : QStringLiteral("absent or incomplete")),
+        QStringLiteral("Hybris native-buffer extension: %1; missing entry points: %2")
+            .arg(hasExtension(extensions, "EGL_HYBRIS_native_buffer2") ? QStringLiteral("advertised") : QStringLiteral("absent"),
+                 missingHybrisEntries.isEmpty() ? QStringLiteral("none") : missingHybrisEntries.join(QStringLiteral(", "))),
         QStringLiteral("Gralloc: %1").arg(grallocStatus),
         QStringLiteral("GBM test: %1").arg(probeGbmRenderTarget(64, 64)),
-        QStringLiteral("Aurora Store uses CPU Canvas; this probe does not test peer import or screen output.")
+        QStringLiteral("This probe does not test peer import or screen output.")
     };
 }
 
-QString EmbeddedGpuTransport::probeGbmRenderTarget(int width, int height,
-    const std::function<bool(const AuroraDmaBufFrame &, QString *)> &verifyParent)
+bool aurora_copy_gpu_texture(GLuint source, GLuint target, int width, int height, QString *error)
 {
+    if (!source || !target || source == target || width <= 0 || height <= 0) {
+        setError(error, QStringLiteral("GPU copy has invalid texture or dimensions"));
+        return false;
+    }
+    for (int i = 0; i < 16; ++i) {
+        if (glGetError() == GL_NO_ERROR) break;
+        if (i == 15) {
+            setError(error, QStringLiteral("GPU context has persistent errors before the copy"));
+            return false;
+        }
+    }
+    GLint previous = 0, previousTexture = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
+    bool complete = fbo && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (complete) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
+        complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (complete) {
+            glBindTexture(GL_TEXTURE_2D, target);
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+            glFinish();
+        }
+    }
+    const GLenum glError = glGetError();
+    glBindTexture(GL_TEXTURE_2D, GLuint(previousTexture));
+    glBindFramebuffer(GL_FRAMEBUFFER, GLuint(previous));
+    if (fbo) glDeleteFramebuffers(1, &fbo);
+    if (!complete || glError != GL_NO_ERROR) {
+        setError(error, QStringLiteral("GPU texture copy failed (framebuffer complete=%1, GL error 0x%2)")
+                 .arg(complete).arg(glError, 0, 16));
+        return false;
+    }
+    return true;
+}
+
+static QString processGbmRenderTarget(int width, int height, GLuint source,
+    const std::function<bool(const AuroraDmaBufFrame &, QString *)> &consume, bool *success)
+{
+    if (success) *success = false;
     if (width <= 0 || height <= 0 || width > maxDimension || height > maxDimension ||
         quint64(width) * quint64(height) > maxFramePixels)
         return QStringLiteral("unavailable: frame dimensions exceed the GPU transport limits");
@@ -760,7 +816,8 @@ QString EmbeddedGpuTransport::probeGbmRenderTarget(int width, int height,
     if (!hasExtension(extensions, "EGL_KHR_image_base") || !hasGlExtension("GL_OES_EGL_image"))
         return QStringLiteral("unavailable: worker EGL/GLES lacks image-to-texture support");
 #ifndef ACL_HAVE_GBM_HEADER
-    Q_UNUSED(verifyParent)
+    Q_UNUSED(source)
+    Q_UNUSED(consume)
     return QStringLiteral("unavailable: build SDK lacks the GBM API header");
 #else
     QLibrary gbm(QStringLiteral("libgbm.so.1"));
@@ -814,6 +871,7 @@ QString EmbeddedGpuTransport::probeGbmRenderTarget(int width, int height,
         const uint32_t flags[] = {GBM_BO_USE_RENDERING, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR};
         QString lastError;
         for (const uint32_t format : formats) {
+            if (source && format != GBM_FORMAT_ARGB8888) continue;
             for (const uint32_t use : flags) {
                 AuroraDmaBufFrame frame;
                 frame.width = width;
@@ -836,7 +894,8 @@ QString EmbeddedGpuTransport::probeGbmRenderTarget(int width, int height,
                     frame.strides[plane] = int(stride);
                     frame.offsets[plane] = int(offset);
                     frame.fds[plane] = gbm_bo_get_fd_for_plane(buffer.get(), plane);
-                    valid = frame.fds[plane] >= 0;
+                    valid = frame.fds[plane] >= 0 &&
+                        fcntl(frame.fds[plane], F_SETFD, FD_CLOEXEC) == 0;
                 }
                 if (!valid) {
                     lastError = QStringLiteral("allocation produced unusable plane metadata or FDs");
@@ -844,36 +903,48 @@ QString EmbeddedGpuTransport::probeGbmRenderTarget(int width, int height,
                 }
                 const GLuint texture = aurora_import_dma_buf_texture(frame, display, &lastError);
                 if (!texture) continue;
-                GLint previous = 0;
-                glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous);
-                GLuint fbo = 0;
-                glGenFramebuffers(1, &fbo);
-                glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
-                const bool complete = fbo && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
-                if (complete) {
-                    glClear(GL_COLOR_BUFFER_BIT);
-                    glFinish();
+                bool rendered = false;
+                if (source) {
+                    rendered = aurora_copy_gpu_texture(source, texture, width, height, &lastError);
+                } else {
+                    GLint previous = 0;
+                    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous);
+                    GLuint fbo = 0;
+                    glGenFramebuffers(1, &fbo);
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+                    rendered = fbo && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+                    if (rendered) {
+                        glClear(GL_COLOR_BUFFER_BIT);
+                        glFinish();
+                    }
+                    const GLenum glError = glGetError();
+                    glBindFramebuffer(GL_FRAMEBUFFER, GLuint(previous));
+                    if (fbo) glDeleteFramebuffers(1, &fbo);
+                    rendered = rendered && glError == GL_NO_ERROR;
+                    if (!rendered)
+                        lastError = QStringLiteral("import succeeded but GLES rendering failed (GL error 0x%1)")
+                            .arg(glError, 0, 16);
                 }
-                const GLenum glError = glGetError();
-                glBindFramebuffer(GL_FRAMEBUFFER, GLuint(previous));
-                glDeleteFramebuffers(1, &fbo);
                 glDeleteTextures(1, &texture);
-                if (complete && glError == GL_NO_ERROR) {
+                if (rendered) {
                     const QString producer = QStringLiteral("%1: allocated, imported and rendered a %2x%3 test buffer "
                                                             "(fourcc 0x%4, modifier 0x%5, %6 plane(s))")
                         .arg(node).arg(width).arg(height).arg(frame.fourcc, 0, 16)
                         .arg(frame.modifier, 0, 16).arg(frame.planeCount);
-                    if (!verifyParent) return producer + QStringLiteral("; parent import and presentation not tested");
+                    if (!consume) {
+                        if (success) *success = true;
+                        return producer + QStringLiteral("; parent import and presentation not tested");
+                    }
                     frame.id = nextFrameId();
-                    frame.probeOnly = true;
+                    frame.probeOnly = !source;
                     QString parentError;
-                    if (!verifyParent(frame, &parentError))
+                    if (!consume(frame, &parentError))
                         return producer + QStringLiteral("; parent import/ACK failed: ") + parentError;
-                    return producer + QStringLiteral("; parent Qt import and GPU snapshot acknowledged; not displayed");
+                    if (success) *success = true;
+                    return producer + (source ? QStringLiteral("; live frame acknowledged")
+                                             : QStringLiteral("; parent Qt import and GPU snapshot acknowledged; not displayed"));
                 }
-                lastError = QStringLiteral("import succeeded but GLES rendering failed (GL error 0x%1)")
-                    .arg(glError, 0, 16);
             }
         }
         if (lastError.isEmpty())
@@ -884,6 +955,27 @@ QString EmbeddedGpuTransport::probeGbmRenderTarget(int width, int height,
     return failures.isEmpty() ? QStringLiteral("unavailable: no visible DRM render node")
                               : QStringLiteral("unavailable: %1").arg(failures.join(QStringLiteral("; ")));
 #endif
+}
+
+QString EmbeddedGpuTransport::probeGbmRenderTarget(int width, int height,
+    const std::function<bool(const AuroraDmaBufFrame &, QString *)> &verifyParent, bool *available)
+{
+    return processGbmRenderTarget(width, height, 0, verifyParent, available);
+}
+
+bool EmbeddedGpuTransport::presentGbmTexture(GLuint texture, int width, int height, QString *error)
+{
+    if (!texture) {
+        setError(error, tr("The GPU source texture is invalid."));
+        return false;
+    }
+    bool success = false;
+    const QString result = processGbmRenderTarget(width, height, texture,
+        [this](const AuroraDmaBufFrame &frame, QString *reason) {
+            return sendFrame(frame, reason);
+        }, &success);
+    if (!success) setError(error, result);
+    return success;
 }
 
 bool EmbeddedGpuTransport::presentTexture(GLuint texture, int width, int height, QString *error)

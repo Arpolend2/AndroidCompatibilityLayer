@@ -242,6 +242,12 @@ EmbeddedPreview::EmbeddedPreview(QObject *parent)
     });
     connect(&m_channel, &EmbeddedChannel::message, this, &EmbeddedPreview::receive);
     connect(&m_channel, &EmbeddedChannel::frame, this, [this](const QImage &image) {
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+        if (m_suppressCpuFrames.loadAcquire()) {
+            command(QStringLiteral("frameAck"));
+            return;
+        }
+#endif
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
         gpuState()->clear();
 #endif
@@ -254,12 +260,14 @@ EmbeddedPreview::EmbeddedPreview(QObject *parent)
         receiveGpuFrame(std::move(frame));
     });
     connect(&m_gpuTransport, &EmbeddedGpuTransport::failed, this, [this](const QString &reason) {
+        m_suppressCpuFrames.storeRelease(0);
         gpuState()->clear();
         emit frameChanged();
         if (!m_stopping && !m_restarting)
             qWarning().noquote() << "Embedded GPU transport unavailable; CPU fallback remains active:" << reason;
     });
     connect(&m_gpuTransport, &EmbeddedGpuTransport::peerDisconnected, this, [this]() {
+        m_suppressCpuFrames.storeRelease(0);
         gpuState()->clear();
         emit frameChanged();
     });
@@ -291,7 +299,8 @@ bool EmbeddedPreview::listen(QProcess *process, QString *error)
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
     m_gpuTransport.close();
     m_gpuEndpoint.clear();
-    if (!m_cpuFrameTransportOnly || m_verifyGpuImport) {
+    m_suppressCpuFrames.storeRelease(0);
+    if (!m_cpuFrameTransportOnly) {
         m_gpuEndpoint = m_directory.path() + QStringLiteral("/gpu");
         QString gpuError;
         if (!m_gpuTransport.listen(m_gpuEndpoint, -1, &gpuError)) {
@@ -369,22 +378,43 @@ void EmbeddedPreview::receiveGpuFrame(AuroraDmaBufFrame &&frame)
             m_gpuTransport.sendReply(id, false);
         return;
     }
-    QImage placeholder(frame.width, frame.height, QImage::Format_RGB32);
-    if (placeholder.isNull()) {
-        m_gpuTransport.sendReply(id, false);
-        return;
-    }
-    placeholder.fill(Qt::black);
+    const int width = frame.width;
+    const int height = frame.height;
     QPointer<EmbeddedPreview> self(this);
-    if (!gpuState()->submitDmaBuf(std::move(frame), this, [self](quint64 frameId, bool accepted) {
-            if (self) self->m_gpuTransport.sendReply(frameId, accepted);
+    // Ignore older CPU-channel frames while this GPU frame is awaiting import.
+    m_suppressCpuFrames.storeRelease(1);
+    if (!gpuState()->submitDmaBuf(std::move(frame), this, [self, width, height](quint64 frameId, bool accepted) {
+            if (self) {
+                if (accepted) {
+                    QMetaObject::invokeMethod(self, "gpuFrameReady", Qt::QueuedConnection,
+                                              Q_ARG(int, width), Q_ARG(int, height));
+                } else {
+                    self->m_suppressCpuFrames.storeRelease(0);
+                }
+                if (!self->m_gpuTransport.sendReply(frameId, accepted))
+                    qWarning("Embedded GPU frame acknowledgment could not be sent.");
+            }
         })) {
+        m_suppressCpuFrames.storeRelease(0);
         m_gpuTransport.sendReply(id, false);
         qWarning().noquote() << "Embedded GPU frame rejected; using CPU fallback:"
                              << gpuState()->lastFailure();
         return;
     }
-    m_frame = placeholder;
+}
+
+void EmbeddedPreview::gpuFrameReady(int width, int height)
+{
+    if (!m_suppressCpuFrames.loadAcquire()) return;
+    if (m_frame.size() != QSize(width, height)) {
+        QImage placeholder(width, height, QImage::Format_RGB32);
+        if (placeholder.isNull()) {
+            qWarning("Cannot allocate the GPU frame size placeholder.");
+            return;
+        }
+        placeholder.fill(Qt::black);
+        m_frame = placeholder;
+    }
     emit remoteStatusChanged();
     emit frameChanged();
 }
@@ -406,16 +436,13 @@ void EmbeddedPreview::acceptPending()
         m_channel.attach(socket);
         m_connectionTimer.stop();
         m_server.close();
-        if (qgetenv("ACL_EMBEDDED_CPU_SHARED_FRAMES") == "1") {
-            const QString sharedPath = m_channel.createSharedFrames();
-            if (!sharedPath.isEmpty())
-                command(QStringLiteral("sharedFrames"), QJsonObject{{QStringLiteral("path"), sharedPath}});
-        }
+        const QString sharedPath = m_channel.createSharedFrames();
+        if (!sharedPath.isEmpty())
+            command(QStringLiteral("sharedFrames"), QJsonObject{{QStringLiteral("path"), sharedPath}});
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
         if (!m_gpuEndpoint.isEmpty())
             command(QStringLiteral("gpuConnect"), QJsonObject{
-                {QStringLiteral("endpoint"), m_gpuEndpoint},
-                {QStringLiteral("probeOnly"), m_verifyGpuImport}
+                {QStringLiteral("endpoint"), m_gpuEndpoint}
             });
 #endif
         if (m_stopping) {
@@ -476,9 +503,13 @@ void EmbeddedPreview::back()
     command(QStringLiteral("back"));
 }
 
-void EmbeddedPreview::setViewport(qreal width, qreal height, qreal ratio)
+void EmbeddedPreview::setViewport(qreal width, qreal height, qreal ratio, int rotation)
 {
-    PreviewPlayer::setViewport(width, height, ratio);
+    if (width <= 0 || height <= 0 || ratio <= 0 || rotation < -1 || rotation > 3) {
+        PreviewPlayer::setViewport(width, height, ratio, rotation);
+        return;
+    }
+    PreviewPlayer::setViewport(width, height, ratio, rotation);
     m_width = width; m_height = height; m_ratio = ratio;
     command(QStringLiteral("viewport"), QJsonObject{{QStringLiteral("width"), width},
             {QStringLiteral("height"), height}, {QStringLiteral("ratio"), ratio},
@@ -568,6 +599,13 @@ void EmbeddedPreview::showFailed(const QString &token)
 void EmbeddedPreview::receive(const QJsonObject &message)
 {
     const QString type = message.value(QStringLiteral("type")).toString();
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    if (type == QLatin1String("gpuFallback")) {
+        m_suppressCpuFrames.storeRelease(0);
+        gpuState()->clear();
+        emit frameChanged();
+    } else
+#endif
     if (type == QLatin1String("shutdownComplete")) {
         if (m_stopping) emit shutdownComplete();
     } else if (type == QLatin1String("status")) {
@@ -685,18 +723,27 @@ bool MEGLER_CB EmbeddedPreviewChild::presentGpuCanvas(void *user, uint32_t textu
     EmbeddedPreviewChild *self = static_cast<EmbeddedPreviewChild *>(user);
     if (!self || self->m_gpuFailed.loadAcquire()) return false;
     QString error;
-    const bool accepted = self->m_gpuTransport.presentTexture(texture, width, height, &error);
+    const bool directExport = EmbeddedGpuTransport::canExportDmaBuf(nullptr);
+    const bool accepted = directExport
+        ? self->m_gpuTransport.presentTexture(texture, width, height, &error)
+        : self->m_gpuTransport.presentGbmTexture(texture, width, height, &error);
     self->m_gpuPresenting.storeRelease(accepted ? 1 : 0);
     if (accepted) {
         if (self->m_gpuActiveLogged.testAndSetOrdered(0, 1))
-            qInfo("Embedded GPU DMA-BUF frame imported and acknowledged; CPU readback is disabled");
+            qInfo("Embedded GPU DMA-BUF frame imported and acknowledged; frame readback is disabled");
     } else {
         self->m_gpuFailed.storeRelease(1);
         self->m_gpuTransport.closePeer();
+        QMetaObject::invokeMethod(self, "notifyGpuFallback", Qt::QueuedConnection);
         qWarning().noquote() << "Embedded GPU presentation unavailable; using CPU fallback:"
                              << (error.isEmpty() ? QStringLiteral("GPU channel is unavailable") : error);
     }
     return accepted;
+}
+
+void EmbeddedPreviewChild::notifyGpuFallback()
+{
+    command(QStringLiteral("gpuFallback"));
 }
 #endif
 
@@ -769,10 +816,10 @@ void EmbeddedPreviewChild::receive(const QJsonObject &message)
             qWarning().noquote() << "Embedded GPU channel unavailable; using CPU presentation:"
                                  << (error.isEmpty() ? QStringLiteral("missing endpoint") : error);
         } else {
-            const bool probeOnly = message.value(QStringLiteral("probeOnly")).toBool();
-            m_player->setRemoteGpuCanvasPresentation(probeOnly ? nullptr : presentGpuCanvas,
+            m_player->setRemoteGpuCanvasPresentation(presentGpuCanvas,
                                                       this, &m_gpuTransport);
             qInfo("Embedded worker authenticated a GPU channel to its parent");
+            emit gpuChannelConnected();
         }
         maybeStart();
     } else
@@ -795,14 +842,16 @@ void EmbeddedPreviewChild::receive(const QJsonObject &message)
     } else if (type == QLatin1String("viewport") &&
                number(message, "width", 1, 8192, &a) && number(message, "height", 1, 8192, &b) &&
                number(message, "ratio", 0.1, 8, &c)) {
+        int viewportRotation = -1;
         if (message.contains(QStringLiteral("rotation"))) {
             double rotation;
-            if (number(message, "rotation", 0, 3, &rotation) && rotation == int(rotation))
-                m_player->setDisplayRotation(int(rotation));
-            else
+            if (!number(message, "rotation", 0, 3, &rotation) || rotation != int(rotation)) {
                 qWarning() << "Invalid embedded viewport rotation";
+                return;
+            }
+            viewportRotation = int(rotation);
         }
-        m_player->setViewport(a, b, c);
+        m_player->setViewport(a, b, c, viewportRotation);
         m_haveViewport = true;
         maybeStart();
     } else if (type == QLatin1String("touch") &&

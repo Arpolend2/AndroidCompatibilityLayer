@@ -16,3 +16,8 @@ ApplicationName=appmanager
 ExecDBus=/usr/bin/ru.androidcompatibilitylayer.appmanager --microg-service
 ExportDBusInterfaces=ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager.microg;ru.androidcompatibilitylayer.appmanager.log
 Intents=OpenURI;Start
+
+[X-Task MicrogWatchdog]
+Type=periodic
+Exec=/usr/bin/ru.androidcompatibilitylayer.appmanager --microg-watchdog
+Permissions=Internet;UserDirs;DeviceInfo;Camera;Sensors;Audio;Bluetooth;Location

@@ -376,6 +376,7 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
         "[Desktop Entry]\nType=Application\nX-Nemo-Application-Type=silica-qt5\n"
         "Icon=%1\nExec=%2 --standalone\nName=%3\n\n[X-Application]\n"
         "Permissions=%4\n"
+        "Intents=Start\n"
         "OrganizationName=%5\nApplicationName=%6\n")
         .arg(appId, binaryPath, title, osPermissions.join(QLatin1Char(';')),
              organization, appId.mid(organization.size() + 1));

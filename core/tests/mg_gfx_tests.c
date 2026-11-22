@@ -505,6 +505,33 @@ static void test_bitmaps(void)
     CHECK_HEX(at(&d, 4, 3), 0xFF00FF00u);
     CHECK_HEX(at(&d, 3, 4), 0xFF0000FFu);
     CHECK_HEX(at(&d, 4, 4), 0x80404040u);
+    erase(&d);
+    p.flags |= MEGLER_GFX_FILTER_BITMAP;
+    H->draw_bitmap(H->user, d.cv, &image, whole, four, &p);
+    CHECK_HEX(at(&d, 0, 0), 0xFFFF0000u);
+    CHECK_HEX(at(&d, 1, 1), 0xF7933434u);
+    erase(&d);
+    H->draw_bitmap(H->user, d.cv, &image, one, four, &p);
+    CHECK_INT(count_of(&d, 0xFF00FF00u), 16);
+    erase(&d);
+    {
+        float single[4] = { 0, 0, 1, 1 };
+        H->draw_bitmap(H->user, d.cv, &image, whole, single, &p);
+        CHECK_HEX(at(&d, 0, 0), 0xDF505050u);
+    }
+    erase(&d);
+    d.px[0] = 0xFFFF0000u;
+    d.px[1] = 0xFF00FF00u;
+    d.px[8] = 0xFF0000FFu;
+    d.px[9] = 0xFFFFFFFFu;
+    image_of(&d, &image);
+    {
+        float overlapping[4] = { 1, 0, 5, 4 };
+        H->draw_bitmap(H->user, d.cv, &image, whole, overlapping, &p);
+        CHECK_HEX(at(&d, 2, 0), 0xFFBF4000u);
+    }
+    image_of(&s, &image);
+    p.flags &= ~MEGLER_GFX_FILTER_BITMAP;
     /* A part of it: nothing from outside the part shows. */
     erase(&d);
     H->draw_bitmap(H->user, d.cv, &image, one, four, &p);

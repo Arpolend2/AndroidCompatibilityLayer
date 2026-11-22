@@ -6,8 +6,7 @@ host, Canvas capture consumer, input adapter and their mock tests were removed.
 Android apps continue to use Android's `WebViewFactory` and Chromium loader.
 
 With Aurora SDK 5.2.1, configure the project with
-`ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS=ON` and
-`ANDROID_COMPATIBILITY_LAYER_BUILD_WEBVIEW_PROBE=ON`, then build and run
+`ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS=ON`, then explicitly build and run
 `android_compatibility_layer_webview_native_probe` in a graphical Aurora
 environment as a non-root user. This target is not installed with the manager.
 It loads fixed offline HTML with JavaScript disabled and checks the title.

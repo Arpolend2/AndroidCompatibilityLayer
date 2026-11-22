@@ -944,8 +944,8 @@ static void test_drawing(void)
     call("cvDrawBitmap", 11, J(cv), J(src), F(0), F(0), F(2), F(2), F(4), F(4), F(12), F(12), L(NULL));
     CHECK(exactly(bm, 4, 4, 12, 12));
     CHECK_HEX(word(bm, 4, 4), 0xFFFF0000u);
-    CHECK_HEX(word(bm, 8, 4), 0xFF00FF00u);
-    CHECK_HEX(word(bm, 7, 8), 0xFF0000FFu);
+    CHECK_HEX(word(bm, 8, 4), 0xFF609F00u);
+    CHECK_HEX(word(bm, 7, 8), 0xFF78609Fu);
     CHECK_HEX(word(bm, 11, 11), 0xFFFFFFFFu);
     erase(bm);
     call("cvDrawBitmap", 11, J(cv), J(src), F(1), F(0), F(2), F(1), F(0), F(0), F(3), F(3), L(paint(0x80000000u)));

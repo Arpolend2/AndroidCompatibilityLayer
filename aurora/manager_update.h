@@ -1,6 +1,8 @@
 #ifndef ANDROID_COMPATIBILITY_LAYER_MANAGER_UPDATE_H
 #define ANDROID_COMPATIBILITY_LAYER_MANAGER_UPDATE_H
 
+#include "package_architecture.h"
+
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QNetworkAccessManager>
@@ -11,6 +13,14 @@
 #include <QUrl>
 
 class QNetworkReply;
+
+inline QString managerUpdatePackageArchitecture()
+{
+    const QString architecture = packageBuildArchitecture();
+    if (architecture == QLatin1String("aarch64") || architecture == QLatin1String("armv7hl"))
+        return architecture;
+    return QString();
+}
 
 struct ManagerUpdateRelease {
     QUrl url;

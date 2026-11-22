@@ -22,6 +22,8 @@ public:
     bool isConfigured() const { return !m_program.isEmpty(); }
     bool openChannel(const QString &package, int uid, int pid, quint64 channelId,
                      int serverFd, QString *error);
+    bool startRetained(QString *error);
+    void releaseRetention();
     void closeChannel(quint64 channelId);
     void stop();
 
@@ -59,6 +61,7 @@ private:
     int m_controlFd = -1;
     bool m_ready = false;
     bool m_stopping = false;
+    bool m_retainWithoutClients = false;
     QSet<quint64> m_channels;
     QSet<quint64> m_usedChannelIds;
     QSet<quint64> m_closedChannelIds;

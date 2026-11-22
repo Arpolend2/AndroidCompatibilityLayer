@@ -436,7 +436,7 @@
 <context>
     <name>AndroidCompatibilityLayer</name>
     <message><source>What's new in this build</source><translation>Что нового в этой сборке</translation></message>
-    <message><source>- Check GitHub for updates, download RPMs with progress, and offer installation.&#10;- Optional update checks at startup.&#10;- An About section with a description, links, and build information.&#10;- Pause and resume log capture.&#10;- Clear logs when disabling logging or deleting log files; exported files are kept when logging is disabled.</source><translation>- Проверка обновлений на GitHub, скачивание RPM с прогрессом и предложением установки.&#10;- Необязательная проверка обновлений при запуске.&#10;- Раздел «О приложении» с описанием, ссылками и информацией о сборке.&#10;- Пауза записи журналов с последующим возобновлением.&#10;- Очистка журналов при их выключении и удалении файлов; экспортированные файлы при выключении сохраняются.</translation></message>
+    <message><source>- GPU acceleration for Aurora Store and microG settings, with improved image scaling.&#10;- Notifications from Android apps now appear in Aurora.&#10;- Standalone apps can continue background tasks after their window is closed.</source><translation>- GPU-ускорение интерфейса Aurora Store и настроек microG, улучшенное масштабирование изображений.&#10;- Уведомления Android-приложений теперь отображаются в Авроре.&#10;- Standalone-приложения могут продолжать фоновые задачи после закрытия окна.</translation></message>
     <message><source>Could not open the link.</source><translation>Не удалось открыть ссылку.</translation></message>
     <message><source>Disable and clear logs</source><translation>Выключить и очистить журнал</translation></message>
     <message><source>Detailed logs may contain passwords, tokens, app data, paths and network addresses. Standalone snapshots are stored in a shared organization folder. Turning logging off clears the current and shared logs, but keeps files exported to Documents. Running apps may briefly recreate snapshots. Review logs before sharing.</source><translation>Подробный журнал может содержать пароли, токены, данные приложений, пути и сетевые адреса. Снимки отдельных приложений хранятся в общей папке организации. Выключение записи очищает текущий и общие журналы, но сохраняет файлы, экспортированные в «Документы». Запущенные приложения могут ненадолго создать снимки снова. Проверяйте журнал перед отправкой.</translation></message>
@@ -1135,6 +1135,10 @@ Pick an Android app&apos;s APK to add it to the library.</source>
     <message>
         <source>Android app is running.</source>
         <translation>Android-приложение запущено.</translation>
+    </message>
+    <message>
+        <source>Android app is running in the background.</source>
+        <translation>Android-приложение работает в фоновом режиме.</translation>
     </message>
     <message>
         <source>Android app ended (status %1).</source>

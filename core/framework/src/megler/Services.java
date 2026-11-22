@@ -83,7 +83,7 @@ public final class Services {
         case Context.POWER_SERVICE: return new android.os.PowerManager();
         case Context.ACTIVITY_SERVICE: return new android.app.ActivityManager();
         case Context.CONNECTIVITY_SERVICE: return new android.net.ConnectivityManager();
-        case Context.NOTIFICATION_SERVICE: return new android.app.NotificationManager();
+        case Context.NOTIFICATION_SERVICE: return new android.app.NotificationManager(c);
         case Context.ALARM_SERVICE: return new android.app.AlarmManager();
         case Context.ACCESSIBILITY_SERVICE: return new android.view.accessibility.AccessibilityManager();
         case Context.UI_MODE_SERVICE: return new android.app.UiModeManager();

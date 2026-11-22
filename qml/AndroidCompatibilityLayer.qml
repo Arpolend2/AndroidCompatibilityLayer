@@ -1251,7 +1251,7 @@ ApplicationWindow {
                             objectName: "managerReleaseNotes"
                             x: Theme.horizontalPageMargin
                             width: parent.width - 2 * x
-                            text: qsTr("- Check GitHub for updates, download RPMs with progress, and offer installation.\n- Optional update checks at startup.\n- An About section with a description, links, and build information.\n- Pause and resume log capture.\n- Clear logs when disabling logging or deleting log files; exported files are kept when logging is disabled.")
+                            text: qsTr("- GPU acceleration for Aurora Store and microG settings, with improved image scaling.\n- Notifications from Android apps now appear in Aurora.\n- Standalone apps can continue background tasks after their window is closed.")
                             textFormat: Text.PlainText
                             wrapMode: Text.Wrap
                             color: palette.secondaryColor

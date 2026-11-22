@@ -76,6 +76,34 @@ ManagerLifecycle::ManagerLifecycle(const std::function<bool()> &showGui, QObject
     });
     connect(&m_worker, &SharedMicrogSupervisor::workerDied,
             &m_provider, &SharedMicrogProviderObject::revokeAllChannels);
+    m_microgRestart.setSingleShot(true);
+    connect(&m_worker, &SharedMicrogSupervisor::workerDied, this, [this]() {
+        if (m_microgBackground) m_microgRestart.start(30000);
+    });
+    connect(&m_microgRestart, &QTimer::timeout, this, [this]() {
+        if (!m_microgBackground) return;
+        QString error;
+        if (!m_worker.startRetained(&error)) {
+            qWarning("Cannot start the background microG worker: %s", qPrintable(error));
+            if (m_microgBackground) m_microgRestart.start(30000);
+        }
+    });
+    m_provider.setWorkerCheckHandler([this](QString *error) {
+        if (!m_microgBackground) {
+            if (error) *error = QStringLiteral("The shared microG worker is not configured.");
+            return false;
+        }
+        if (m_microgRestart.isActive() && m_microgRestart.remainingTime() > 0) {
+            if (error) *error = QStringLiteral("The shared microG worker is waiting to retry.");
+            return false;
+        }
+        if (!m_worker.startRetained(error)) {
+            if (m_microgBackground) m_microgRestart.start(30000);
+            return false;
+        }
+        m_microgRestart.stop();
+        return true;
+    });
     connect(&m_worker, &SharedMicrogSupervisor::channelDisconnected,
             &m_provider, &SharedMicrogProviderObject::releaseChannelById);
 }
@@ -357,11 +385,20 @@ void ManagerLifecycle::releaseClientAppMetadata(quint64 channelId)
 
 void ManagerLifecycle::disableSharedMicrogWorker()
 {
+    m_microgBackground = false;
+    m_microgRestart.stop();
+    m_worker.releaseRetention();
     m_provider.revokeAllChannels();
     m_worker.stop();
     QString error;
     if (!m_provider.clearBackend(&error))
         qWarning("Cannot disable shared microG backend: %s", qPrintable(error));
+}
+
+void ManagerLifecycle::enableSharedMicrogBackground()
+{
+    m_microgBackground = true;
+    m_microgRestart.start(0);
 }
 
 SharedMicrogProviderObject::PackageResolver ManagerLifecycle::registryPackageResolver(

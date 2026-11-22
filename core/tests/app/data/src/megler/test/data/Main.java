@@ -8334,6 +8334,16 @@ public class Main extends Activity {
      * must not be null").
      */
     private void notificationChannel() {
+        step("notification-builder-channel", () -> {
+            android.app.Notification.Builder builder = new android.app.Notification.Builder(this, "first");
+            android.app.Notification initial = builder.build();
+            if (!"first".equals(initial.getChannelId())) return false;
+            android.app.Notification changed = builder.setChannelId("second").build();
+            if (!"second".equals(changed.getChannelId())) return false;
+            android.app.Notification recovered = android.app.Notification.Builder.recoverBuilder(this, changed).build();
+            return "second".equals(recovered.getChannelId()) &&
+                    new android.app.Notification.Builder(this).build().getChannelId() == null;
+        });
         step("notification-channel", () -> {
             android.app.NotificationChannel d = new android.app.NotificationChannel("defaults", "Defaults", android.app.NotificationManager.IMPORTANCE_DEFAULT);
             android.media.AudioAttributes da = d.getAudioAttributes();

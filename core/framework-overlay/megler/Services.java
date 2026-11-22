@@ -20,13 +20,21 @@ import java.util.HashMap;
 public final class Services {
     private static final HashMap<String, Service> sRunning = new HashMap<>();
     private static final HashMap<ServiceConnection, String> sBound = new HashMap<>();
+    private static final java.util.HashSet<String> sStarted = new java.util.HashSet<>();
     private static volatile SharedMicrogClientRouter sSharedMicrogRouter;
     private static final Object sSharedMicrogLock = new Object();
     /* The id of the latest start of each of the app's services (postStart). */
     private static final HashMap<String, Integer> sLastStart = new HashMap<>();
     private Services() {}
     /** The app's services that are running now (main thread). */
-    public static java.util.List<Service> running() { return new java.util.ArrayList<>(sRunning.values()); }
+    public static java.util.List<Service> running() {
+        synchronized (sRunning) { return new java.util.ArrayList<>(sRunning.values()); }
+    }
+    /** Started services and app-owned bindings; excludes services created only to run a job. */
+    public static boolean hasBackgroundWork() {
+        synchronized (sStarted) { if (!sStarted.isEmpty()) return true; }
+        synchronized (sBound) { return !sBound.isEmpty(); }
+    }
     private static Manifest.Component find(Intent i) {
         String pkg = i.getComponent() == null ? i.getPackage() : i.getComponent().getPackageName();
         if (pkg != null && !pkg.equals(Native.packageName())) return null;
@@ -63,7 +71,13 @@ public final class Services {
         Manifest.Component c = find(i);
         if (c == null) return null;
         postStart(sLastStart, c.name, id -> {
-            try { Service s = create(c); s.onStartCommand(Processes.forLoader(i, s.getClass().getClassLoader()), 0, id); } catch (Throwable t) { android.util.Log.e("Megler", "service " + c.name + " failed", t); }
+            synchronized (sStarted) { sStarted.add(c.name); }
+            try { Service s = create(c); s.onStartCommand(Processes.forLoader(i, s.getClass().getClassLoader()), 0, id); }
+            catch (Throwable t) {
+                synchronized (sStarted) { sStarted.remove(c.name); }
+                android.util.Log.e("Megler", "service " + c.name + " failed", t);
+            }
+            finally { AppRunner.backgroundWorkChanged(); }
         });
         return new ComponentName(Native.packageName(), c.name);
     }
@@ -98,7 +112,13 @@ public final class Services {
         if (MicroG.stop(i)) return true;
         Manifest.Component c = find(i);
         if (c == null || !sRunning.containsKey(c.name)) return false;
-        MicroG.onMain(() -> { Service s; synchronized (sRunning) { s = sRunning.remove(c.name); } if (s != null) s.onDestroy(); });
+        MicroG.onMain(() -> {
+            Service s;
+            synchronized (sRunning) { s = sRunning.remove(c.name); }
+            synchronized (sStarted) { sStarted.remove(c.name); }
+            if (s != null) s.onDestroy();
+            AppRunner.backgroundWorkChanged();
+        });
         return true;
     }
     /** Service.stopSelfResult: true when the service stops, false when a later start keeps it or it is not running. */
@@ -112,7 +132,9 @@ public final class Services {
         return postStop(sLastStart, name, id, () -> {
             boolean still;
             synchronized (sRunning) { still = sRunning.get(name) == s; if (still) sRunning.remove(name); }
+            if (still) synchronized (sStarted) { sStarted.remove(name); }
             if (still) s.onDestroy();
+            AppRunner.backgroundWorkChanged();
         });
     }
     public static boolean bind(Context from, Intent i, ServiceConnection conn) {
@@ -138,7 +160,8 @@ public final class Services {
             try {
                 Service s = create(c);
                 IBinder b = s.onBind(Processes.forLoader(i, s.getClass().getClassLoader()));
-                sBound.put(conn, c.name);
+                synchronized (sBound) { sBound.put(conn, c.name); }
+                AppRunner.backgroundWorkChanged();
                 ComponentName cn = new ComponentName(Native.packageName(), c.name);
                 if (b != null) conn.onServiceConnected(cn, b); else conn.onNullBinding(cn);
             } catch (Throwable t) { android.util.Log.e("Megler", "binding " + c.name + " failed", t); }
@@ -151,7 +174,10 @@ public final class Services {
             shared.unbind(conn);
             return;
         }
-        if (!MicroG.unbind(conn)) sBound.remove(conn);
+        if (!MicroG.unbind(conn)) {
+            synchronized (sBound) { sBound.remove(conn); }
+            AppRunner.backgroundWorkChanged();
+        }
     }
 
     public static void setSharedMicrogClientRouter(SharedMicrogClientRouter router) {
@@ -189,7 +215,7 @@ public final class Services {
         case Context.POWER_SERVICE: return new android.os.PowerManager();
         case Context.ACTIVITY_SERVICE: return new android.app.ActivityManager();
         case Context.CONNECTIVITY_SERVICE: return new android.net.ConnectivityManager();
-        case Context.NOTIFICATION_SERVICE: return new android.app.NotificationManager();
+        case Context.NOTIFICATION_SERVICE: return new android.app.NotificationManager(c);
         case Context.ALARM_SERVICE: return new android.app.AlarmManager();
         case Context.ACCESSIBILITY_SERVICE: return new android.view.accessibility.AccessibilityManager();
         case Context.UI_MODE_SERVICE: return new android.app.UiModeManager();

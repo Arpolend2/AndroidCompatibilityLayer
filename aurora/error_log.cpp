@@ -1,5 +1,6 @@
 #include "error_log.h"
 #include "memory_log_bus.h"
+#include "package_architecture.h"
 
 #include <QDateTime>
 #include <QCoreApplication>
@@ -28,11 +29,18 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <limits>
+#include <mutex>
+#include <poll.h>
+#include <system_error>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <dirent.h>
 #include <sys/file.h>
 #include <sys/socket.h>
@@ -58,21 +66,22 @@ QMap<QString, RemoteHistory> remoteHistory;
 quint64 rejectedRemoteEvents = 0;
 const int MaxRemoteClients = 32;
 const int MaxRemoteSafe = 128 * 1024;
-const int MaxRemoteDetailed = 512 * 1024;
+const int MaxRemoteDetailed = 10000000;
 const int MaxContext = 131072;
 const int MaxJournalBytes = 4 * 1024 * 1024;
-const int MaxJournalEntry = 65536;
-const int MaxDetailedBytes = 16 * 1024 * 1024;
+const int MaxJournalEntry = 10000000;
+const int MaxDetailedBytes = 20000000;
+const int MaxReportBytes = 10000000;
 const char ExportDirectoryName[] = "AndroidCompatibilityLayer-Error-Logs";
 const char SharedStandaloneDirectoryName[] = "AndroidCompatibilityLayer-Standalone-Logs";
 const char JournalTruncated[] = "[Earlier shared history was truncated.]\n";
 const char DetailedTruncated[] = "[Earlier detailed output was truncated.]\n";
 const int MaxStandaloneSnapshots = 32;
-const int MaxStandaloneSnapshotBytes = 256 * 1024;
-const int MaxStandaloneSnapshotEvents = 512;
+const int MaxStandaloneSnapshotBytes = 64 * 1024 * 1024;
+const int MaxStandaloneSnapshotEvents = 500000;
 const int StandaloneStartupEvents = 32;
-const int MaxStandalonePendingBytes = 128 * 1024;
-const int MaxStandaloneMessageChars = 4096;
+const int MaxStandalonePendingBytes = MaxReportBytes;
+const int MaxStandaloneMessageChars = MaxReportBytes;
 const int MaxStandaloneExportCursors = 512;
 const int MaxSnapshotBytes = 96 * 1024 * 1024;
 const quint32 SnapshotMagic = 0x41434c4c;
@@ -123,8 +132,14 @@ struct StandaloneWriter {
     QString applicationId;
     QString error;
     QVector<StandaloneEvent> pending;
+    int pendingBytes = 0;
     quint64 nextSequence = 0;
     quint64 dropped = 0;
+    QString lastErrorSource;
+    QString lastErrorSafeSource;
+    QString lastErrorMessage;
+    QString lastRepeatTime;
+    quint64 repeats = 0;
 };
 StandaloneWriter standaloneWriter;
 QString sharedStandaloneDirectory;
@@ -133,7 +148,41 @@ bool standaloneSnapshotMode = false;
 QMap<QString, quint64> exportedStandaloneSequences;
 int coreSender = -1;
 int coreReceiver = -1;
-std::atomic<quint64> coreDropped(0);
+static_assert(ATOMIC_INT_LOCK_FREE == 2, "Core log atomics must be lock-free");
+std::atomic<unsigned int> coreDropped(0);
+std::atomic<unsigned int> coreIncomplete(0);
+const size_t MaxCoreQueueBytes = 10000000;
+struct CorePacket {
+    quint32 id;
+    quint32 offset;
+    quint32 total;
+    int level;
+    quint32 abort;
+};
+struct CoreMessage {
+    int level;
+    QByteArray text;
+};
+struct CoreChannel {
+    int wakeSender = -1;
+    int wakeReceiver = -1;
+    std::mutex mutex;
+    std::deque<CoreMessage> pending;
+    size_t bytes = 0;
+    std::atomic<bool> stop{false};
+    std::atomic<unsigned int> nextId{0};
+    std::thread worker;
+    ~CoreChannel()
+    {
+        stop.store(true, std::memory_order_relaxed);
+        if (worker.joinable()) worker.join();
+        if (wakeSender >= 0) ::close(wakeSender);
+        if (wakeReceiver >= 0) ::close(wakeReceiver);
+        if (coreSender >= 0) ::close(coreSender);
+        if (coreReceiver >= 0) ::close(coreReceiver);
+    }
+} coreChannel;
+void finishCoreChannel();
 bool exitReportConnected = false;
 thread_local bool recording = false;
 struct RecordingGuard {
@@ -150,15 +199,12 @@ QString reportHeader()
         : QStringLiteral("other");
     const QString version = QSysInfo::productVersion();
     const QRegularExpression versionPattern(QStringLiteral("\\A[0-9]+(?:\\.[0-9]+){0,4}\\z"));
-    const QString architecture = QSysInfo::currentCpuArchitecture();
-    const QStringList architectures = {QStringLiteral("arm64"), QStringLiteral("aarch64"),
-                                       QStringLiteral("arm"), QStringLiteral("x86_64"),
-                                       QStringLiteral("i386"), QStringLiteral("i686")};
+    const QString architecture = packageBuildArchitecture();
     return QStringLiteral("Report format: 2\nBuild: %1 %2\n"
-                          "System: %3\nArchitecture: %4\nQt: %5\nTime: %6 UTC\n\n")
+                          "System: %3\nPackage architecture (build): %4\nQt: %5\nTime: %6 UTC\n\n")
         .arg(QString::fromLatin1(__DATE__)).arg(QString::fromLatin1(__TIME__))
         .arg(versionPattern.match(version).hasMatch() ? system + QLatin1Char(' ') + version : system)
-        .arg(architectures.contains(architecture) ? architecture : QStringLiteral("other"))
+        .arg(architecture.isEmpty() ? QStringLiteral("unknown") : architecture)
         .arg(QString::fromLatin1(qVersion())).arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
 }
 
@@ -342,6 +388,49 @@ StandaloneEvent dropStandaloneEvent(QVector<StandaloneEvent> *events)
     int index = firstCandidate;
     while (index < events->size() && events->at(index).error) ++index;
     return events->takeAt(index < events->size() ? index : firstCandidate);
+}
+
+QString safeSnapshotText(QString text);
+
+QString standaloneEventText(const StandaloneEvent &event)
+{
+    return QStringLiteral("[%1 UTC] [%2]%3 %4\n")
+        .arg(event.time, safeSnapshotText(event.source),
+             event.error ? QStringLiteral(" error") : QString(),
+             safeSnapshotText(event.message));
+}
+
+int standalonePendingEventBytes(const StandaloneEvent &event)
+{
+    return standaloneEventText(event).toUtf8().size();
+}
+
+void appendStandalonePending(const QString &time, const QString &source,
+                             const QString &message, bool error)
+{
+    StandaloneEvent event{++standaloneWriter.nextSequence, time, source, message, error};
+    standaloneWriter.pending.append(event);
+    standaloneWriter.pendingBytes += standalonePendingEventBytes(event);
+    while (!standaloneWriter.pending.isEmpty() &&
+           (standaloneWriter.pendingBytes > MaxStandalonePendingBytes ||
+            standaloneWriter.pending.size() > MaxStandaloneSnapshotEvents)) {
+        const StandaloneEvent removed = dropStandaloneEvent(&standaloneWriter.pending);
+        standaloneWriter.pendingBytes -= standalonePendingEventBytes(removed);
+        if (standaloneWriter.dropped != std::numeric_limits<quint64>::max())
+            ++standaloneWriter.dropped;
+    }
+}
+
+void appendStandaloneRepeatSummary()
+{
+    if (!standaloneWriter.repeats) return;
+    const QString prefix = QStringLiteral("[Repeated %1 additional times; last %2 UTC] ")
+        .arg(standaloneWriter.repeats).arg(standaloneWriter.lastRepeatTime);
+    const QString message = prefix + standaloneWriter.lastErrorMessage.left(
+        MaxStandaloneMessageChars - prefix.size());
+    appendStandalonePending(standaloneWriter.lastRepeatTime, standaloneWriter.lastErrorSafeSource,
+                            message, true);
+    standaloneWriter.repeats = 0;
 }
 
 int lockStandaloneSnapshot(int directoryFd, const QString &fileName, QString *error)
@@ -634,6 +723,7 @@ bool collectStandaloneSnapshots(bool holdLocks, QVector<StandaloneSnapshot> *sna
         names.resize(MaxStandaloneSnapshots);
         if (omitted) omitted->append(QStringLiteral("Snapshot count limit reached; additional files were omitted."));
     }
+    qint64 collectedBytes = 0;
     for (const QString &name : names) {
         QString issue;
         const int lockFd = lockStandaloneSnapshot(fd, name, &issue);
@@ -649,8 +739,15 @@ bool collectStandaloneSnapshots(bool holdLocks, QVector<StandaloneSnapshot> *sna
         bool exists = false;
         struct stat fileStatus;
         StandaloneSnapshot snapshot;
-        const bool readOk = readStandaloneFile(fd, name, &bytes, &exists, &issue, &fileStatus) && exists &&
-            parseStandaloneSnapshot(bytes, name, &snapshot, &issue);
+        bool readOk = readStandaloneFile(fd, name, &bytes, &exists, &issue, &fileStatus) && exists;
+        if (readOk && bytes.size() > MaxStandaloneSnapshotBytes - collectedBytes) {
+            readOk = false;
+            issue = QStringLiteral("Snapshot collection size limit reached; file was retained.");
+        }
+        if (readOk) {
+            readOk = parseStandaloneSnapshot(bytes, name, &snapshot, &issue);
+            if (readOk) collectedBytes += bytes.size();
+        }
         if (!readOk) {
             ::flock(lockFd, LOCK_UN);
             ::close(lockFd);
@@ -697,39 +794,102 @@ QString safeSnapshotText(QString text)
 
 QString standaloneSnapshotText(const QVector<StandaloneSnapshot> &snapshots,
                               const QStringList &omitted,
-                              const QMap<QString, quint64> &exported, QSet<QString> *included,
-                              bool *partial)
+                              const QMap<QString, quint64> &exported,
+                              QMap<QString, quint64> *exportedThrough,
+                              QSet<QString> *completed, bool *partial, int byteBudget,
+                              bool *sizeExceeded)
 {
     QString text;
-    if (snapshots.isEmpty() && omitted.isEmpty())
-        text += QStringLiteral("\n[No standalone snapshots found in the configured organization directory; "
-                               "successfully exported snapshots may already have been removed.]\n");
+    if (sizeExceeded) *sizeExceeded = false;
+    int bytes = 0;
+    const auto append = [&](const QString &item) {
+        const int size = item.toUtf8().size();
+        if (size > byteBudget - bytes) return false;
+        text += item;
+        bytes += size;
+        return true;
+    };
+    const auto truncated = [&]() {
+        if (partial) *partial = true;
+        if (sizeExceeded) *sizeExceeded = true;
+        return text;
+    };
+    if (snapshots.isEmpty() && omitted.isEmpty() &&
+        !append(QStringLiteral("\n[No standalone snapshots found in the configured organization directory; "
+                               "successfully exported snapshots may already have been removed.]\n"))) {
+        return truncated();
+    }
     if (!omitted.isEmpty()) {
         if (partial) *partial = true;
-        text += QStringLiteral("\n[Standalone export partial: %1 snapshot(s) omitted or unavailable.]\n")
-                    .arg(omitted.size());
+        if (!append(QStringLiteral("\n[Standalone export partial: %1 snapshot(s) omitted or unavailable.]\n")
+                    .arg(omitted.size())))
+            return truncated();
         for (const QString &issue : omitted)
-            text += QStringLiteral("[Standalone snapshot skipped: %1]\n").arg(safeSnapshotText(issue));
+            if (!append(QStringLiteral("[Standalone snapshot skipped: %1]\n").arg(safeSnapshotText(issue))))
+                return truncated();
     }
     for (const StandaloneSnapshot &snapshot : snapshots) {
-        text += QStringLiteral("\n[Standalone snapshot; untrusted shared file, not cryptographically authenticated; "
+        if (!append(QStringLiteral("\n[Standalone snapshot; untrusted shared file, not cryptographically authenticated; "
                                "organization apps may access it; appId=%1; instance=%2]\n")
-                    .arg(snapshot.applicationId, snapshot.instance);
+                    .arg(snapshot.applicationId, snapshot.instance))) {
+            return truncated();
+        }
         if (snapshot.dropped) {
             if (partial) *partial = true;
-            text += QStringLiteral("[Standalone snapshot entries dropped due to limits: %1]\n")
-                        .arg(snapshot.dropped);
+            if (!append(QStringLiteral("[Standalone snapshot entries dropped due to limits: %1]\n")
+                        .arg(snapshot.dropped)))
+                return truncated();
         }
+        bool hadEvents = false;
         for (const StandaloneEvent &event : snapshot.events) {
             if (event.sequence <= exported.value(snapshot.instance, 0)) continue;
-            if (included) included->insert(snapshot.instance);
-            text += QStringLiteral("[%1 UTC] [%2]%3 %4\n")
-                .arg(event.time, safeSnapshotText(event.source),
-                     event.error ? QStringLiteral(" error") : QString(),
-                     safeSnapshotText(event.message));
+            if (!append(standaloneEventText(event))) {
+                return truncated();
+            }
+            hadEvents = true;
+            if (exportedThrough) exportedThrough->insert(snapshot.instance, event.sequence);
         }
+        if (hadEvents && completed) completed->insert(snapshot.instance);
     }
     return text;
+}
+
+QString boundedReportManagerText(const QString &text, int managerLimit, bool *partial)
+{
+    const QByteArray bytes = text.toUtf8();
+    if (bytes.size() <= managerLimit) return text;
+    if (partial) *partial = true;
+    const QString header = reportHeader();
+    const QString marker = QStringLiteral("[Manager log truncated to fit the report size limit.]\n");
+    const int keep = managerLimit - header.toUtf8().size() - marker.toUtf8().size();
+    int start = bytes.size() - keep;
+    while (start < bytes.size() && (static_cast<unsigned char>(bytes.at(start)) & 0xc0) == 0x80)
+        ++start;
+    return header + marker + QString::fromUtf8(bytes.constData() + start, bytes.size() - start);
+}
+
+QString composeDetailedReport(const QString &managerText, const QVector<StandaloneSnapshot> &snapshots,
+                              const QStringList &omitted, const QMap<QString, quint64> &exported,
+                              QMap<QString, quint64> *exportedThrough, QSet<QString> *completed,
+                              bool *partial)
+{
+    bool managerPartial = false;
+    QString manager = boundedReportManagerText(managerText, MaxReportBytes, &managerPartial);
+    bool sizeExceeded = false;
+    QString standalone = standaloneSnapshotText(snapshots, omitted, exported, exportedThrough, completed,
+        partial, MaxReportBytes - manager.toUtf8().size(), &sizeExceeded);
+    if (sizeExceeded) {
+        const QString marker = QStringLiteral(
+            "\n[Report truncated at 10000000 bytes; unexported events were retained.]\n");
+        if (exportedThrough) exportedThrough->clear();
+        if (completed) completed->clear();
+        manager = boundedReportManagerText(managerText, MaxReportBytes / 2, &managerPartial);
+        standalone = standaloneSnapshotText(snapshots, omitted, exported, exportedThrough, completed,
+            partial, MaxReportBytes - marker.toUtf8().size() - manager.toUtf8().size(), &sizeExceeded);
+        standalone += marker;
+    }
+    if (managerPartial && partial) *partial = true;
+    return manager + standalone;
 }
 
 QByteArray serializeWriterSnapshot(const QString &instance, const QString &applicationId,
@@ -753,6 +913,7 @@ bool flushStandaloneWriter()
     {
         QMutexLocker lock(&mutex);
         if (!standaloneWriter.active) return false;
+        appendStandaloneRepeatSummary();
         if (standaloneWriter.pending.isEmpty() && standaloneWriter.dropped == 0) return true;
         path = standaloneWriter.directory;
         instance = standaloneWriter.instance;
@@ -828,18 +989,27 @@ bool flushStandaloneWriter()
         snapshot.events += pending;
         const quint64 available = std::numeric_limits<quint64>::max() - snapshot.dropped;
         snapshot.dropped += qMin(available, pendingDropped);
+        qint64 reportBytes = 0;
+        for (const StandaloneEvent &event : snapshot.events)
+            reportBytes += standalonePendingEventBytes(event);
+        while (reportBytes > MaxReportBytes || snapshot.events.size() > MaxStandaloneSnapshotEvents) {
+            const StandaloneEvent removed = dropStandaloneEvent(&snapshot.events);
+            reportBytes -= standalonePendingEventBytes(removed);
+            if (snapshot.dropped != std::numeric_limits<quint64>::max()) ++snapshot.dropped;
+        }
         QByteArray contents;
         while (true) {
             contents = serializeStandaloneSnapshot(snapshot);
-            if (contents.size() <= MaxStandaloneSnapshotBytes &&
-                snapshot.events.size() <= MaxStandaloneSnapshotEvents) break;
+            if (contents.size() <= MaxStandaloneSnapshotBytes) break;
             if (snapshot.events.isEmpty()) {
                 ok = false;
                 error = QStringLiteral("Standalone snapshot metadata exceeds its safe limits.");
                 break;
             }
-            dropStandaloneEvent(&snapshot.events);
-            if (snapshot.dropped != std::numeric_limits<quint64>::max()) ++snapshot.dropped;
+            for (int i = 0; i < 64 && !snapshot.events.isEmpty(); ++i) {
+                dropStandaloneEvent(&snapshot.events);
+                if (snapshot.dropped != std::numeric_limits<quint64>::max()) ++snapshot.dropped;
+            }
         }
         if (ok) ok = writeStandaloneFile(directoryFd, fileName, contents, &error);
     }
@@ -850,8 +1020,10 @@ bool flushStandaloneWriter()
         const quint64 lastWritten = pending.isEmpty() ? 0 : pending.last().sequence;
         QMutexLocker lock(&mutex);
         while (!standaloneWriter.pending.isEmpty() &&
-               standaloneWriter.pending.first().sequence <= lastWritten)
+               standaloneWriter.pending.first().sequence <= lastWritten) {
+            standaloneWriter.pendingBytes -= standalonePendingEventBytes(standaloneWriter.pending.first());
             standaloneWriter.pending.removeFirst();
+        }
         standaloneWriter.dropped = standaloneWriter.dropped >= pendingDropped
             ? standaloneWriter.dropped - pendingDropped : 0;
         standaloneWriter.error.clear();
@@ -1213,7 +1385,12 @@ void ErrorLog::record(const QString &source, const QString &message, bool error)
     RecordingGuard guard;
     QMutexLocker lock(&mutex);
     if (standaloneSnapshotMode) {
-        if (!MemoryLogBus::clientDetailedEnabled()) return;
+        if (!MemoryLogBus::clientDetailedEnabled()) {
+            appendStandaloneRepeatSummary();
+            standaloneWriter.lastErrorSource.clear();
+            standaloneWriter.lastErrorMessage.clear();
+            return;
+        }
         static const QRegularExpression sourcePattern(QStringLiteral("[^A-Za-z0-9_. -]"));
         QString safeSource = source.left(128);
         safeSource.replace(sourcePattern, QStringLiteral("_"));
@@ -1222,20 +1399,21 @@ void ErrorLog::record(const QString &source, const QString &message, bool error)
         if (boundedMessage.size() > MaxStandaloneMessageChars)
             boundedMessage = boundedMessage.left(MaxStandaloneMessageChars - 24) +
                              QStringLiteral(" [entry truncated]");
-        StandaloneEvent event{++standaloneWriter.nextSequence,
-            QDateTime::currentDateTimeUtc().toString(Qt::ISODate), safeSource, boundedMessage, error};
-        standaloneWriter.pending.append(event);
-        int bytes = 0;
-        for (const StandaloneEvent &pending : standaloneWriter.pending)
-            bytes += pending.source.toUtf8().size() + pending.message.toUtf8().size() + 128;
-        while (!standaloneWriter.pending.isEmpty() &&
-               (bytes > MaxStandalonePendingBytes ||
-                standaloneWriter.pending.size() > MaxStandaloneSnapshotEvents)) {
-            const StandaloneEvent removed = dropStandaloneEvent(&standaloneWriter.pending);
-            bytes -= removed.source.toUtf8().size() + removed.message.toUtf8().size() + 128;
-            if (standaloneWriter.dropped != std::numeric_limits<quint64>::max())
-                ++standaloneWriter.dropped;
+        const QString time = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+        const bool canCoalesce = error && !source.isEmpty() && source.size() <= 128 &&
+                                 message.size() <= MaxStandaloneMessageChars;
+        if (canCoalesce && source == standaloneWriter.lastErrorSource &&
+            message == standaloneWriter.lastErrorMessage &&
+            standaloneWriter.repeats != std::numeric_limits<quint64>::max()) {
+            ++standaloneWriter.repeats;
+            standaloneWriter.lastRepeatTime = time;
+            return;
         }
+        appendStandaloneRepeatSummary();
+        standaloneWriter.lastErrorSource = canCoalesce ? source : QString();
+        standaloneWriter.lastErrorSafeSource = canCoalesce ? safeSource : QString();
+        standaloneWriter.lastErrorMessage = canCoalesce ? message : QString();
+        appendStandalonePending(time, safeSource, boundedMessage, error);
         return;
     }
     if (!detailedCaptureEnabled()) return;
@@ -1293,8 +1471,8 @@ bool ErrorLog::saveReport(QString *path, QString *error)
         if (error) *error = QStringLiteral("Log capture is unavailable.");
         return false;
     }
-    return writeText(reportHeader() + sharedHistory() + QStringLiteral("Current process context:\n") + recent,
-                     path, error);
+    const QString text = reportHeader() + sharedHistory() + QStringLiteral("Current process context:\n") + recent;
+    return writeText(boundedReportManagerText(text, MaxReportBytes, nullptr), path, error);
 }
 
 bool ErrorLog::detailedEnabled(bool *enabled, QString *error)
@@ -1413,7 +1591,7 @@ bool ErrorLog::detailedReport(QString *text, QString *error)
     QStringList omitted;
     if (!collectStandaloneSnapshots(false, &snapshots, &omitted, nullptr, error)) return false;
     bool partial = !omitted.isEmpty();
-    *text = managerText + standaloneSnapshotText(snapshots, omitted, exported, nullptr, &partial);
+    *text = composeDetailedReport(managerText, snapshots, omitted, exported, nullptr, nullptr, &partial);
     return true;
 }
 
@@ -1457,8 +1635,10 @@ bool ErrorLog::saveDetailedReport(QString *path, QString *error, bool *partial,
     int directoryFd = -1;
     if (!collectStandaloneSnapshots(true, &snapshots, &omitted, &directoryFd, error)) return false;
     bool exportPartial = !omitted.isEmpty();
-    QSet<QString> included;
-    QString text = managerText + standaloneSnapshotText(snapshots, omitted, exported, &included, &exportPartial);
+    QMap<QString, quint64> exportedThrough;
+    QSet<QString> completed;
+    const QString text = composeDetailedReport(managerText, snapshots, omitted, exported, &exportedThrough,
+                                               &completed, &exportPartial);
     for (const StandaloneSnapshot &snapshot : snapshots)
         if (snapshot.dropped) exportPartial = true;
     if (partial) *partial = exportPartial;
@@ -1476,16 +1656,11 @@ bool ErrorLog::saveDetailedReport(QString *path, QString *error, bool *partial,
 
     {
         QMutexLocker lock(&mutex);
-        for (const StandaloneSnapshot &snapshot : snapshots) {
-            if (!included.contains(snapshot.instance)) continue;
-            quint64 last = exportedStandaloneSequences.value(snapshot.instance, 0);
-            if (!snapshot.events.isEmpty())
-                last = qMax(last, snapshot.events.last().sequence);
-            exportedStandaloneSequences.insert(snapshot.instance, last);
-        }
-        if (!included.isEmpty()) changed();
+        for (auto it = exportedThrough.constBegin(); it != exportedThrough.constEnd(); ++it)
+            exportedStandaloneSequences.insert(it.key(), it.value());
+        if (!exportedThrough.isEmpty()) changed();
     }
-    if (!included.isEmpty() && !storagePath.isEmpty()) {
+    if (!exportedThrough.isEmpty() && !storagePath.isEmpty()) {
         if (storageWorker.thread.joinable()) storageWorker.thread.join();
         flushSnapshot();
         if (storageWorker.thread.joinable()) storageWorker.thread.join();
@@ -1499,7 +1674,7 @@ bool ErrorLog::saveDetailedReport(QString *path, QString *error, bool *partial,
     QSet<QString> removedInstances;
     for (StandaloneSnapshot &snapshot : snapshots) {
         QString issue;
-        if (included.contains(snapshot.instance)) {
+        if (completed.contains(snapshot.instance)) {
             if (directoryFd >= 0 &&
                 removeStandaloneFile(directoryFd, snapshot.fileName, &issue, &snapshot))
                 removedInstances.insert(snapshot.instance);
@@ -1734,6 +1909,7 @@ bool ErrorLog::startStandaloneSnapshots(const QString &sharedRoot, const QString
     timer->setInterval(500);
     QObject::connect(timer, &QTimer::timeout, timer, []() { ErrorLog::flushStandaloneSnapshots(); });
     QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, []() {
+        finishCoreChannel();
         ErrorLog::flushStandaloneSnapshots();
     });
     timer->start();
@@ -1802,6 +1978,7 @@ bool ErrorLog::startPersistence(const QString &privateRoot, QString *error)
     timer->setInterval(5000);
     QObject::connect(timer, &QTimer::timeout, timer, []() { flushSnapshot(); });
     QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, []() {
+        finishCoreChannel();
         if (storageWorker.thread.joinable()) storageWorker.thread.join();
         flushSnapshot();
         if (storageWorker.thread.joinable()) storageWorker.thread.join();
@@ -1834,6 +2011,7 @@ bool ErrorLog::startStandaloneDiagnosticFile(QString *path, QString *error)
         timer->setInterval(5000);
         QObject::connect(timer, &QTimer::timeout, timer, []() { flushStandaloneFile(); });
         QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, []() {
+            finishCoreChannel();
             if (standaloneFileWorker.thread.joinable()) standaloneFileWorker.thread.join();
             flushStandaloneFile();
             if (standaloneFileWorker.thread.joinable()) standaloneFileWorker.thread.join();
@@ -1852,6 +2030,175 @@ QString ErrorLog::standaloneDiagnosticFileError()
     return standaloneFileError;
 }
 
+namespace {
+struct CorePartial {
+    QByteArray text;
+    quint32 total;
+    int level;
+    bool accepted;
+    std::chrono::steady_clock::time_point updated;
+};
+
+void wakeCoreConsumer()
+{
+    const char wake = 1;
+    if (::send(coreChannel.wakeSender, &wake, 1, MSG_DONTWAIT | MSG_NOSIGNAL) < 0 &&
+        errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+        std::fprintf(stderr, "Error log channel wake failed: %s\n", std::strerror(errno));
+}
+
+void drainCoreMessages()
+{
+    char wake[256];
+    while (::recv(coreChannel.wakeReceiver, wake, sizeof(wake), MSG_DONTWAIT) > 0) {}
+    std::deque<CoreMessage> batch;
+    bool remaining;
+    {
+        std::lock_guard<std::mutex> lock(coreChannel.mutex);
+        for (int i = 0; i < 256 && !coreChannel.pending.empty(); ++i) {
+            coreChannel.bytes -= size_t(coreChannel.pending.front().text.size()) + 32;
+            batch.push_back(std::move(coreChannel.pending.front()));
+            coreChannel.pending.pop_front();
+        }
+        remaining = !coreChannel.pending.empty();
+    }
+    if (remaining) wakeCoreConsumer();
+    for (const CoreMessage &message : batch)
+        ErrorLog::record(QStringLiteral("Android"), QString::fromUtf8(message.text),
+                         message.level >= MEGLER_LOG_ERROR);
+}
+
+void receiveCoreMessages()
+{
+    std::unordered_map<quint32, CorePartial> partials;
+    for (;;) {
+        pollfd fd = {coreReceiver, POLLIN, 0};
+        const int ready = ::poll(&fd, 1, coreChannel.stop.load(std::memory_order_relaxed) ? 0 : 250);
+        if (ready == 0 && coreChannel.stop.load(std::memory_order_relaxed)) break;
+        if (ready > 0 && !(fd.revents & POLLIN) && (fd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            std::fputs("Error log channel receiver closed unexpectedly.\n", stderr);
+            break;
+        }
+        if (ready > 0 && (fd.revents & POLLIN)) {
+            char packet[4096];
+            const ssize_t count = ::recv(coreReceiver, packet, sizeof(packet), MSG_DONTWAIT | MSG_TRUNC);
+            if (count == 0 && coreChannel.stop.load(std::memory_order_relaxed)) break;
+            if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                std::fprintf(stderr, "Error log channel read failed: %s\n", std::strerror(errno));
+                break;
+            }
+            if (count > ssize_t(sizeof(packet))) coreDropped.fetch_add(1, std::memory_order_relaxed);
+            if (count >= ssize_t(sizeof(CorePacket)) && count <= ssize_t(sizeof(packet))) {
+                CorePacket header;
+                std::memcpy(&header, packet, sizeof(header));
+                const int payload = int(count - sizeof(header));
+                auto it = partials.find(header.id);
+                if (header.abort) {
+                    if (it != partials.end()) {
+                        if (it->second.accepted) {
+                            std::lock_guard<std::mutex> lock(coreChannel.mutex);
+                            coreChannel.bytes -= size_t(it->second.total) + 32;
+                            coreIncomplete.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        partials.erase(it);
+                    }
+                    continue;
+                }
+                if (it == partials.end() && header.offset == 0 &&
+                    header.total <= MaxCoreQueueBytes && size_t(payload) <= header.total) {
+                    bool accepted;
+                    {
+                        std::lock_guard<std::mutex> lock(coreChannel.mutex);
+                        const size_t cost = size_t(header.total) + 32;
+                        accepted = cost <= MaxCoreQueueBytes - coreChannel.bytes;
+                        if (accepted) coreChannel.bytes += cost;
+                    }
+                    CorePartial partial{QByteArray(), header.total, header.level, accepted,
+                                        std::chrono::steady_clock::now()};
+                    if (accepted) partial.text.reserve(int(header.total));
+                    it = partials.emplace(header.id, std::move(partial)).first;
+                }
+                if (it == partials.end()) continue;
+                CorePartial &partial = it->second;
+                if (header.total != partial.total || header.level != partial.level ||
+                    header.offset > header.total || size_t(payload) > header.total - header.offset ||
+                    (partial.accepted && header.offset != quint32(partial.text.size()))) {
+                    if (partial.accepted) {
+                        std::lock_guard<std::mutex> lock(coreChannel.mutex);
+                        coreChannel.bytes -= size_t(partial.total) + 32;
+                        coreDropped.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    partials.erase(it);
+                    continue;
+                }
+                partial.updated = std::chrono::steady_clock::now();
+                if (partial.accepted) partial.text.append(packet + sizeof(header), payload);
+                if (header.offset + quint32(payload) == header.total) {
+                    if (partial.accepted) {
+                        {
+                            std::lock_guard<std::mutex> lock(coreChannel.mutex);
+                            coreChannel.pending.push_back(CoreMessage{partial.level, std::move(partial.text)});
+                        }
+                        wakeCoreConsumer();
+                    } else coreDropped.fetch_add(1, std::memory_order_relaxed);
+                    partials.erase(it);
+                }
+            }
+        } else if (ready < 0 && errno != EINTR) {
+            std::fprintf(stderr, "Error log channel poll failed: %s\n", std::strerror(errno));
+            break;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = partials.begin(); it != partials.end();) {
+            if (now - it->second.updated < std::chrono::seconds(30)) {
+                ++it;
+                continue;
+            }
+            if (it->second.accepted) {
+                std::lock_guard<std::mutex> lock(coreChannel.mutex);
+                coreChannel.bytes -= size_t(it->second.total) + 32;
+            }
+            it = partials.erase(it);
+        }
+    }
+    for (const auto &partial : partials) {
+        if (partial.second.accepted) {
+            std::lock_guard<std::mutex> lock(coreChannel.mutex);
+            coreChannel.bytes -= size_t(partial.second.total) + 32;
+            coreIncomplete.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void reportCoreLosses()
+{
+    const unsigned int dropped = coreDropped.exchange(0, std::memory_order_relaxed);
+    if (dropped)
+        ErrorLog::record(QStringLiteral("Android"),
+                         QStringLiteral("Android log channel: %1 events dropped").arg(dropped), false);
+    const unsigned int incomplete = coreIncomplete.exchange(0, std::memory_order_relaxed);
+    if (incomplete)
+        ErrorLog::record(QStringLiteral("Android"),
+                         QStringLiteral("Android log channel: %1 incomplete events discarded").arg(incomplete),
+                         false);
+}
+
+void finishCoreChannel()
+{
+    if (!coreChannel.worker.joinable()) return;
+    if (::shutdown(coreSender, SHUT_WR) < 0)
+        std::fprintf(stderr, "Error log channel shutdown failed: %s\n", std::strerror(errno));
+    coreChannel.stop.store(true, std::memory_order_relaxed);
+    coreChannel.worker.join();
+    for (;;) {
+        drainCoreMessages();
+        std::lock_guard<std::mutex> lock(coreChannel.mutex);
+        if (coreChannel.pending.empty()) break;
+    }
+    reportCoreLosses();
+}
+}
+
 bool ErrorLog::startCoreChannel(QString *error)
 {
     if (error) error->clear();
@@ -1861,36 +2208,38 @@ bool ErrorLog::startCoreChannel(QString *error)
         if (error) *error = QString::fromLocal8Bit(std::strerror(errno));
         return false;
     }
+    int wake[2];
+    if (::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, wake) < 0) {
+        if (error) *error = QString::fromLocal8Bit(std::strerror(errno));
+        ::close(sockets[0]);
+        ::close(sockets[1]);
+        return false;
+    }
     coreSender = sockets[0];
     coreReceiver = sockets[1];
-    QSocketNotifier *notifier = new QSocketNotifier(coreReceiver, QSocketNotifier::Read);
-    QObject::connect(notifier, &QSocketNotifier::activated, notifier, [](int) {
-        char bytes[4096];
-        for (int i = 0; i < 256; ++i) {
-            const ssize_t count = ::recv(coreReceiver, bytes, sizeof(bytes), MSG_DONTWAIT | MSG_TRUNC);
-            if (count < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK)
-                    std::fprintf(stderr, "Error log channel read failed: %s\n", std::strerror(errno));
-                break;
-            }
-            if (count < ssize_t(sizeof(int)) || count > ssize_t(sizeof(bytes))) {
-                coreDropped.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            int level;
-            std::memcpy(&level, bytes, sizeof(level));
-            ErrorLog::record(QStringLiteral("Android"), QString::fromUtf8(bytes + sizeof(level),
-                             int(count - sizeof(level))), level >= MEGLER_LOG_ERROR);
-        }
-    });
+    coreChannel.wakeSender = wake[0];
+    coreChannel.wakeReceiver = wake[1];
+    try {
+        coreChannel.worker = std::thread(receiveCoreMessages);
+    } catch (const std::system_error &failure) {
+        if (error) *error = QString::fromLocal8Bit(failure.what());
+        ::close(coreSender);
+        ::close(coreReceiver);
+        ::close(coreChannel.wakeSender);
+        ::close(coreChannel.wakeReceiver);
+        coreSender = coreReceiver = coreChannel.wakeSender = coreChannel.wakeReceiver = -1;
+        return false;
+    }
+    QSocketNotifier *notifier = new QSocketNotifier(coreChannel.wakeReceiver, QSocketNotifier::Read);
+    QObject::connect(notifier, &QSocketNotifier::activated, notifier, [](int) { drainCoreMessages(); });
     QTimer *lossTimer = new QTimer(notifier);
     lossTimer->setInterval(250);
     QObject::connect(lossTimer, &QTimer::timeout, notifier, []() {
-        const quint64 dropped = coreDropped.exchange(0, std::memory_order_relaxed);
-        if (dropped)
-            ErrorLog::record(QStringLiteral("Android"),
-                             QStringLiteral("Android log channel: %1 events dropped").arg(dropped), false);
+        drainCoreMessages();
+        reportCoreLosses();
     });
+    QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, notifier,
+                     []() { finishCoreChannel(); });
     lossTimer->start();
     return true;
 }
@@ -1898,15 +2247,34 @@ bool ErrorLog::startCoreChannel(QString *error)
 void ErrorLog::sendCoreLine(int level, const char *line)
 {
     if (coreSender < 0 || !line) return;
-    const size_t length = std::strlen(line);
-    if (length > 4096 - sizeof(level)) {
+    const int savedErrno = errno;
+    size_t length = 0;
+    while (length <= MaxCoreQueueBytes && line[length]) ++length;
+    if (length > MaxCoreQueueBytes) {
         coreDropped.fetch_add(1, std::memory_order_relaxed);
+        errno = savedErrno;
         return;
     }
-    iovec parts[2] = {{&level, sizeof(level)}, {const_cast<char *>(line), length}};
-    msghdr message = {};
-    message.msg_iov = parts;
-    message.msg_iovlen = 2;
-    if (::sendmsg(coreSender, &message, MSG_DONTWAIT | MSG_NOSIGNAL) < 0)
-        coreDropped.fetch_add(1, std::memory_order_relaxed);
+    const quint32 id = coreChannel.nextId.fetch_add(1, std::memory_order_relaxed);
+    size_t offset = 0;
+    do {
+        const size_t chunk = qMin(length - offset, size_t(4096 - sizeof(CorePacket)));
+        CorePacket header{id, quint32(offset), quint32(length), level, 0};
+        iovec parts[2] = {{&header, sizeof(header)}, {const_cast<char *>(line + offset), chunk}};
+        msghdr message = {};
+        message.msg_iov = parts;
+        message.msg_iovlen = 2;
+        ssize_t sent;
+        do {
+            sent = ::sendmsg(coreSender, &message, MSG_DONTWAIT | MSG_NOSIGNAL);
+        } while (sent < 0 && errno == EINTR);
+        if (sent < 0) {
+            coreDropped.fetch_add(1, std::memory_order_relaxed);
+            header.abort = 1;
+            ::send(coreSender, &header, sizeof(header), MSG_DONTWAIT | MSG_NOSIGNAL);
+            break;
+        }
+        offset += chunk;
+    } while (offset < length);
+    errno = savedErrno;
 }

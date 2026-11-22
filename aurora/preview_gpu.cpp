@@ -110,7 +110,6 @@ bool PreviewGpuState::submitDmaBuf(AuroraDmaBufFrame &&incoming, QObject *notifi
     dmaBufFrame = std::move(incoming);
     dmaBufCompletion = completion;
     dmaBufPending = true;
-    if (!dmaBufFrame.probeOnly) active = true;
     if (!QMetaObject::invokeMethod(notifier, "requestGpuFrame", Qt::QueuedConnection)) {
         dmaBufFrame.close();
         dmaBufPending = false;
@@ -546,6 +545,7 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
         } else {
             m_state->failureReason = importError;
             m_state->active = m_state->nativeFrame || m_state->java || m_state->canvasMode;
+            qWarning().noquote() << "Embedded GPU frame import failed; using CPU fallback:" << importError;
         }
         m_state->dmaBufFrame.close();
         m_state->dmaBufPending = false;

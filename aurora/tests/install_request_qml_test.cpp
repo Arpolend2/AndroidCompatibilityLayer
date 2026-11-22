@@ -647,8 +647,8 @@ int main(int argc, char **argv)
                 !notes->property("visible").toBool() ||
                 icon->property("status").toInt() != 1 ||
                 icon->property("sourceSize").toSize() != QSize(512, 512) ||
-                !notes->property("text").toString().contains(QStringLiteral("Optional update checks at startup.")) ||
-                notes->property("text").toString().count(QLatin1Char('\n')) != 4) {
+                !notes->property("text").toString().contains(QStringLiteral("GPU acceleration for Aurora Store and microG settings")) ||
+                notes->property("text").toString().count(QLatin1Char('\n')) != 2) {
                 std::fprintf(stderr, "Update or about section missing: page=%d action=%d progress=%d auto=%d about=%d project=%d used=%d optional=%d\n",
                              bool(page), bool(action), bool(progress), bool(automatic), bool(about),
                              bool(root->findChild<QObject *>(QStringLiteral("managerProjectLink"))),
@@ -772,8 +772,8 @@ int main(int argc, char **argv)
             if (!button || button->property("text").toString() !=
                 QString::fromUtf8("Добавить установочный пакет") || !notes ||
                 !notes->property("text").toString().contains(
-                    QString::fromUtf8("Необязательная проверка обновлений при запуске.")) ||
-                notes->property("text").toString().count(QLatin1Char('\n')) != 4) return 1;
+                    QString::fromUtf8("GPU-ускорение интерфейса Aurora Store и настроек microG")) ||
+                notes->property("text").toString().count(QLatin1Char('\n')) != 2) return 1;
             return 0;
         }
         auto prompt = root->findChild<QQuickItem *>(QStringLiteral("installConfirmation"));

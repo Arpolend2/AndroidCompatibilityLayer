@@ -2,8 +2,8 @@
  * A stand-in for the shell's drawing, for tests (mg_gfx_standin.h).
  *
  * It draws straight into the memory it is given, so flush and touched have
- * nothing to do. Nothing is smoothed, whatever the paint says: a pixel is
- * drawn when its centre is inside the shape (on a left or top edge: inside),
+ * nothing to do. Shape edges are not smoothed: a pixel is drawn when its
+ * centre is inside the shape (on a left or top edge: inside),
  * and every number is worked out the same way on every machine, so a test
  * can name the pixels it expects.
  *
@@ -31,8 +31,8 @@
  *     only while what is drawn in the layer does not overlap itself, and the
  *     layer's blend mode is not done.
  *   - OVERLAY is drawn as SRC_OVER. Shadows are not drawn.
- *   - Bitmaps are sampled at the nearest pixel, with or without the filter
- *     flag.
+ *   - Bitmap filtering interpolates premultiplied channels and clamps to
+ *     the source rectangle; transformed rectangle edges remain hard.
  *   - A gradient is its first colour, a bitmap shader its bitmap's top left
  *     pixel.
  *   - Text is boxes. Every UTF-16 unit advances (0.6 + letter_spacing) *
@@ -785,11 +785,35 @@ static MEGLER_CB void s_draw_color(void *user, void *canvas, uint32_t color, int
     }
 }
 
-/*
- * Every pixel whose centre the matrix takes from inside `dst` gets the pixel
- * of the image that the same place in `src` falls in: the nearest one, never
- * one outside `src`.
- */
+static u32 bitmap_sample_linear(const megler_gfx_image *image, double x, double y,
+                                i32 left, i32 top, i32 right, i32 bottom)
+{
+    i32 x0 = pixel_at(floor(x)), y0 = pixel_at(floor(y));
+    i32 x1 = x0 + 1, y1 = y0 + 1;
+    double fx = x - floor(x), fy = y - floor(y);
+    u32 p[4], result = 0;
+    int shift;
+    if (x0 < left) x0 = left;
+    if (x0 > right) x0 = right;
+    if (x1 < left) x1 = left;
+    if (x1 > right) x1 = right;
+    if (y0 < top) y0 = top;
+    if (y0 > bottom) y0 = bottom;
+    if (y1 < top) y1 = top;
+    if (y1 > bottom) y1 = bottom;
+    p[0] = mg_rd32((const u8 *)image->pixels + (size_t)y0 * (size_t)image->stride + 4 * (size_t)x0);
+    p[1] = mg_rd32((const u8 *)image->pixels + (size_t)y0 * (size_t)image->stride + 4 * (size_t)x1);
+    p[2] = mg_rd32((const u8 *)image->pixels + (size_t)y1 * (size_t)image->stride + 4 * (size_t)x0);
+    p[3] = mg_rd32((const u8 *)image->pixels + (size_t)y1 * (size_t)image->stride + 4 * (size_t)x1);
+    for (shift = 0; shift < 32; shift += 8) {
+        double upper = (double)((p[0] >> shift) & 255) * (1 - fx) + (double)((p[1] >> shift) & 255) * fx;
+        double lower = (double)((p[2] >> shift) & 255) * (1 - fx) + (double)((p[3] >> shift) & 255) * fx;
+        result |= (u32)floor(upper * (1 - fy) + lower * fy + 0.5) << shift;
+    }
+    return result;
+}
+
+/* Sample pixel centres inside dst, clamping the filter to src. */
 static MEGLER_CB void s_draw_bitmap(void *user, void *canvas, const megler_gfx_image *image, const float *src, const float *dst, const megler_gfx_paint *paint)
 {
     scanvas *v = (scanvas *)canvas;
@@ -798,6 +822,8 @@ static MEGLER_CB void s_draw_bitmap(void *user, void *canvas, const megler_gfx_i
     double det = (double)m[0] * m[4] - (double)m[1] * m[3], lx, ly, dx, dy;
     i32 box[4], x, y, sx, sy, sx0, sy0, sx1, sy1;
     u32 alpha = paint->color >> 24, filter = premultiplied(paint->filter_color), c;
+    megler_gfx_image snapshot;
+    void *snapshot_pixels = NULL;
     (void)user;
     if (!image || !image->pixels || !(fabs(det) > 1e-30) || !(dst[2] > dst[0]) || !(dst[3] > dst[1])) return;
     sx0 = pixel_at(floor(src[0]));
@@ -809,6 +835,14 @@ static MEGLER_CB void s_draw_bitmap(void *user, void *canvas, const megler_gfx_i
     if (sx1 > image->width - 1) sx1 = image->width - 1;
     if (sy1 > image->height - 1) sy1 = image->height - 1;
     if (sx1 < sx0 || sy1 < sy0) return;
+    if (image->pixels == v->px) {
+        size_t bytes = (size_t)image->stride * (size_t)image->height;
+        snapshot_pixels = mg_alloc(bytes);
+        memcpy(snapshot_pixels, image->pixels, bytes);
+        snapshot = *image;
+        snapshot.pixels = snapshot_pixels;
+        image = &snapshot;
+    }
     pixel_box(m, dst[0], dst[1], dst[2], dst[3], box);
     if (box[0] < s->clip[0]) box[0] = s->clip[0];
     if (box[1] < s->clip[1]) box[1] = s->clip[1];
@@ -823,17 +857,25 @@ static MEGLER_CB void s_draw_bitmap(void *user, void *canvas, const megler_gfx_i
             ly = (m[0] * dy - m[3] * dx) / det;
             if (!(lx >= dst[0] && lx < dst[2] && ly >= dst[1] && ly < dst[3])) continue;
             if ((s->cuts && cut_out(s, x, y)) || !path_clip_contains(s, x, y)) continue;
-            sx = pixel_at(floor(src[0] + (lx - dst[0]) * ((double)src[2] - src[0]) / ((double)dst[2] - dst[0])));
-            sy = pixel_at(floor(src[1] + (ly - dst[1]) * ((double)src[3] - src[1]) / ((double)dst[3] - dst[1])));
-            if (sx < sx0) sx = sx0;
-            if (sx > sx1) sx = sx1;
-            if (sy < sy0) sy = sy0;
-            if (sy > sy1) sy = sy1;
-            c = faded(mg_rd32((const u8 *)image->pixels + (size_t)sy * (size_t)image->stride + 4 * (size_t)sx), alpha);
+            dx = src[0] + (lx - dst[0]) * ((double)src[2] - src[0]) / ((double)dst[2] - dst[0]);
+            dy = src[1] + (ly - dst[1]) * ((double)src[3] - src[1]) / ((double)dst[3] - dst[1]);
+            if (paint->flags & MEGLER_GFX_FILTER_BITMAP) {
+                c = bitmap_sample_linear(image, dx - 0.5, dy - 0.5, sx0, sy0, sx1, sy1);
+            } else {
+                sx = pixel_at(floor(dx));
+                sy = pixel_at(floor(dy));
+                if (sx < sx0) sx = sx0;
+                if (sx > sx1) sx = sx1;
+                if (sy < sy0) sy = sy0;
+                if (sy > sy1) sy = sy1;
+                c = mg_rd32((const u8 *)image->pixels + (size_t)sy * (size_t)image->stride + 4 * (size_t)sx);
+            }
+            c = faded(c, alpha);
             if (paint->filter_mode >= 0) c = blended(paint->filter_mode, filter, c);
             mg_wr32(row + 4 * (size_t)x, blended(paint->blend, faded(c, s->alpha), mg_rd32(row + 4 * (size_t)x)));
         }
     }
+    free(snapshot_pixels);
 }
 
 /* ------------------------------------------------------------------- text */

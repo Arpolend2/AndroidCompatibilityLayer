@@ -56,23 +56,16 @@ class EmbeddedPreview : public PreviewPlayer, public EmbeddedEndpoint
     Q_PROPERTY(bool showStatus READ remoteShowStatus NOTIFY remoteStatusChanged)
 public:
     explicit EmbeddedPreview(QObject *parent = nullptr);
-    void setCpuFrameTransportOnly(bool verifyGpuImport = false)
+    void setCpuFrameTransportOnly()
     {
         m_cpuFrameTransportOnly = true;
-#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
-        m_verifyGpuImport = verifyGpuImport;
-#else
-        Q_UNUSED(verifyGpuImport)
-#endif
     }
     bool listen(QProcess *process, QString *error) override;
     QString endpoint() const override;
     bool stopping() const override { return m_stopping; }
     bool usesGpuSurface() const override
     {
-#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
-        return !m_cpuFrameTransportOnly || m_verifyGpuImport;
-#elif defined(MG_EXPERIMENTAL_GPU_COMPOSITION)
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION)
         return !m_cpuFrameTransportOnly;
 #else
         return false;
@@ -85,7 +78,7 @@ public:
     QImage frame() const override { return m_frame; }
     bool touch(int phase, float x, float y) override;
     void back() override;
-    void setViewport(qreal width, qreal height, qreal ratio) override;
+    void setViewport(qreal width, qreal height, qreal ratio, int rotation = -1) override;
     void setDisplayRotation(int rotation) override;
     void expectRestart();
     Q_INVOKABLE void close() override;
@@ -106,6 +99,10 @@ signals:
     void photoValidated(const QString &token, bool valid);
     void channelError(const QString &reason);
     void shutdownComplete();
+private slots:
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    void gpuFrameReady(int width, int height);
+#endif
 private:
     void acceptPending();
     void receive(const QJsonObject &message);
@@ -120,7 +117,7 @@ private:
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
     EmbeddedGpuTransport m_gpuTransport;
     QString m_gpuEndpoint;
-    bool m_verifyGpuImport = false;
+    QAtomicInt m_suppressCpuFrames = 0;
 #endif
     QPointer<QProcess> m_process;
     QPointer<PreviewKeyboard> m_keyboard;
@@ -146,9 +143,15 @@ public:
 signals:
     void ready();
     void failed(const QString &reason);
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    void gpuChannelConnected();
+#endif
 private slots:
     void showKeyboard(int kind, int flags, int enter);
     void hideKeyboard();
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    void notifyGpuFallback();
+#endif
 private:
     static void MEGLER_CB requestShow(void *user, int kind, int flags, int enter);
     static void MEGLER_CB requestHide(void *user);

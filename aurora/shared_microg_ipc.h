@@ -39,6 +39,8 @@ public:
                             const ChannelReleaseHandler &releaseHandler, QString *error);
     bool setPackageResolver(const PackageResolver &packageResolver, QString *error);
     bool setApkMetadataResolver(const ApkMetadataResolver &metadataResolver, QString *error);
+    void setWorkerCheckHandler(const std::function<bool(QString *)> &handler)
+    { m_workerCheckHandler = handler; }
     bool clearBackend(QString *error);
     QString introspect(const QString &path) const override;
     bool handleMessage(const QDBusMessage &message, const QDBusConnection &connection) override;
@@ -75,6 +77,7 @@ private:
     ChannelReleaseHandler m_channelReleaseHandler;
     PackageResolver m_packageResolver;
     ApkMetadataResolver m_apkMetadataResolver;
+    std::function<bool(QString *)> m_workerCheckHandler;
 };
 
 QDBusPendingReply<QString> requestSharedMicrogProvider(const QDBusConnection &bus, bool autoStart = true);

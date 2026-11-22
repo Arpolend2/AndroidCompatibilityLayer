@@ -123,6 +123,9 @@
      *  0 undecided, 1 granted, 2 denied (may be asked again), 3 denied for good. With `ask` the user is asked first and this
      *  thread waits, as long as they take: never on the main thread. A shell without it grants every group. */
     public static native int permission(String group, boolean ask);
+    public static native boolean notification(int operation, String tag, int id, String title, String body);
+    public static native boolean notificationDetailed(String tag, int id, String title, String body,
+                                                      int flags, int max, int progress, boolean indeterminate);
     /** The phone's picker of files (kind 0) or its camera, for a photo (1) or a video (2) (megler_system_host.pick, megler.Pickers):
      *  request `id`, the MIME types each followed by '\n', several or one (at most `max`, 0 none), the request's folder as the
      *  app sees it, where the shell puts what was picked or taken, a video's limit and quality (-1 none said), and where the
@@ -147,6 +150,17 @@
     /** What the app did with the Back numbered seq (megler_back; AppRunner.back): 0 took it, 1 showed nothing new yet, 2 went
      *  to the back, 3 ended its last activity (core/src/drivers/mg_java.c). */
     public static native void backDone(int seq, int answer);
+    /** Whether process-local Android services, jobs or alarms still need the host process. */
+    private static volatile boolean sBackgroundWorkBridgeAvailable = true;
+    public static void backgroundWorkChanged(boolean active) {
+        if (!sBackgroundWorkBridgeAvailable) return;
+        try { backgroundWorkChangedNative(active); }
+        catch (UnsatisfiedLinkError e) {
+            sBackgroundWorkBridgeAvailable = false;
+            android.util.Log.w("Megler", "Background-work reporting is unavailable in this runtime.", e);
+        }
+    }
+    private static native void backgroundWorkChangedNative(boolean active);
     /** The app went to the back (AppRunner.moveTaskToBack): the Back being waited for, or the shell's next one, is the system's. */
     public static native void toBack();
     /**

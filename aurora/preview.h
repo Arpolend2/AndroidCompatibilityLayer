@@ -27,6 +27,7 @@ class EmbeddedGpuTransport;
 
 #include "../core/include/megler.h"
 #include "shared_folders.h"
+#include "notification_host.h"
 
 class PreviewKeyboard;
 class PreviewSurface;
@@ -57,6 +58,8 @@ public:
     int exitStatus() const { return m_exitStatus; }
     void setCloseOnBackGesture(bool enabled) { m_closeOnBackGesture = enabled; }
     void setCloseOnExit(bool enabled) { m_closeOnExit = enabled; }
+    void setCloseToBackground(bool enabled) { m_closeToBackground = enabled; }
+    void resumeFromBackground();
     void setSharedMicrog(bool enabled) { m_sharedMicrogEnabled = enabled; }
     void setStandaloneSettings(const QString &locale, const QString &theme, const QString &location);
     void setDeniedPermissions(const QStringList &denied) { m_deniedPermissions = denied; }
@@ -81,7 +84,7 @@ public:
     }
 #endif
     void setSurface(PreviewSurface *surface);
-    virtual void setViewport(qreal width, qreal height, qreal pixelRatio);
+    virtual void setViewport(qreal width, qreal height, qreal pixelRatio, int rotation = -1);
     virtual void setDisplayRotation(int rotation);
     int displayRotation() const { return m_displayRotation; }
     virtual bool usesGpuSurface() const { return true; }
@@ -151,7 +154,10 @@ private:
     std::unique_ptr<SharedMicrogClientChannel> m_sharedMicrog;
     int m_exitStatus = 0;
     bool m_closing = false;
+    bool m_backgrounded = false;
+    bool m_backgroundFinished = false;
     bool m_closeOnExit = false;
+    bool m_closeToBackground = false;
     bool m_closeOnBackGesture = false;
     bool m_cpuPresentationOnly = false;
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
@@ -169,11 +175,13 @@ private:
     int m_displayRotation = 0;
     QPointer<PreviewKeyboard> m_keyboard;
     QPointer<PreviewSurface> m_surface;
+    QTimer *m_backgroundMonitor = nullptr;
     AuroraStorageHost m_storage;
     AuroraAudioOutput *m_audio = nullptr;
     AuroraPickerHost *m_picker = nullptr;
     InstallRequestHost *m_installHost = nullptr;
     megler_system_host m_systemHost = {};
+    NotificationHost *m_notificationHost = nullptr;
     bool m_hasSystemHost = false;
     QByteArray m_appsDirUtf8;
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
@@ -221,8 +229,9 @@ private:
     void startWheelGesture();
     void advanceWheelGesture();
     void cancelWheelGesture();
+    void scheduleViewport();
     void updateViewport();
-    void updateDisplayRotation();
+    int displayRotation();
     QPointer<PreviewPlayer> m_player;
     int m_pageOrientation = 0;
     int m_loggedNative = -2;
@@ -234,6 +243,7 @@ private:
     qreal m_edgeZoneWidth = 32;
     QPointF m_lastPoint;
     QTimer *m_wheelTimer;
+    QTimer *m_viewportTimer;
     QPointF m_wheelPoint, m_wheelStart, m_wheelEnd, m_wheelLast;
     QPointF m_wheelPending;
     int m_wheelStep = 0;

@@ -13,10 +13,31 @@ The manager and standalone app interface use Russian when the device language
 is Russian and otherwise use English. Android apps choose their own language;
 the Android language setting is independent of the manager interface.
 
+Android notifications from a running app are sent to the system notification
+service when its notification permission and channel allow them. Updates and
+removals are tracked while that app process remains alive. Progress notifications
+include their progress and stay visible until updated or removed; updates to
+progress or notifications marked `onlyAlertOnce` suppress repeat previews and
+sound. Notification actions
+and PendingIntent taps are not supported, and notifications left after a process
+exit cannot yet be updated or removed by a later process.
+
+When microG is selected, the manager starts and retains its shared worker even
+without an attached client, and retries after a worker failure while the manager
+is running. A RuntimeManager periodic task is registered with a 15-minute
+interval and autostart. If the manager's D-Bus service is absent, it attempts to
+start a detached background manager; otherwise it asks the manager to check and
+restart the shared worker. The task is disabled when microG is deselected.
+Aurora may suspend or stop the background manager, including after
+the task exits; uninterrupted operation, restart after reboot and permissions
+require device verification. This does not yet deliver FCM to stopped Android
+apps; registration and real push delivery on Aurora remain unverified.
+
 Settings contains a manual manager update check. It includes published GitHub
-prereleases, but not drafts, and downloads only a newer RPM for the device
-architecture. The download shows progress and is checked against GitHub's
-size and SHA-256 metadata before opening the system installer for confirmation.
+prereleases, but not drafts, and downloads only a newer RPM matching the
+manager's build ABI, independently of the kernel architecture. The download
+shows progress and is checked against GitHub's size and SHA-256 metadata before
+opening the system installer for confirmation.
 An optional startup check, disabled by default and limited to once per six
 hours, notifies about a newer version without downloading or installing it.
 The verified RPM remains in Downloads. The checksum verifies integrity against
@@ -29,15 +50,31 @@ announces each reported phase. The progress notification is removed when the
 page becomes visible again or the build ends; errors are reported separately.
 
 The log menu can pause detailed capture without clearing existing entries.
+The report header identifies the RPM architecture from the running executable's
+build ABI, rather than the device CPU; unknown builds are reported as such.
 Standalone processes receive the paused state through the existing polling
 channel, so they may take a moment to stop recording. Capture resumes when
 the manager restarts; this does not control system logs outside the manager.
 Disabling detailed logging clears the current manager history and shared
 snapshots but retains exported files in Documents. Clearing the log folder also
 clears the current manager history; active apps may recreate shared snapshots.
+The exported report is limited to 10,000,000 bytes. Standalone snapshot and
+pending event limits allow up to that much formatted event data per process;
+on overflow, the report indicates lost events. Events that do not fit in an
+exported report remain available for a subsequent export.
+Consecutive identical standalone errors are summarized with repeat counts and
+the last occurrence time; errors from different sources remain separate.
+The Android log channel splits longer messages into packets and reconstructs
+them on a dedicated receiver thread. Its queue is bounded to 10,000,000 bytes
+including per-message accounting. A saturated socket can still lose messages
+before the queue fills; such losses and queue overflow are reported. The
+legacy D-Bus transport also has independent queue and rate limits. Core log
+formatting can truncate messages before they reach the channel.
 
-Native EGL/GLES rendering is experimental and disabled by default in CMake. In the
-Aurora IDE, set the CMake option `ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL=ON` to try it.
+Native EGL/GLES rendering is always built into the Aurora runtime, including
+Aurora IDE builds. New runtime features do not require experimental build or
+environment switches; diagnostic fixtures do not replace normal application
+execution. Device support is still subject to validation.
 Android GL frames use system EGL pbuffers and CPU readback for preview; this
 is not the Windows GPU compositor or zero-copy presentation. The default EGL
 display, device drivers and actual Android apps still need device validation.
@@ -52,8 +89,7 @@ display and GLES driver. On a headless Mesa system, run it with
 `EGL_PLATFORM=surfaceless`. This software-renderer test does not verify a
 device GPU.
 
-For experiments only, setting both `ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL=ON` and
-`ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_COMPOSITION=ON` enables an EGLImage-to-Qt scenegraph
+The runtime includes an EGLImage-to-Qt scenegraph
 path for native-activity window frames and Java SurfaceView layers. It copies
 EGL frames on the GPU; the premultiplied Java views image is uploaded from CPU
 memory. It falls back
@@ -66,57 +102,53 @@ After a fallback, other SurfaceView layers cannot recover their last GPU-only
 frames until they swap again. Qt scenegraph interoperation, concurrent layers,
 and device drivers have not been verified on an Aurora device. This is an
 experimental device test configuration, not a complete GPU implementation, and
-is not suitable as a production default.
+remains experimental.
 Back-gesture frame comparison cannot detect changed GPU-only frames, so its
 existing timeout may be used instead.
 
-For the experimental Android Canvas path, also set
-`ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_GPU_CANVAS=ON`. It requires both
-options above. If the shared graphics context or presentation is unavailable,
+The Android GPU Canvas path is also always included.
+If the shared graphics context or presentation is unavailable,
 the Canvas path falls back to CPU rendering. When combined with SurfaceView,
 the Canvas texture occupies the same composition position as the CPU views:
 above ordinary SurfaceView layers and below layers placed on top. This path
-has not been validated on an Aurora device. All three CMake options are off
-by default.
+has been exercised on an Aurora device with standalone RuStore, but other
+devices and applications can behave differently. The former experimental CMake
+options no longer control the build, including values retained in an existing
+CMake cache.
 
 microG settings open as a page in the manager, where the back gesture can start
-anywhere on the page. The Android runtime remains in a separate process and
-continues to use the bounded CPU frame channel.
-
-Aurora Store uses CPU Canvas and the bounded CPU frame channel on all builds.
-For IPC testing, `ACL_EMBEDDED_CPU_SHARED_FRAMES=1` lets embedded previews
-exchange CPU pixels through a private file in `/dev/shm`. The authenticated
+anywhere on the page. The Android runtime remains in a separate process.
+Aurora Store and the embedded microG settings page attempt GPU Canvas
+presentation automatically. CPU rendering
+and the bounded CPU frame channel remain available as fallback.
+Embedded previews exchange CPU fallback pixels through a private file in
+`/dev/shm` when available. The authenticated
 socket still carries the frame notice and ACK; the reader copies the pixels
 before acknowledging them. If shared storage cannot be used, frames travel
-over the socket as before. This does not enable GPU rendering in the Store.
+over the socket as before. This CPU transport does not replace GPU rendering.
 
-Run the manager executable with `--gpu-probe` in its normal GUI environment
-to check Qt GLES context creation, EGL DMA-BUF capabilities and a local GBM
-render target. It reports whether the optional Hybris gralloc library and
-native-buffer import entry points are available, but does not initialize
+GPU diagnostics are explicit, non-installed test targets, not manager launch
+modes. The former manager GPU probe switch has been removed. EGL DMA-BUF,
+GBM/import and Qt scene-graph checks remain in the GPU transport, import and
+state tests. Capability detection in the runtime does not initialize Hybris
 gralloc or use it for frames: the platform ABI and peer import are unverified.
-The probe does not test Qt scene-graph presentation or prove GPU screen output.
+Advertised extensions alone do not prove GPU screen output.
 
-Other embedded workers can attempt GPU Canvas presentation when both
-experimental GPU options are enabled. They probe the current EGL context for
-DMA-BUF export support before selecting the GPU transport. If direct export
-is unavailable, the one-time `Embedded GPU GBM probe` log
-checks whether the worker can allocate a buffer at the current preview size on
-a visible DRM render node and render to it after EGL import.
-For device testing, launch the manager with `ACL_EMBEDDED_GPU_GBM_VERIFY_PARENT=1`
-in the Aurora IDE run environment. In Store this opens a probe-only channel:
-its worker tests GBM even when texture export is advertised, and the manager
-rejects live GPU frames. Store still renders and presents its normal CPU frames.
-The same probe line shows the flag as seen
-by the worker (`verify_parent`), the connection state before the test
-(`gpu_channel`), and the probe result or why it was skipped, including when
-the GPU channel was never negotiated. With the flag enabled, a channel
-available, and allocation successful, the worker sends one test buffer
-through the authenticated channel. The parent acknowledges it after
-EGL import and a GPU copy in the Qt scene graph, then discards the test texture
-without showing it. This opt-in test neither changes permissions nor enables
-GPU presentation. The
-parent verifies the actual format and modifier against its EGL
+Embedded workers probe the current EGL context for DMA-BUF export support.
+If direct export is unavailable, the one-time `Embedded GPU GBM probe` checks
+allocation and rendering at the current preview size on a visible DRM render
+node. If successful, each live frame is copied on the GPU into a freshly
+allocated ARGB8888 GBM buffer, imported as a GLES render target, then sent to
+Qt as DMA-BUF. Allocation and copy are currently per-frame, not a buffer pool.
+The frame transport itself does not read pixels back on the successful GPU
+path; unsupported Canvas operations can still use their CPU fallbacks.
+The Android core may also read back before Canvas self-copy, even when the
+copy itself runs on the GPU. GPU presentation therefore does not mean every
+Canvas operation is CPU-free.
+The one-time probe checks local GBM capability; it does not send a discarded
+test frame instead of live application output. The former probe-only
+environment override is no longer read by the manager or worker.
+For live frames, the parent verifies the actual format and modifier against its EGL
 importer, imports the file descriptors, and copies into a parent-owned GPU
 texture before acknowledging buffer release. A credential-checked local
 `SOCK_SEQPACKET` channel carries the descriptors and per-plane format, stride,
@@ -127,8 +159,26 @@ to CPU texture readback and the existing CPU frame channel. The GPU path is
 logged as active only after a live GPU frame is imported and acknowledged. This
 experimental path still requires device validation; it does not establish
 DMA-BUF support on Aurora ARM64.
+
+For live device verification, build and deploy normally in Aurora IDE.
+Launch the manager, open Aurora Store and then microG settings, and
+inspect each worker's log. `Embedded GPU DMA-BUF frame imported and
+acknowledged` confirms a live frame reached Qt; a fallback warning identifies
+failure instead. Exercise redraw, resize/rotation, input and back navigation
+in both views, and compare the actual screen with CPU presentation. An ACK
+alone does not verify visible pixels or the absence of per-operation CPU
+fallbacks. Device GPU/GBM and peer import are not yet verified by this change.
+The optional `android_compatibility_layer_embedded_gpu_import_test --gbm-live`
+exercises live GBM copying, pixel import, resizing and rejection without a Qt
+scene graph; exit code 77 means no suitable GBM/EGL device is available.
 Returning from the microG page stops that process after the transition;
 cancelling the gesture leaves it running.
+
+Preview orientation and size changes are coalesced in one event-loop turn.
+The runtime receives the final viewport and display rotation together, including
+embedded workers, instead of relaying intermediate width/height or rotation-only
+configurations during a page rotation. This avoids redundant Android relayouts;
+the app still needs to render a frame for the new configuration.
 
 Aurora Store keeps its own window while its Android process restarts. The
 supervisor recognizes the ProcessPhoenix default-launcher restart used by
@@ -336,14 +386,23 @@ preserves source coverage (`CLEAR`, `DST`, `SRC_IN`, `DST_IN`, `DST_OUT`,
 `SRC_ATOP` or `MODULATE`). Other filter/blend combinations, invalid filter
 modes and GLES setup failures retain the CPU fallback. `canvas_copies_gpu`
 counts Canvas copies that sampled a GPU snapshot instead of reading the source
-bitmap back. In addition to integer-aligned 1:1 copies, standalone GLES 3
-supports exact 2x nearest-neighbor enlargement between different canvases
-with unfiltered, full-opacity `SRC_OVER` paint and a destination fully inside
-the target. Both paths require a source used by the current
-GLES context only and support rectangular integer clips. Other scales, complex
-clips, and unsupported paint combinations keep the existing fallback.
-Android core self-draws still settle the source first;
-the GPU host can avoid an additional readback for eligible direct self-draws.
+bitmap back. Integer-aligned 1:1 copies support paint opacity and supported color
+filters and blend modes. Standalone GLES 3 also supports nearest-neighbor
+scaled copies between different canvases at integer-aligned source and
+destination coordinates when no destination pixel center lands on a source
+pixel boundary, including independently scaled axes and destinations cropped
+at target bounds. With `FILTER_BITMAP`, scaled copies use bilinear filtering
+on a GPU snapshot cropped to the source rectangle, preventing samples outside
+it. Both copy paths require a source used by the current GLES context only and
+support integer rectangular clips, including closed rectangular paths and up to
+eight rectangular difference clips. Ambiguous nearest-neighbor sampling,
+nonrectangular or fractional path clips, unsupported paint combinations, other
+contexts, and reversed destination coordinates keep the existing CPU fallback.
+Text shaping, measurement and
+glyph-outline generation remain CPU-side through Qt, while the GPU Canvas
+renders the resulting outlines. Android core self-draws still settle the source
+first; the GPU host can avoid an additional readback for eligible direct
+self-draws, including overlapping copies and GLES 3 scaling.
 Embedded previews use CPU Canvas from startup if the GPU channel or EGL
 DMA-BUF export is unavailable. They do not use GPU readback as the startup
 fallback: readback still needs a current EGL context on the drawing thread.
@@ -519,6 +578,12 @@ in that case. Close an app before removing it. Bundle and standalone APK
 updates are not supported; an existing installation and its data are left
 unchanged if the same package is selected again. This does not install
 applications into Aurora.
+Closing a standalone app window pauses its Android activities. Megler keeps
+that process alive only while it has an active service, scheduled job or alarm,
+and the launcher icon's `Start` intent can reopen the window while the process
+still exists. This state is process-local: Aurora may suspend or terminate the
+process, and jobs or alarms are not restored after termination or reboot. This
+does not provide FCM delivery or guarantee continuous background execution.
 Only trusted APKs and bundles should be used: Android app permissions and
 isolation are not implemented, so code can access Megler's Aurora permissions
 and data.

@@ -1735,8 +1735,8 @@ service death, revocation and delivery to stopped apps. A caller-supplied
 package name, a shared socket alone, or the manager's provider-status D-Bus
 method is not that boundary. Its IPC and ABI are not implemented here.
 
-The build-only `ANDROID_COMPATIBILITY_LAYER_BUILD_SHARED_MICROG_PROBE` fixture
-is off by default and is not installed. Its fixed, typed test response uses
+The build-only `acl-shared-microg-probe` fixture
+is an explicit, non-default test target and is not installed. Its fixed, typed test response uses
 the actual D-Bus sender, but does not identify or authorize the caller. Run
 `aurora/tests/shared_microg_headless/test.py` with the fixture and client
 paths to test separately started and D-Bus-activated processes on private
@@ -1752,14 +1752,15 @@ name owner before `GetProvider`, then received `microg` without a manager
 window. This does not verify a generated Android standalone or a Google API.
 
 Generated standalones declare the manager's main interface, not its `microg`
-interface. The optional `ANDROID_COMPATIBILITY_LAYER_STANDALONE_MICROG_DIAGNOSTIC`
-build enables a no-argument `DiagnosticPing` on that main interface and a
-diagnostic screen in newly exported standalones. The manager records each
+interface. Earlier diagnostic builds enabled a no-argument `DiagnosticPing`
+on that main interface and a diagnostic screen in newly exported standalones.
+That build switch has been removed; synthetic diagnostics remain confined to
+test targets and do not replace normal standalone execution. The manager records each
 successfully exported RPM's app ID and Android package in its private registry,
 including on cache reuse. It looks up the executable identified for the actual
 D-Bus sender, and returns only `synthetic-ok` for known IDs. Unknown or
-unidentified callers are refused; the client cannot supply an ID. The option
-is off by default and changes neither microG nor its login.
+unidentified callers are refused; the client cannot supply an ID.
+These synthetic checks change neither microG nor its login.
 
 The registry records what the manager exported, not installation, APK integrity,
 or authorization to use an account or Google API. `IdentifyByBusName` provides
@@ -1915,10 +1916,8 @@ not recorded. Later standalone requests re-activate the service over D-Bus
 requests in flight at that moment fail. The number of covers or switcher
 entries and other launch scenarios were not checked.
 
-For a tablet test, add
-`--extra-options " -DANDROID_COMPATIBILITY_LAYER_STANDALONE_MICROG_DIAGNOSTIC:BOOL=ON"`
-to the Aurora IDE `apptool build` step for the ARM64 manager and rebuild/deploy
-it. The leading space inside the quotes is required by apptool. Import an
+The following describes the earlier synthetic tablet test, not instructions
+for the current manager build. It used a diagnostic ARM64 manager. Import an
 offline test APK, export and install a fresh standalone from this manager, then
 restart the tablet without opening the manager. Closing its window or waiting
 60 seconds does not guarantee that the background process has exited. Launch the installed
@@ -1929,9 +1928,8 @@ failed test, not an absent owner; `AccessDenied` means the sender could not be
 matched to the export registry. Continue dismisses the diagnostic and starts
 the Android app. This test uses no account or network.
 
-After testing, configure the same IDE step once with `BOOL=OFF`, rebuild and
-deploy, then remove the extra option. Merely removing it can leave `ON` in the
-CMake cache. A standalone exported by the diagnostic build retains its
+Current builds ignore the removed diagnostic CMake option and require no IDE
+override. A standalone exported by the earlier diagnostic build retains its
 diagnostic launcher until it is recreated and reinstalled from an OFF build.
 
 The local service router checks whether a service is exported, but does not

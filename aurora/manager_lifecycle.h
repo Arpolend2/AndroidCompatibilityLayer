@@ -29,6 +29,7 @@ public:
                                      const SharedMicrogProviderObject::ApkMetadataResolver &metadataResolver,
                                      QString *error);
     void disableSharedMicrogWorker();
+    void enableSharedMicrogBackground();
     static SharedMicrogProviderObject::PackageResolver registryPackageResolver(
         const QString &identityDirectory);
     void setKeepAlive(bool keepAlive);
@@ -68,6 +69,8 @@ private:
     bool m_background = false;
     bool m_keepAlive = false;
     QTimer m_idle;
+    QTimer m_microgRestart;
+    bool m_microgBackground = false;
     ExternalApkReceiver m_receiver;
     SharedMicrogSupervisor m_worker;
     SharedMicrogProviderObject m_provider;

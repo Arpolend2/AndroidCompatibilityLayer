@@ -1,4 +1,6 @@
 /build/
+/build-*/
+/Testing/
 /aurora/android-runtime/
 /aurora/sqlite/
 /app/Megler/AppPackages/

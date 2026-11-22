@@ -133,6 +133,7 @@ void megler_keyboard_height(int pixels) { mg_java_keyboard_height(pixels); }
 void megler_set_insets(int left, int top, int right, int bottom) { mg_java_set_insets(left, top, right, bottom); }
 void megler_set_surface(int width, int height, int density_dpi, int rotation) { mg_run_set_surface(width, height, density_dpi, rotation); }
 void megler_set_paused(bool paused) { mg_run_set_paused(paused); }
+bool megler_background_work_active(void) { return mg_java_background_work_active(); }
 
 bool megler_settle_databases(int ms)
 {

@@ -5,6 +5,9 @@
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QNetworkReply>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -129,6 +132,18 @@ int main(int argc, char **argv)
     const QByteArray older = "[" + release("0.3.0", "aarch64", rpm) + "]";
     ManagerUpdateRelease result;
     QString error;
+    QJsonObject dualRelease = QJsonDocument::fromJson(release("0.3.2", "aarch64", rpm)).object();
+    QJsonArray assets = dualRelease.value(QStringLiteral("assets")).toArray();
+    assets.append(QJsonDocument::fromJson(release("0.3.2", "armv7hl", rpm)).object()
+                      .value(QStringLiteral("assets")).toArray().first());
+    dualRelease.insert(QStringLiteral("assets"), assets);
+    const QByteArray both = QJsonDocument(QJsonArray{dualRelease}).toJson();
+    if (managerUpdateRelease(both, QStringLiteral("0.3.1-1"), QStringLiteral("armv7hl"), &result, &error) != ManagerUpdateResult::Update ||
+        !result.url.fileName().endsWith(QLatin1String(".armv7hl.rpm")) ||
+        managerUpdateRelease(both, QStringLiteral("0.3.1-1"), QStringLiteral("aarch64"), &result, &error) != ManagerUpdateResult::Update ||
+        !result.url.fileName().endsWith(QLatin1String(".aarch64.rpm")) ||
+        managerUpdateRelease(both, QStringLiteral("0.3.1-1"), QString(), &result, &error) != ManagerUpdateResult::Error)
+        return 1;
     if (managerUpdateRelease(newer, QStringLiteral("0.3.1-1"), QStringLiteral("aarch64"), &result, &error) != ManagerUpdateResult::Update ||
         managerUpdateRelease(newer, QStringLiteral("0.3.2-1"), QStringLiteral("aarch64"), &result, &error) != ManagerUpdateResult::Current ||
         managerUpdateRelease(older, QStringLiteral("0.3.2-1"), QStringLiteral("aarch64"), &result, &error) != ManagerUpdateResult::Current ||

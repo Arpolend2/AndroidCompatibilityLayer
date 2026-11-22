@@ -63,6 +63,7 @@ void mg_java_keyboard_height(int pixels);
 void mg_java_set_insets(int left, int top, int right, int bottom);
 /* The phone's accent colour and night (megler.h, megler_set_theme), for the next app to read as it starts. */
 void mg_java_set_theme(uint32_t accent_argb, bool night);
+bool mg_java_background_work_active(void);
 
 /* mg_java_sqlite.c: megler.Sqlite's native methods, on the SQLite compiled into the core -- or, in a build without it, their refusal. */
 const mg_jhle *mg_java_sqlite_natives(void);

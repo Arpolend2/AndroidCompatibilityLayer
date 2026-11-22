@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <fcntl.h>
 #include <thread>
@@ -35,6 +36,11 @@ static void check(bool value, const char *description)
         std::fprintf(stderr, "FAIL: %s\n", description);
         std::exit(1);
     }
+}
+
+static void coreLogSignalHandler(int)
+{
+    ErrorLog::sendCoreLine(MEGLER_LOG_ERROR, "core signal handler event");
 }
 
 static const char RemoteGpuSummary[] =
@@ -75,7 +81,9 @@ public:
 int main(int argc, char **argv)
 {
     if (argc == 3 && (QByteArray(argv[1]) == "--standalone-snapshot" ||
-                      QByteArray(argv[1]) == "--standalone-snapshot-stress")) {
+                      QByteArray(argv[1]) == "--standalone-snapshot-stress" ||
+                      QByteArray(argv[1]) == "--standalone-snapshot-overflow" ||
+                      QByteArray(argv[1]) == "--standalone-snapshot-repeats")) {
         QCoreApplication app(argc, argv);
         QString error;
         const QString appId = QStringLiteral(
@@ -91,14 +99,25 @@ int main(int argc, char **argv)
             QThread::msleep(5);
         }
         check(MemoryLogBus::clientDetailedEnabled(), "wait for confirmed logging State");
-        if (QByteArray(argv[1]) == "--standalone-snapshot-stress") {
+        if (QByteArray(argv[1]) == "--standalone-snapshot-repeats") {
+            for (int i = 0; i < 2000; ++i) {
+                ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("identical error"), true);
+                if (i == 999)
+                    check(ErrorLog::flushStandaloneSnapshots(), "publish repeated errors");
+            }
+            ErrorLog::record(QStringLiteral("Android"), QStringLiteral("identical error"), true);
+            ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("different error"), true);
+        } else if (QByteArray(argv[1]) != "--standalone-snapshot") {
             ErrorLog::record(QStringLiteral("Android"), QStringLiteral("startup retained"), false);
-            for (int i = 0; i < 700; ++i) {
+            const bool overflow = QByteArray(argv[1]) == "--standalone-snapshot-overflow";
+            const int count = 7000;
+            for (int i = 0; i < count; ++i) {
                 ErrorLog::record(QStringLiteral("Android"),
                                  i == 100 ? QStringLiteral("important retained error")
-                                          : QStringLiteral("verbose event %1").arg(i),
+                                          : QStringLiteral("verbose event %1").arg(i) +
+                                            (overflow ? QString(1600, QLatin1Char('x')) : QString()),
                                  i == 100);
-                if (i % 100 == 99)
+                if (i % 1000 == 999)
                     check(ErrorLog::flushStandaloneSnapshots(), "publish bounded snapshot batch");
             }
         } else {
@@ -172,6 +191,21 @@ int main(int argc, char **argv)
             return 0;
         }
         check(ErrorLog::startPersistence(QString::fromLocal8Bit(argv[2]), &error), "start private storage");
+        if (mode == "--core-quit") {
+            check(ErrorLog::setDetailedEnabled(true, &error) && ErrorLog::startCoreChannel(&error),
+                  "start persistent core channel");
+            QTimer::singleShot(0, &app, [&app]() {
+                ErrorLog::sendCoreLine(MEGLER_LOG_INFO, "core event immediately before quit");
+                app.quit();
+            });
+            return app.exec();
+        }
+        if (mode == "--read-core-quit") {
+            check(ErrorLog::detailedReport(&text, &error) &&
+                  text.contains(QStringLiteral("core event immediately before quit")),
+                  "core channel is drained before the final snapshot");
+            return 0;
+        }
         if (mode == "--fail-write") {
             check(QDir().mkpath(QString::fromLocal8Bit(argv[2]) +
                                 QStringLiteral("/diagnostic-log/manager-state-v1.dat.pending")),
@@ -195,8 +229,10 @@ int main(int argc, char **argv)
         if (mode == "--read") {
             check(enabled && ErrorLog::detailedReport(&text, &error) &&
                   text.contains(QStringLiteral("persistent private secret")), "restore detailed history");
-            check(text.contains(QStringLiteral("[Earlier detailed output was truncated.]")),
-                  "bounded detailed history reports truncation");
+            check(!text.contains(QStringLiteral("[Earlier detailed output was truncated.]")) &&
+                  !text.contains(QStringLiteral("[Manager log truncated")) &&
+                  text.toUtf8().size() < 10000000,
+                  "detailed history below ten megabytes is preserved");
             check(ErrorLog::report().contains(QStringLiteral("SecurityException")) &&
                   !ErrorLog::report().contains(QStringLiteral("persistent private secret")), "restore safe history");
         } else if (mode == "--read-remote") {
@@ -354,6 +390,19 @@ int main(int argc, char **argv)
     }
     QString error;
     check(ErrorLog::initialize(QStringLiteral("Android App Manager"), &error, oldDir), "initialize");
+    const QString reportHeader = ErrorLog::report().section(QLatin1Char('\n'), 0, 5);
+#if defined(Q_PROCESSOR_ARM_64)
+    const QString expectedArchitecture = QStringLiteral("aarch64");
+#elif defined(__arm__) && defined(__ARM_PCS_VFP)
+    const QString expectedArchitecture = QStringLiteral("armv7hl");
+#elif defined(Q_PROCESSOR_X86_64)
+    const QString expectedArchitecture = QStringLiteral("x86_64");
+#else
+    const QString expectedArchitecture = QStringLiteral("unknown");
+#endif
+    check(reportHeader.contains(QStringLiteral("Package architecture (build): ") + expectedArchitecture) &&
+          !reportHeader.contains(QStringLiteral("\nArchitecture:")),
+          "report identifies package build architecture rather than device architecture");
     const QString mainPrivateRoot = home.path() + QStringLiteral("/live-manager");
     check(ErrorLog::startPersistence(mainPrivateRoot, &error), "start manager storage");
     ErrorLog::record(QStringLiteral("Android"), QStringLiteral("private secret"), true);
@@ -577,20 +626,64 @@ int main(int argc, char **argv)
           "unavailable snapshot directory is reported without exposing its path");
     child.start(app.applicationFilePath(), QStringList() << QStringLiteral("--standalone-snapshot-stress")
                 << sharedLogRoot.path());
-    timeout.start(10000);
+    timeout.start(60000);
     loop.exec();
     check(child.state() == QProcess::NotRunning && child.exitCode() == 0,
-          "bounded standalone snapshot writer completed");
+          "large standalone snapshot writer completed");
     check(ErrorLog::detailedReport(&detailed, &error) &&
           detailed.contains(QStringLiteral("startup retained")) &&
           detailed.contains(QStringLiteral("important retained error")) &&
-          detailed.contains(QStringLiteral("verbose event 699")) &&
-          detailed.contains(QStringLiteral("Standalone snapshot entries dropped due to limits:")),
-          "bounded snapshots retain startup, errors and recent events while reporting loss");
+          detailed.contains(QStringLiteral("verbose event 6999")) &&
+          !detailed.contains(QStringLiteral("Standalone snapshot entries dropped due to limits:")),
+          "standalone snapshot retains 7000 events without loss");
     QString stressPath;
     check(ErrorLog::saveDetailedReport(&stressPath, &error, &partialExport, &cleanupWarning) &&
-          partialExport && QFile::remove(stressPath),
-          "truncated standalone snapshot exports as partial and is cleaned up");
+          !partialExport && QFile::remove(stressPath),
+          "large standalone snapshot exports without loss");
+    child.start(app.applicationFilePath(), QStringList() << QStringLiteral("--standalone-snapshot-overflow")
+                << sharedLogRoot.path());
+    timeout.start(60000);
+    loop.exec();
+    check(child.state() == QProcess::NotRunning && child.exitCode() == 0,
+          "overflowing standalone snapshot writer completed");
+    check(ErrorLog::detailedReport(&detailed, &error) &&
+          detailed.contains(QStringLiteral("startup retained")) &&
+          detailed.contains(QStringLiteral("important retained error")) &&
+          detailed.contains(QStringLiteral("Standalone snapshot entries dropped due to limits:")),
+          "bounded snapshots retain startup, errors and recent events while reporting loss");
+    check(ErrorLog::saveDetailedReport(&stressPath, &error, &partialExport, &cleanupWarning) &&
+          partialExport, "truncated standalone snapshot exports as partial");
+    QFile firstLargeExport(stressPath);
+    check(firstLargeExport.open(QIODevice::ReadOnly), "open first bounded export");
+    const QByteArray firstLargeContents = firstLargeExport.readAll();
+    check(firstLargeContents.size() <= 10000000 &&
+          firstLargeContents.contains("Report truncated at 10000000 bytes") &&
+          QFile::remove(stressPath), "first export respects total byte limit");
+    check(ErrorLog::saveDetailedReport(&stressPath, &error, &partialExport, &cleanupWarning),
+          "export remaining standalone events");
+    QFile secondLargeExport(stressPath);
+    check(secondLargeExport.open(QIODevice::ReadOnly), "open second bounded export");
+    const QByteArray secondLargeContents = secondLargeExport.readAll();
+    check(secondLargeContents.size() <= 10000000 &&
+          secondLargeContents.contains("verbose event 6999") &&
+          !secondLargeContents.contains("startup retained") &&
+          QFile::remove(stressPath), "remaining events survive and are exported without duplicates");
+    child.start(app.applicationFilePath(), QStringList() << QStringLiteral("--standalone-snapshot-repeats")
+                << sharedLogRoot.path());
+    timeout.start(10000);
+    loop.exec();
+    check(child.state() == QProcess::NotRunning && child.exitCode() == 0,
+          "repeated error snapshot writer completed");
+    check(ErrorLog::detailedReport(&detailed, &error) &&
+          detailed.contains(QStringLiteral("[Repeated 999 additional times; last ")) &&
+          detailed.contains(QStringLiteral("[Repeated 1000 additional times; last ")) &&
+          detailed.count(QStringLiteral("identical error")) == 4 &&
+          detailed.contains(QStringLiteral("[Android] error identical error")) &&
+          detailed.contains(QStringLiteral("different error")) &&
+          !detailed.contains(QStringLiteral("Standalone snapshot entries dropped due to limits:")),
+          "consecutive identical errors retain counts across flushes and distinct errors");
+    check(ErrorLog::saveDetailedReport(&stressPath, &error, &partialExport, &cleanupWarning) &&
+          !partialExport && QFile::remove(stressPath), "export repeated error snapshot");
     const QString largeManagerEntry(60000, QLatin1Char('m'));
     for (int i = 0; i < 140; ++i)
         ErrorLog::record(QStringLiteral("test"), largeManagerEntry, false);
@@ -651,8 +744,11 @@ int main(int argc, char **argv)
     check(raceExport.open(QIODevice::ReadOnly), "open concurrent export");
     const QByteArray raceContents = raceExport.readAll();
     check(raceContents.count("snapshot-before-export") == 1 &&
-          raceContents.count("snapshot-during-export") == 0,
-          "concurrent export contains only the locked snapshot version");
+          raceContents.count("snapshot-during-export") == 0 &&
+          raceContents.size() <= 10000000 &&
+          !raceContents.contains("[Manager log truncated") &&
+          !raceContents.contains("[Report truncated at 10000000 bytes"),
+          "sub-limit combined export retains manager and locked snapshot data");
     check(child.waitForFinished(6000) && child.exitCode() == 0,
           "concurrent snapshot writer completes");
     QFile updatedSnapshot(updateSnapshotPath);
@@ -729,15 +825,54 @@ int main(int argc, char **argv)
     check(ErrorLog::detailedReport(&detailed, &error) && !detailed.contains(QStringLiteral("detailed secret")),
           "disabled capture clears detailed memory");
     check(ErrorLog::startCoreChannel(&error), "start core channel");
-    QByteArray longLine(5000, 'x');
+    QByteArray longLine("core-long-start:");
+    longLine += QByteArray(4059, 'x');
+    longLine += "\xe2\x82\xac";
+    longLine += QByteArray(2000, 'y');
+    longLine += ":core-long-end";
+    const QByteArray first = QByteArray("core-thread-a:") + QByteArray(6000, 'a') + ":end-a";
+    const QByteArray second = QByteArray("core-thread-b:") + QByteArray(6000, 'b') + ":end-b";
     ErrorLog::sendCoreLine(MEGLER_LOG_ERROR, longLine.constData());
+    std::thread firstSender([&]() { ErrorLog::sendCoreLine(MEGLER_LOG_INFO, first.constData()); });
+    std::thread secondSender([&]() { ErrorLog::sendCoreLine(MEGLER_LOG_INFO, second.constData()); });
+    firstSender.join();
+    secondSender.join();
+    const auto previousHandler = std::signal(SIGUSR1, coreLogSignalHandler);
+    check(previousHandler != SIG_ERR && std::raise(SIGUSR1) == 0, "send core log from signal handler");
+    check(std::signal(SIGUSR1, previousHandler) != SIG_ERR, "restore signal handler");
+    for (int i = 0; i < 100; ++i) {
+        const QByteArray event = QByteArray("core-burst-") + QByteArray::number(i) + ":end";
+        ErrorLog::sendCoreLine(MEGLER_LOG_INFO, event.constData());
+    }
     QElapsedTimer timer;
     timer.start();
+    bool received = false;
+    while (timer.elapsed() < 5000 && !received) {
+        app.processEvents();
+        received = ErrorLog::detailedReport(&detailed, &error) &&
+            detailed.contains(QString::fromUtf8(longLine)) &&
+            detailed.contains(QString::fromUtf8(first)) &&
+            detailed.contains(QString::fromUtf8(second)) &&
+            detailed.contains(QStringLiteral("core signal handler event")) &&
+            detailed.contains(QStringLiteral("core-burst-99:end"));
+        QThread::msleep(10);
+    }
+    check(received, "long UTF-8 and concurrent core messages are reassembled intact");
+    for (int i = 0; i < 100; ++i)
+        check(detailed.contains(QStringLiteral("core-burst-%1:end").arg(i)),
+              "burst is buffered while the Qt event loop is not processing");
+    const QByteArray oversized(10000001, 'z');
+    ErrorLog::sendCoreLine(MEGLER_LOG_ERROR, oversized.constData());
+    timer.restart();
     while (timer.elapsed() < 1500 && !ErrorLog::report().contains(QStringLiteral("events dropped"))) {
         app.processEvents();
         QThread::msleep(10);
     }
     check(ErrorLog::report().contains(QStringLiteral("events dropped")), "oversized core event reported");
+    const QString quitRoot = home.path() + QStringLiteral("/core-quit");
+    check(QProcess::execute(app.applicationFilePath(), QStringList() << QStringLiteral("--core-quit") << quitRoot) == 0 &&
+          QProcess::execute(app.applicationFilePath(), QStringList() << QStringLiteral("--read-core-quit") << quitRoot) == 0,
+          "persist queued core messages on normal shutdown");
     const QString privateRoot = home.path() + QStringLiteral("/manager-private");
     const QString snapshotPath = privateRoot + QStringLiteral("/diagnostic-log/manager-state-v1.dat");
     QProcess writer;

@@ -52,10 +52,12 @@ public:
     bool sendReply(quint64 frameId, bool accepted);
     bool sendFrame(const AuroraDmaBufFrame &frame, QString *error);
     bool presentTexture(GLuint texture, int width, int height, QString *error);
+    bool presentGbmTexture(GLuint texture, int width, int height, QString *error);
     static bool canExportDmaBuf(QString *error);
     static QStringList currentGpuCapabilities();
     static QString probeGbmRenderTarget(int width, int height,
-        const std::function<bool(const AuroraDmaBufFrame &, QString *)> &verifyParent = {});
+        const std::function<bool(const AuroraDmaBufFrame &, QString *)> &verifyParent = {},
+        bool *available = nullptr);
     static bool sendFramePacket(int socket, const AuroraDmaBufFrame &frame);
     static bool receiveFramePacket(int socket, AuroraDmaBufFrame *frame);
     static bool sendReplyPacket(int socket, quint64 frameId, bool accepted);
@@ -90,5 +92,6 @@ private:
 
 GLuint aurora_import_dma_buf_texture(const AuroraDmaBufFrame &frame, EGLDisplay display,
                                      QString *error);
+bool aurora_copy_gpu_texture(GLuint source, GLuint target, int width, int height, QString *error);
 
 #endif

@@ -1,0 +1,6 @@
+#ifndef ANDROID_COMPATIBILITY_LAYER_MICROG_WATCHDOG_H
+#define ANDROID_COMPATIBILITY_LAYER_MICROG_WATCHDOG_H
+
+int runMicrogWatchdog(int argc, char **argv);
+
+#endif

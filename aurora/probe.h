@@ -557,10 +557,7 @@ public:
     void startManagerUpdate(bool checkOnly)
     {
         if (m_managerUpdate.busy()) return;
-        const QString cpu = QSysInfo::currentCpuArchitecture().toLower();
-        const QString arch = cpu == QLatin1String("arm64") || cpu == QLatin1String("aarch64")
-            ? QStringLiteral("aarch64") : cpu == QLatin1String("arm") || cpu == QLatin1String("armv7l")
-            ? QStringLiteral("armv7hl") : QString();
+        const QString arch = managerUpdatePackageArchitecture();
         const QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
         m_managerUpdateProgress = -1;
         m_managerUpdateStatus = tr("Checking GitHub for a manager update...");

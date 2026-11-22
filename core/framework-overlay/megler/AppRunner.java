@@ -713,6 +713,13 @@ public final class AppRunner {
         if (sHeadless) return;
         if (sStack.isEmpty()) sHandler.post(() -> { if (sStack.isEmpty()) { endPending(); Native.exit(); } });
     }
+    /** Reports process-local Android work so the host can keep a standalone app alive without its window. */
+    public static void backgroundWorkChanged() {
+        boolean active = Services.hasBackgroundWork()
+            || android.app.job.JobScheduler.Impl.hasPendingJobs()
+            || android.app.AlarmManager.hasPendingAlarms();
+        Native.backgroundWorkChanged(active);
+    }
     /*
      * A finished activity whose place the one below took (finishNow): hidden at once, and stopped and destroyed once the one
      * below has been drawn and the main thread has nothing left to do, as Android stops a finishing activity only when the

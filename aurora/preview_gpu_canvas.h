@@ -96,7 +96,7 @@ private:
     bool drawFilteredBitmap(Canvas *canvas, const megler_gfx_image *image, const float *src, const float *dst,
                             const megler_gfx_paint *paint);
     void paintPath(Canvas *canvas, const QPainterPath &path, const megler_gfx_paint *paint, void *shader);
-    void clip(Canvas *canvas, const QPainterPath &path, int op);
+    void clip(Canvas *canvas, const QPainterPath &path, int op, bool rectangular = false);
     void *cpuShader(void *shader) const;
 
     const megler_gfx_host *m_cpu;

@@ -15,6 +15,7 @@ extern "C" {
 }
 
 #include <QFile>
+#include <QDBusUnixFileDescriptor>
 #include <QGuiApplication>
 #include <QInputMethodEvent>
 #include <QProcess>
@@ -29,6 +30,39 @@ extern "C" {
 
 static megler_run_config config;
 static void output(const char *text) { std::printf("%s\n", text); std::fflush(stdout); }
+
+static bool testViewportUpdates()
+{
+    class ViewportPlayer : public PreviewPlayer {
+    public:
+        ViewportPlayer() : PreviewPlayer(QStringLiteral("."), QStringLiteral(".")) {}
+        bool usesGpuSurface() const override { return false; }
+        void setViewport(qreal width, qreal height, qreal ratio, int rotation = -1) override
+        {
+            ++updates;
+            size = QSizeF(width, height);
+            PreviewPlayer::setViewport(width, height, ratio, rotation);
+        }
+        int updates = 0;
+        QSizeF size;
+    } player;
+    PreviewSurface surface;
+    surface.setWidth(540);
+    surface.setHeight(960);
+    surface.setPlayer(&player);
+    QCoreApplication::processEvents();
+    player.updates = 0;
+    surface.setPageOrientation(Qt::LandscapeOrientation);
+    surface.setWidth(960);
+    surface.setHeight(540);
+    if (player.updates != 0) return false;
+    QCoreApplication::processEvents();
+    if (player.updates != 1 || player.size != QSizeF(960, 540)) return false;
+    player.setViewport(960, 540, 1, 3);
+    if (player.displayRotation() != 3) return false;
+    player.setViewport(960, 540, 1);
+    return player.displayRotation() == 3;
+}
 
 static bool testSharedFrames()
 {
@@ -145,8 +179,19 @@ static bool drawTestFrame(uint32_t color)
 #endif
 extern "C" bool megler_init(const megler_config *) { return true; }
 extern "C" bool mg_apk_read_info(const char *, mg_apk_info *) { return false; }
+extern "C" void mg_apk_info_free(mg_apk_info *) {}
 extern "C" bool mg_apk_gms_name(const char *) { return false; }
 extern "C" bool mg_apk_is_microg(const char *) { return false; }
+extern "C" bool mg_java_set_shared_microg_client(int, int, int, const char *) { return false; }
+extern "C" void mg_java_close_shared_microg_client() {}
+extern "C" bool megler_apk_describe_activities(const char *, const char *, const char *) { return false; }
+extern "C" bool megler_background_work_active() { return false; }
+extern "C" void megler_set_paused(bool) {}
+int takeSharedMicrogStream(QDBusUnixFileDescriptor *, QString *error)
+{
+    if (error) *error = QStringLiteral("Shared microG is not available in this test");
+    return -1;
+}
 extern "C" void megler_set_locale(const char *) {}
 extern "C" void megler_set_theme(uint32_t, bool) {}
 extern "C" bool megler_run(const megler_run_config *run)
@@ -177,8 +222,10 @@ extern "C" bool megler_run(const megler_run_config *run)
 extern "C" const char *megler_last_error() { return ""; }
 extern "C" void megler_touch(int phase, int, float, float) { if (phase == 0) output("touch"); }
 extern "C" void megler_key(int, bool) {}
-extern "C" void megler_set_surface(int, int, int, int rotation)
+extern "C" void megler_set_surface(int width, int height, int, int rotation)
 {
+    const QByteArray size = QStringLiteral("surface:%1x%2:%3").arg(width).arg(height).arg(rotation).toLatin1();
+    output(size.constData());
     if (rotation == 3) output("rotation3");
 }
 extern "C" void megler_stop() {
@@ -263,9 +310,13 @@ int main(int argc, char **argv)
         count.close();
         if (mode == "frames" || mode == "teardown-hang" || mode == "teardown-normal") {
             PreviewPlayer player(QStringLiteral("."), QStringLiteral("."));
+            player.setCpuPresentationOnly(true);
             AuroraPickerHost picker;
             player.setPicker(&picker);
             EmbeddedPreviewChild bridge(&player, &picker);
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+            QObject::connect(&bridge, &EmbeddedPreviewChild::gpuChannelConnected, []() { output("gpu-connected"); });
+#endif
             player.setRemoteKeyboard(bridge.keyboardHost());
             QString error;
             if (!bridge.connectTo(QString::fromLocal8Bit(argv[4]), &error)) return 8;
@@ -303,7 +354,7 @@ int main(int argc, char **argv)
     if (argc == 2 && QByteArray(argv[1]) == "--supervisor-test") {
         QTemporaryDir directory;
         if (!directory.isValid()) return 1;
-        const bool verifyGpuImport = qEnvironmentVariableIntValue("ACL_EMBEDDED_GPU_GBM_VERIFY_PARENT") == 1;
+        const bool storeGpu = qEnvironmentVariableIntValue("ACL_TEST_STORE_GPU") == 1;
         const QByteArray modes[] = {"restart", "hang", "hang-close", "hang-preview-close",
                                     "stale-watchdog", "normal", "error", "crash",
                                     "requested-crash", "close", "rate", "other", "frames",
@@ -312,7 +363,7 @@ int main(int argc, char **argv)
         for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
             const QString countName = directory.path() + QLatin1Char('/') + QString::fromLatin1(modes[i]);
             EmbeddedPreview preview;
-            preview.setCpuFrameTransportOnly(verifyGpuImport);
+            if (!storeGpu) preview.setCpuFrameTransportOnly();
             preview.setViewport(540, 960, 1);
             preview.setUiReady(true);
             StorePreviewSupervisor supervisor(&preview, QCoreApplication::applicationFilePath(),
@@ -355,9 +406,9 @@ int main(int argc, char **argv)
             elapsed.start();
             if (!supervisor.start(&error)) { std::fprintf(stderr, "%s\n", qPrintable(error)); return 1; }
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
-            if (QFileInfo(QFileInfo(preview.endpoint()).dir().filePath(QStringLiteral("gpu"))).exists() != verifyGpuImport ||
-                preview.usesGpuSurface() != verifyGpuImport) {
-                std::fprintf(stderr, "Store did not configure its probe-only GPU endpoint as requested\n");
+            if (QFileInfo(QFileInfo(preview.endpoint()).dir().filePath(QStringLiteral("gpu"))).exists() != storeGpu ||
+                preview.usesGpuSurface() != storeGpu) {
+                std::fprintf(stderr, "Store did not configure its requested GPU endpoint\n");
                 return 1;
             }
 #endif
@@ -403,6 +454,9 @@ int main(int argc, char **argv)
         testFolder = argv[3];
         player.setPicker(&picker);
         EmbeddedPreviewChild bridge(&player, &picker);
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+        QObject::connect(&bridge, &EmbeddedPreviewChild::gpuChannelConnected, []() { output("gpu-connected"); });
+#endif
         player.setRemoteKeyboard(bridge.keyboardHost());
         QString error;
         if (!bridge.connectTo(QString::fromLocal8Bit(argv[2]), &error)) return 2;
@@ -414,6 +468,10 @@ int main(int argc, char **argv)
         return app.exec();
     }
 
+    if (!testViewportUpdates()) {
+        std::fprintf(stderr, "viewport resize was not coalesced into one event-loop update\n");
+        return 1;
+    }
     QTemporaryDir directory;
     if (!directory.isValid()) return 1;
     const QString fileName = directory.path() + QStringLiteral("/picked.txt");
@@ -492,9 +550,15 @@ int main(int argc, char **argv)
     auto start = [&]() {
         QString error;
         if (!preview.listen(&process, &error)) { std::fprintf(stderr, "%s\n", qPrintable(error)); failed = true; return; }
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+        if (!preview.usesGpuSurface() ||
+            !QFileInfo(QFileInfo(preview.endpoint()).dir().filePath(QStringLiteral("gpu"))).exists()) {
+            std::fprintf(stderr, "microG preview did not open its GPU endpoint\n");
+            failed = true;
+        }
+#endif
         if (preview.stopping()) failed = true;
-        preview.setDisplayRotation(1);
-        preview.setViewport(540, 960, 1);
+        preview.setViewport(540, 960, 1, 1);
         preview.setUiReady(true);
         if (runs == 0) {
             rogue.connectToServer(preview.endpoint());
@@ -511,8 +575,14 @@ int main(int argc, char **argv)
                 outputText.contains("text\n") && outputText.contains("picked\n") &&
                 outputText.contains("pickedMultiple\n") && outputText.contains("pickedPhoto\n") &&
                 outputText.contains("photoCanceled\n") && outputText.contains("stopped\n") &&
-                outputText.contains("initialRotation1\n") && outputText.contains("rotation3\n");
+                outputText.contains("initialRotation1\n") && outputText.contains("rotation3\n") &&
+                outputText.count("surface:960x540:3\n") == 1 &&
+                !outputText.contains("surface:540x960:3\n");
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
+        if (runs < 2 && !outputText.contains("gpu-connected\n")) {
+            std::fprintf(stderr, "microG GPU channel was not authenticated\n");
+            failed = true;
+        }
         const QByteArray expectedRenderer = qgetenv("ACL_TEST_EXPECT_GPU") == "1" ? "gpu\n" : "cpu-canvas\n";
         if (runs < 2 && !outputText.contains(expectedRenderer)) {
             std::fprintf(stderr, "expected renderer %s; child output: %s\n",
@@ -520,7 +590,8 @@ int main(int argc, char **argv)
             failed = true;
         }
 #endif
-        if (status != QProcess::NormalExit || code != 0 || (runs < 2 ? !normalRun : !outputText.isEmpty())) {
+        if (status != QProcess::NormalExit || code != 0 ||
+            (runs < 2 ? !normalRun : (!outputText.isEmpty() && outputText != "gpu-connected\n"))) {
             std::fprintf(stderr, "child output: %s, code %d\n", outputText.constData(), code);
             failed = true;
         }
@@ -542,8 +613,10 @@ int main(int argc, char **argv)
     });
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, [&]() {
-        if (outputText.contains("initialRotation1\n") && preview.displayRotation() == 1)
-            preview.setDisplayRotation(3);
+        // The mock emits fixed-size frames; finish input before requesting a different size.
+        if (outputText.contains("initialRotation1\n") && outputText.contains("text\n") &&
+            preview.displayRotation() == 1)
+            preview.setViewport(960, 540, 1, 3);
         if (keyboard.inputMethodQuery(Qt::ImEnabled).toBool() &&
             outputText.contains("started\n") && outputText.contains("touch\n") && picks > runs) {
             QInputMethodEvent event;

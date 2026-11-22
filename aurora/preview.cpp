@@ -206,20 +206,13 @@ void PreviewPlayer::start()
     bool gpuCanvasReady = false;
     bool remoteGpuCanvasReady = false;
 #if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
-    constexpr char verifyParentVariable[] = "ACL_EMBEDDED_GPU_GBM_VERIFY_PARENT";
     const bool gpuChannelConnected = m_remoteGpuTransport && m_remoteGpuTransport->connected();
-    const bool probeOnly = gpuChannelConnected && !m_remoteGpuCanvasPresent;
-    const bool verifyParentEnabled = m_cpuPresentationOnly &&
-        (probeOnly || qEnvironmentVariableIntValue(verifyParentVariable) == 1);
     const auto logGbmProbe = [&](const QString &result) {
-        const char *flag = verifyParentEnabled ? "enabled" :
-                           (qEnvironmentVariableIsSet(verifyParentVariable) ? "disabled" : "unset");
-        qInfo().noquote() << QStringLiteral("Embedded GPU GBM probe: verify_parent=%1; gpu_channel=%2; %3")
-                                 .arg(QLatin1String(flag),
-                                      QLatin1String(gpuChannelConnected ? "connected" : "unavailable"),
+        qInfo().noquote() << QStringLiteral("Embedded GPU GBM probe: gpu_channel=%1; %2")
+                                 .arg(QLatin1String(gpuChannelConnected ? "connected" : "unavailable"),
                                       result);
     };
-    if (m_cpuPresentationOnly && (m_remoteGpuCanvasPresent || probeOnly)) {
+    if (m_cpuPresentationOnly && m_remoteGpuCanvasPresent) {
         QOpenGLContext *context = new QOpenGLContext(this);
         QSurfaceFormat format = QSurfaceFormat::defaultFormat();
         format.setRenderableType(QSurfaceFormat::OpenGLES);
@@ -227,23 +220,16 @@ void PreviewPlayer::start()
         context->setFormat(format);
         QString exportError;
         bool exportAvailable = false;
+        bool gbmAvailable = false;
         if (context->create() && context->isOpenGLES()) {
             QOffscreenSurface probeSurface;
             probeSurface.setFormat(context->format());
             probeSurface.create();
             if (probeSurface.isValid() && context->makeCurrent(&probeSurface)) {
-                exportAvailable = !probeOnly && EmbeddedGpuTransport::canExportDmaBuf(&exportError);
+                exportAvailable = EmbeddedGpuTransport::canExportDmaBuf(&exportError);
                 if (!exportAvailable) {
-                    std::function<bool(const AuroraDmaBufFrame &, QString *)> verifyParent;
-                    if (m_remoteGpuTransport && verifyParentEnabled) {
-                        verifyParent = [this](const AuroraDmaBufFrame &frame, QString *error) {
-                            const bool ok = m_remoteGpuTransport->sendFrame(frame, error);
-                            // Do not leave a late reply on the stream after a timeout.
-                            if (!ok) m_remoteGpuTransport->closePeer();
-                            return ok;
-                        };
-                    }
-                    logGbmProbe(EmbeddedGpuTransport::probeGbmRenderTarget(run.width, run.height, verifyParent));
+                    logGbmProbe(EmbeddedGpuTransport::probeGbmRenderTarget(run.width, run.height, {},
+                                                                           &gbmAvailable));
                 } else {
                     logGbmProbe(QStringLiteral("skipped: EGL DMA-BUF export is available"));
                 }
@@ -256,20 +242,18 @@ void PreviewPlayer::start()
             exportError = tr("Could not create the worker GLES context.");
             logGbmProbe(QStringLiteral("skipped: worker GLES context unavailable"));
         }
-        if (exportAvailable) {
+        if (exportAvailable || gbmAvailable) {
             remoteGpuCanvasReady = m_gpuCanvas.prepareRemotePresentation(
                 context, presentRemoteGpuCanvas, releaseRemoteGpuCanvas, this);
             gpuCanvasReady = remoteGpuCanvasReady;
         }
         if (!gpuCanvasReady) {
             delete context;
-            if (!probeOnly) {
-                if (exportError.isEmpty())
-                    exportError = tr("The DMA-BUF GPU Canvas could not be initialized.");
-                // GPU readback still needs a working EGL binding on the drawing thread.
-                qWarning().noquote() << "Embedded GPU DMA-BUF presentation unavailable; using CPU Canvas:"
-                                     << exportError;
-            }
+            if (exportError.isEmpty())
+                exportError = tr("The DMA-BUF GPU Canvas could not be initialized.");
+            // GPU readback still needs a working EGL binding on the drawing thread.
+            qWarning().noquote() << "Embedded GPU DMA-BUF presentation unavailable; using CPU Canvas:"
+                                 << exportError;
         }
     } else if (m_cpuPresentationOnly) {
         logGbmProbe(QStringLiteral("skipped: GPU channel was not negotiated"));
@@ -323,6 +307,11 @@ void PreviewPlayer::start()
         run.apps_dir = m_appsDirUtf8.constData();
     } else if (m_picker) {
         run.system = m_picker->host();
+    }
+    if (!m_deniedPermissions.contains(QStringLiteral("notifications"))) {
+        // The core can retain host callbacks until the process exits.
+        if (!m_notificationHost) m_notificationHost = new NotificationHost;
+        run.notifications = m_notificationHost->host();
     }
     if (m_keyboard) {
         m_keyboard->start();
@@ -404,17 +393,24 @@ void PreviewPlayer::setSurface(PreviewSurface *surface)
     if (m_keyboard) m_keyboard->setSurface(surface, QSize(m_surfaceWidth, m_surfaceHeight));
 }
 
-void PreviewPlayer::setViewport(qreal width, qreal height, qreal pixelRatio)
+void PreviewPlayer::setViewport(qreal width, qreal height, qreal pixelRatio, int rotation)
 {
     if (width <= 0 || height <= 0 || pixelRatio <= 0) return;
+    if (rotation < -1 || rotation > 3) {
+        qWarning() << "Invalid Android viewport rotation:" << rotation;
+        return;
+    }
+    if (rotation < 0) rotation = m_displayRotation;
     const PreviewViewport viewport = previewViewport(width, height, pixelRatio, m_renderCap);
     const int surfaceWidth = viewport.pixels.width();
     const int surfaceHeight = viewport.pixels.height();
     const int density = viewport.density;
-    if (surfaceWidth == m_surfaceWidth && surfaceHeight == m_surfaceHeight && density == m_density) return;
+    if (surfaceWidth == m_surfaceWidth && surfaceHeight == m_surfaceHeight &&
+        density == m_density && rotation == m_displayRotation) return;
     m_surfaceWidth = surfaceWidth;
     m_surfaceHeight = surfaceHeight;
     m_density = density;
+    m_displayRotation = rotation;
     if (m_keyboard) m_keyboard->setSurface(m_surface, QSize(surfaceWidth, surfaceHeight));
     if (m_running && !m_closing) megler_set_surface(surfaceWidth, surfaceHeight, density, m_displayRotation);
 }
@@ -673,7 +669,7 @@ void PreviewPlayer::ended(int status, const QString &reason)
 
 bool PreviewPlayer::touch(int phase, float x, float y)
 {
-    if (!m_running || m_closing) return false;
+    if (!m_running || m_closing || m_backgrounded) return false;
     {
         QMutexLocker lock(&m_frameMutex);
         if (m_frame.size() != QSize(m_surfaceWidth, m_surfaceHeight)) return false;
@@ -684,7 +680,7 @@ bool PreviewPlayer::touch(int phase, float x, float y)
 
 void PreviewPlayer::back()
 {
-    if (!m_running || m_closing) return;
+    if (!m_running || m_closing || m_backgrounded) return;
     if (m_keyboard && m_keyboard->back()) return;
     megler_key(4, true);
     megler_key(4, false);
@@ -692,7 +688,7 @@ void PreviewPlayer::back()
 
 bool PreviewPlayer::gestureBack()
 {
-    if (!m_running || m_closing) return false;
+    if (!m_running || m_closing || m_backgrounded) return false;
     {
         QMutexLocker lock(&m_frameMutex);
         m_gestureFrame = m_frame;
@@ -727,6 +723,25 @@ void PreviewPlayer::closeToManager()
 void PreviewPlayer::close()
 {
     if (m_closing) return;
+    if (m_closeToBackground && !m_backgroundFinished && m_running) {
+        m_backgrounded = true;
+        if (m_keyboard) m_keyboard->hideKeyboard();
+        megler_set_paused(true);
+        if (!m_backgroundMonitor) {
+            m_backgroundMonitor = new QTimer(this);
+            m_backgroundMonitor->setInterval(1000);
+            connect(m_backgroundMonitor, &QTimer::timeout, this, [this]() {
+                if (!m_backgrounded || !m_running || megler_background_work_active()) return;
+                m_backgroundMonitor->stop();
+                m_backgrounded = false;
+                m_backgroundFinished = true;
+                close();
+            });
+        }
+        m_backgroundMonitor->start();
+        setStatus(tr("Android app is running in the background."));
+        return;
+    }
     m_closing = true;
     if (m_starting && m_sharedMicrog) m_sharedMicrog->close();
     if (m_picker) m_picker->stop();
@@ -745,22 +760,35 @@ void PreviewPlayer::close()
     megler_stop();
 }
 
-PreviewSurface::PreviewSurface(QQuickItem *parent) : QQuickPaintedItem(parent), m_wheelTimer(new QTimer(this))
+void PreviewPlayer::resumeFromBackground()
+{
+    if (!m_backgrounded || !m_running) return;
+    if (m_backgroundMonitor) m_backgroundMonitor->stop();
+    m_backgrounded = false;
+    m_backgroundFinished = false;
+    megler_set_paused(false);
+}
+
+PreviewSurface::PreviewSurface(QQuickItem *parent) : QQuickPaintedItem(parent),
+    m_wheelTimer(new QTimer(this)), m_viewportTimer(new QTimer(this))
 {
     setAcceptedMouseButtons(Qt::LeftButton | Qt::BackButton);
     m_wheelTimer->setInterval(16);
     connect(m_wheelTimer, &QTimer::timeout, this, &PreviewSurface::advanceWheelGesture);
+    m_viewportTimer->setSingleShot(true);
+    m_viewportTimer->setInterval(0);
+    connect(m_viewportTimer, &QTimer::timeout, this, &PreviewSurface::updateViewport);
     connect(this, &QQuickItem::windowChanged, this, [this](QQuickWindow *window) {
         cancelWheelGesture();
         if (window) {
             connect(window, &QWindow::screenChanged, this, [this, window]() {
-                if (window == this->window()) { cancelWheelGesture(); updateViewport(); }
+                if (window == this->window()) { cancelWheelGesture(); scheduleViewport(); }
             });
             connect(window, &QWindow::activeChanged, this, [this, window]() {
                 if (window == this->window() && !window->isActive()) cancelWheelGesture();
             });
         }
-        updateViewport();
+        scheduleViewport();
     });
 }
 
@@ -802,20 +830,20 @@ void PreviewSurface::geometryChanged(const QRectF &newGeometry, const QRectF &ol
 {
     if (newGeometry.size() != oldGeometry.size()) cancelWheelGesture();
     QQuickPaintedItem::geometryChanged(newGeometry, oldGeometry);
-    updateViewport();
+    if (newGeometry.size() != oldGeometry.size()) scheduleViewport();
 }
 
 void PreviewSurface::setPageOrientation(int orientation)
 {
     if (m_pageOrientation == orientation) return;
     m_pageOrientation = orientation;
-    updateDisplayRotation();
+    scheduleViewport();
 }
 
-void PreviewSurface::updateDisplayRotation()
+int PreviewSurface::displayRotation()
 {
     QScreen *screen = window() ? window()->screen() : nullptr;
-    if (!screen || !m_player) return;
+    if (!screen || !m_player) return -1;
     const Qt::ScreenOrientation native = screen->nativeOrientation();
     const Qt::ScreenOrientation actual = static_cast<Qt::ScreenOrientation>(m_pageOrientation);
     const Qt::ScreenOrientation effectiveNative =
@@ -840,12 +868,17 @@ void PreviewSurface::updateDisplayRotation()
                     << "primary" << m_loggedPrimary << "page" << m_loggedActual
                     << "rotation" << rotation;
     }
-    if (rotation >= 0) m_player->setDisplayRotation(rotation);
+    return rotation;
+}
+
+void PreviewSurface::scheduleViewport()
+{
+    // QML can update orientation, width and height separately in one event-loop turn.
+    m_viewportTimer->start();
 }
 
 void PreviewSurface::updateViewport()
 {
-    updateDisplayRotation();
     if (width() <= 0 || height() <= 0) return;
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     if (m_gpuItem) {
@@ -856,7 +889,7 @@ void PreviewSurface::updateViewport()
 #endif
     const qreal ratio = window() ? window()->devicePixelRatio() : 1;
     setTextureSize(previewViewport(width(), height(), ratio, m_player ? m_player->renderCap() : 0).pixels);
-    if (m_player) m_player->setViewport(width(), height(), ratio);
+    if (m_player) m_player->setViewport(width(), height(), ratio, displayRotation());
 }
 
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION

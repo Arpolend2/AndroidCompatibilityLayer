@@ -1,4 +1,6 @@
 #include <auroraapp.h>
+#include <RuntimeManager/RuntimeDispatcher>
+#include <RuntimeManager/Task>
 #include <QCoreApplication>
 #include <QProcess>
 #include <QDebug>
@@ -57,11 +59,6 @@
 #include "apk_store.h"
 #include "preview.h"
 #include "embedded_preview.h"
-#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
-#include <QOffscreenSurface>
-#include <QOpenGLContext>
-#include <QSurfaceFormat>
-#endif
 #include "store_preview_supervisor.h"
 #include "store_worker_teardown.h"
 #include "preview_activation_channel.h"
@@ -692,38 +689,6 @@ struct StoreWorkerTeardownMarker {
 int runApplication(int argc, char *argv[], void (*initReportWebView)())
 {
     const QByteArray mode = argc > 1 ? QByteArray(argv[1]) : QByteArray();
-    if (mode == "--gpu-probe") {
-        if (argc != 2) {
-            std::fprintf(stderr, "Usage: %s --gpu-probe\n", argv[0]);
-            return 2;
-        }
-#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
-        QScopedPointer<QGuiApplication> probeApp(Aurora::Application::application(argc, argv));
-        QOpenGLContext context;
-        QSurfaceFormat format = QSurfaceFormat::defaultFormat();
-        format.setRenderableType(QSurfaceFormat::OpenGLES);
-        format.setVersion(2, 0);
-        context.setFormat(format);
-        if (!context.create() || !context.isOpenGLES()) {
-            std::fprintf(stderr, "GPU probe: could not create a Qt GLES context.\n");
-            return 1;
-        }
-        QOffscreenSurface surface(context.screen());
-        surface.setFormat(context.format());
-        surface.create();
-        if (!surface.isValid() || !context.makeCurrent(&surface)) {
-            std::fprintf(stderr, "GPU probe: could not bind the Qt GLES context.\n");
-            return 1;
-        }
-        for (const QString &line : EmbeddedGpuTransport::currentGpuCapabilities())
-            std::puts(qPrintable(line));
-        context.doneCurrent();
-        return 0;
-#else
-        std::puts("GPU probe unavailable: build has no experimental GPU composition. Aurora Store uses CPU Canvas.");
-        return 1;
-#endif
-    }
     if (mode == "--unpack-bundle" || mode == "--unpack-store-bundle" || mode == "--unpack-store-xapk") {
         if (argc != 10) {
             std::fprintf(stderr, "Invalid APK bundle importer arguments.\n");
@@ -737,6 +702,10 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
     if (backgroundManager && argc != 2) {
         std::fprintf(stderr, "Invalid background manager arguments.\n");
         return 2;
+    }
+    if (backgroundManager) {
+        qunsetenv("AURORA_TASK_ID");
+        qunsetenv("AURORA_TASK_FD");
     }
     // A D-Bus-started manager can later show the same UI, including the WebView report form.
     if (!child)
@@ -923,7 +892,6 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
         if (storePreview && !embedded) {
             qmlRegisterType<PreviewSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
             EmbeddedPreview remote;
-            remote.setCpuFrameTransportOnly(qEnvironmentVariableIntValue("ACL_EMBEDDED_GPU_GBM_VERIFY_PARENT") == 1);
             QScopedPointer<QQuickView> view(Aurora::Application::createView());
             view->setTitle(QStringLiteral("Aurora Store"));
             view->setResizeMode(QQuickView::SizeRootObjectToView);
@@ -1123,11 +1091,40 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
         AuroraAudioOutput *audio = new AuroraAudioOutput;
         preview.setAudio(audio);
         AuroraNetworkHost network;
+        RuntimeManager::RuntimeDispatcher *standaloneDispatcher = nullptr;
+        bool standaloneRuntimeStarted = false;
+        if (standalone) {
+            standaloneDispatcher = RuntimeManager::RuntimeDispatcher::instance();
+            standaloneDispatcher->registerIntent(QStringLiteral("Start"),
+                [&preview, &view](const QJsonObject &, const RuntimeManager::RuntimeDispatcher::HandlerCb &reply) {
+                    reply(QJsonObject());
+                    QTimer::singleShot(0, &preview, [&preview, &view]() {
+                        if (view) {
+                            view->showFullScreen();
+                            view->raise();
+                            view->requestActivate();
+                        }
+                        preview.resumeFromBackground();
+                    });
+                });
+            const RuntimeManager::Error runtimeError = standaloneDispatcher->startService();
+            standaloneRuntimeStarted = !runtimeError;
+            if (!standaloneRuntimeStarted) {
+                standaloneDispatcher->unregisterIntent(QStringLiteral("Start"));
+                qWarning("RuntimeManager Start service unavailable for standalone app: %s",
+                         qPrintable(runtimeError.message()));
+            }
+        }
+        preview.setCloseToBackground(standalone && standaloneRuntimeStarted);
         QObject::connect(app.data(), &QGuiApplication::lastWindowClosed, &preview, &PreviewPlayer::close);
         QObject::connect(&preview, &PreviewPlayer::finished, app.data(), &QCoreApplication::quit);
         view->showFullScreen();
         QTimer::singleShot(50, &preview, [&preview]() { preview.start(); });
         const int result = app->exec();
+        if (standaloneDispatcher) {
+            standaloneDispatcher->unregisterIntent(QStringLiteral("Start"));
+            if (standaloneRuntimeStarted) standaloneDispatcher->stopService();
+        }
         auroraLocationShutdown();
         network.shutdown();
         picker->stop();
@@ -1232,11 +1229,46 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
     QStringList configuredWorkerArguments;
     QString configuredIdentityDirectory;
     bool sharedMicrogConfigured = false;
+    RuntimeManager::Task microgWatchdog(QStringLiteral("MicrogWatchdog"));
+    bool watchdogSettingKnown = false;
+    bool watchdogEnabled = false;
     configureSharedMicrog = [&]() {
         QSettings settings;
-        if (settings.value(QStringLiteral("googleServices/provider"),
-                           QStringLiteral("none")).toString() != QLatin1String("microg"))
+        const QString provider = settings.value(QStringLiteral("googleServices/provider"),
+                                                QStringLiteral("none")).toString();
+        if (settings.status() != QSettings::NoError) {
+            qWarning("Cannot read the Google services provider setting.");
             return;
+        }
+        const bool useMicrog = provider == QLatin1String("microg");
+        if ((!backgroundManager || (view && view->isVisible())) &&
+            (!watchdogSettingKnown || watchdogEnabled != useMicrog)) {
+            watchdogSettingKnown = true;
+            watchdogEnabled = useMicrog;
+            if (useMicrog) {
+                microgWatchdog.withInterval(900).withMaximumRunningTime(60).withAutostart(true);
+                microgWatchdog.start([](const RuntimeManager::Error &error) {
+                    if (error.isError())
+                        qWarning("Cannot schedule the microG watchdog: %s", qPrintable(error.message()));
+                });
+            } else {
+                microgWatchdog.stop(RuntimeManager::Task::StopFlag::Disable,
+                                    [](const RuntimeManager::Error &error) {
+                    if (error.isError())
+                        qWarning("Cannot disable the microG watchdog: %s", qPrintable(error.message()));
+                });
+            }
+        }
+        if (!useMicrog) {
+            if (sharedMicrogConfigured) {
+                lifecycle.disableSharedMicrogWorker();
+                sharedMicrogConfigured = false;
+                configuredWorkerProgram.clear();
+                configuredWorkerArguments.clear();
+                configuredIdentityDirectory.clear();
+            }
+            return;
+        }
 
         QString program, identityDirectory, error;
         QStringList arguments;
@@ -1269,6 +1301,7 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
         configuredWorkerArguments = arguments;
         configuredIdentityDirectory = identityDirectory;
         sharedMicrogConfigured = true;
+        lifecycle.enableSharedMicrogBackground();
     };
     configureSharedMicrog();
     QObject::connect(&lifecycle, &ManagerLifecycle::standaloneLaunchFailed, &lifecycle,

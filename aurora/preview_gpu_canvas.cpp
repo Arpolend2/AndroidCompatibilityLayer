@@ -22,6 +22,7 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QRadialGradient>
+#include <QRegion>
 #include <QThread>
 #include <QTransform>
 #include <QVector>
@@ -66,6 +67,7 @@ struct ThreadContext {
     GLuint filterProgram = 0;
     GLint filterTintLocation = -1;
     GLint filterOpacityLocation = -1;
+    GLint filterInputOpacityLocation = -1;
     GLint filterModeLocation = -1;
     GLint filterTextureLocation = -1;
     // The guest thread can outlive the host on an unexpected exit.
@@ -87,7 +89,7 @@ struct ThreadContext {
         if (context && filterProgram && QOpenGLContext::currentContext() == context)
             context->functions()->glDeleteProgram(filterProgram);
         filterProgram = 0;
-        filterTintLocation = filterOpacityLocation = filterModeLocation = filterTextureLocation = -1;
+        filterTintLocation = filterOpacityLocation = filterInputOpacityLocation = filterModeLocation = filterTextureLocation = -1;
         if (context && QOpenGLContext::currentContext() == context)
             context->doneCurrent();
         delete context;
@@ -133,6 +135,7 @@ bool ensureFilterProgram()
         "uniform sampler2D u_mask;\n"
         "uniform vec4 u_tint;\n"
         "uniform float u_opacity;\n"
+        "uniform float u_inputOpacity;\n"
         "uniform int u_filterMode;\n"
         "varying vec2 v_texCoord;\n"
         "float overlayChannel(float s, float d, float sa, float da) {\n"
@@ -165,7 +168,7 @@ bool ensureFilterProgram()
         "  if (mode == 17) return both + max(x, y);\n"
         "  return s + d * (1.0 - sa);\n"
         "}\n"
-        "void main() { vec4 source = texture2D(u_mask, v_texCoord); "
+        "void main() { vec4 source = texture2D(u_mask, v_texCoord) * u_inputOpacity; "
         "gl_FragColor = blendPremultiplied(u_filterMode, u_tint, source) * u_opacity; }\n";
     const auto compile = [gl](GLenum type, const char *source) -> GLuint {
         const GLuint shader = gl->glCreateShader(type);
@@ -218,9 +221,10 @@ bool ensureFilterProgram()
 
     const GLint tint = gl->glGetUniformLocation(program, "u_tint");
     const GLint opacity = gl->glGetUniformLocation(program, "u_opacity");
+    const GLint inputOpacity = gl->glGetUniformLocation(program, "u_inputOpacity");
     const GLint mode = gl->glGetUniformLocation(program, "u_filterMode");
     const GLint texture = gl->glGetUniformLocation(program, "u_mask");
-    if (tint < 0 || opacity < 0 || mode < 0 || texture < 0) {
+    if (tint < 0 || opacity < 0 || inputOpacity < 0 || mode < 0 || texture < 0) {
         gl->glDeleteProgram(program);
         qWarning("GPU Canvas color-filter shader uniforms are unavailable");
         return false;
@@ -228,6 +232,7 @@ bool ensureFilterProgram()
     threadContext.filterProgram = program;
     threadContext.filterTintLocation = tint;
     threadContext.filterOpacityLocation = opacity;
+    threadContext.filterInputOpacityLocation = inputOpacity;
     threadContext.filterModeLocation = mode;
     threadContext.filterTextureLocation = texture;
     return true;
@@ -293,6 +298,26 @@ QPainterPath pathFrom(const float *data, int count, int fill)
     return path;
 }
 
+bool isRectangularPath(const QPainterPath &path)
+{
+    if (path.elementCount() != 5 || !path.elementAt(0).isMoveTo())
+        return false;
+    const QRectF bounds = path.boundingRect();
+    if (bounds.isEmpty())
+        return false;
+    for (int i = 0; i < 4; ++i) {
+        const QPainterPath::Element a = path.elementAt(i);
+        const QPainterPath::Element b = path.elementAt(i + 1);
+        if (!b.isLineTo() ||
+            (a.x != bounds.left() && a.x != bounds.right()) ||
+            (a.y != bounds.top() && a.y != bounds.bottom()) ||
+            ((a.x == b.x) == (a.y == b.y)))
+            return false;
+    }
+    return path.elementAt(4).x == path.elementAt(0).x &&
+           path.elementAt(4).y == path.elementAt(0).y;
+}
+
 QPainter::CompositionMode compositionMode(int blend)
 {
     switch (blend) {
@@ -326,7 +351,7 @@ struct GpuBlendFactors {
     GLenum destinationAlpha;
 };
 
-bool gpuBlendFactors(int blend, GpuBlendFactors *factors)
+bool gpuBlendFactors(int blend, GpuBlendFactors *factors, bool rectangularCopy = false)
 {
     if (!factors)
         return false;
@@ -335,6 +360,15 @@ bool gpuBlendFactors(int blend, GpuBlendFactors *factors)
     factors->sourceAlpha = GL_ONE;
     factors->destinationAlpha = GL_ONE_MINUS_SRC_ALPHA;
     switch (blend) {
+    case MEGLER_GFX_BLEND_CLEAR:
+        if (!rectangularCopy) return false;
+        factors->sourceRgb = factors->sourceAlpha = GL_ZERO;
+        factors->destinationRgb = factors->destinationAlpha = GL_ZERO;
+        return true;
+    case MEGLER_GFX_BLEND_SRC:
+        if (!rectangularCopy) return false;
+        factors->destinationRgb = factors->destinationAlpha = GL_ZERO;
+        return true;
     case MEGLER_GFX_BLEND_SRC_OVER:
         return true;
     case MEGLER_GFX_BLEND_DST_OVER:
@@ -345,9 +379,29 @@ bool gpuBlendFactors(int blend, GpuBlendFactors *factors)
         factors->sourceRgb = factors->sourceAlpha = GL_ZERO;
         factors->destinationRgb = factors->destinationAlpha = GL_ONE_MINUS_SRC_ALPHA;
         return true;
+    case MEGLER_GFX_BLEND_SRC_IN:
+        if (!rectangularCopy) return false;
+        factors->sourceRgb = factors->sourceAlpha = GL_DST_ALPHA;
+        factors->destinationRgb = factors->destinationAlpha = GL_ZERO;
+        return true;
+    case MEGLER_GFX_BLEND_DST_IN:
+        if (!rectangularCopy) return false;
+        factors->sourceRgb = factors->sourceAlpha = GL_ZERO;
+        factors->destinationRgb = factors->destinationAlpha = GL_SRC_ALPHA;
+        return true;
+    case MEGLER_GFX_BLEND_SRC_OUT:
+        if (!rectangularCopy) return false;
+        factors->sourceRgb = factors->sourceAlpha = GL_ONE_MINUS_DST_ALPHA;
+        factors->destinationRgb = factors->destinationAlpha = GL_ZERO;
+        return true;
     case MEGLER_GFX_BLEND_SRC_ATOP:
         factors->sourceRgb = factors->sourceAlpha = GL_DST_ALPHA;
         factors->destinationRgb = factors->destinationAlpha = GL_ONE_MINUS_SRC_ALPHA;
+        return true;
+    case MEGLER_GFX_BLEND_DST_ATOP:
+        if (!rectangularCopy) return false;
+        factors->sourceRgb = factors->sourceAlpha = GL_ONE_MINUS_DST_ALPHA;
+        factors->destinationRgb = factors->destinationAlpha = GL_SRC_ALPHA;
         return true;
     case MEGLER_GFX_BLEND_XOR:
         factors->sourceRgb = factors->sourceAlpha = GL_ONE_MINUS_DST_ALPHA;
@@ -356,6 +410,12 @@ bool gpuBlendFactors(int blend, GpuBlendFactors *factors)
     case MEGLER_GFX_BLEND_PLUS:
         factors->sourceRgb = factors->sourceAlpha = GL_ONE;
         factors->destinationRgb = factors->destinationAlpha = GL_ONE;
+        return true;
+    case MEGLER_GFX_BLEND_MODULATE:
+        if (!rectangularCopy) return false;
+        factors->sourceRgb = GL_DST_COLOR;
+        factors->sourceAlpha = GL_DST_ALPHA;
+        factors->destinationRgb = factors->destinationAlpha = GL_ZERO;
         return true;
     case MEGLER_GFX_BLEND_SCREEN:
         factors->sourceRgb = factors->sourceAlpha = GL_ONE;
@@ -409,6 +469,9 @@ struct PreviewGpuCanvasHost::Canvas {
     struct State {
         QTransform matrix;
         QPainterPath clip;
+        QRegion copyClip;
+        bool copyClipValid = true;
+        int copyClipCuts = 0;
         bool hasClip = false;
         qreal opacity = 1.0;
     };
@@ -839,15 +902,18 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     if (!canvas || !paint)
         return false;
     GpuBlendFactors blendFactors;
-    if (!gpuBlendFactors(paint->blend, &blendFactors)) {
+    if (!gpuBlendFactors(paint->blend, &blendFactors, copyCanvas != nullptr)) {
         m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::UnsupportedBlend);
         return false;
     }
-    if (paint->blend != MEGLER_GFX_BLEND_SRC_OVER && !filterScalesWithSource(paint->filter_mode)) {
+    if (!copyCanvas && paint->blend != MEGLER_GFX_BLEND_SRC_OVER && !filterScalesWithSource(paint->filter_mode)) {
         m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::UnsupportedBlend);
         return false;
     }
     const bool scaledCopy = copyCanvas && QSizeF(copySource.size()) != deviceBounds.size();
+    const Canvas::State &state = canvas->states.last();
+    if (copyCanvas && !state.copyClipValid)
+        return false;
     if (scaledCopy) {
         GLint readFramebuffer = 0, drawFramebuffer = 0;
         auto *gl = threadContext.context->functions();
@@ -863,7 +929,6 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     }
 
     QRectF clippedBounds = deviceBounds.intersected(QRectF(0, 0, canvas->width, canvas->height));
-    const Canvas::State &state = canvas->states.last();
     if (state.hasClip)
         clippedBounds = clippedBounds.intersected(state.clip.boundingRect());
     if (clippedBounds.isEmpty())
@@ -874,6 +939,12 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     const int scissorBottom = qBound(0, static_cast<int>(std::ceil(clippedBounds.bottom())), canvas->height);
     if (scissorLeft >= scissorRight || scissorTop >= scissorBottom)
         return true;
+    const QRegion copyClip = copyCanvas
+        ? state.copyClip.intersected(QRect(scissorLeft, scissorTop,
+                                           scissorRight - scissorLeft, scissorBottom - scissorTop))
+        : QRegion();
+    if (copyCanvas && copyClip.isEmpty())
+        return true;
 
     ThreadFramebuffer framebuffer = threadContext.framebuffers.value(canvas->id);
     QOpenGLFunctions *gl = threadContext.context->functions();
@@ -882,18 +953,57 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     if (scaledCopy) {
         auto *extra = threadContext.context->extraFunctions();
         const auto target = deviceBounds.toRect();
+        const bool smooth = (paint->flags & MEGLER_GFX_FILTER_BITMAP) != 0;
+        GLuint snapshotTexture = 0, snapshotFramebuffer = 0;
+        GLint previousTexture = 0;
+        gl->glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+        gl->glBindFramebuffer(GL_FRAMEBUFFER, threadContext.framebuffers.value(copyCanvas->id).id);
+        if (smooth) {
+            gl->glGenTextures(1, &snapshotTexture);
+            gl->glBindTexture(GL_TEXTURE_2D, snapshotTexture);
+            gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, copySource.width(), copySource.height(), 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            gl->glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, copySource.x(),
+                                    copyCanvas->height - copySource.y() - copySource.height(),
+                                    copySource.width(), copySource.height());
+            gl->glGenFramebuffers(1, &snapshotFramebuffer);
+            gl->glBindFramebuffer(GL_READ_FRAMEBUFFER, snapshotFramebuffer);
+            gl->glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, snapshotTexture, 0);
+            const bool ready = snapshotTexture && snapshotFramebuffer &&
+                gl->glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
+                gl->glGetError() == GL_NO_ERROR;
+            if (!ready) {
+                gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
+                gl->glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+                if (snapshotFramebuffer) gl->glDeleteFramebuffers(1, &snapshotFramebuffer);
+                if (snapshotTexture) gl->glDeleteTextures(1, &snapshotTexture);
+                clearGlErrors(gl);
+                m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::GpuFailure);
+                return false;
+            }
+        }
         const bool scissor = gl->glIsEnabled(GL_SCISSOR_TEST);
         if (scissor)
             gl->glDisable(GL_SCISSOR_TEST);
-        gl->glBindFramebuffer(GL_READ_FRAMEBUFFER, threadContext.framebuffers.value(copyCanvas->id).id);
         gl->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer.filterId);
-        extra->glBlitFramebuffer(copySource.x(), copyCanvas->height - copySource.y() - copySource.height(),
-                                 copySource.x() + copySource.width(), copyCanvas->height - copySource.y(),
+        const int sourceLeft = smooth ? 0 : copySource.x();
+        const int sourceBottom = smooth ? 0 : copyCanvas->height - copySource.y() - copySource.height();
+        extra->glBlitFramebuffer(sourceLeft, sourceBottom,
+                                 sourceLeft + copySource.width(), sourceBottom + copySource.height(),
                                  target.x(), canvas->height - target.y() - target.height(),
                                  target.x() + target.width(), canvas->height - target.y(),
-                                 GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                                 GL_COLOR_BUFFER_BIT, smooth ? GL_LINEAR : GL_NEAREST);
         if (scissor)
             gl->glEnable(GL_SCISSOR_TEST);
+        gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
+        gl->glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+        if (snapshotFramebuffer) gl->glDeleteFramebuffers(1, &snapshotFramebuffer);
+        if (snapshotTexture) gl->glDeleteTextures(1, &snapshotTexture);
     } else if (copyCanvas) {
         const int width = scissorRight - scissorLeft, height = scissorBottom - scissorTop;
         const QPoint origin = copySource.topLeft() + QPoint(scissorLeft, scissorTop) - deviceBounds.topLeft().toPoint();
@@ -1011,6 +1121,8 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
                     static_cast<GLfloat>(tint.blueF()) * tintAlpha,
                     tintAlpha);
     gl->glUniform1f(threadContext.filterOpacityLocation, static_cast<GLfloat>(canvas->states.last().opacity));
+    gl->glUniform1f(threadContext.filterInputOpacityLocation,
+                    copyCanvas ? static_cast<GLfloat>(qAlpha(paint->color) / 255.0) : 1.0f);
     gl->glUniform1i(threadContext.filterModeLocation, paint->filter_mode);
     gl->glUniform1i(threadContext.filterTextureLocation, 0);
     gl->glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -1018,8 +1130,17 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     gl->glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, vertices);
 
     GLenum error = gl->glGetError();
-    if (error == GL_NO_ERROR)
-        gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    if (error == GL_NO_ERROR) {
+        if (copyCanvas) {
+            for (const QRect &rect : copyClip.rects()) {
+                gl->glScissor(rect.x(), canvas->height - rect.y() - rect.height(),
+                              rect.width(), rect.height());
+                gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            }
+        } else {
+            gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+    }
     const GLenum drawError = gl->glGetError();
 
     if (attributeBuffer)
@@ -1185,7 +1306,7 @@ bool PreviewGpuCanvasHost::drawFilteredBitmap(Canvas *canvas, const megler_gfx_i
 bool PreviewGpuCanvasHost::copyCanvasPixels(Canvas *canvas, Canvas *source, const float *src, const float *dst,
                                             const megler_gfx_paint *paint)
 {
-    if (!src || !dst || !paint || qAlpha(paint->color) != 255 ||
+    if (!src || !dst || !paint ||
         paint->filter_mode > MEGLER_GFX_BLEND_LIGHTEN || source->states.size() != 1)
         return false;
     const Canvas::State &state = canvas->states.last();
@@ -1206,34 +1327,35 @@ bool PreviewGpuCanvasHost::copyCanvasPixels(Canvas *canvas, Canvas *source, cons
     const QRectF sourceRect(src[0], src[1], qreal(src[2]) - src[0], qreal(src[3]) - src[1]);
     const QRectF bounds(dst[0] + state.matrix.dx(), dst[1] + state.matrix.dy(),
                         qreal(dst[2]) - dst[0], qreal(dst[3]) - dst[1]);
+    if (bounds.width() <= 0 || bounds.height() <= 0)
+        return false;
     const bool scaled = sourceRect.size() != bounds.size();
-    if (scaled && (m_offscreenContexts || canvas == source || sourceRect.size() * 2 != bounds.size() ||
-                   (paint->flags & MEGLER_GFX_FILTER_BITMAP) || paint->filter_mode >= 0 ||
-                   paint->blend != MEGLER_GFX_BLEND_SRC_OVER || state.opacity != 1.0 ||
-                   !QRectF(0, 0, canvas->width, canvas->height).contains(bounds)))
+    const auto exactNearestScale = [](qreal from, qreal to) {
+        int numerator = static_cast<int>(from);
+        int denominator = static_cast<int>(to);
+        while (denominator) {
+            const int remainder = numerator % denominator;
+            numerator = denominator;
+            denominator = remainder;
+        }
+        return (static_cast<int>(from) / numerator) % 2 == 1;
+    };
+    if (scaled && (m_offscreenContexts ||
+                   (!(paint->flags & MEGLER_GFX_FILTER_BITMAP) &&
+                    (!exactNearestScale(sourceRect.width(), bounds.width()) ||
+                     !exactNearestScale(sourceRect.height(), bounds.height())))))
         return false;
-    if (canvas == source && sourceRect.intersects(bounds) && sourceRect != bounds)
+    if (!state.copyClipValid)
         return false;
-    if (state.hasClip) {
-        const QRectF clipBounds = state.clip.boundingRect();
-        QPainterPath rectangle;
-        rectangle.addRect(clipBounds);
-        if (rectangle != state.clip || !integral(clipBounds.left()) || !integral(clipBounds.top()) ||
-            !integral(clipBounds.right()) || !integral(clipBounds.bottom()))
-            return false;
-    }
 
     if (paint->blend == MEGLER_GFX_BLEND_DST)
         return true;
     GpuBlendFactors factors;
-    if (!gpuBlendFactors(paint->blend, &factors))
+    if (!gpuBlendFactors(paint->blend, &factors, true))
         return false;
     megler_gfx_paint copyPaint = *paint;
     if (copyPaint.filter_mode < 0)
         copyPaint.filter_mode = MEGLER_GFX_BLEND_DST; // Identity filter.
-    if (copyPaint.blend != MEGLER_GFX_BLEND_SRC_OVER && !filterScalesWithSource(copyPaint.filter_mode))
-        return false;
-
     // Sharing a texture is not enough to order writes submitted by different contexts.
     // Decline rather than impose a new cross-context fence or read stale pixels.
     if (!ensureCurrent("copy-canvas") || source->contextId.load() != threadContext.contextId ||
@@ -1290,12 +1412,31 @@ void *PreviewGpuCanvasHost::cpuShader(void *handle) const
     return handle ? static_cast<Shader *>(handle)->cpuShader : nullptr;
 }
 
-void PreviewGpuCanvasHost::clip(Canvas *canvas, const QPainterPath &path, int op)
+void PreviewGpuCanvasHost::clip(Canvas *canvas, const QPainterPath &path, int op, bool rectangular)
 {
     if (!canvas || canvas->states.isEmpty())
         return;
     Canvas::State &state = canvas->states.last();
     const QPainterPath devicePath = state.matrix.map(path);
+    if (state.copyClipValid) {
+        const QRectF rect = devicePath.boundingRect();
+        const auto integral = [](qreal value) {
+            return value >= -16777216 && value <= 16777216 && value == std::floor(value);
+        };
+        if (!rectangular || state.matrix.type() > QTransform::TxTranslate ||
+            !integral(rect.left()) || !integral(rect.top()) ||
+            !integral(rect.right()) || !integral(rect.bottom()) ||
+            (op != MEGLER_GFX_CLIP_INTERSECT && op != MEGLER_GFX_CLIP_DIFFERENCE) ||
+            (op == MEGLER_GFX_CLIP_DIFFERENCE && ++state.copyClipCuts > 8)) {
+            state.copyClipValid = false;
+        } else {
+            const QRect deviceRect = rect.toRect();
+            if (op == MEGLER_GFX_CLIP_DIFFERENCE)
+                state.copyClip -= QRegion(deviceRect);
+            else
+                state.copyClip &= QRegion(deviceRect);
+        }
+    }
     if (op == MEGLER_GFX_CLIP_DIFFERENCE) {
         if (state.hasClip)
             state.clip = state.clip.subtracted(devicePath);
@@ -1396,6 +1537,7 @@ void *MEGLER_CB PreviewGpuCanvasHost::canvasNew(void *user, void *pixels, int wi
     canvas->stride = stride;
     canvas->cpuCanvas = cpuCanvas;
     canvas->states.append(Canvas::State());
+    canvas->states.last().copyClip = QRegion(0, 0, width, height);
     {
         QMutexLocker lock(&self->m_mutex);
         canvas->id = self->m_nextCanvasId++;
@@ -1558,7 +1700,7 @@ void MEGLER_CB PreviewGpuCanvasHost::saveLayer(void *user, void *handle, const f
     if (bounds) {
         QPainterPath boundsPath;
         boundsPath.addRect(QRectF(bounds[0], bounds[1], bounds[2] - bounds[0], bounds[3] - bounds[1]));
-        self->clip(canvas, boundsPath, MEGLER_GFX_CLIP_INTERSECT);
+        self->clip(canvas, boundsPath, MEGLER_GFX_CLIP_INTERSECT, true);
     }
     if (self->m_cpu->save_layer)
         self->m_cpu->save_layer(self->m_cpu->user, canvas->cpuCanvas, bounds, alpha, blend);
@@ -1580,7 +1722,7 @@ void MEGLER_CB PreviewGpuCanvasHost::saveLayerBlur(void *user, void *handle, con
     if (bounds) {
         QPainterPath boundsPath;
         boundsPath.addRect(QRectF(bounds[0], bounds[1], bounds[2] - bounds[0], bounds[3] - bounds[1]));
-        self->clip(canvas, boundsPath, MEGLER_GFX_CLIP_INTERSECT);
+        self->clip(canvas, boundsPath, MEGLER_GFX_CLIP_INTERSECT, true);
     }
     if (self->m_cpu->save_layer_blur) {
         self->m_cpu->save_layer_blur(self->m_cpu->user, canvas->cpuCanvas, bounds, alpha, radiusX, radiusY, clamp);
@@ -1629,7 +1771,7 @@ void MEGLER_CB PreviewGpuCanvasHost::clipRect(void *user, void *handle, float le
     }
     QPainterPath path;
     path.addRect(QRectF(left, top, right - left, bottom - top));
-    self->clip(canvas, path, op);
+    self->clip(canvas, path, op, true);
     if (self->m_cpu->clip_rect)
         self->m_cpu->clip_rect(self->m_cpu->user, canvas->cpuCanvas, left, top, right, bottom, op);
 }
@@ -1643,7 +1785,8 @@ void MEGLER_CB PreviewGpuCanvasHost::clipPath(void *user, void *handle, const fl
             self->m_cpu->clip_path(self->m_cpu->user, handle, path, count, fill, op);
         return;
     }
-    self->clip(canvas, pathFrom(path, count, fill), op);
+    const QPainterPath shape = pathFrom(path, count, fill);
+    self->clip(canvas, shape, op, isRectangularPath(shape));
     if (self->m_cpu->clip_path)
         self->m_cpu->clip_path(self->m_cpu->user, canvas->cpuCanvas, path, count, fill, op);
 }
