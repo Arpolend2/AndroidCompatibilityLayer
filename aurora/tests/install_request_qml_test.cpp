@@ -83,10 +83,16 @@ class FakeProbe : public QObject
     Q_PROPERTY(QString officialStoreStatus READ empty CONSTANT)
     Q_PROPERTY(bool officialStoreDownloadActive READ disabled CONSTANT)
     Q_PROPERTY(int officialStoreDownloadProgress READ unknownProgress CONSTANT)
+    Q_PROPERTY(bool managerUpdateBusy READ managerUpdateBusy NOTIFY managerUpdateChanged)
+    Q_PROPERTY(QString managerUpdateStatus READ managerUpdateStatus NOTIFY managerUpdateChanged)
+    Q_PROPERTY(int managerUpdateProgress READ managerUpdateProgress NOTIFY managerUpdateChanged)
+    Q_PROPERTY(QString managerVersion READ managerVersion CONSTANT)
+    Q_PROPERTY(bool autoCheckManagerUpdate READ autoCheckManagerUpdate NOTIFY managerUpdateChanged)
     Q_PROPERTY(QString runtimeSettingsError READ empty CONSTANT)
     Q_PROPERTY(QString coreLog READ coreLog NOTIFY coreLogChanged)
     Q_PROPERTY(bool coreLogAvailable READ yes CONSTANT)
     Q_PROPERTY(bool detailedLogEnabled READ detailedLogEnabled NOTIFY detailedLogChanged)
+    Q_PROPERTY(bool detailedLogPaused READ detailedLogPaused NOTIFY detailedLogChanged)
     Q_PROPERTY(QString detailedLogError READ empty CONSTANT)
 public:
     bool previewRunning() const { return m_previewRunning; }
@@ -96,6 +102,20 @@ public:
     void setBusy(bool busy) { m_busy = busy; emit busyChanged(); }
     bool yes() const { return true; }
     bool disabled() const { return false; }
+    bool managerUpdateBusy() const { return m_managerUpdateBusy; }
+    QString managerUpdateStatus() const { return m_managerUpdateStatus; }
+    int managerUpdateProgress() const { return m_managerUpdateProgress; }
+    QString managerVersion() const { return QStringLiteral("0.3.2-1"); }
+    bool autoCheckManagerUpdate() const { return m_autoCheckManagerUpdate; }
+    Q_INVOKABLE void setAutoCheckManagerUpdate(bool enabled) { m_autoCheckManagerUpdate = enabled; emit managerUpdateChanged(); }
+    Q_INVOKABLE void checkManagerUpdateAtStart() {}
+    Q_INVOKABLE void checkManagerUpdate() { setManagerUpdate(true, -1); }
+    void setManagerUpdate(bool busy, int progress) {
+        m_managerUpdateBusy = busy;
+        m_managerUpdateProgress = progress;
+        m_managerUpdateStatus = busy ? QStringLiteral("Checking") : QStringLiteral("Done");
+        emit managerUpdateChanged();
+    }
     bool rpmBusy() const { return m_rpmBusy; }
     bool autoInstallRpm() const { return m_autoInstallRpm; }
     Q_INVOKABLE void setAutoInstallRpm(bool enabled) { m_autoInstallRpm = enabled; emit runtimeSettingsChanged(); }
@@ -119,10 +139,12 @@ public:
     QString empty() const { return QString(); }
     QString coreLog() const { return m_coreLog; }
     bool detailedLogEnabled() const { return m_detailedLogEnabled; }
-    Q_INVOKABLE void setDetailedLogEnabled(bool enabled) { m_detailedLogEnabled = enabled; emit detailedLogChanged(); }
+    bool detailedLogPaused() const { return m_detailedLogPaused; }
+    Q_INVOKABLE void setDetailedLogEnabled(bool enabled) { m_detailedLogEnabled = enabled; m_detailedLogPaused = false; emit detailedLogChanged(); }
+    Q_INVOKABLE void setDetailedLogPaused(bool paused) { m_detailedLogPaused = paused; emit detailedLogChanged(); }
     Q_INVOKABLE QString diagnosticReport() const { return QStringLiteral("Safe test report"); }
     Q_INVOKABLE QString saveCoreLog() { ++saveLogCount; return saveLogResult; }
-    Q_INVOKABLE QString clearSavedLogs() { ++clearLogsCount; return QStringLiteral("Log files deleted: 2."); }
+    Q_INVOKABLE QString clearSavedLogs() { ++clearLogsCount; setCoreLog(QString()); return QStringLiteral("Current log cleared. Files deleted: 2."); }
     int saveLogCount = 0;
     int clearLogsCount = 0;
     QString saveLogResult = QStringLiteral("Saved for test");
@@ -230,11 +252,18 @@ signals:
     void microgPreviewRequested();
     void officialStoreDownloadNotification(const QString &message, int percent, bool complete);
     void officialStoreLaunchFailed(const QString &message);
+    void managerUpdateChanged();
+    void managerUpdateAvailable(const QString &message);
 private:
+    bool m_managerUpdateBusy = false;
+    bool m_autoCheckManagerUpdate = false;
+    int m_managerUpdateProgress = -1;
+    QString m_managerUpdateStatus;
     bool m_visible = true;
     bool m_busy = false;
     bool m_previewRunning = false;
     bool m_detailedLogEnabled = false;
+    bool m_detailedLogPaused = false;
     bool m_rpmBusy = false;
     bool m_autoInstallRpm = false;
     bool m_rpmOpened = false;
@@ -255,6 +284,13 @@ static bool fits(const QQuickItem *item, const QQuickItem *parent)
            topLeft.x() >= 0 && topLeft.y() >= 0 &&
            topLeft.x() + item->width() <= parent->width() &&
            topLeft.y() + item->height() <= parent->height();
+}
+
+static bool fitsHorizontally(const QQuickItem *item, const QQuickItem *parent)
+{
+    const QPointF topLeft = item->mapToItem(parent, QPointF());
+    return item->isVisible() && item->width() > 0 && item->height() > 0 &&
+           topLeft.x() >= 0 && topLeft.x() + item->width() <= parent->width();
 }
 
 static bool click(QQuickItem *button)
@@ -283,6 +319,7 @@ static void coverItemsNamed(QQuickItem *parent, const QString &name, QList<QQuic
 static bool checkDetailedLog(QObject *root, FakeProbe &probe)
 {
     auto *toggle = root->findChild<QQuickItem *>(QStringLiteral("toggleDetailedLog"));
+    auto *hold = root->findChild<QQuickItem *>(QStringLiteral("holdDetailedLog"));
     auto *save = root->findChild<QQuickItem *>(QStringLiteral("saveLog"));
     auto *send = root->findChild<QQuickItem *>(QStringLiteral("reportToYandex"));
     auto *clear = root->findChild<QQuickItem *>(QStringLiteral("clearLogFolder"));
@@ -290,7 +327,7 @@ static bool checkDetailedLog(QObject *root, FakeProbe &probe)
     auto *menu = root->findChild<QQuickItem *>(QStringLiteral("mainPulleyMenu"));
     if (!menu || !menu->setProperty("active", true)) return false;
     QCoreApplication::processEvents();
-    if (!toggle || !save || !send || !clear || !content || save->isVisible() || send->isVisible() ||
+    if (!toggle || !hold || !save || !send || !clear || !content || hold->isVisible() || save->isVisible() || send->isVisible() ||
         clear->isVisible() ||
         !toggle->isVisible() || content->isVisible() ||
         toggle->property("text").toString() != QStringLiteral("Enable logs")) return false;
@@ -328,8 +365,9 @@ static bool checkDetailedLog(QObject *root, FakeProbe &probe)
             items.append(item);
     }
     if (!content->isVisible() || !save->isVisible() || !send->isVisible() ||
-        toggle->property("text").toString() != QStringLiteral("Disable logs") ||
-        !clear->isVisible() || items.indexOf(clear) != items.indexOf(toggle) + 1 ||
+        toggle->property("text").toString() != QStringLiteral("Disable and clear logs") ||
+        !hold->isVisible() || items.indexOf(hold) != items.indexOf(toggle) + 1 ||
+        !clear->isVisible() || items.indexOf(clear) != items.indexOf(hold) + 1 ||
         items.indexOf(send) <= items.indexOf(clear) || items.indexOf(save) <= items.indexOf(send)) {
         std::fprintf(stderr, "Enabled journal menu or order is incorrect (visible entries: %d; toggle=%d clear=%d send=%d save=%d)\n",
                      items.size(), items.indexOf(toggle), items.indexOf(clear), items.indexOf(send), items.indexOf(save));
@@ -339,6 +377,9 @@ static bool checkDetailedLog(QObject *root, FakeProbe &probe)
     if (!message || save->isEnabled() || !send->isEnabled() ||
         probe.saveLogCount != 0 || !message->property("text").toString().isEmpty()) return false;
     probe.setCoreLog(QStringLiteral("first line\nsecond line\n"));
+    if (!QMetaObject::invokeMethod(hold, "clicked") || !probe.detailedLogPaused() ||
+        hold->property("text").toString() != QStringLiteral("Resume logs") ||
+        !QMetaObject::invokeMethod(hold, "clicked") || probe.detailedLogPaused()) return false;
     auto *logText = root->findChild<QQuickItem *>(QStringLiteral("coreLogText"));
     if (!logText ||
         logText->property("text").toString() != QStringLiteral("second line\nfirst line") ||
@@ -371,7 +412,8 @@ static bool checkDetailedLog(QObject *root, FakeProbe &probe)
     if (!QMetaObject::invokeMethod(clear, "clicked")) return false;
     auto *clearDialog = waitForCleanupDialog();
     if (!clearDialog || !QMetaObject::invokeMethod(clearDialog, "accepted") ||
-        probe.clearLogsCount != 1 || message->property("text").toString() != QStringLiteral("Log files deleted: 2.")) {
+        probe.clearLogsCount != 1 || !probe.coreLog().isEmpty() ||
+        message->property("text").toString() != QStringLiteral("Current log cleared. Files deleted: 2.")) {
         std::fprintf(stderr, "Cleanup confirmation failed (dialog: %d; calls: %d; message: %s)\n",
                      clearDialog != nullptr, probe.clearLogsCount, qPrintable(message->property("text").toString()));
         return false;
@@ -398,6 +440,7 @@ int main(int argc, char **argv)
                                      QByteArray(argv[2]) == "--launch-install-only" ||
                                      QByteArray(argv[2]) == "--cover-only" ||
                                      QByteArray(argv[2]) == "--microg-only" ||
+                                     QByteArray(argv[2]) == "--manager-update-only" ||
                                      QByteArray(argv[2]) == "--translation-only"))) return 2;
     QTranslator translator;
     if (argc == 3 && QByteArray(argv[2]) == "--translation-only" &&
@@ -576,6 +619,93 @@ int main(int argc, char **argv)
             }
             return 0;
         }
+        if (argc == 3 && QByteArray(argv[2]) == "--manager-update-only") {
+            probe.setVisible(false);
+            QQuickItem *page = root->findChild<QQuickItem *>(QStringLiteral("launcherPage"));
+            QQuickItem *action = root->findChild<QQuickItem *>(QStringLiteral("checkManagerUpdate"));
+            QQuickItem *progress = root->findChild<QQuickItem *>(QStringLiteral("managerUpdateProgress"));
+            QQuickItem *automatic = root->findChild<QQuickItem *>(QStringLiteral("autoCheckManagerUpdate"));
+            QQuickItem *about = root->findChild<QQuickItem *>(QStringLiteral("managerAboutVersion"));
+            QQuickItem *description = root->findChild<QQuickItem *>(QStringLiteral("managerAboutDescription"));
+            QQuickItem *header = root->findChild<QQuickItem *>(QStringLiteral("managerAboutHeader"));
+            QQuickItem *updateHeading = root->findChild<QQuickItem *>(QStringLiteral("managerUpdateHeading"));
+            QQuickItem *updateDescription = root->findChild<QQuickItem *>(QStringLiteral("managerUpdateDescription"));
+            QQuickItem *aboutHeading = root->findChild<QQuickItem *>(QStringLiteral("managerAboutHeading"));
+            QQuickItem *notes = root->findChild<QQuickItem *>(QStringLiteral("managerReleaseNotes"));
+            QQuickItem *icon = root->findChild<QQuickItem *>(QStringLiteral("managerAboutIcon"));
+            QList<QQuickItem *> usedLinks, optionalLinks;
+            if (page) {
+                coverItemsNamed(page, QStringLiteral("usedProjectLink"), &usedLinks);
+                coverItemsNamed(page, QStringLiteral("optionalProjectLink"), &optionalLinks);
+            }
+            if (!page || !action || !progress || !automatic || !about || !description || !header || !notes || !icon ||
+                !updateHeading || !updateDescription || !aboutHeading ||
+                !root->findChild<QObject *>(QStringLiteral("managerProjectLink")) ||
+                usedLinks.size() != 16 || optionalLinks.size() != 2 ||
+                !page->setProperty("section", 3) ||
+                !about->property("text").toString().contains(QStringLiteral("0.3.2-1")) ||
+                !notes->property("visible").toBool() ||
+                icon->property("status").toInt() != 1 ||
+                icon->property("sourceSize").toSize() != QSize(512, 512) ||
+                !notes->property("text").toString().contains(QStringLiteral("Optional update checks at startup.")) ||
+                notes->property("text").toString().count(QLatin1Char('\n')) != 4) {
+                std::fprintf(stderr, "Update or about section missing: page=%d action=%d progress=%d auto=%d about=%d project=%d used=%d optional=%d\n",
+                             bool(page), bool(action), bool(progress), bool(automatic), bool(about),
+                             bool(root->findChild<QObject *>(QStringLiteral("managerProjectLink"))),
+                             usedLinks.size(), optionalLinks.size());
+                return 1;
+            }
+            const QList<QQuickItem *> settingsItems = updateHeading->parentItem()->childItems();
+            if (updateDescription->parentItem() != updateHeading->parentItem() ||
+                aboutHeading->parentItem() != updateHeading->parentItem() ||
+                settingsItems.indexOf(updateHeading) >= settingsItems.indexOf(updateDescription) ||
+                settingsItems.indexOf(updateDescription) + 1 != settingsItems.indexOf(aboutHeading)) {
+                std::fprintf(stderr, "Update section is not directly before About\n");
+                return 1;
+            }
+            if (!click(automatic) || !probe.autoCheckManagerUpdate()) {
+                std::fprintf(stderr, "Automatic update check setting failed\n");
+                return 1;
+            }
+            for (const QSize size : {QSize(480, 854), QSize(854, 480), QSize(320, 240)}) {
+                view.resize(size);
+                page->setSize(size);
+                QTest::qWait(100);
+                if (!fitsHorizontally(action, action->parentItem()) ||
+                    !fitsHorizontally(notes, notes->parentItem()) ||
+                    !fits(icon, header) || !fits(about, header) || !fits(description, header) ||
+                    !fitsHorizontally(usedLinks.first(), usedLinks.first()->parentItem()) ||
+                    qAbs(icon->width() - icon->height()) > 0.01 ||
+                    icon->mapToItem(header, QPointF(icon->width(), 0)).x() >
+                        about->mapToItem(header, QPointF()).x() ||
+                    icon->mapToItem(header, QPointF(icon->width(), 0)).x() >
+                        description->mapToItem(header, QPointF()).x()) {
+                    std::fprintf(stderr, "Settings horizontal layout invalid at %dx%d\n",
+                                 size.width(), size.height());
+                    return 1;
+                }
+            }
+            if (progress->isVisible() || !click(action)) {
+                std::fprintf(stderr, "Update action could not be invoked\n"); return 1;
+            }
+            QCoreApplication::processEvents();
+            if (!probe.managerUpdateBusy() || !progress->isVisible() ||
+                !progress->property("indeterminate").toBool() || action->property("enabled").toBool()) {
+                std::fprintf(stderr, "Update check indicator state is incorrect: busy=%d visible=%d indeterminate=%d enabled=%d\n",
+                             probe.managerUpdateBusy(), progress->isVisible(),
+                             progress->property("indeterminate").toBool(), action->property("enabled").toBool()); return 1;
+            }
+            probe.setManagerUpdate(true, 42);
+            QCoreApplication::processEvents();
+            if (progress->property("indeterminate").toBool() ||
+                qAbs(progress->property("value").toReal() - 0.42) > 0.001) {
+                std::fprintf(stderr, "Update percentage state is incorrect\n"); return 1;
+            }
+            probe.setManagerUpdate(false, -1);
+            QCoreApplication::processEvents();
+            if (progress->isVisible() || !action->property("enabled").toBool()) return 1;
+            return 0;
+        }
         if (argc == 3 && QByteArray(argv[2]) == "--auto-rpm-only") {
             probe.setVisible(false);
             QObject *page = root->findChild<QObject *>(QStringLiteral("launcherPage"));
@@ -638,8 +768,12 @@ int main(int argc, char **argv)
         }
         if (argc == 3 && QByteArray(argv[2]) == "--translation-only") {
             QObject *button = root->findChild<QObject *>(QStringLiteral("installApk"));
+            QObject *notes = root->findChild<QObject *>(QStringLiteral("managerReleaseNotes"));
             if (!button || button->property("text").toString() !=
-                QString::fromUtf8("Добавить установочный пакет")) return 1;
+                QString::fromUtf8("Добавить установочный пакет") || !notes ||
+                !notes->property("text").toString().contains(
+                    QString::fromUtf8("Необязательная проверка обновлений при запуске.")) ||
+                notes->property("text").toString().count(QLatin1Char('\n')) != 4) return 1;
             return 0;
         }
         auto prompt = root->findChild<QQuickItem *>(QStringLiteral("installConfirmation"));

@@ -21,6 +21,7 @@
 #include "application_executables.h"
 #include <QSysInfo>
 #include <QTimer>
+#include <QDateTime>
 #include <QQuickView>
 #include <QScreen>
 #include <QUuid>
@@ -30,6 +31,7 @@
 #include "external_apk_install.h"
 #include "microg_install.h"
 #include "official_store_download.h"
+#include "manager_update.h"
 #include "preview_sessions.h"
 #include "runtime_settings.h"
 #include "log_channel.h"
@@ -77,11 +79,17 @@ class Probe : public QObject
     Q_PROPERTY(QString officialStoreStatus READ officialStoreStatus NOTIFY officialStoreChanged)
     Q_PROPERTY(bool officialStoreDownloadActive READ officialStoreDownloadActive NOTIFY officialStoreChanged)
     Q_PROPERTY(int officialStoreDownloadProgress READ officialStoreDownloadProgress NOTIFY officialStoreChanged)
+    Q_PROPERTY(bool managerUpdateBusy READ managerUpdateBusy NOTIFY managerUpdateChanged)
+    Q_PROPERTY(QString managerUpdateStatus READ managerUpdateStatus NOTIFY managerUpdateChanged)
+    Q_PROPERTY(int managerUpdateProgress READ managerUpdateProgress NOTIFY managerUpdateChanged)
+    Q_PROPERTY(QString managerVersion READ managerVersion CONSTANT)
+    Q_PROPERTY(bool autoCheckManagerUpdate READ autoCheckManagerUpdate NOTIFY runtimeSettingsChanged)
     Q_PROPERTY(QString runtimeSettingsError READ runtimeSettingsError NOTIFY runtimeSettingsChanged)
     Q_PROPERTY(QString coreLog READ coreLog NOTIFY coreLogChanged)
     Q_PROPERTY(bool coreLogAvailable READ coreLogAvailable NOTIFY coreLogChanged)
     Q_PROPERTY(QString logStorageError READ logStorageError NOTIFY coreLogChanged)
     Q_PROPERTY(bool detailedLogEnabled READ detailedLogEnabled NOTIFY detailedLogChanged)
+    Q_PROPERTY(bool detailedLogPaused READ detailedLogPaused NOTIFY detailedLogChanged)
     Q_PROPERTY(QString detailedLogError READ detailedLogError NOTIFY detailedLogChanged)
     Q_PROPERTY(bool installConfirmationVisible READ installConfirmationVisible NOTIFY installConfirmationChanged)
     Q_PROPERTY(QString installConfirmationToken READ installConfirmationToken NOTIFY installConfirmationChanged)
@@ -104,9 +112,35 @@ public:
           m_microgInstall(microgApkPath()),
           m_diagnosticLog(diagnosticLog)
     {
+        connect(&m_managerUpdate, &ManagerUpdate::progress, this, [this](int percent) {
+            m_managerUpdateProgress = percent;
+            m_managerUpdateStatus = tr("Downloading the manager update...");
+            emit managerUpdateChanged();
+        });
+        connect(&m_managerUpdate, &ManagerUpdate::current, this, [this]() {
+            m_managerUpdateStatus = tr("No newer manager update is available.");
+            emit managerUpdateChanged();
+        });
+        connect(&m_managerUpdate, &ManagerUpdate::available, this, [this](const QString &version) {
+            m_managerUpdateStatus = tr("Manager update %1 is available. Select Check now to download it.").arg(version);
+            emit managerUpdateChanged();
+            emit managerUpdateAvailable(m_managerUpdateStatus);
+        });
+        connect(&m_managerUpdate, &ManagerUpdate::failed, this, [this](const QString &message) {
+            m_managerUpdateStatus = message;
+            emit managerUpdateChanged();
+        });
+        connect(&m_managerUpdate, &ManagerUpdate::ready, this, [this](const QString &path, const QString &version) {
+            if (QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
+                m_managerUpdateStatus = tr("Update %1 downloaded. Confirm installation in the system installer.").arg(version);
+            else
+                m_managerUpdateStatus = tr("Update %1 was saved to %2, but the system installer could not be opened.").arg(version, path);
+            emit managerUpdateChanged();
+        });
         QString detailedError;
         if (!ErrorLog::detailedEnabled(&m_detailedLogEnabled, &detailedError))
             m_detailedLogError = detailedError;
+        m_detailedLogPaused = ErrorLog::detailedPaused();
         m_detailedLogTimer.setInterval(1000);
         connect(&m_detailedLogTimer, &QTimer::timeout, this, [this]() {
             if (m_detailedLogEnabled) refreshDetailedLog();
@@ -493,6 +527,48 @@ public:
     QString officialStoreStatus() const { return m_officialStoreStatus; }
     bool officialStoreDownloadActive() const { return m_officialStoreActive && m_officialStoreOnline; }
     int officialStoreDownloadProgress() const { return m_officialStoreProgress; }
+    bool managerUpdateBusy() const { return m_managerUpdate.busy(); }
+    QString managerUpdateStatus() const { return m_managerUpdateStatus; }
+    int managerUpdateProgress() const { return m_managerUpdateProgress; }
+    QString managerVersion() const { return QCoreApplication::applicationVersion(); }
+    bool autoCheckManagerUpdate() const { return QSettings().value(QStringLiteral("updates/checkAtStart"), false).toBool(); }
+    Q_INVOKABLE void setAutoCheckManagerUpdate(bool enabled)
+    {
+        if (RuntimeSettings::save(QStringLiteral("updates/checkAtStart"), enabled))
+            m_runtimeSettingsError.clear();
+        else
+            m_runtimeSettingsError = tr("Could not save automatic update checking.");
+        emit runtimeSettingsChanged();
+    }
+    Q_INVOKABLE void checkManagerUpdateAtStart()
+    {
+        if (!autoCheckManagerUpdate() || m_managerUpdate.busy()) return;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        const qint64 last = QSettings().value(QStringLiteral("updates/lastCheck"), 0).toLongLong();
+        if (last > 0 && last <= now && now - last < 6LL * 60 * 60 * 1000) return;
+        if (!RuntimeSettings::save(QStringLiteral("updates/lastCheck"), now)) {
+            m_managerUpdateStatus = tr("Could not save the update check time.");
+            emit managerUpdateChanged();
+            return;
+        }
+        startManagerUpdate(true);
+    }
+    Q_INVOKABLE void checkManagerUpdate() { startManagerUpdate(false); }
+    void startManagerUpdate(bool checkOnly)
+    {
+        if (m_managerUpdate.busy()) return;
+        const QString cpu = QSysInfo::currentCpuArchitecture().toLower();
+        const QString arch = cpu == QLatin1String("arm64") || cpu == QLatin1String("aarch64")
+            ? QStringLiteral("aarch64") : cpu == QLatin1String("arm") || cpu == QLatin1String("armv7l")
+            ? QStringLiteral("armv7hl") : QString();
+        const QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+        m_managerUpdateProgress = -1;
+        m_managerUpdateStatus = tr("Checking GitHub for a manager update...");
+        QString error;
+        if (!m_managerUpdate.start(downloads, QCoreApplication::applicationVersion(), arch, &error, checkOnly))
+            m_managerUpdateStatus = error;
+        emit managerUpdateChanged();
+    }
     bool googleServicesBundled() const {
         const QFileInfo file(QDir(m_androidRoot).filePath(QStringLiteral("services/GmsCore.apk")));
         return file.isFile() && file.isReadable();
@@ -511,25 +587,42 @@ public:
         return text;
     }
     bool detailedLogEnabled() const { return m_detailedLogEnabled; }
+    bool detailedLogPaused() const { return m_detailedLogPaused; }
     QString detailedLogError() const { return m_detailedLogError; }
+    Q_INVOKABLE void setDetailedLogPaused(bool paused)
+    {
+        if (!ErrorLog::setDetailedPaused(paused)) {
+            m_detailedLogError = tr("Cannot pause logging while it is disabled.");
+        } else {
+            m_detailedLogPaused = paused;
+            m_detailedLogError.clear();
+        }
+        emit detailedLogChanged();
+    }
     Q_INVOKABLE void setDetailedLogEnabled(bool enabled)
     {
+        const quint64 cleanupGeneration = ++m_logCleanupGeneration;
         QString error;
         if (!ErrorLog::setDetailedEnabled(enabled, &error)) {
             QString stateError;
             ErrorLog::detailedEnabled(&m_detailedLogEnabled, &stateError);
+            if (!m_detailedLogEnabled) m_detailedLogPaused = false;
             m_detailedLogText.clear();
             if (m_detailedLogEnabled) refreshDetailedLog();
             m_detailedLogError = tr("Detailed logging changed, but saving its state failed: %1").arg(error);
+            if (!enabled && !m_detailedLogEnabled) clearSharedLogsAfterDisable(cleanupGeneration);
             emit detailedLogChanged();
             emit coreLogChanged();
             return;
         }
         m_detailedLogEnabled = enabled;
+        m_detailedLogPaused = false;
         m_detailedLogError.clear();
         m_detailedLogText.clear();
         if (enabled) {
             refreshDetailedLog();
+        } else {
+            clearSharedLogsAfterDisable(cleanupGeneration);
         }
         emit detailedLogChanged();
         emit coreLogChanged();
@@ -556,11 +649,15 @@ public:
     }
     Q_INVOKABLE QString clearSavedLogs()
     {
+        QString error;
+        const bool currentCleared = ErrorLog::clearCurrentLog(&error);
         int removed = 0;
-        if (!ErrorLog::clearSavedLogs(removed))
-            return tr("Could not clear the log folder completely. Files deleted: %1.").arg(removed);
-        if (!removed) return tr("There are no saved logs to delete.");
-        return tr("Log files deleted: %1.").arg(removed);
+        const bool filesCleared = ErrorLog::clearSavedLogs(removed);
+        if (m_detailedLogEnabled) refreshDetailedLog();
+        emit coreLogChanged();
+        if (!currentCleared || !filesCleared)
+            return tr("Could not clear the current log or all saved files. Files deleted: %1.").arg(removed);
+        return tr("Current log cleared. Files deleted: %1.").arg(removed);
     }
     QUrl yandexLogFormUrl() const
     {
@@ -876,12 +973,31 @@ signals:
     void microgChanged();
     void microgPreviewRequested();
     void officialStoreChanged();
+    void managerUpdateChanged();
+    void managerUpdateAvailable(const QString &message);
     void officialStoreLaunchFailed(const QString &message);
     void microgDownloadNotification(const QString &message, int percent, bool complete);
     void officialStoreDownloadNotification(const QString &message, int percent, bool complete);
     void installConfirmationChanged();
 
 private:
+    void clearSharedLogsAfterDisable(quint64 generation)
+    {
+        int removed = 0;
+        if (!ErrorLog::clearSavedLogs(removed, false)) {
+            if (!m_detailedLogError.isEmpty()) m_detailedLogError += QLatin1Char(' ');
+            m_detailedLogError += tr("Some shared log files could not be deleted.");
+        }
+        QTimer::singleShot(2000, this, [this, generation]() {
+            if (generation != m_logCleanupGeneration || m_detailedLogEnabled) return;
+            int removed = 0;
+            if (!ErrorLog::clearSavedLogs(removed, false)) {
+                if (!m_detailedLogError.isEmpty()) m_detailedLogError += QLatin1Char(' ');
+                m_detailedLogError += tr("Some shared log files could not be deleted.");
+                emit detailedLogChanged();
+            }
+        });
+    }
     void libraryAppAdded(const QString &package, bool allowAutomaticRpm = true)
     {
         notifyInstalledAppsChanged();
@@ -1212,6 +1328,9 @@ private:
     ApkBundleInstall m_bundleInstall;
     MicrogInstall m_microgInstall;
     OfficialStoreDownload m_officialStoreDownload;
+    ManagerUpdate m_managerUpdate;
+    QString m_managerUpdateStatus;
+    int m_managerUpdateProgress = -1;
     DiagnosticLog *m_diagnosticLog;
     PreviewSessions m_sessions;
     LogChannel m_logChannel;
@@ -1227,6 +1346,8 @@ private:
     bool m_installUiReady = false;
     bool m_logFailed = false;
     bool m_detailedLogEnabled = false;
+    bool m_detailedLogPaused = false;
+    quint64 m_logCleanupGeneration = 0;
     void (*m_initReportWebView)() = nullptr;
     QString m_detailedLogError;
     QString m_detailedLogText;

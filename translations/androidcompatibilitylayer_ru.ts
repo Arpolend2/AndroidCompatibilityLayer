@@ -2,6 +2,17 @@
 <!DOCTYPE TS>
 <TS version="2.1" language="ru_RU">
 <context>
+    <name>ManagerUpdate</name>
+    <message><source>The update download timed out.</source><translation>Время ожидания загрузки обновления истекло.</translation></message>
+    <message><source>The update check is unavailable or already running.</source><translation>Проверка обновлений недоступна или уже выполняется.</translation></message>
+    <message><source>The update server redirected to an untrusted address.</source><translation>Сервер обновлений перенаправил запрос на недоверенный адрес.</translation></message>
+    <message><source>The GitHub release list is too large.</source><translation>Список выпусков GitHub слишком велик.</translation></message>
+    <message><source>Cannot save the update RPM or its size exceeds the release metadata.</source><translation>Не удалось сохранить RPM обновления или его размер превышает указанный в выпуске.</translation></message>
+    <message><source>Cannot download the update: %1 (HTTP %2).</source><translation>Не удалось скачать обновление: %1 (HTTP %2).</translation></message>
+    <message><source>Cannot create the temporary update RPM.</source><translation>Не удалось создать временный RPM обновления.</translation></message>
+    <message><source>The update RPM does not match the GitHub release checksum or size.</source><translation>Размер или контрольная сумма RPM не совпадает с данными выпуска GitHub.</translation></message>
+</context>
+<context>
     <name>StandaloneRpmNotification</name>
     <message><source>Android App Manager</source><translation>Менеджер приложений Android</translation></message>
     <message><source>Creating RPM for %1</source><translation>Создание RPM для %1</translation></message>
@@ -424,6 +435,25 @@
 </context>
 <context>
     <name>AndroidCompatibilityLayer</name>
+    <message><source>What's new in this build</source><translation>Что нового в этой сборке</translation></message>
+    <message><source>- Check GitHub for updates, download RPMs with progress, and offer installation.&#10;- Optional update checks at startup.&#10;- An About section with a description, links, and build information.&#10;- Pause and resume log capture.&#10;- Clear logs when disabling logging or deleting log files; exported files are kept when logging is disabled.</source><translation>- Проверка обновлений на GitHub, скачивание RPM с прогрессом и предложением установки.&#10;- Необязательная проверка обновлений при запуске.&#10;- Раздел «О приложении» с описанием, ссылками и информацией о сборке.&#10;- Пауза записи журналов с последующим возобновлением.&#10;- Очистка журналов при их выключении и удалении файлов; экспортированные файлы при выключении сохраняются.</translation></message>
+    <message><source>Could not open the link.</source><translation>Не удалось открыть ссылку.</translation></message>
+    <message><source>Disable and clear logs</source><translation>Выключить и очистить журнал</translation></message>
+    <message><source>Detailed logs may contain passwords, tokens, app data, paths and network addresses. Standalone snapshots are stored in a shared organization folder. Turning logging off clears the current and shared logs, but keeps files exported to Documents. Running apps may briefly recreate snapshots. Review logs before sharing.</source><translation>Подробный журнал может содержать пароли, токены, данные приложений, пути и сетевые адреса. Снимки отдельных приложений хранятся в общей папке организации. Выключение записи очищает текущий и общие журналы, но сохраняет файлы, экспортированные в «Документы». Запущенные приложения могут ненадолго создать снимки снова. Проверяйте журнал перед отправкой.</translation></message>
+    <message><source>This clears the current manager log and deletes saved manager and standalone files in Documents and shared organization snapshots. Close running diagnostic apps first; active apps may recreate snapshot files.</source><translation>Текущий журнал менеджера будет очищен, а сохранённые файлы в «Документах» и общие снимки удалены. Сначала закройте диагностические приложения: запущенные приложения могут снова создать снимки.</translation></message>
+    <message><source>Hold logs</source><translation>Приостановить журнал</translation></message>
+    <message><source>Resume logs</source><translation>Продолжить запись</translation></message>
+    <message><source>Detailed logging is paused. Other processes may take a moment to stop recording. Logging resumes when the manager restarts.</source><translation>Подробная запись приостановлена. Другие процессы могут прекратить запись не сразу. После перезапуска менеджера запись возобновится.</translation></message>
+    <message><source>Add Android APKs to a library, launch compatible apps, and create standalone RPMs. Compatibility is experimental.</source><translation>Добавляйте APK в библиотеку, запускайте совместимые Android-приложения и создавайте самостоятельные RPM. Совместимость экспериментальная.</translation></message>
+    <message><source>Android App Manager %1</source><translation>Менеджер приложений Android %1</translation></message>
+    <message><source>Project on GitHub</source><translation>Проект на GitHub</translation></message>
+    <message><source>Used projects</source><translation>Используемые проекты</translation></message>
+    <message><source>Optional integrations</source><translation>Дополнительные интеграции</translation></message>
+    <message><source>Updates</source><translation>Обновления</translation></message>
+    <message><source>Check at startup</source><translation>Проверять при запуске</translation></message>
+    <message><source>Check GitHub at most once every six hours. Download and installation remain manual.</source><translation>Проверять GitHub не чаще одного раза в шесть часов. Загрузка и установка выполняются вручную.</translation></message>
+    <message><source>Check now</source><translation>Проверить сейчас</translation></message>
+    <message><source>New manager versions come from GitHub releases, including prereleases. The RPM is checked before the system installer opens.</source><translation>Новые версии менеджера поступают из выпусков GitHub, включая предварительные. RPM проверяется перед открытием системного установщика.</translation></message>
     <message><source>No Apps Yet</source><translation>Пока нет приложений</translation></message>
     <message><source>No log available to save.</source><translation>Нет журнала для сохранения.</translation></message>
     <message><source>Aurora WebView is unavailable.</source><translation>Aurora WebView недоступен.</translation></message>
@@ -1155,6 +1185,18 @@ Pick an Android app&apos;s APK to add it to the library.</source>
 </context>
 <context>
     <name>Probe</name>
+    <message><source>Some shared log files could not be deleted.</source><translation>Не удалось удалить некоторые общие файлы журнала.</translation></message>
+    <message><source>Could not clear the current log or all saved files. Files deleted: %1.</source><translation>Не удалось полностью очистить текущий журнал или сохранённые файлы. Удалено файлов: %1.</translation></message>
+    <message><source>Current log cleared. Files deleted: %1.</source><translation>Текущий журнал очищен. Удалено файлов: %1.</translation></message>
+    <message><source>Cannot pause logging while it is disabled.</source><translation>Нельзя приостановить запись выключенного журнала.</translation></message>
+    <message><source>Manager update %1 is available. Select Check now to download it.</source><translation>Доступно обновление менеджера %1. Выберите «Проверить сейчас», чтобы скачать его.</translation></message>
+    <message><source>Could not save automatic update checking.</source><translation>Не удалось сохранить настройку автоматической проверки обновлений.</translation></message>
+    <message><source>Could not save the update check time.</source><translation>Не удалось сохранить время проверки обновлений.</translation></message>
+    <message><source>Downloading the manager update...</source><translation>Загрузка обновления менеджера...</translation></message>
+    <message><source>No newer manager update is available.</source><translation>Более новых обновлений менеджера нет.</translation></message>
+    <message><source>Update %1 downloaded. Confirm installation in the system installer.</source><translation>Обновление %1 скачано. Подтвердите установку в системном установщике.</translation></message>
+    <message><source>Update %1 was saved to %2, but the system installer could not be opened.</source><translation>Обновление %1 сохранено в %2, но открыть системный установщик не удалось.</translation></message>
+    <message><source>Checking GitHub for a manager update...</source><translation>Поиск обновления менеджера на GitHub...</translation></message>
     <message>
         <source>Could not clear the log folder completely. Files deleted: %1.</source>
         <translation>Не удалось полностью очистить папку журналов. Удалено файлов: %1.</translation>
@@ -1494,6 +1536,17 @@ Pick an Android app&apos;s APK to add it to the library.</source>
 </context>
 <context>
     <name>QObject</name>
+    <message><source>The installed version or device architecture is unsupported.</source><translation>Установленная версия или архитектура устройства не поддерживается.</translation></message>
+    <message><source>Cannot read the GitHub release list.</source><translation>Не удалось прочитать список выпусков GitHub.</translation></message>
+    <message><source>The GitHub release list is too large.</source><translation>Список выпусков GitHub слишком велик.</translation></message>
+    <message><source>Invalid GitHub release metadata.</source><translation>Некорректные данные выпуска GitHub.</translation></message>
+    <message><source>GitHub contains ambiguous release versions.</source><translation>На GitHub найдены выпуски с одинаковыми версиями.</translation></message>
+    <message><source>No published GitHub release was found.</source><translation>Опубликованные выпуски на GitHub не найдены.</translation></message>
+    <message><source>The latest release has no RPM for this device.</source><translation>В последнем выпуске нет RPM для этого устройства.</translation></message>
+    <message><source>Invalid GitHub release asset.</source><translation>Некорректные данные файла выпуска GitHub.</translation></message>
+    <message><source>The release RPM has invalid metadata or checksum.</source><translation>Некорректные данные или контрольная сумма RPM выпуска.</translation></message>
+    <message><source>The release RPM version is invalid.</source><translation>Недопустимая версия RPM выпуска.</translation></message>
+    <message><source>The latest release does not contain exactly one RPM for this device.</source><translation>В последнем выпуске нет единственного RPM для этого устройства.</translation></message>
     <message>
         <source>Cannot inspect the app's permissions.</source>
         <translation>Не удалось проверить разрешения приложения.</translation>

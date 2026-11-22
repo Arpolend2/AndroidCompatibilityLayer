@@ -124,6 +124,8 @@ add_library(acl_runtime_objects OBJECT
     aurora/official_store_release.h
     aurora/official_store_download.cpp
     aurora/official_store_download.h
+    aurora/manager_update.cpp
+    aurora/manager_update.h
     aurora/picker_host.cpp
     aurora/picker_host.h
     aurora/shared_folders.cpp
@@ -512,6 +514,10 @@ add_executable(android_compatibility_layer_official_store_download_test EXCLUDE_
     aurora/official_store_download.h aurora/official_store_release.cpp)
 target_link_libraries(android_compatibility_layer_official_store_download_test PRIVATE Qt5::Network)
 
+add_executable(android_compatibility_layer_manager_update_test EXCLUDE_FROM_ALL
+    aurora/tests/manager_update_test.cpp aurora/manager_update.cpp aurora/manager_update.h)
+target_link_libraries(android_compatibility_layer_manager_update_test PRIVATE Qt5::Network)
+
 add_executable(android_compatibility_layer_download_notification_test EXCLUDE_FROM_ALL
     aurora/tests/download_notification_test.cpp)
 target_link_libraries(android_compatibility_layer_download_notification_test PRIVATE Qt5::Quick Qt5::DBus)
@@ -709,6 +715,7 @@ target_link_libraries(android_compatibility_layer_preview_sessions_test PRIVATE 
 if(NOT CMAKE_CROSSCOMPILING)
     add_executable(android_compatibility_layer_probe_multitask_test EXCLUDE_FROM_ALL
         aurora/tests/probe_multitask_test.cpp aurora/probe.h
+        aurora/manager_update.cpp aurora/manager_update.h
         aurora/official_store_download.cpp aurora/official_store_download.h aurora/official_store_release.cpp
         aurora/apk_store.cpp aurora/external_apk_install.cpp aurora/external_apk_install.h
         aurora/apk_bundle_install.cpp aurora/apk_bundle_install.h

@@ -48,6 +48,7 @@ QString recent;
 QString memoryHistory;
 QString memoryDetailed;
 std::atomic<bool> memoryDetailedEnabled(false);
+std::atomic<bool> memoryDetailedPaused(false);
 bool initialized = false;
 struct RemoteHistory {
     QString safe;
@@ -1308,7 +1309,22 @@ bool ErrorLog::detailedEnabled(bool *enabled, QString *error)
 
 bool ErrorLog::detailedCaptureEnabled()
 {
-    return memoryDetailedEnabled.load(std::memory_order_relaxed) || MemoryLogBus::clientDetailedEnabled();
+    return (memoryDetailedEnabled.load(std::memory_order_relaxed) &&
+            !memoryDetailedPaused.load(std::memory_order_relaxed)) || MemoryLogBus::clientDetailedEnabled();
+}
+
+bool ErrorLog::detailedPaused()
+{
+    return memoryDetailedEnabled.load(std::memory_order_relaxed) &&
+        memoryDetailedPaused.load(std::memory_order_relaxed);
+}
+
+bool ErrorLog::setDetailedPaused(bool paused)
+{
+    QMutexLocker lock(&mutex);
+    if (!memoryDetailedEnabled) return false;
+    memoryDetailedPaused.store(paused, std::memory_order_relaxed);
+    return true;
 }
 
 bool ErrorLog::setDetailedEnabled(bool enabled, QString *error)
@@ -1324,6 +1340,33 @@ bool ErrorLog::setDetailedEnabled(bool enabled, QString *error)
         remoteHistory.clear();
         rejectedRemoteEvents = 0;
         memoryDetailedEnabled = enabled;
+        memoryDetailedPaused = false;
+        changed();
+    }
+    if (!storagePath.isEmpty()) {
+        if (storageWorker.thread.joinable()) storageWorker.thread.join();
+        flushSnapshot();
+        if (storageWorker.thread.joinable()) storageWorker.thread.join();
+        QMutexLocker lock(&mutex);
+        if (!storageError.isEmpty()) {
+            *error = storageError;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ErrorLog::clearCurrentLog(QString *error)
+{
+    if (!error) return false;
+    error->clear();
+    {
+        QMutexLocker lock(&mutex);
+        memoryHistory.clear();
+        recent.clear();
+        memoryDetailed.clear();
+        remoteHistory.clear();
+        rejectedRemoteEvents = 0;
         changed();
     }
     if (!storagePath.isEmpty()) {
@@ -1348,7 +1391,7 @@ bool ErrorLog::detailedReport(QString *text, QString *error)
     QMap<QString, quint64> exported;
     {
         QMutexLocker lock(&mutex);
-        if (!detailedCaptureEnabled()) {
+        if (!memoryDetailedEnabled && !MemoryLogBus::clientDetailedEnabled()) {
             *error = QStringLiteral("Detailed logging is not enabled.");
             return false;
         }
@@ -1391,7 +1434,7 @@ bool ErrorLog::saveDetailedReport(QString *path, QString *error, bool *partial,
     QMap<QString, quint64> exported;
     {
         QMutexLocker lock(&mutex);
-        if (!detailedCaptureEnabled()) {
+        if (!memoryDetailedEnabled && !MemoryLogBus::clientDetailedEnabled()) {
             *error = QStringLiteral("Detailed logging is not enabled.");
             return false;
         }
@@ -1498,14 +1541,14 @@ bool ErrorLog::saveDetailedReport(QString *path, QString *error, bool *partial,
     return true;
 }
 
-bool ErrorLog::clearSavedLogs(int &removed)
+bool ErrorLog::clearSavedLogs(int &removed, bool includeExports)
 {
     removed = 0;
     bool ok = true;
     const QString documents = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
-    if (documents.isEmpty()) {
+    if (includeExports && documents.isEmpty()) {
         ok = false;
-    } else {
+    } else if (includeExports) {
         const QString root = QFileInfo(documents).canonicalFilePath();
         if (root.isEmpty()) {
             ok = false;
@@ -1539,6 +1582,7 @@ bool ErrorLog::clearSavedLogs(int &removed)
     {
         QMutexLocker lock(&mutex);
         sharedPath = sharedStandaloneDirectory;
+        if (!sharedStandaloneError.isEmpty()) ok = false;
     }
     if (!sharedPath.isEmpty()) {
         const int sharedFd = ::open(QFile::encodeName(sharedPath).constData(),
@@ -1577,7 +1621,7 @@ bool ErrorLog::startCollector(QString *error)
     const bool started = MemoryLogBus::startServer(
         [](const QString &identity, const QString &source, const QString &message, bool isError, quint64 dropped) {
             QMutexLocker lock(&mutex);
-            if (!memoryDetailedEnabled) return;
+            if (!memoryDetailedEnabled || memoryDetailedPaused) return;
             if (!remoteHistory.contains(identity) && remoteHistory.size() >= MaxRemoteClients) {
                 const quint64 available = std::numeric_limits<quint64>::max() - rejectedRemoteEvents;
                 const quint64 count = message.isEmpty() ? dropped
@@ -1604,7 +1648,8 @@ bool ErrorLog::startCollector(QString *error)
         },
         []() {
             QMutexLocker lock(&mutex);
-            return memoryDetailedEnabled.load(std::memory_order_relaxed);
+            return memoryDetailedEnabled.load(std::memory_order_relaxed) &&
+                !memoryDetailedPaused.load(std::memory_order_relaxed);
         }, error);
     if (!started) {
         {

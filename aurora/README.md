@@ -13,12 +13,28 @@ The manager and standalone app interface use Russian when the device language
 is Russian and otherwise use English. Android apps choose their own language;
 the Android language setting is independent of the manager interface.
 
+Settings contains a manual manager update check. It includes published GitHub
+prereleases, but not drafts, and downloads only a newer RPM for the device
+architecture. The download shows progress and is checked against GitHub's
+size and SHA-256 metadata before opening the system installer for confirmation.
+An optional startup check, disabled by default and limited to once per six
+hours, notifies about a newer version without downloading or installing it.
+The verified RPM remains in Downloads. The checksum verifies integrity against
+GitHub metadata, not an independent signature; system package checks still apply.
 While a standalone RPM is being prepared, the matching app page shows the
 current phase and an indeterminate progress indicator. Away from that page,
 including when the manager is minimized, a system notification shows the
 package and phase without inventing a percentage. A separate transient banner
 announces each reported phase. The progress notification is removed when the
 page becomes visible again or the build ends; errors are reported separately.
+
+The log menu can pause detailed capture without clearing existing entries.
+Standalone processes receive the paused state through the existing polling
+channel, so they may take a moment to stop recording. Capture resumes when
+the manager restarts; this does not control system logs outside the manager.
+Disabling detailed logging clears the current manager history and shared
+snapshots but retains exported files in Documents. Clearing the log folder also
+clears the current manager history; active apps may recreate shared snapshots.
 
 Native EGL/GLES rendering is experimental and disabled by default in CMake. In the
 Aurora IDE, set the CMake option `ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL=ON` to try it.

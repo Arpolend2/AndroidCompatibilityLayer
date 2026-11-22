@@ -59,7 +59,10 @@ ApplicationWindow {
                              return page && page.objectName === "yandexFormPage"
                          }))
                          ? Orientation.All : defaultAllowedOrientations
-    Component.onCompleted: probe.setInstallUiReady(true)
+    Component.onCompleted: {
+        probe.setInstallUiReady(true)
+        probe.checkManagerUpdateAtStart()
+    }
     Component.onDestruction: probe.setInstallUiReady(false)
     cover: Component {
         CoverBackground {
@@ -194,6 +197,12 @@ ApplicationWindow {
         previewBody: qsTr("Only add apps you trust. APK signatures are not verified.")
     }
     Notification {
+        id: managerUpdateBanner
+        appName: qsTr("Android App Manager")
+        appIcon: "ru.androidcompatibilitylayer.appmanager"
+        previewSummary: qsTr("Android App Manager")
+    }
+    Notification {
         id: coverActionBanner
         objectName: "coverActionBanner"
         appName: qsTr("Android App Manager")
@@ -202,6 +211,11 @@ ApplicationWindow {
     }
     Connections {
         target: probe
+        onManagerUpdateAvailable: {
+            managerUpdateBanner.previewBody = message
+            managerUpdateBanner.replacesId = 0
+            managerUpdateBanner.publish()
+        }
         onMicrogDownloadNotification: microgDownloadNotification.publishUpdate(message, percent, complete)
         onMicrogPreviewRequested: {
             if (!window.microgPage) {
@@ -472,7 +486,7 @@ ApplicationWindow {
                                 objectName: "detailedLogWarning"
                                 x: Theme.horizontalPageMargin
                                 width: parent.width - 2 * x
-                                text: qsTr("Detailed logs may contain passwords, tokens, app data, paths and network addresses. Standalone snapshots are stored in a shared organization folder that other apps in the organization can access. Standalone apps record only while the manager's confirmed detailed logging state is enabled. “Save to file” combines available manager and standalone logs in Documents and removes included snapshots only after a successful save. Turning logging off stops new entries, but saved files remain. Review logs before sharing.")
+                                text: qsTr("Detailed logs may contain passwords, tokens, app data, paths and network addresses. Standalone snapshots are stored in a shared organization folder. Turning logging off clears the current and shared logs, but keeps files exported to Documents. Running apps may briefly recreate snapshots. Review logs before sharing.")
                                 wrapMode: Text.Wrap
                             }
                         }
@@ -498,7 +512,7 @@ ApplicationWindow {
                             Label {
                                 x: Theme.horizontalPageMargin
                                 width: parent.width - 2 * x
-                                text: qsTr("This deletes saved manager and standalone files in Documents and shared organization snapshots, but does not clear the current journal. Close running diagnostic apps first; active apps may recreate snapshot files.")
+                                text: qsTr("This clears the current manager log and deletes saved manager and standalone files in Documents and shared organization snapshots. Close running diagnostic apps first; active apps may recreate snapshot files.")
                                 wrapMode: Text.Wrap
                             }
                         }
@@ -857,13 +871,19 @@ ApplicationWindow {
                     MenuItem {
                         objectName: "toggleDetailedLog"
                         visible: launcher.section === 2
-                        text: probe.detailedLogEnabled ? qsTr("Disable logs") : qsTr("Enable logs")
+                        text: probe.detailedLogEnabled ? qsTr("Disable and clear logs") : qsTr("Enable logs")
                         onClicked: {
                             if (probe.detailedLogEnabled)
                                 probe.setDetailedLogEnabled(false)
                             else
                                 pageStack.push(detailedLogDialog)
                         }
+                    }
+                    MenuItem {
+                        objectName: "holdDetailedLog"
+                        visible: launcher.section === 2 && probe.detailedLogEnabled
+                        text: probe.detailedLogPaused ? qsTr("Resume logs") : qsTr("Hold logs")
+                        onClicked: probe.setDetailedLogPaused(!probe.detailedLogPaused)
                     }
                     MenuItem {
                         objectName: "clearLogFolder"
@@ -945,6 +965,14 @@ ApplicationWindow {
                         width: parent.width
                         visible: launcher.section === 2 && probe.detailedLogEnabled
                         spacing: Theme.paddingMedium
+                        Label {
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            visible: probe.detailedLogPaused
+                            text: qsTr("Detailed logging is paused. Other processes may take a moment to stop recording. Logging resumes when the manager restarts.")
+                            wrapMode: Text.Wrap
+                            color: palette.highlightColor
+                        }
                         function newestFirst(text) {
                             var lines = text.split("\n")
                             if (lines[lines.length - 1] === "") lines.pop()
@@ -1012,7 +1040,9 @@ ApplicationWindow {
                         }
                     }
                     Column {
+                        id: settingsContent
                         objectName: "settingsContent"
+                        property string linkError: ""
                         width: parent.width
                         visible: launcher.section === 3
                         Item { width: parent.width; height: Theme.paddingMedium }
@@ -1100,6 +1130,195 @@ ApplicationWindow {
                             width: parent.width
                             pageStack: window.pageStack
                             pageBackground: window.pageBackground
+                        }
+                        SectionHeader { objectName: "managerUpdateHeading"; text: qsTr("Updates") }
+                        TextSwitch {
+                            objectName: "autoCheckManagerUpdate"
+                            text: qsTr("Check at startup")
+                            description: qsTr("Check GitHub at most once every six hours. Download and installation remain manual.")
+                            checked: probe.autoCheckManagerUpdate
+                            automaticCheck: false
+                            onClicked: probe.setAutoCheckManagerUpdate(!checked)
+                        }
+                        BackgroundItem {
+                            objectName: "checkManagerUpdate"
+                            width: parent.width
+                            enabled: !probe.managerUpdateBusy
+                            onClicked: probe.checkManagerUpdate()
+                            Icon {
+                                id: updateIcon
+                                x: Theme.horizontalPageMargin
+                                anchors.verticalCenter: parent.verticalCenter
+                                source: "image://theme/icon-m-refresh"
+                            }
+                            Label {
+                                anchors.left: updateIcon.right
+                                anchors.leftMargin: Theme.paddingMedium
+                                anchors.right: parent.right
+                                anchors.rightMargin: Theme.horizontalPageMargin
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: qsTr("Check now")
+                                truncationMode: TruncationMode.Fade
+                                color: parent.highlighted ? palette.highlightColor : palette.primaryColor
+                            }
+                        }
+                        ProgressBar {
+                            objectName: "managerUpdateProgress"
+                            width: parent.width
+                            visible: probe.managerUpdateBusy
+                            indeterminate: probe.managerUpdateProgress < 0
+                            value: Math.max(0, probe.managerUpdateProgress) / 100
+                            valueText: indeterminate ? "" : qsTr("%1%").arg(probe.managerUpdateProgress)
+                        }
+                        Label {
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            text: probe.managerUpdateStatus
+                            visible: text.length > 0
+                            textFormat: Text.PlainText
+                            wrapMode: Text.Wrap
+                            color: palette.secondaryColor
+                        }
+                        Label {
+                            objectName: "managerUpdateDescription"
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            wrapMode: Text.Wrap
+                            font.pixelSize: Theme.fontSizeExtraSmall
+                            color: palette.secondaryColor
+                            text: qsTr("New manager versions come from GitHub releases, including prereleases. The RPM is checked before the system installer opens.")
+                        }
+                        SectionHeader { objectName: "managerAboutHeading"; text: qsTr("About") }
+                        Item {
+                            id: aboutHeader
+                            objectName: "managerAboutHeader"
+                            width: parent.width
+                            height: Math.max(aboutIcon.height, aboutText.height)
+                            Image {
+                                id: aboutIcon
+                                objectName: "managerAboutIcon"
+                                x: Theme.horizontalPageMargin
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: Math.min(2 * Theme.iconSizeLarge,
+                                                Math.max(0, parent.width - 2 * Theme.horizontalPageMargin - Theme.paddingMedium) * 0.35)
+                                height: width
+                                source: "icons/manager-about.png"
+                                fillMode: Image.PreserveAspectFit
+                            }
+                            Item {
+                                id: aboutText
+                                x: aboutIcon.x + aboutIcon.width + Theme.paddingMedium
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: Math.max(0, parent.width - x - Theme.horizontalPageMargin)
+                                height: aboutVersion.height + Theme.paddingSmall + aboutDescription.height
+                                Label {
+                                    id: aboutVersion
+                                    objectName: "managerAboutVersion"
+                                    width: parent.width
+                                    text: qsTr("Android App Manager %1").arg(probe.managerVersion)
+                                    wrapMode: Text.Wrap
+                                }
+                                Label {
+                                    id: aboutDescription
+                                    objectName: "managerAboutDescription"
+                                    anchors.top: aboutVersion.bottom
+                                    anchors.topMargin: Theme.paddingSmall
+                                    width: parent.width
+                                    text: qsTr("Add Android APKs to a library, launch compatible apps, and create standalone RPMs. Compatibility is experimental.")
+                                    wrapMode: Text.Wrap
+                                    color: palette.secondaryColor
+                                    font.pixelSize: Theme.fontSizeExtraSmall
+                                }
+                            }
+                        }
+                        BackgroundItem {
+                            objectName: "managerProjectLink"
+                            width: parent.width
+                            onClicked: settingsContent.linkError = Qt.openUrlExternally("https://github.com/Arpolend2/AndroidCompatibilityLayer")
+                                ? "" : qsTr("Could not open the link.")
+                            Label {
+                                x: Theme.horizontalPageMargin
+                                width: parent.width - 2 * x
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: qsTr("Project on GitHub")
+                                color: parent.highlighted ? palette.highlightColor : palette.primaryColor
+                            }
+                        }
+                        SectionHeader {
+                            text: qsTr("What's new in this build")
+                        }
+                        Label {
+                            objectName: "managerReleaseNotes"
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            text: qsTr("- Check GitHub for updates, download RPMs with progress, and offer installation.\n- Optional update checks at startup.\n- An About section with a description, links, and build information.\n- Pause and resume log capture.\n- Clear logs when disabling logging or deleting log files; exported files are kept when logging is disabled.")
+                            textFormat: Text.PlainText
+                            wrapMode: Text.Wrap
+                            color: palette.secondaryColor
+                            font.pixelSize: Theme.fontSizeExtraSmall
+                        }
+                        SectionHeader { text: qsTr("Used projects") }
+                        Repeater {
+                            model: [
+                                { name: "Megler", url: "https://github.com/Computershik73/megler-w10m" },
+                                { name: "Husk", url: "https://github.com/Leviidev/Husk" },
+                                { name: "Android Open Source Project", url: "https://source.android.com/" },
+                                { name: "OpenJDK", url: "https://openjdk.org/" },
+                                { name: "Apache Harmony", url: "https://harmony.apache.org/" },
+                                { name: "Apache Xalan", url: "https://xalan.apache.org/" },
+                                { name: "Apache HttpComponents", url: "https://hc.apache.org/" },
+                                { name: "Bouncy Castle", url: "https://www.bouncycastle.org/" },
+                                { name: "OkHttp", url: "https://github.com/square/okhttp" },
+                                { name: "Netty", url: "https://netty.io/" },
+                                { name: "zlib", url: "https://zlib.net/" },
+                                { name: "SQLite", url: "https://sqlite.org/" },
+                                { name: "stb_vorbis", url: "https://github.com/nothings/stb" },
+                                { name: "minimp3", url: "https://github.com/lieff/minimp3" },
+                                { name: "Qt", url: "https://www.qt.io/" },
+                                { name: "Mozilla CA certificates", url: "https://curl.se/docs/caextract.html" }
+                            ]
+                            delegate: BackgroundItem {
+                                objectName: "usedProjectLink"
+                                width: parent.width
+                                onClicked: settingsContent.linkError = Qt.openUrlExternally(modelData.url)
+                                    ? "" : qsTr("Could not open the link.")
+                                Label {
+                                    x: Theme.horizontalPageMargin
+                                    width: parent.width - 2 * x
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: modelData.name
+                                    truncationMode: TruncationMode.Fade
+                                    color: parent.highlighted ? palette.highlightColor : palette.primaryColor
+                                }
+                            }
+                        }
+                        SectionHeader { text: qsTr("Optional integrations") }
+                        Repeater {
+                            model: [
+                                { name: "Aurora Store", url: "https://gitlab.com/AuroraOSS/AuroraStore" },
+                                { name: "microG", url: "https://github.com/microg/GmsCore" }
+                            ]
+                            delegate: BackgroundItem {
+                                objectName: "optionalProjectLink"
+                                width: parent.width
+                                onClicked: settingsContent.linkError = Qt.openUrlExternally(modelData.url)
+                                    ? "" : qsTr("Could not open the link.")
+                                Label {
+                                    x: Theme.horizontalPageMargin
+                                    width: parent.width - 2 * x
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: modelData.name
+                                    color: parent.highlighted ? palette.highlightColor : palette.primaryColor
+                                }
+                            }
+                        }
+                        Label {
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            visible: settingsContent.linkError.length > 0
+                            text: settingsContent.linkError
+                            wrapMode: Text.Wrap
+                            color: palette.highlightColor
                         }
                         Label {
                             x: Theme.horizontalPageMargin

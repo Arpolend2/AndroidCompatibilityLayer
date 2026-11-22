@@ -372,6 +372,19 @@ int main(int argc, char **argv)
     check(!ErrorLog::report().contains(gpuSummary), "GPU summary omitted while detailed capture is disabled");
     check(ErrorLog::setDetailedEnabled(true, &error), "enable detailed capture");
     check(ErrorLog::detailedCaptureEnabled(), "detailed capture state is visible");
+    ErrorLog::record(QStringLiteral("PauseTest"), QStringLiteral("before hold"), false);
+    check(ErrorLog::setDetailedPaused(true) && !ErrorLog::detailedCaptureEnabled(), "pause detailed capture");
+    ErrorLog::record(QStringLiteral("PauseTest"), QStringLiteral("during hold"), false);
+    QString pausedReport;
+    check(ErrorLog::detailedReport(&pausedReport, &error) &&
+          pausedReport.contains(QStringLiteral("before hold")) &&
+          !pausedReport.contains(QStringLiteral("during hold")), "pause retains previous events without recording new ones");
+    check(ErrorLog::setDetailedPaused(false) && ErrorLog::detailedCaptureEnabled(), "resume detailed capture");
+    ErrorLog::record(QStringLiteral("PauseTest"), QStringLiteral("after hold"), false);
+    check(ErrorLog::detailedReport(&pausedReport, &error) &&
+          pausedReport.contains(QStringLiteral("before hold")) &&
+          pausedReport.contains(QStringLiteral("after hold")) &&
+          !pausedReport.contains(QStringLiteral("during hold")), "resume retains prior events");
     const QString rpmEvent = QStringLiteral("Standalone RPM: pid=123 request=1 event=stage-build");
     ErrorLog::record(QStringLiteral("Qt"), rpmEvent, false);
     ErrorLog::record(QStringLiteral("Qt"), rpmEvent + QStringLiteral(" PRIVATE-RPM"), false);
@@ -690,6 +703,18 @@ int main(int argc, char **argv)
     check(ErrorLog::clearSavedLogs(removed) && removed == 0 &&
           ErrorLog::detailedReport(&detailed, &error) && detailed.contains(largeManagerEntry),
           "cleanup is repeatable and preserves the current journal");
+    check(ErrorLog::clearCurrentLog(&error) && ErrorLog::detailedReport(&detailed, &error) &&
+          !detailed.contains(largeManagerEntry), "clear current journal while capture remains enabled");
+    exported.close();
+    check(exported.open(QIODevice::WriteOnly) && exported.write("user export") > 0,
+          "recreate exported log");
+    exported.close();
+    clearSnapshot.close();
+    check(clearSnapshot.open(QIODevice::WriteOnly) && clearSnapshot.write("{}") > 0,
+          "recreate shared snapshot");
+    clearSnapshot.close();
+    check(ErrorLog::clearSavedLogs(removed, false) && removed == 1 &&
+          !clearSnapshot.exists() && exported.exists(), "clear shared snapshots without deleting exported files");
     check(ErrorLog::setDetailedEnabled(false, &error), "disable detailed capture");
     check(!ErrorLog::detailedCaptureEnabled(), "disabled detailed capture state is visible");
     child.start(app.applicationFilePath(), QStringList() << QStringLiteral("--gpu-after-disable"));

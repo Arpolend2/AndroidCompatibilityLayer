@@ -758,6 +758,7 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
     loadTranslations(app.data(), &translator);
     if (!child && diagnosticLog.available()) diagnosticLog.startNotifications();
     app->setOrganizationName(QStringLiteral("ru.androidcompatibilitylayer"));
+    app->setApplicationVersion(QStringLiteral(ACL_MANAGER_BUILD_VERSION));
     const QString standaloneId = QString::fromLocal8Bit(qgetenv("AURORA_APP_ID"));
     const QString standalonePrefix = QStringLiteral("ru.androidcompatibilitylayer.");
     app->setApplicationName(standalone && standaloneId.startsWith(standalonePrefix)

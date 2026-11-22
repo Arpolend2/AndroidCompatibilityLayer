@@ -12,11 +12,14 @@ QString report();
 bool saveReport(QString *path, QString *error);
 bool detailedEnabled(bool *enabled, QString *error);
 bool detailedCaptureEnabled();
+bool detailedPaused();
+bool setDetailedPaused(bool paused);
 bool setDetailedEnabled(bool enabled, QString *error);
+bool clearCurrentLog(QString *error);
 bool detailedReport(QString *text, QString *error);
 bool saveDetailedReport(QString *path, QString *error, bool *partial = nullptr,
                         QString *cleanupWarning = nullptr);
-bool clearSavedLogs(int &removed);
+bool clearSavedLogs(int &removed, bool includeExports = true);
 bool startCoreChannel(QString *error);
 void sendCoreLine(int level, const char *line);
 bool startCollector(QString *error);
