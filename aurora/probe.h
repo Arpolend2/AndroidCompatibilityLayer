@@ -120,7 +120,14 @@ public:
         connect(&m_standaloneTimeout, &QTimer::timeout, this, [this]() {
             if (m_standaloneRpm.state() == QProcess::NotRunning) return;
             m_standaloneTimedOut = true;
+            logStandaloneRpmEvent("timeout");
             m_standaloneRpm.kill();
+        });
+        connect(&m_standaloneRpm, &QProcess::started, this, [this]() {
+            qInfo("Standalone RPM: pid=%lld request=%llu event=started worker=%lld",
+                  static_cast<long long>(QCoreApplication::applicationPid()),
+                  static_cast<unsigned long long>(m_standaloneRequest),
+                  static_cast<long long>(m_standaloneRpm.processId()));
         });
         connect(&m_standaloneRpm, &QProcess::readyReadStandardError, this, [this]() {
             readStandaloneRpmDiagnostics(false);
@@ -129,6 +136,10 @@ public:
                 this, [this](int exitCode, QProcess::ExitStatus status) {
             qInfo("Standalone RPM: builder finished exit=%d normal=%d timed-out=%d",
                   exitCode, status == QProcess::NormalExit, m_standaloneTimedOut);
+            qInfo("Standalone RPM: pid=%lld request=%llu event=finished exit=%d normal=%d timed-out=%d",
+                  static_cast<long long>(QCoreApplication::applicationPid()),
+                  static_cast<unsigned long long>(m_standaloneRequest), exitCode,
+                  status == QProcess::NormalExit, m_standaloneTimedOut);
             m_standaloneTimeout.stop();
             const QByteArray output = m_standaloneRpm.readAllStandardOutput();
             readStandaloneRpmDiagnostics(true);
@@ -165,6 +176,7 @@ public:
         });
         connect(&m_standaloneRpm, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
             if (error != QProcess::FailedToStart) return;
+            logStandaloneRpmEvent("failed-to-start");
             m_standaloneTimeout.stop();
             m_standaloneRpmStatus = tr("Could not start the RPM builder: %1").arg(m_standaloneRpm.errorString());
             ErrorLog::record(QStringLiteral("RPM"), m_standaloneRpmStatus, true);
@@ -436,7 +448,13 @@ public:
     Q_INVOKABLE void installStandaloneRpm(const QString &package)
     {
         qInfo("Standalone RPM: requested");
-        if (standaloneRpmBusy()) return;
+        if (standaloneRpmBusy()) {
+            logStandaloneRpmEvent("ignored-busy");
+            return;
+        }
+        static quint64 nextRequest = 0;
+        m_standaloneRequest = ++nextRequest;
+        logStandaloneRpmEvent("accepted");
         m_standaloneRpmOpened = false;
         m_standalonePackage = package;
         m_standaloneErrorBuffer.clear();
@@ -457,6 +475,7 @@ public:
         emit standaloneRpmChanged();
         if (preflightFailed) {
             qWarning("Standalone RPM: preflight failed");
+            logStandaloneRpmEvent("preflight-failed");
             emit standaloneRpmError(m_standalonePackage, m_standaloneRpmStatus);
         }
     }
@@ -916,6 +935,13 @@ private:
         emit signatureReminder();
     }
 
+    void logStandaloneRpmEvent(const char *event) const
+    {
+        qInfo("Standalone RPM: pid=%lld request=%llu event=%s",
+              static_cast<long long>(QCoreApplication::applicationPid()),
+              static_cast<unsigned long long>(m_standaloneRequest), event);
+    }
+
     void readStandaloneRpmDiagnostics(bool final)
     {
         m_standaloneErrorBuffer += m_standaloneRpm.readAllStandardError();
@@ -928,11 +954,18 @@ private:
             m_standaloneErrorBuffer = newline < 0 ? QByteArray()
                                                  : m_standaloneErrorBuffer.mid(newline + 1);
             QString stage;
-            if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:inspect") stage = tr("Inspecting the app and preparing the package...");
-            else if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:build") stage = tr("Building the RPM with the app and runtime...");
-            else if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:sign") stage = tr("Signing the RPM...");
-            else if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:save") stage = tr("Saving the RPM in the library...");
+            const char *event = nullptr;
+            if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:inspect") {
+                stage = tr("Inspecting the app and preparing the package..."); event = "stage-inspect";
+            } else if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:build") {
+                stage = tr("Building the RPM with the app and runtime..."); event = "stage-build";
+            } else if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:sign") {
+                stage = tr("Signing the RPM..."); event = "stage-sign";
+            } else if (line == "ANDROID_COMPATIBILITY_LAYER_RPM_STAGE:save") {
+                stage = tr("Saving the RPM in the library..."); event = "stage-save";
+            }
             if (!stage.isEmpty()) {
+                logStandaloneRpmEvent(event);
                 m_standaloneRpmStatus = stage;
                 emit standaloneRpmChanged();
             } else {
@@ -1161,6 +1194,7 @@ private:
     QString m_androidRoot;
     EmbeddedEndpoint *m_embeddedMicrog = nullptr;
     QProcess m_standaloneRpm;
+    quint64 m_standaloneRequest = 0;
     QQueue<QString> m_automaticRpmQueue;
     QString m_standalonePackage;
     QByteArray m_standaloneErrorBuffer;

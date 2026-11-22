@@ -258,6 +258,12 @@ int main(int argc, char **argv)
         StandaloneAppMapping::read(mappingDir) != secondId ||
         StandaloneAppMapping::save(mappingDir, QDir(root.path()).filePath(QFileInfo(firstRpm).fileName())) ||
         StandaloneAppMapping::read(mappingDir) != secondId) return 1;
+    const QString armRpm = QDir(mappingDir).filePath(firstId + QStringLiteral("-1.0.0-1.armv7hl.rpm"));
+    QFile armFile(armRpm);
+    if (!armFile.open(QIODevice::WriteOnly)) return 1;
+    armFile.close();
+    if (!StandaloneAppMapping::save(mappingDir, armRpm) ||
+        StandaloneAppMapping::read(mappingDir) != firstId) return 1;
     QFile badMapping(QDir(mappingDir).filePath(QStringLiteral(".last-created-app-id")));
     if (!badMapping.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
         badMapping.write("bad") != 3) return 1;

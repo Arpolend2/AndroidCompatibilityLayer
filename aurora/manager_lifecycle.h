@@ -5,6 +5,9 @@
 #include "shared_microg_ipc.h"
 #include "shared_microg_supervisor.h"
 
+#include <QHash>
+#include <QList>
+#include <QSet>
 #include <QTimer>
 #include <functional>
 
@@ -20,6 +23,10 @@ public:
     bool start(bool background, QString *error);
     bool configureSharedMicrogWorker(const QString &program, const QStringList &arguments,
                                      const SharedMicrogProviderObject::PackageResolver &packageResolver,
+                                     QString *error);
+    bool configureSharedMicrogWorker(const QString &program, const QStringList &arguments,
+                                     const SharedMicrogProviderObject::PackageResolver &packageResolver,
+                                     const SharedMicrogProviderObject::ApkMetadataResolver &metadataResolver,
                                      QString *error);
     void disableSharedMicrogWorker();
     static SharedMicrogProviderObject::PackageResolver registryPackageResolver(
@@ -41,8 +48,21 @@ signals:
     void standaloneLaunchFailed(const QString &package, const QString &message);
 
 private:
+    struct ClientAppMetadata {
+        QByteArray payload;
+        QByteArray appsLine;
+        QList<QByteArray> previousAppsLines;
+        QByteArray previousActivities;
+        bool hadAppsFile = false;
+        bool hadActivities = false;
+        QSet<quint64> channels;
+    };
     bool showGui();
     void noteRequest();
+    bool publishClientAppMetadata(const QString &package, const QByteArray &payload,
+                                  quint64 channelId, QString *error);
+    void releaseClientAppMetadata(quint64 channelId);
+    bool writeClientAppsList(QString *error);
 
     std::function<bool()> m_showGui;
     bool m_background = false;
@@ -51,6 +71,9 @@ private:
     ExternalApkReceiver m_receiver;
     SharedMicrogSupervisor m_worker;
     SharedMicrogProviderObject m_provider;
+    QString m_appsDirectory;
+    QHash<QString, ClientAppMetadata> m_clientAppMetadata;
+    QHash<quint64, QString> m_clientAppChannels;
 };
 
 #endif

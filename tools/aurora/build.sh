@@ -6,8 +6,8 @@ SRC="$(cd "$RECIPE/../.." && pwd)"
 ARCH="${1:?Use the aarch64/build.sh or armv7hl/build.sh wrapper}"
 STEP="${2:-check}"
 case "$ARCH" in
-    aarch64) TRIPLET=aarch64-meego-linux-gnu ;;
-    armv7hl) TRIPLET=armv7hl-meego-linux-gnueabi ;;
+    aarch64) TRIPLET=aarch64-meego-linux-gnu; DEFAULT_RUNTIME="$SRC/aurora/android-runtime" ;;
+    armv7hl) TRIPLET=armv7hl-meego-linux-gnueabi; DEFAULT_RUNTIME="$SRC/build/android9/root-armeabi-v7a" ;;
     *) echo "Unsupported Aurora architecture: $ARCH" >&2; exit 2 ;;
 esac
 case "$STEP" in
@@ -17,7 +17,7 @@ esac
 SYS="${SYS:-/opt/cross/$TRIPLET/sys-root}"
 HOST_TOOLS="${AURORA_HOST_TOOLS:-/usr/lib64/qt5/bin}"
 CROSS="${AURORA_CROSS_PREFIX:-/opt/cross/bin/$TRIPLET-}"
-RUNTIME="${ANDROID_ROOT:-$SRC/aurora/android-runtime}"
+RUNTIME="${ANDROID_ROOT:-$DEFAULT_RUNTIME}"
 WORK="${WORKDIR:-$SRC/build/aurora-$ARCH}"
 if [[ "$STEP" == stage && -e "$WORK/stage" ]]; then
     echo "Stage already exists: $WORK/stage. Use a fresh WORKDIR to avoid packaging stale files." >&2

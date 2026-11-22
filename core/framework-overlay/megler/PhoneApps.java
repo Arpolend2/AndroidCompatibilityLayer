@@ -206,14 +206,19 @@ public final class PhoneApps {
         return s != null ? s.clone() : null;
     }
 
-    /* What the shell described of the app, read again for another version: { version, activities, signatures }. */
+    /* What the shell described of the app: { version, activities, signatures, source JSON }. */
+    static boolean descriptionMatches(Object[] cached, long versionCode, byte[] json) {
+        return cached != null && (Long) cached[0] == versionCode &&
+            java.util.Arrays.equals((byte[]) cached[3], json);
+    }
+
     private static Object[] described(App a) {
         synchronized (sActivities) {
             Object[] had = sActivities.get(a.packageName);
-            if (had != null && (Long) had[0] == a.versionCode) return had;
+            byte[] json = Native.appActivities(a.packageName);
+            if (descriptionMatches(had, a.versionCode, json)) return had;
             java.util.List<Activity> list = null;
             android.content.pm.Signature[] sigs = null;
-            byte[] json = Native.appActivities(a.packageName);
             if (json != null) {
                 try {
                     org.json.JSONObject d = new org.json.JSONObject(new String(json, java.nio.charset.StandardCharsets.UTF_8));
@@ -240,7 +245,7 @@ public final class PhoneApps {
                     list = null;
                 }
             }
-            Object[] d = new Object[] { a.versionCode, list, sigs };
+            Object[] d = new Object[] { a.versionCode, list, sigs, json };
             sActivities.put(a.packageName, d);
             return d;
         }

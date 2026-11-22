@@ -372,6 +372,14 @@ int main(int argc, char **argv)
     check(!ErrorLog::report().contains(gpuSummary), "GPU summary omitted while detailed capture is disabled");
     check(ErrorLog::setDetailedEnabled(true, &error), "enable detailed capture");
     check(ErrorLog::detailedCaptureEnabled(), "detailed capture state is visible");
+    const QString rpmEvent = QStringLiteral("Standalone RPM: pid=123 request=1 event=stage-build");
+    ErrorLog::record(QStringLiteral("Qt"), rpmEvent, false);
+    ErrorLog::record(QStringLiteral("Qt"), rpmEvent + QStringLiteral(" PRIVATE-RPM"), false);
+    ErrorLog::record(QStringLiteral("Qt"),
+                     QStringLiteral("Standalone RPM: pid=123 request=1 event=stage-PRIVATE-RPM"), false);
+    check(ErrorLog::report().contains(rpmEvent) &&
+          !ErrorLog::report().contains(QStringLiteral("PRIVATE-RPM")),
+          "safe RPM events are strictly filtered");
     ErrorLog::record(QStringLiteral("Android"), QStringLiteral("another private secret"), true);
     check(ErrorLog::report().contains(QStringLiteral("Android runtime error")) &&
           !ErrorLog::report().contains(QStringLiteral("another private secret")), "safe report retains only error category");

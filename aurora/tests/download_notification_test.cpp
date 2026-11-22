@@ -26,6 +26,7 @@ public slots:
         record.insert(QStringLiteral("previewBody"), hints.value(QStringLiteral("x-nemo-preview-body")).toString());
         record.insert(QStringLiteral("hasProgress"), hints.contains(QStringLiteral("x-nemo-progress")));
         record.insert(QStringLiteral("progress"), hints.value(QStringLiteral("x-nemo-progress")).toDouble());
+        record.insert(QStringLiteral("transient"), hints.value(QStringLiteral("transient")).toBool());
         std::puts(QJsonDocument(record).toJson(QJsonDocument::Compact).constData());
         std::fflush(stdout);
         if (summary.contains(QStringLiteral("org.example.delayed"))) QThread::msleep(350);
@@ -92,50 +93,70 @@ int main(int argc, char **argv)
         if (service.canReadLine()) return 1;
         notification->setProperty("detailsVisible", false);
         settle();
+        QJsonObject banner = readRecord(service);
         QJsonObject first = readRecord(service);
-        if (first.value(QStringLiteral("replaces")).toInt(-1) != 0 ||
+        if (banner.value(QStringLiteral("replaces")).toInt(-1) != 0 ||
+            !banner.value(QStringLiteral("summary")).toString().isEmpty() ||
+            !banner.value(QStringLiteral("body")).toString().isEmpty() ||
+            banner.value(QStringLiteral("previewSummary")).toString() != QStringLiteral("Creating RPM for org.example.app") ||
+            banner.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Inspecting") ||
+            banner.value(QStringLiteral("hasProgress")).toBool() ||
+            !banner.value(QStringLiteral("transient")).toBool() ||
+            first.value(QStringLiteral("replaces")).toInt(-1) != 0 ||
             first.value(QStringLiteral("summary")).toString() != QStringLiteral("Creating RPM for org.example.app") ||
-            first.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Inspecting") ||
+            first.value(QStringLiteral("body")).toString() != QStringLiteral("Inspecting") ||
+            !first.value(QStringLiteral("previewBody")).toString().isEmpty() ||
             !first.value(QStringLiteral("hasProgress")).toBool() ||
             first.value(QStringLiteral("progress")).toDouble() != -1) return 1;
         notification->setProperty("status", QStringLiteral("Building"));
         settle();
+        QJsonObject buildingBanner = readRecord(service);
         QJsonObject building = readRecord(service);
-        if (building.value(QStringLiteral("replaces")).toInt() != 42 ||
-            building.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Building") ||
+        if (buildingBanner.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Building") ||
+            building.value(QStringLiteral("replaces")).toInt() != 43 ||
+            building.value(QStringLiteral("body")).toString() != QStringLiteral("Building") ||
+            !building.value(QStringLiteral("previewBody")).toString().isEmpty() ||
             building.value(QStringLiteral("progress")).toDouble() != -1) return 1;
         notification->setProperty("status", QStringLiteral("Signing"));
         settle();
+        QJsonObject signingBanner = readRecord(service);
         QJsonObject signing = readRecord(service);
-        if (signing.value(QStringLiteral("replaces")).toInt() != 42 ||
-            signing.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Signing")) return 1;
+        if (signingBanner.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Signing") ||
+            signing.value(QStringLiteral("replaces")).toInt() != 43 ||
+            signing.value(QStringLiteral("body")).toString() != QStringLiteral("Signing")) return 1;
         notification->setProperty("status", QStringLiteral("Saving"));
         settle();
+        QJsonObject savingBanner = readRecord(service);
         QJsonObject saving = readRecord(service);
-        if (saving.value(QStringLiteral("replaces")).toInt() != 42 ||
-            saving.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Saving")) return 1;
+        if (savingBanner.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Saving") ||
+            saving.value(QStringLiteral("replaces")).toInt() != 43 ||
+            saving.value(QStringLiteral("body")).toString() != QStringLiteral("Saving")) return 1;
         notification->setProperty("detailsVisible", true);
         settle();
-        if (readRecord(service).value(QStringLiteral("closed")).toInt() != 42) return 1;
+        if (readRecord(service).value(QStringLiteral("closed")).toInt() != 43) return 1;
         notification->setProperty("detailsVisible", false);
         settle();
+        QJsonObject returnedBanner = readRecord(service);
         QJsonObject returned = readRecord(service);
-        if (returned.value(QStringLiteral("replaces")).toInt(-1) != 0 ||
-            returned.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Saving")) return 1;
+        if (returnedBanner.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Saving") ||
+            returned.value(QStringLiteral("replaces")).toInt(-1) != 0 ||
+            returned.value(QStringLiteral("body")).toString() != QStringLiteral("Saving")) return 1;
         notification->setProperty("busy", false);
         notification->setProperty("status", QStringLiteral("Failed"));
         settle();
-        if (readRecord(service).value(QStringLiteral("closed")).toInt() != 43) return 1;
+        if (readRecord(service).value(QStringLiteral("closed")).toInt() != 48) return 1;
         notification->setProperty("appPackage", QStringLiteral("org.example.next"));
         notification->setProperty("status", QStringLiteral("Inspecting again"));
         notification->setProperty("busy", true);
         settle();
+        QJsonObject nextBanner = readRecord(service);
         QJsonObject next = readRecord(service);
-        if (next.value(QStringLiteral("replaces")).toInt(-1) != 0 ||
+        if (nextBanner.value(QStringLiteral("previewBody")).toString() != QStringLiteral("Inspecting again") ||
+            next.value(QStringLiteral("replaces")).toInt(-1) != 0 ||
             next.value(QStringLiteral("summary")).toString() != QStringLiteral("Creating RPM for org.example.next")) return 1;
         notification.reset();
         settle();
-        if (readRecord(service).value(QStringLiteral("closed")).toInt() != 44) return 1;
+        if (readRecord(service).value(QStringLiteral("closed")).toInt() != 50) return 1;
         notification.reset(component.create());
         if (!notification) return 1;
         notification->setProperty("appPackage", QStringLiteral("org.example.delayed"));
@@ -148,8 +169,9 @@ int main(int argc, char **argv)
         QEventLoop delayedWait;
         QTimer::singleShot(600, &delayedWait, &QEventLoop::quit);
         delayedWait.exec();
-        if (readRecord(service).value(QStringLiteral("replaces")).toInt(-1) != 0 ||
-            readRecord(service).value(QStringLiteral("closed")).toInt() != 45) return 1;
+        if (readRecord(service).value(QStringLiteral("previewBody")).toString() != QStringLiteral("Inspecting") ||
+            readRecord(service).value(QStringLiteral("replaces")).toInt(-1) != 0 ||
+            readRecord(service).value(QStringLiteral("closed")).toInt() != 52) return 1;
         notification.reset();
         service.terminate();
         service.waitForFinished();

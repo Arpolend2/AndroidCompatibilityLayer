@@ -1,6 +1,6 @@
 Name:       ru.androidcompatibilitylayer.appmanager
 Summary:    AndroidCompatibilityLayer for Aurora OS
-Version:    0.3.1
+Version:    0.3.2
 Release:    1
 License:    GPL-3.0-only
 URL:        https://github.com/Arpolend2/AndroidCompatibilityLayer

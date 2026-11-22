@@ -2086,6 +2086,26 @@ manager-to-supervisor-to-worker handshake, but does not verify Sailjail access,
 the device's identification service, the guest client-router startup wiring,
 accounts, or network behavior.
 
+For a shared-microG client, the client reads the certificate bytes from the
+exact APK being launched and sends bounded metadata (at most 1 MiB) through
+`OpenClientChannelWithMetadata`. The manager checks the package against the
+identified caller and validates and publishes the metadata for the worker.
+The client reads its own APK because its Aurora resource/private paths need not
+be visible or readable in the manager's filesystem namespace. Passing that path
+alone caused `The running client's APK is unavailable` at startup.
+The manager exposes the certificate bytes to the worker without verifying the
+APK's signature or certificate trust. This is intentional: an APK that claims a
+Google package name can supply an untrusted certificate and may consequently be
+accepted by microG as that package. This is not APK attestation and does not
+grant other Android permissions or bypass unrelated framework checks.
+New clients fall back to the legacy channel method when talking to an older
+manager; that compatibility path does not provide APK metadata. The earlier
+`OpenClientChannelWithApk` path method remains available to old clients when the
+manager can read the exact supplied APK. Old standalone binaries that use that
+method must be rebuilt to use metadata transport when their APK is inaccessible
+to the manager; the manager never substitutes the library's possibly different
+APK or silently drops metadata on a path error.
+
 For the guest test on Windows, with an existing Linux x86_64 runner, Android
 root, JDK 8 and Android SDK 29, and the local `aurora-build-tools:5.2.1.200`
 Docker image:

@@ -32,6 +32,19 @@ const char iface[] = "test.megler.binder";
 const char managerService[] = "ru.androidcompatibilitylayer.appmanager";
 const char standaloneId[] = "ru.androidcompatibilitylayer.Android0123456789abcdef01234567";
 
+class ProviderFixture : public SharedMicrogProviderObject
+{
+public:
+    using SharedMicrogProviderObject::SharedMicrogProviderObject;
+    bool legacy = false;
+    bool handleMessage(const QDBusMessage &message, const QDBusConnection &connection) override
+    {
+        if (legacy && message.member() == QLatin1String("OpenClientChannelWithMetadata"))
+            return false;
+        return SharedMicrogProviderObject::handleMessage(message, connection);
+    }
+};
+
 class IdentityFixture : public QDBusVirtualObject
 {
 public:
@@ -189,6 +202,8 @@ int main(int argc, char **argv)
     const bool managerSmokeClient = app.arguments().contains(QStringLiteral("--manager-smoke-client"));
     const bool managerCancelClient = app.arguments().contains(QStringLiteral("--manager-cancel-client"));
     const bool managerAuthClient = app.arguments().contains(QStringLiteral("--manager-auth-client"));
+    const bool managerMetadataClient = app.arguments().contains(QStringLiteral("--manager-metadata-client"));
+    const bool managerLegacyClient = app.arguments().contains(QStringLiteral("--manager-legacy-client"));
     const bool managerUntrustedClient = app.arguments().contains(QStringLiteral("--manager-untrusted-client"));
     const bool managerWrongPackageClient = app.arguments().contains(QStringLiteral("--manager-wrongpackage-client"));
     const bool managerErrorClient = app.arguments().contains(QStringLiteral("--manager-error-client"));
@@ -225,17 +240,48 @@ int main(int argc, char **argv)
         channel.close();
         return 0;
     }
-    if (managerAuthClient || managerUntrustedClient || managerWrongPackageClient) {
+    if (managerAuthClient || managerMetadataClient || managerLegacyClient ||
+        managerUntrustedClient || managerWrongPackageClient) {
         SharedMicrogClientChannel channel;
         QString error;
         const QString package = managerWrongPackageClient ? QStringLiteral("example.wrong") :
                                                           QStringLiteral("megler.test.binderfd");
-        const bool opened = channel.openClient(package, &error);
-        if (!managerAuthClient) {
+        const QByteArray metadata("{\"package\":\"megler.test.binderfd\",\"activities\":{"
+                                  "\"package\":\"megler.test.binderfd\",\"certificates\":[\"3000\"]}}");
+        if (managerMetadataClient) {
+            SharedMicrogClientChannel invalid;
+            check(!invalid.openClientWithMetadata(package, QByteArray(1024 * 1024 + 1, 'x'), &error) &&
+                  !error.isEmpty(), "reject oversized client metadata");
+            const QVariantList invalidArguments = QVariantList()
+                << QVariant(QStringLiteral("/private/base.apk")) << QVariant(QByteArray())
+                << QVariant(QByteArray(1024 * 1024 + 1, 'x'));
+            for (const QVariant &argument : invalidArguments) {
+                QDBusMessage request = QDBusMessage::createMethodCall(
+                    QString::fromLatin1(managerService),
+                    QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+                    QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"),
+                    QStringLiteral("OpenClientChannelWithMetadata"));
+                request << argument;
+                QDBusPendingCallWatcher watcher(bus.asyncCall(request, 5000));
+                if (!watcher.isFinished()) {
+                    QEventLoop loop;
+                    QObject::connect(&watcher, &QDBusPendingCallWatcher::finished, &loop, &QEventLoop::quit);
+                    loop.exec();
+                }
+                QDBusPendingReply<> reply(watcher);
+                check(reply.isError() && reply.error().type() == QDBusError::InvalidArgs,
+                      "manager rejects invalid metadata type, empty payload and oversized payload");
+            }
+        }
+        const bool opened = managerMetadataClient || managerLegacyClient
+            ? channel.openClientWithMetadata(package, metadata, &error)
+            : channel.openClient(package, &error);
+        if (!managerAuthClient && !managerMetadataClient && !managerLegacyClient) {
             check(!opened && !error.isEmpty(), "reject untrusted manager or mismatched package");
             check(channel.takeStream(&error) < 0, "rejected manager bootstrap cannot export stream");
             return 0;
         }
+        if (!opened) std::fprintf(stderr, "Manager open error: %s\n", qPrintable(error));
         check(opened && channel.uid() == 16464 && channel.pid() >= 50000 &&
               channel.package() == package, "verified atomic manager client identity");
         const int fd = channel.takeStream(&error);
@@ -294,11 +340,13 @@ int main(int argc, char **argv)
     const bool managerSmoke = app.arguments().contains(QStringLiteral("--manager-smoke"));
     const bool managerCancel = app.arguments().contains(QStringLiteral("--manager-cancel"));
     const bool managerAuth = app.arguments().contains(QStringLiteral("--manager-auth"));
+    const bool managerMetadata = app.arguments().contains(QStringLiteral("--manager-metadata"));
+    const bool managerLegacy = app.arguments().contains(QStringLiteral("--manager-legacy"));
     const bool managerUntrusted = app.arguments().contains(QStringLiteral("--manager-untrusted"));
     const bool managerWrongPackage = app.arguments().contains(QStringLiteral("--manager-wrongpackage"));
     const bool managerRejected = managerUntrusted || managerWrongPackage;
     const bool managerFixture = managerGuests || managerJvm || managerSmoke || managerCancel ||
-                                managerAuth || managerRejected;
+                                managerAuth || managerMetadata || managerLegacy || managerRejected;
     fixture.drop = app.arguments().contains(QStringLiteral("--drop"));
     fixture.guestServer = managerGuests || app.arguments().contains(QStringLiteral("--two-guests"));
     QTemporaryDir identityDirectory;
@@ -312,14 +360,20 @@ int main(int argc, char **argv)
     clientWatcher.setWatchMode(QDBusServiceWatcher::WatchForUnregistration);
     QObject::connect(&clientWatcher, &QDBusServiceWatcher::serviceUnregistered, &app,
                      [&fixture](const QString &) { fixture.clientDisconnected = true; });
-    SharedMicrogProviderObject provider(bus, nullptr, {}, identityDirectory.path(),
-        [&fixture, &identity, &clientWatcher, managerGuests, managerSmoke, managerCancel, managerAuth, managerRejected](const QString &sender, const QString &package, int uid, int pid, quint64,
+    ProviderFixture provider(bus, nullptr, {}, identityDirectory.path(),
+        [&fixture, &identity, &clientWatcher, managerGuests, managerSmoke, managerCancel, managerAuth, managerMetadata, managerLegacy, managerRejected](const QString &sender, const QString &package, const QByteArray &metadata, int uid, int pid, quint64,
                               const QDBusUnixFileDescriptor &server, QString *error) {
             if (fixture.server > 0 || sender != identity.sender ||
                 package != QLatin1String("megler.test.binderfd") || uid != 16464 || pid < 50000) {
                 *error = QStringLiteral("Unexpected manager-assigned identity");
                 return false;
             }
+            if (managerMetadata)
+                check(metadata == QByteArray("{\"package\":\"megler.test.binderfd\",\"activities\":{"
+                                             "\"package\":\"megler.test.binderfd\",\"certificates\":[\"3000\"]}}"),
+                      "manager receives client certificate without reopening its private APK path");
+            if (managerLegacy)
+                check(metadata.isEmpty(), "legacy server opens a compatible channel without APK metadata");
             clientWatcher.addWatchedService(sender);
             const int fd = ::fcntl(server.fileDescriptor(), F_DUPFD_CLOEXEC, 3);
             if (fd < 0) {
@@ -333,7 +387,7 @@ int main(int argc, char **argv)
                 if (::setenv("MEGLER_TEST_BINDER_CALLER_UID", uidText.constData(), 1) != 0 ||
                     ::setenv("MEGLER_TEST_BINDER_CALLER_PID", pidText.constData(), 1) != 0) _exit(125);
                 if (managerGuests) execGuest(fd, true);
-                if (managerSmoke || managerCancel || managerAuth || managerRejected)
+                if (managerSmoke || managerCancel || managerAuth || managerMetadata || managerLegacy || managerRejected)
                     execStreamCheck(fd, managerCancel || managerRejected);
                 execJvm(fd, "server");
             }
@@ -354,6 +408,7 @@ int main(int argc, char **argv)
             const QString id = StandaloneDiagnosticRegistry::appIdFromExecutable(executable);
             return StandaloneDiagnosticRegistry::lookup(identityDirectory.path(), id);
         });
+    provider.legacy = managerLegacy;
     if (managerFixture) {
         check(identityDirectory.isValid() && identityBus.isConnected(), "create manager identity fixture");
         app.setOrganizationName(QStringLiteral("ru.androidcompatibilitylayer"));
@@ -379,6 +434,12 @@ int main(int argc, char **argv)
         check(identityBus.registerVirtualObject(QStringLiteral("/ru/omp/am"), &identity) &&
               identityBus.registerService(QStringLiteral("ru.omp.am")), "register fake Aurora identity");
         QString error;
+        if (managerMetadata)
+            check(provider.setApkMetadataResolver(
+                [](const QString &, const QString &, QString *) -> QByteArray {
+                    qFatal("The manager must not reopen an APK from the client's filesystem namespace");
+                    return QByteArray();
+                }, &error), "install inaccessible-client-filesystem regression guard");
         check(bus.registerService(QString::fromLatin1(managerService)) && provider.start(&error),
               "start manager channel fixture");
     } else {
@@ -400,6 +461,8 @@ int main(int argc, char **argv)
                   managerSmoke ? QStringLiteral("--manager-smoke-client") :
                   managerCancel ? QStringLiteral("--manager-cancel-client") :
                   managerAuth ? QStringLiteral("--manager-auth-client") :
+                  managerMetadata ? QStringLiteral("--manager-metadata-client") :
+                  managerLegacy ? QStringLiteral("--manager-legacy-client") :
                   managerUntrusted ? QStringLiteral("--manager-untrusted-client") :
                   managerWrongPackage ? QStringLiteral("--manager-wrongpackage-client") :
                   app.arguments().contains(QStringLiteral("--manager-error")) ? QStringLiteral("--manager-error-client") :

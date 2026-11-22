@@ -22,8 +22,12 @@ SDK. `AURORA_HOST_TOOLS` is the directory containing runnable **host** `moc`,
 Qt and runtime-manager libraries are checked for the selected ELF ABI;
 metadata selecting host `libcef.so` is rejected rather than rewritten.
 
-`ANDROID_ROOT` defaults to `aurora/android-runtime`, exactly as in the IDE.
-An explicit path is preserved by CMake. Supply a **complete** ABI-matched
+By default, the IDE and these recipes select `aurora/android-runtime` for
+ARM64 and `build/android9/root-armeabi-v7a` for ARMv7. CMake's `ANDROID_ROOT`
+cache entry is empty by default, so the default follows the target architecture;
+an explicit non-empty path overrides it. Clear an old cached `ANDROID_ROOT`
+value in IDE build settings if it was set by an earlier configuration.
+Supply a **complete** ABI-matched
 runtime; all native ELF files are checked. APKs with native libraries must
 include the selected ABI; universal APKs are allowed.
 The ARM runtime check runs again during installation, including stock IDE/RPM
@@ -50,7 +54,7 @@ rejected, not recursively deleted or merged with new files.
 - Separate CEF-free `<id>.runtime` payload, mode `0644`, in `/usr/share/<id>`.
 - Shared Android runtime in `/usr/share/common/ru.androidcompatibilitylayer/appmanager/android-runtime`,
   with the current `.standalone-abi` marker and ABI-matched native ELF files.
-- Required ARM64 Android WebView APK, installed by the existing pinned CMake recipe.
+- Required ABI-matched Android WebView APK, installed by the pinned CMake recipe.
 
 There is no automatic RPM creation or signing step. Build/deploy through the
 Aurora IDE/SDK using the stock spec. Do not package a staged tree with the PR's
@@ -71,10 +75,10 @@ root at `build/android9/root-armeabi-v7a` has passed the SDK/runtime checks,
 full ARMv7 cross build, and stock CMake installation:
 
 ```sh
-ANDROID_ROOT="$PWD/build/android9/root-armeabi-v7a" \
 bash tools/aurora/armv7hl/build.sh check
 
-ANDROID_ROOT="$PWD/build/android9/root-armeabi-v7a" \
+bash tools/webview-fetch.sh --aosp-chromium-128 armeabi-v7a
+
 WORKDIR=/path/to/fresh/armv7-build \
 bash tools/aurora/armv7hl/build.sh stage
 ```
@@ -84,11 +88,12 @@ Android libcore is ARM ELF32 soft-float, as expected for `armeabi-v7a`. The
 stage includes only the matching Android runtime and the current ABI marker.
 These recipes never fill missing files with ARM64 libraries.
 
-This is build/install validation, not device validation. The local ARM32
-runtime does not include Android WebView, and its behavior on a device has
-not been verified. The default ARM64 runtime and its pinned WebView remain
-unchanged; the ARM64 provider is not installed in the ARMv7 stage.
-The current in-app standalone RPM builder also supports only `aarch64` and
-`x86_64`; these cross recipes do not enable ARMv7 standalone RPM creation.
+The ARMv7 stage includes the pinned `armeabi-v7a` provider from
+`build/webview/webview.apk`, not the ARM64 provider. The in-app standalone RPM
+builder also supports `armv7hl` hosts and generates 32-bit RPM dependencies.
+Cross-building and staging do not verify WebView, RPM installation, or Android
+app execution on an ARMv7 device. QEMU user-mode can exercise ARM executables
+with a compatible ARMv7 sysroot, but GUI and Sailjail testing require a suitable
+ARM32 Aurora system image and emulator environment.
 
 Input guard tests: `python3 -m unittest discover -s tools/aurora/tests`.

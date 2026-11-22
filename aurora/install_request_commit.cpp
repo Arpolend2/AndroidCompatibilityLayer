@@ -47,7 +47,7 @@ void removeRpmCache(int appDir)
     static const QRegularExpression pattern(
         QStringLiteral("\\Aru\\.androidcompatibilitylayer\\.Android[0-9a-f]{24}\\z"));
     if (pattern.match(QString::fromLatin1(id)).hasMatch()) {
-        for (const char *arch : {"aarch64", "x86_64"}) {
+        for (const char *arch : {"aarch64", "armv7hl", "x86_64"}) {
             const QByteArray name = id + "-1.0.0-1." + arch + ".rpm";
             if (unlinkat(cache, name.constData(), 0) != 0 && errno != ENOENT)
                 qWarning("Could not remove the obsolete cached RPM.");

@@ -46,6 +46,17 @@ int main()
     QFile saved(data + QStringLiteral("/saved"));
     check(saved.open(QIODevice::WriteOnly) && saved.write("data") == 4, "write app data");
     saved.close();
+    const QString cache = root + QStringLiteral("/org.example.app/standalone-rpm");
+    const QByteArray id("ru.androidcompatibilitylayer.Android0123456789abcdef01234567");
+    check(QDir().mkpath(cache), "create RPM cache");
+    QFile mapping(cache + QStringLiteral("/.last-created-app-id"));
+    check(mapping.open(QIODevice::WriteOnly) && mapping.write(id) == id.size(), "write RPM mapping");
+    mapping.close();
+    const QString armRpm = cache + QLatin1Char('/') + QString::fromLatin1(id) +
+                           QStringLiteral("-1.0.0-1.armv7hl.rpm");
+    QFile armFile(armRpm);
+    check(armFile.open(QIODevice::WriteOnly), "create ARMv7 cached RPM");
+    armFile.close();
     InstallRequestCommit update(source, root, QStringLiteral("org.example.app"), true);
     update.start();
     update.wait();
@@ -56,6 +67,7 @@ int main()
     check(!update.commit(&error), "running app update rejected");
     lock.unlock();
     check(update.commit(&error), "update succeeds");
+    check(!QFile::exists(armRpm), "update removes stale ARMv7 RPM");
     check(stored.open(QIODevice::ReadOnly) && stored.readAll() == "changed", "updates staged contents");
     stored.close();
     check(saved.open(QIODevice::ReadOnly) && saved.readAll() == "data", "update preserves app data");

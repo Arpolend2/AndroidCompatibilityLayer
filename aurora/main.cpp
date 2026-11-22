@@ -24,6 +24,7 @@
 #include <QTimer>
 #include <QTranslator>
 #include <QtQml>
+#include <QJsonParseError>
 
 #include <cstdio>
 #include <cstdlib>
@@ -74,6 +75,7 @@
 #include <QEventLoop>
 #endif
 #include "shared_runtime.h"
+#include "shared_microg_apk_metadata.h"
 #include "rpm_standalone.h"
 #include "rpm_signers.h"
 #include "rpm_test_keys.h"
@@ -156,6 +158,11 @@ static bool prepareSharedMicrogWorker(QString *program, QStringList *arguments,
         << QStringLiteral("--apps-dir=") + QDir(appsDirectory).absolutePath();
     *identityDirectory = appData;
     return true;
+}
+
+static SharedMicrogProviderObject::ApkMetadataResolver sharedMicrogApkMetadataResolver()
+{
+    return readSharedMicrogApkMetadata;
 }
 
 static bool validateStoreBundle(const QString &path, int *splitCount, QString *error)
@@ -643,7 +650,7 @@ static int buildStandaloneRpm(const QString &package, bool fileDiagnostics)
                     qWarning("Standalone RPM: could not save cache metadata");
                 }
                 if (ok && !previous.isEmpty()) {
-                    for (const QString &arch : {QStringLiteral("aarch64"), QStringLiteral("x86_64")}) {
+                    for (const QString &arch : {QStringLiteral("aarch64"), QStringLiteral("armv7hl"), QStringLiteral("x86_64")}) {
                         const QString old = QDir(publishedDir).filePath(previous + QStringLiteral("-1.0.0-1.") +
                                                                         arch + QStringLiteral(".rpm"));
                         if (old != published && QFileInfo(old).exists() && !QFile::remove(old))
@@ -1251,7 +1258,8 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
             sharedMicrogConfigured = false;
         }
         if (!lifecycle.configureSharedMicrogWorker(
-                program, arguments, ManagerLifecycle::registryPackageResolver(identityDirectory), &error)) {
+                program, arguments, ManagerLifecycle::registryPackageResolver(identityDirectory),
+                sharedMicrogApkMetadataResolver(), &error)) {
             lifecycle.disableSharedMicrogWorker();
             qWarning().noquote() << "Shared microG backend unavailable:" << error;
             return;

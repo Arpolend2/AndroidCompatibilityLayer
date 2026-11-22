@@ -11,6 +11,7 @@
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
+#include <QFileInfo>
 #include <QProcess>
 #include <QSettings>
 #include <QSocketNotifier>
@@ -426,7 +427,31 @@ int sharedMicrogWorkerIntegration(const QString &workerExecutable, const QString
     lifecycle.refreshSharedMicrogProvider();
     check(lifecycle.configureSharedMicrogWorker(
               QFileInfo(workerExecutable).absoluteFilePath(), workerArguments,
-              ManagerLifecycle::registryPackageResolver(identityDirectory), &error),
+              ManagerLifecycle::registryPackageResolver(identityDirectory),
+              [](const QString &apkPath, const QString &package, QString *metadataError) {
+                  if (metadataError) metadataError->clear();
+                  if (package != QLatin1String("example.client1")) {
+                      if (metadataError) *metadataError = QStringLiteral("unexpected package");
+                      return QByteArray();
+                  }
+                  if (apkPath == QLatin1String("/fixture/mismatch.apk"))
+                      return QByteArray("{\"package\":\"example.other\",\"activity\":\"\",\"label\":\"Other\","
+                                        "\"versionName\":\"1\",\"versionCode\":\"1\",\"activities\":{"
+                                        "\"package\":\"example.other\",\"activities\":[],\"certificates\":[\"3000\"]}}");
+                  if (apkPath == QLatin1String("/fixture/client-v2.apk"))
+                      return QByteArray("{\"package\":\"example.client1\",\"activity\":\"\",\"label\":\"Client v2\","
+                                        "\"versionName\":\"2.0\",\"versionCode\":\"2\",\"activities\":{"
+                                        "\"package\":\"example.client1\",\"activities\":[],\"certificates\":[\"3000\"]}}");
+                  if (apkPath == QLatin1String("/fixture/missing.apk")) {
+                      if (metadataError) *metadataError = QStringLiteral("APK unavailable");
+                      return QByteArray();
+                  }
+                  if (apkPath == QLatin1String("/fixture/oversize.apk"))
+                      return QByteArray(1024 * 1024 + 1, 'x');
+                  return QByteArray("{\"package\":\"example.client1\",\"activity\":\"\",\"label\":\"Client live\","
+                                    "\"versionName\":\"1.0\",\"versionCode\":\"1\",\"activities\":{"
+                                    "\"package\":\"example.client1\",\"activities\":[],\"certificates\":[\"3000\"]}}");
+              }, &error),
           "configure manager-derived resolver and production worker after opt-in");
 
     int stream = -1;
@@ -446,10 +471,53 @@ int sharedMicrogWorkerIntegration(const QString &workerExecutable, const QString
               identityReply.value().at(3).toInt() >= 50000,
               "resolve fixture caller through IdentifyByBusName and export registry");
 
+        QDBusMessage missingPath = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"),
+            QStringLiteral("OpenClientChannelWithApk"));
+        QDBusPendingReply<> rejectedMissingPath(waitFor(client.asyncCall(missingPath, 120000), 120000));
+        check(rejectedMissingPath.isError() &&
+              rejectedMissingPath.error().type() == QDBusError::InvalidArgs,
+              "reject a client APK request without a path");
+
+        QDBusMessage missingApk = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"),
+            QStringLiteral("OpenClientChannelWithApk"));
+        missingApk << QStringLiteral("/fixture/missing.apk");
+        QDBusPendingReply<> rejectedMissingApk(waitFor(client.asyncCall(missingApk, 120000), 120000));
+        check(rejectedMissingApk.isError() && rejectedMissingApk.error().type() == QDBusError::Failed,
+              "report a missing client APK instead of opening a metadata-free channel");
+
+        QDBusMessage oversize = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"),
+            QStringLiteral("OpenClientChannelWithApk"));
+        oversize << QStringLiteral("/fixture/oversize.apk");
+        QDBusPendingReply<> rejectedOversize(waitFor(client.asyncCall(oversize, 120000), 120000));
+        check(rejectedOversize.isError() && rejectedOversize.error().type() == QDBusError::Failed,
+              "reject oversized APK metadata before opening a worker channel");
+
+        QDBusMessage mismatch = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"),
+            QStringLiteral("OpenClientChannelWithApk"));
+        mismatch << QStringLiteral("/fixture/mismatch.apk");
+        QDBusPendingReply<QDBusUnixFileDescriptor, int, int, QString> rejectedMetadata(
+            waitFor(client.asyncCall(mismatch, 120000), 120000));
+        check(rejectedMetadata.isError() && rejectedMetadata.error().type() == QDBusError::Failed,
+              "reject APK metadata whose package differs from the identified client");
+
         QDBusMessage open = QDBusMessage::createMethodCall(
             QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
             QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
-            QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"), QStringLiteral("OpenClientChannel"));
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"),
+            QStringLiteral("OpenClientChannelWithApk"));
+        open << QStringLiteral("/fixture/client.apk");
         const QDBusMessage opened = QDBusPendingCallWatcher(
             waitFor(client.asyncCall(open, 120000), 120000)).reply();
         const QList<QVariant> values = opened.arguments();
@@ -465,6 +533,32 @@ int sharedMicrogWorkerIntegration(const QString &workerExecutable, const QString
         QDBusUnixFileDescriptor descriptor = values.at(0).value<QDBusUnixFileDescriptor>();
         stream = takeSharedMicrogStream(&descriptor, &error);
         check(stream >= 0, "take manager-issued stream descriptor");
+
+        QFile publishedList(QDir(appsDirectory).filePath(QStringLiteral("apps.txt")));
+        check(publishedList.open(QIODevice::ReadOnly) &&
+              publishedList.readAll().contains("example.client1\t\tClient live\t1.0\t1\n"),
+              "publish live APK package metadata for the shared worker");
+        QFile publishedActivities(QDir(appsDirectory).filePath(
+            QStringLiteral("example.client1/activities.json")));
+        check(publishedActivities.open(QIODevice::ReadOnly) &&
+              publishedActivities.readAll().contains("\"certificates\":[\"3000\"]"),
+              "publish the live APK certificate in the worker metadata");
+
+        const QString secondClientName = QStringLiteral("shared-microg-worker-conflict-client");
+        QDBusConnection secondClient = QDBusConnection::connectToBus(
+            QDBusConnection::SessionBus, secondClientName);
+        check(secondClient.isConnected(), "connect second fixture client");
+        QDBusMessage conflict = QDBusMessage::createMethodCall(
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+            QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+            QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"),
+            QStringLiteral("OpenClientChannelWithApk"));
+        conflict << QStringLiteral("/fixture/client-v2.apk");
+        QDBusPendingReply<QDBusUnixFileDescriptor, int, int, QString> rejectedVersion(
+            waitFor(secondClient.asyncCall(conflict, 120000), 120000));
+        check(rejectedVersion.isError() && rejectedVersion.error().type() == QDBusError::Failed,
+              "reject concurrent conflicting versions of the same package");
+        QDBusConnection::disconnectFromBus(secondClientName);
         QDBusConnection::disconnectFromBus(clientName);
     }
 
@@ -483,6 +577,12 @@ int sharedMicrogWorkerIntegration(const QString &workerExecutable, const QString
     }
     ::close(stream);
     check(eof, "client disconnect revokes channel and stops worker bridge");
+    QFile restoredList(QDir(appsDirectory).filePath(QStringLiteral("apps.txt")));
+    check(restoredList.open(QIODevice::ReadOnly) && restoredList.readAll() == appList,
+          "restore the library package list after the final client disconnects");
+    check(!QFileInfo(QDir(appsDirectory).filePath(
+              QStringLiteral("example.client1/activities.json"))).exists(),
+          "remove temporary APK metadata after the final client disconnects");
     bus.unregisterService(QStringLiteral("ru.omp.am"));
     bus.unregisterObject(QStringLiteral("/ru/omp/am"));
     std::puts("Manager→supervisor→production self-spawn→microG worker integration passed");
@@ -835,6 +935,14 @@ int main(int argc, char **argv)
               "reject conflicting mapping");
         check(StandaloneDiagnosticRegistry::lookup(root, id) == QLatin1String("org.example.app") &&
               StandaloneDiagnosticRegistry::lookup(root, second).isEmpty(), "lookup exact exported ID");
+        const QString armId = QStringLiteral("ru.androidcompatibilitylayer.Android2123456789abcdef01234567");
+        const QString armRpm = directory.path() + QLatin1Char('/') + armId + QStringLiteral("-1.0.0-1.armv7hl.rpm");
+        QFile armFixture(armRpm);
+        check(armFixture.open(QIODevice::WriteOnly), "create ARMv7 exported RPM fixture");
+        armFixture.close();
+        check(StandaloneDiagnosticRegistry::save(root, armRpm, QStringLiteral("org.example.arm")) &&
+              StandaloneDiagnosticRegistry::lookup(root, armId) == QLatin1String("org.example.arm"),
+              "register ARMv7 exported mapping");
         check(StandaloneDiagnosticRegistry::appIdFromExecutable(QStringLiteral("/usr/bin/") + id) == id &&
               StandaloneDiagnosticRegistry::appIdFromExecutable(
                   QStringLiteral("/opt/app/") + id + QStringLiteral("/1.0/bin/") + id) == id &&

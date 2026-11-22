@@ -32,6 +32,11 @@ public final class SharedMicrogClientIdentityTest {
         check(pm.getPackagesForUid(11024) == null && pm.getNameForUid(11024) == null, "unknown uid");
         PhoneApps.App other = new PhoneApps.App("example.other", null, "Other", "", 0, 11024);
         check(PhoneApps.applicationInfo(other).uid == -1, "other app uid is not guessed");
+        Object[] cached = { 7L, null, null, new byte[] { 1, 2, 3 } };
+        check(PhoneApps.descriptionMatches(cached, 7L, new byte[] { 1, 2, 3 }),
+                "unchanged APK description keeps its cache");
+        check(!PhoneApps.descriptionMatches(cached, 7L, new byte[] { 1, 2, 4 }),
+                "changed APK certificate description invalidates the cache at the same version");
         try {
             pm.getPackageUid("example.other", 0);
             throw new AssertionError("unknown package uid guessed");

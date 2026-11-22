@@ -125,6 +125,12 @@ int main(int argc, char **argv)
     if (original.isEmpty() || !RpmStandalone::cachedRpm(cacheDir, original).isEmpty() ||
         !RpmStandalone::saveCache(cacheDir, cached, original) ||
         RpmStandalone::cachedRpm(cacheDir, fingerprint()) != cached) return 1;
+    const QString armCached = QDir(cacheDir).filePath(StandaloneAppMapping::read(cacheDir) +
+                                                       QStringLiteral("-1.0.0-1.armv7hl.rpm"));
+    if ((armCached != cached && !QFile::copy(output, armCached)) ||
+        !RpmStandalone::saveCache(cacheDir, armCached, original) ||
+        RpmStandalone::cachedRpm(cacheDir, original) != armCached ||
+        !RpmStandalone::saveCache(cacheDir, cached, original)) return 1;
     int generated = 0;
     QString resolved;
     bool hit = false;

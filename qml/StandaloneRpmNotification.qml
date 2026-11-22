@@ -39,12 +39,26 @@ Item {
         publishedStatus = status
         notification.summary = qsTr("Creating RPM for %1").arg(appPackage)
         notification.body = status
+        previewNotification.previewSummary = notification.summary
+        previewNotification.previewBody = notification.body
+        previewNotification.replacesId = 0
+        previewNotification.publish()
         notification.previewSummary = notification.summary
         notification.previewBody = notification.body
+        notification.previewSummary = ""
+        notification.previewBody = ""
         awaitingId = notification.replacesId === 0
         notification.publish()
     }
 
+    Notification {
+        id: previewNotification
+        objectName: "standaloneRpmPreviewNotification"
+        appName: qsTr("Android App Manager")
+        appIcon: "ru.androidcompatibilitylayer.appmanager"
+        isTransient: true
+        suppressSound: true
+    }
     Notification {
         id: notification
         objectName: "standaloneRpmSystemNotification"

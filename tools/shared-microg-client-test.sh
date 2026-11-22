@@ -16,5 +16,7 @@ dbus-run-session -- "$tmp/test" --manager-error
 dbus-run-session -- "$tmp/test" --manager-smoke
 dbus-run-session -- "$tmp/test" --manager-cancel
 dbus-run-session -- "$tmp/test" --manager-auth
+dbus-run-session -- "$tmp/test" --manager-metadata
+dbus-run-session -- "$tmp/test" --manager-legacy
 dbus-run-session -- "$tmp/test" --manager-untrusted
 dbus-run-session -- "$tmp/test" --manager-wrongpackage

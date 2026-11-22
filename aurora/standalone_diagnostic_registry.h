@@ -58,7 +58,7 @@ inline QString lookup(const QString &root, const QString &id)
 inline bool save(const QString &root, const QString &rpmFile, const QString &package)
 {
     static const QRegularExpression filename(QStringLiteral(
-        "\\A(ru\\.androidcompatibilitylayer\\.Android[0-9a-f]{24})-1\\.0\\.0-1\\.(?:aarch64|x86_64)\\.rpm\\z"));
+        "\\A(ru\\.androidcompatibilitylayer\\.Android[0-9a-f]{24})-1\\.0\\.0-1\\.(?:aarch64|armv7hl|x86_64)\\.rpm\\z"));
     const QFileInfo rpm(rpmFile);
     const QRegularExpressionMatch match = filename.match(rpm.fileName());
     if (root.isEmpty() || !QFileInfo(root).isDir() || QFileInfo(root).isSymLink() ||

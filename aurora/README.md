@@ -16,8 +16,9 @@ the Android language setting is independent of the manager interface.
 While a standalone RPM is being prepared, the matching app page shows the
 current phase and an indeterminate progress indicator. Away from that page,
 including when the manager is minimized, a system notification shows the
-package and phase without inventing a percentage. It is removed when the page
-becomes visible again or the build ends; errors are reported separately.
+package and phase without inventing a percentage. A separate transient banner
+announces each reported phase. The progress notification is removed when the
+page becomes visible again or the build ends; errors are reported separately.
 
 Native EGL/GLES rendering is experimental and disabled by default in CMake. In the
 Aurora IDE, set the CMake option `ANDROID_COMPATIBILITY_LAYER_EXPERIMENTAL_NATIVE_EGL=ON` to try it.
@@ -449,7 +450,7 @@ The host has been exercised in the x86 SDK but not on an Aurora device.
 Android video playback is not yet supported. The shared MediaCodec input normalizer accepts
 Annex-B and 1-, 2- or 4-byte MP4 NAL lengths from avcC/hvcC records for a
 future video decoder; this does not add a decoder or verify device playback.
-ARM64 builds include Android System WebView in the shared runtime. It is
+ARM64 and ARMv7 builds include Android System WebView in the shared runtime. It is
 separate from Aurora's native WebView, which handles the manager's feedback form.
 The experimental camera bridge supports CPU-accessible NV12/NV21 preview
 frames. Autofocus, macro focus and torch are available only when the Qt camera
@@ -646,9 +647,13 @@ building, run `tools/sqlite-fetch.sh` and copy `build/sqlite/sqlite3.c` and
 Aurora IDE creates a source archive. The verified source is generated data
 and is not committed to Git. SQLite is public domain.
 
-The prepared Android runtime is required in `aurora/android-runtime` when
-building the project, including when Aurora IDE creates its RPM source
-archive. It is generated data and is not committed to Git. To regenerate it,
+The prepared Android runtime is required when building the project. By default,
+ARM64 uses `aurora/android-runtime` and ARMv7 uses
+`build/android9/root-armeabi-v7a`; include the appropriate directory when
+Aurora IDE creates its RPM source archive. These are generated data and are not
+committed to Git. Set the CMake `ANDROID_ROOT` cache entry only to override the
+automatic selection; clear an older cached value to restore it. To regenerate
+the ARM64 runtime,
 prepare `build/android9/root-arm64-v8a` with the upstream Android 9 tools,
 including the ARM64 native libraries and Java framework, then copy that root
 into `aurora/android-runtime`.
@@ -665,7 +670,7 @@ and not the old WKWebView bridge. The abandoned Android-to-QML/Aurora bridge and
 its mock tests have been removed; the independent native diagnostic remains
 documented in `aurora/webview_native_probe.md`.
 
-CMake installs `aurora/android-runtime` once, with its ABI marker, into
+CMake installs the selected Android runtime once, with its ABI marker, into
 `/usr/share/common/ru.androidcompatibilitylayer/appmanager/android-runtime`.
 The manager and new standalone packages resolve it with
 `Aurora::Application::organizationPathTo`. They must be signed with the same
@@ -703,8 +708,9 @@ The factory invokes the provider's public static
 `com.android.webview.chromium.WebViewChromiumFactoryProviderForT`. The loader
 does not enforce a particular package name or minimum version code. The exact
 native lookup is
-`/system/app/webview/webview.apk!/lib/arm64-v8a/libwebviewchromium.so`; it must
-be an ELF64 little-endian AArch64 shared object. Other required native
+`/system/app/webview/webview.apk!/lib/arm64-v8a/libwebviewchromium.so` on
+ARM64; it must be an ELF64 little-endian AArch64 shared object. On ARMv7 the
+path instead uses `armeabi-v7a` and the library must be ELF32 ARM. Other required native
 dependencies must also exist in the APK or runtime. The
 `libwebviewchromium_plat_support.so` system-library name is currently a stub
 backed by Megler native hooks, not an APK substitute. This runtime uses an
@@ -713,17 +719,21 @@ runtime's Java APIs; the factory does not validate `minSdkVersion`.
 The installed Android SDK/platform are API 36, but they supply no WebView APK;
 no emulator system image is installed either.
 
-Before configuring the ARM64 Aurora build, fetch the
+Before configuring an ARM Aurora build, fetch the
 [pinned AOSP Chromium 128.0.6613.88 provider](https://android.googlesource.com/platform/external/chromium-webview/+/27ac2bdb9a1a4e55dc65bb6cdc752dbfdea3b9f4/)
-with `tools/webview-fetch.sh --aosp-chromium-128 arm64-v8a`. The local build
-input is `build/webview/arm64-v8a/webview.apk`; it is not checked into Git or
+with `tools/webview-fetch.sh --aosp-chromium-128 arm64-v8a` for ARM64 or
+`tools/webview-fetch.sh --aosp-chromium-128 armeabi-v7a` for ARMv7. The local
+build input is `build/webview/arm64-v8a/webview.apk` or `build/webview/webview.apk`,
+respectively; it is not checked into Git or
 downloaded by CMake. Aurora IDE's standard apptool build uses the source tree
 in place; if building from a source archive instead, include this ignored APK
-at the same relative path as well as `aurora/android-runtime` and
+at the same relative path as well as the selected Android runtime and
 `aurora/sqlite`. The ordinary Aurora RPM spec works without a local wrapper
 or a WebView flag. CMake verifies the pinned SHA-256 and stages the APK and
 its platform support stub in the manager's installed shared runtime.
-Non-ARM64 builds do not stage this provider.
+Non-ARM builds do not stage this provider. ARMv7 requires a separate complete
+`armeabi-v7a` Android runtime; its WebView and standalone RPMs have not yet
+been verified on a device.
 
 Applications using that shared runtime can attempt to use the standard Android
 WebView API without an allowlist or per-app provider copy. Standalone packages

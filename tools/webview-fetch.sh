@@ -24,7 +24,7 @@
 #
 # What is there already is not fetched again (remove it to fetch it anew). The root builder
 # ignores this APK unless MEGLER_WEBVIEW_TEST_PROVIDER=chromium-128-aosp is explicitly set.
-# Aurora's ARM64 CMake build stages the provider from this path independently.
+# Aurora's ARM CMake builds stage the matching provider independently.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/build/webview"

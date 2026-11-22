@@ -115,6 +115,18 @@ bool SharedMicrogProviderObject::setPackageResolver(const PackageResolver &packa
     return true;
 }
 
+bool SharedMicrogProviderObject::setApkMetadataResolver(const ApkMetadataResolver &metadataResolver,
+                                                        QString *error)
+{
+    if (error) error->clear();
+    if (!m_channels.isEmpty() || !metadataResolver) {
+        if (error) *error = QStringLiteral("Cannot configure shared microG APK metadata.");
+        return false;
+    }
+    m_apkMetadataResolver = metadataResolver;
+    return true;
+}
+
 bool SharedMicrogProviderObject::clearBackend(QString *error)
 {
     if (error) error->clear();
@@ -125,6 +137,7 @@ bool SharedMicrogProviderObject::clearBackend(QString *error)
     m_channelHandler = ChannelHandler();
     m_channelReleaseHandler = ChannelReleaseHandler();
     m_packageResolver = PackageResolver();
+    m_apkMetadataResolver = ApkMetadataResolver();
     return true;
 }
 
@@ -167,7 +180,15 @@ QString SharedMicrogProviderObject::introspect(const QString &path) const
         result += QStringLiteral("<method name=\"OpenChannel\"><arg type=\"h\" direction=\"out\"/></method>"
                                  "<method name=\"OpenClientChannel\"><arg type=\"h\" direction=\"out\"/>"
                                  "<arg type=\"i\" direction=\"out\"/><arg type=\"i\" direction=\"out\"/>"
-                                 "<arg type=\"s\" direction=\"out\"/></method>");
+                                 "<arg type=\"s\" direction=\"out\"/></method>"
+                                 "<method name=\"OpenClientChannelWithApk\"><arg type=\"s\" direction=\"in\"/>"
+                                 "<arg type=\"h\" direction=\"out\"/><arg type=\"i\" direction=\"out\"/>"
+                                 "<arg type=\"i\" direction=\"out\"/><arg type=\"s\" direction=\"out\"/>"
+                                 "</method>"
+                                 "<method name=\"OpenClientChannelWithMetadata\"><arg type=\"ay\" direction=\"in\"/>"
+                                 "<arg type=\"h\" direction=\"out\"/><arg type=\"i\" direction=\"out\"/>"
+                                 "<arg type=\"i\" direction=\"out\"/><arg type=\"s\" direction=\"out\"/>"
+                                 "</method>");
     return result + QStringLiteral("</interface>");
 }
 
@@ -219,7 +240,8 @@ void SharedMicrogProviderObject::revokeAllChannels()
 }
 
 void SharedMicrogProviderObject::openChannel(const QDBusMessage &message, const QDBusConnection &connection,
-                                            const QString &sender, const QString &package, int uid, int pid,
+                                            const QString &sender, const QString &package,
+                                            const QByteArray &appMetadata, int uid, int pid,
                                             bool withIdentity)
 {
     QString provider, error;
@@ -245,7 +267,7 @@ void SharedMicrogProviderObject::openChannel(const QDBusMessage &message, const 
     const quint64 channelId = m_nextChannelId++;
     m_channels.insert(sender, Channel{channelId, server, false});
     if (!m_providerCheck.isActive()) m_providerCheck.start();
-    if (!m_channelHandler(sender, package, uid, pid, channelId, server, &error)) {
+    if (!m_channelHandler(sender, package, appMetadata, uid, pid, channelId, server, &error)) {
         releaseChannel(sender, channelId);
         sendIdentificationReply(connection, message.createErrorReply(QDBusError::Failed,
             error.isEmpty() ? QStringLiteral("The microG server refused the channel.") : error));
@@ -253,6 +275,8 @@ void SharedMicrogProviderObject::openChannel(const QDBusMessage &message, const 
     }
     const auto it = m_channels.constFind(sender);
     if (it == m_channels.constEnd() || it->id != channelId) {
+        if (m_channelReleaseHandler)
+            m_channelReleaseHandler(sender, channelId);
         sendIdentificationReply(connection, message.createErrorReply(QDBusError::Failed,
             QStringLiteral("The microG server closed the channel.")));
         return;
@@ -277,14 +301,31 @@ bool SharedMicrogProviderObject::handleMessage(const QDBusMessage &message, cons
          message.member() != QLatin1String("InspectCaller") &&
          message.member() != QLatin1String("ResolveCaller") &&
          message.member() != QLatin1String("OpenChannel") &&
-         message.member() != QLatin1String("OpenClientChannel")))
+         message.member() != QLatin1String("OpenClientChannel") &&
+         message.member() != QLatin1String("OpenClientChannelWithApk") &&
+         message.member() != QLatin1String("OpenClientChannelWithMetadata")))
         return false;
-    if (!message.arguments().isEmpty()) {
+    const bool withApk = message.member() == QLatin1String("OpenClientChannelWithApk");
+    const bool withMetadata = message.member() == QLatin1String("OpenClientChannelWithMetadata");
+    QString apkPath;
+    QByteArray suppliedMetadata;
+    if (withApk && message.arguments().size() == 1 &&
+        message.arguments().first().type() == QVariant::String) {
+        apkPath = message.arguments().first().toString();
+    }
+    if (withMetadata && message.arguments().size() == 1 &&
+        message.arguments().first().type() == QVariant::ByteArray)
+        suppliedMetadata = message.arguments().first().toByteArray();
+    if ((!withApk && !withMetadata && !message.arguments().isEmpty()) ||
+        (withApk && (apkPath.isEmpty() || apkPath.size() > 4096)) ||
+        (withMetadata && (suppliedMetadata.isEmpty() || suppliedMetadata.size() > 1024 * 1024))) {
         connection.send(message.createErrorReply(QDBusError::InvalidArgs,
-                                                QStringLiteral("This method accepts no arguments.")));
+            withMetadata ? QStringLiteral("Bounded APK metadata is required.")
+                : withApk ? QStringLiteral("A bounded APK path is required.")
+                    : QStringLiteral("This method accepts no arguments.")));
         return true;
     }
-    const bool withIdentity = message.member() == QLatin1String("OpenClientChannel");
+    const bool withIdentity = message.member() == QLatin1String("OpenClientChannel") || withApk || withMetadata;
     const bool open = withIdentity || message.member() == QLatin1String("OpenChannel");
     if (open && !m_channelHandler) {
         sendIdentificationReply(connection, message.createErrorReply(QDBusError::NotSupported,
@@ -319,7 +360,8 @@ bool SharedMicrogProviderObject::handleMessage(const QDBusMessage &message, cons
         QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(
             connection.asyncCall(identify, 5000), this);
         connect(watcher, &QDBusPendingCallWatcher::finished, this,
-                [this, watcher, connection, message, sender, resolve, open, withIdentity]() {
+                [this, watcher, connection, message, sender, resolve, open, withIdentity,
+                 withApk, apkPath, suppliedMetadata]() {
             --m_pendingIdentifications;
             const QDBusMessage reply = watcher->reply();
             if (reply.type() == QDBusMessage::ErrorMessage) {
@@ -350,33 +392,53 @@ bool SharedMicrogProviderObject::handleMessage(const QDBusMessage &message, cons
                         sendIdentificationReply(connection, message.createErrorReply(QDBusError::AccessDenied,
                             resolutionError.isEmpty() ? QStringLiteral("Unknown standalone caller.")
                                                       : resolutionError));
-                    } else if (!m_virtualPids.contains(sender) &&
-                               (m_virtualPids.size() >= 1024 || m_nextVirtualPid > 99999)) {
-                        sendIdentificationReply(connection, message.createErrorReply(QDBusError::LimitsExceeded,
-                            QStringLiteral("Virtual process identity limit reached.")));
                     } else {
-                        const bool existing = m_virtualPids.contains(sender);
-                        if (!existing) m_senderWatcher->addWatchedService(sender);
-                        const QDBusReply<bool> alive = connection.interface()->isServiceRegistered(sender);
-                        int uid = -1;
-                        QString error;
-                        if (!alive.isValid() || !alive.value()) {
-                            if (!existing) m_senderWatcher->removeWatchedService(sender);
-                            sendIdentificationReply(connection, message.createErrorReply(QDBusError::AccessDenied,
-                                QStringLiteral("Caller disconnected.")));
-                        } else if (!sharedMicrogUidForPackage(m_identityDirectory, package, &uid, &error)) {
-                            if (!existing) m_senderWatcher->removeWatchedService(sender);
-                            sendIdentificationReply(connection, message.createErrorReply(QDBusError::Failed, error));
-                        } else {
-                            if (!existing) {
-                                m_virtualPids.insert(sender, m_nextVirtualPid++);
+                        QByteArray appMetadata = suppliedMetadata;
+                        bool metadataReady = !withApk;
+                        if (withApk) {
+                            QString metadataError;
+                            if (!m_apkMetadataResolver)
+                                metadataError = QStringLiteral("The manager cannot inspect this client's APK.");
+                            else {
+                                appMetadata = m_apkMetadataResolver(apkPath, package, &metadataError);
+                                metadataReady = !appMetadata.isEmpty() && metadataError.isEmpty();
                             }
-                            const int pid = m_virtualPids.value(sender);
-                            if (open) openChannel(message, connection, sender, package, uid, pid,
-                                                  withIdentity);
-                            else sendIdentificationReply(connection, message.createReply(QVariantList() <<
-                                (QStringList() << sender << package << QString::number(uid)
-                                 << QString::number(pid))));
+                            if (metadataError.isEmpty() && appMetadata.isEmpty())
+                                metadataError = QStringLiteral("The client's APK metadata is unavailable.");
+                            if (!metadataError.isEmpty()) {
+                                sendIdentificationReply(connection, message.createErrorReply(QDBusError::Failed,
+                                    metadataError));
+                            }
+                        }
+                        if (metadataReady) {
+                            if (!m_virtualPids.contains(sender) &&
+                                (m_virtualPids.size() >= 1024 || m_nextVirtualPid > 99999)) {
+                                sendIdentificationReply(connection, message.createErrorReply(QDBusError::LimitsExceeded,
+                                    QStringLiteral("Virtual process identity limit reached.")));
+                            } else {
+                                const bool existing = m_virtualPids.contains(sender);
+                                if (!existing) m_senderWatcher->addWatchedService(sender);
+                                const QDBusReply<bool> alive = connection.interface()->isServiceRegistered(sender);
+                                int uid = -1;
+                                QString error;
+                                if (!alive.isValid() || !alive.value()) {
+                                    if (!existing) m_senderWatcher->removeWatchedService(sender);
+                                    sendIdentificationReply(connection, message.createErrorReply(QDBusError::AccessDenied,
+                                        QStringLiteral("Caller disconnected.")));
+                                } else if (!sharedMicrogUidForPackage(m_identityDirectory, package, &uid, &error)) {
+                                    if (!existing) m_senderWatcher->removeWatchedService(sender);
+                                    sendIdentificationReply(connection, message.createErrorReply(QDBusError::Failed, error));
+                                } else {
+                                    if (!existing)
+                                        m_virtualPids.insert(sender, m_nextVirtualPid++);
+                                    const int pid = m_virtualPids.value(sender);
+                                    if (open) openChannel(message, connection, sender, package, appMetadata,
+                                                          uid, pid, withIdentity);
+                                    else sendIdentificationReply(connection, message.createReply(QVariantList() <<
+                                        (QStringList() << sender << package << QString::number(uid)
+                                         << QString::number(pid))));
+                                }
+                            }
                         }
                     }
                 }

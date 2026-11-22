@@ -18,11 +18,15 @@ public:
     // Runs on the provider's thread. The trusted backend must duplicate or retain
     // the server descriptor and release the channel when its bridge terminates.
     using ChannelHandler = std::function<bool(const QString &sender, const QString &package,
+                                               const QByteArray &appMetadata,
                                                int uid, int pid, quint64 channelId,
                                                const QDBusUnixFileDescriptor &server, QString *error)>;
     using ChannelReleaseHandler = std::function<void(const QString &sender, quint64 channelId)>;
     using PackageResolver = std::function<QString(const QString &executable,
                                                    const QString &identityKey, QString *error)>;
+    using ApkMetadataResolver = std::function<QByteArray(const QString &apkPath,
+                                                         const QString &expectedPackage,
+                                                         QString *error)>;
     explicit SharedMicrogProviderObject(const QDBusConnection &bus, QObject *parent = nullptr,
                                        const std::function<void()> &onRequest = {},
                                        const QString &identityDirectory = QString(),
@@ -34,6 +38,7 @@ public:
     bool setChannelHandlers(const ChannelHandler &channelHandler,
                             const ChannelReleaseHandler &releaseHandler, QString *error);
     bool setPackageResolver(const PackageResolver &packageResolver, QString *error);
+    bool setApkMetadataResolver(const ApkMetadataResolver &metadataResolver, QString *error);
     bool clearBackend(QString *error);
     QString introspect(const QString &path) const override;
     bool handleMessage(const QDBusMessage &message, const QDBusConnection &connection) override;
@@ -51,7 +56,8 @@ private:
     };
     void revokeChannel(const QString &sender);
     void openChannel(const QDBusMessage &message, const QDBusConnection &connection,
-                     const QString &sender, const QString &package, int uid, int pid,
+                     const QString &sender, const QString &package, const QByteArray &appMetadata,
+                     int uid, int pid,
                      bool withIdentity);
 
     QDBusConnection m_bus;
@@ -68,6 +74,7 @@ private:
     ChannelHandler m_channelHandler;
     ChannelReleaseHandler m_channelReleaseHandler;
     PackageResolver m_packageResolver;
+    ApkMetadataResolver m_apkMetadataResolver;
 };
 
 QDBusPendingReply<QString> requestSharedMicrogProvider(const QDBusConnection &bus, bool autoStart = true);

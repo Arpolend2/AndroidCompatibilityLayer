@@ -189,7 +189,7 @@ QString RpmStandalone::cachedRpm(const QString &directory, const QByteArray &fin
     const QString id = StandaloneAppMapping::read(directory);
     const QString name = object.value(QStringLiteral("file")).toString();
     static const QRegularExpression pattern(QStringLiteral(
-        "\\Aru\\.androidcompatibilitylayer\\.Android[0-9a-f]{24}-1\\.0\\.0-1\\.(?:aarch64|x86_64)\\.rpm\\z"));
+        "\\Aru\\.androidcompatibilitylayer\\.Android[0-9a-f]{24}-1\\.0\\.0-1\\.(?:aarch64|armv7hl|x86_64)\\.rpm\\z"));
     if (id.isEmpty() || !pattern.match(name).hasMatch() || !name.startsWith(id + QLatin1Char('-')) ||
         object.value(QStringLiteral("inputs")).toString().toLatin1() != fingerprint) return {};
     const QString path = QDir(directory).filePath(name);
@@ -405,6 +405,8 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     rpm.buildTime = uint32_t(QDateTime::currentMSecsSinceEpoch() / 1000);
 #if defined(Q_PROCESSOR_ARM_64)
     rpm.arch = "aarch64";
+#elif defined(__arm__) && defined(__ARM_PCS_VFP)
+    rpm.arch = "armv7hl";
 #elif defined(Q_PROCESSOR_X86_64)
     rpm.arch = "x86_64";
 #else
@@ -412,16 +414,18 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     return false;
 #endif
     const char *libraries[] = {
-        "libEGL.so.1()(64bit)", "libGLESv2.so.2()(64bit)", "libQt5Core.so.5()(64bit)",
-        "libQt5DBus.so.5()(64bit)", "libQt5Gui.so.5()(64bit)", "libQt5Multimedia.so.5()(64bit)",
-        "libQt5Network.so.5()(64bit)", "libQt5Positioning.so.5()(64bit)", "libQt5Qml.so.5()(64bit)", "libQt5Quick.so.5()(64bit)",
-        "libQt5Sensors.so.5()(64bit)", "libauroraapp.so.2()(64bit)", "libc.so.6()(64bit)",
-        "libgcc_s.so.1()(64bit)", "libm.so.6()(64bit)", "libruntime-manager-qt5.so.1()(64bit)",
-        "libstdc++.so.6()(64bit)", "nemo-qml-plugin-notifications-qt5", "qt5-plugin-imageformat-jpeg"
+        "libEGL.so.1", "libGLESv2.so.2", "libQt5Core.so.5",
+        "libQt5DBus.so.5", "libQt5Gui.so.5", "libQt5Multimedia.so.5",
+        "libQt5Network.so.5", "libQt5Positioning.so.5", "libQt5Qml.so.5", "libQt5Quick.so.5",
+        "libQt5Sensors.so.5", "libauroraapp.so.2", "libc.so.6",
+        "libgcc_s.so.1", "libm.so.6", "libruntime-manager-qt5.so.1",
+        "libstdc++.so.6", "nemo-qml-plugin-notifications-qt5", "qt5-plugin-imageformat-jpeg"
     };
     for (const char *name : libraries) {
         RpmWriter::Package::Requirement requirement;
         requirement.name = name;
+        if (sizeof(void *) == 8 && requirement.name.find(".so.") != std::string::npos)
+            requirement.name += "()(64bit)";
         rpm.requires.push_back(requirement);
     }
     RpmWriter::Package::Requirement silica;

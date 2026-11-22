@@ -24,6 +24,12 @@ static void check(bool ok, const char *description)
     }
 }
 
+static QStringList rpmEvents;
+static void captureRpmEvents(QtMsgType, const QMessageLogContext &, const QString &message)
+{
+    if (message.startsWith(QLatin1String("Standalone RPM: pid="))) rpmEvents.append(message);
+}
+
 class RpmUrlReceiver : public QObject
 {
     Q_OBJECT
@@ -383,6 +389,7 @@ int main(int argc, char **argv)
         return 0;
     }
     if (rpmProgressTest) {
+        QtMessageHandler previousHandler = qInstallMessageHandler(captureRpmEvents);
         QSet<QString> stages;
         int errorCount = 0;
         QString errorPackage;
@@ -402,9 +409,23 @@ int main(int argc, char **argv)
         });
         probe.installStandaloneRpm(QStringLiteral("org.example.runner1"));
         check(probe.standaloneRpmBusy(), "RPM builder started");
+        probe.installStandaloneRpm(QStringLiteral("org.example.other-private-package"));
         timeout.start(10000);
         wait.exec();
+        qInstallMessageHandler(previousHandler);
         check(timeout.isActive(), "RPM progress test timed out");
+        const QString prefix = QStringLiteral("Standalone RPM: pid=%1 request=1 event=")
+                                   .arg(QCoreApplication::applicationPid());
+        check(rpmEvents.size() == 8 &&
+              rpmEvents.at(0) == prefix + QStringLiteral("accepted") &&
+              rpmEvents.at(1) == prefix + QStringLiteral("ignored-busy") &&
+              rpmEvents.at(2).startsWith(prefix + QStringLiteral("started worker=")) &&
+              rpmEvents.at(3) == prefix + QStringLiteral("stage-inspect") &&
+              rpmEvents.at(4) == prefix + QStringLiteral("stage-build") &&
+              rpmEvents.at(5) == prefix + QStringLiteral("stage-sign") &&
+              rpmEvents.at(6) == prefix + QStringLiteral("stage-save") &&
+              rpmEvents.at(7) == prefix + QStringLiteral("finished exit=1 normal=1 timed-out=0"),
+              "RPM lifecycle events correlate stages, ignored requests and completion without package data");
         check(stages.contains(QStringLiteral("Inspecting the app and preparing the package...")) &&
               stages.contains(QStringLiteral("Building the RPM with the app and runtime...")) &&
               stages.contains(QStringLiteral("Signing the RPM...")) &&

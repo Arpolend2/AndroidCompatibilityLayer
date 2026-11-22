@@ -776,8 +776,15 @@ install(TARGETS ${APP_ID} RUNTIME DESTINATION bin)
 # Sailjail's private-bin instead of executing another binary.
 install(FILES "$<TARGET_FILE:acl-runtime>" DESTINATION share/${APP_ID}
     PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
-set(ANDROID_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/aurora/android-runtime"
-    CACHE PATH "ABI-matched Android runtime to install")
+set(ANDROID_ROOT "" CACHE PATH "Override the ABI-matched Android runtime to install")
+if(ANDROID_ROOT STREQUAL "")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7.*|arm)$")
+        set(ANDROID_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/build/android9/root-armeabi-v7a")
+    else()
+        set(ANDROID_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/aurora/android-runtime")
+    endif()
+endif()
+message(STATUS "Android runtime: ${ANDROID_ROOT}")
 foreach(file framework/megler-libcore.dex framework/core-oj.dex framework/core-libart.dex
              framework/conscrypt.dex framework/okhttp.dex framework/bouncycastle.dex framework/apache-xml.dex
              framework/megler-framework.dex framework/megler-framework-classes2.dex
@@ -801,18 +808,25 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv7.*|arm)$")
     install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/check_android_runtime.cmake")
 endif()
 set(SHARED_ANDROID_RUNTIME share/common/ru.androidcompatibilitylayer/appmanager/android-runtime)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-    set(WEBVIEW_PROVIDER "${CMAKE_CURRENT_SOURCE_DIR}/build/webview/arm64-v8a/webview.apk")
-    set(WEBVIEW_PROVIDER_SHA256 "492c3d054e4123ae0c1e6f3541e5ab515633e1fb4006e33bf343749ef1b66ae2")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv7.*|arm)$")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        set(WEBVIEW_PROVIDER "${CMAKE_CURRENT_SOURCE_DIR}/build/webview/arm64-v8a/webview.apk")
+        set(WEBVIEW_PROVIDER_SHA256 "492c3d054e4123ae0c1e6f3541e5ab515633e1fb4006e33bf343749ef1b66ae2")
+        set(WEBVIEW_ABI "arm64-v8a")
+    else()
+        set(WEBVIEW_PROVIDER "${CMAKE_CURRENT_SOURCE_DIR}/build/webview/webview.apk")
+        set(WEBVIEW_PROVIDER_SHA256 "19a2cdf16d451ee1a3dea8e5d5b369dc85e7bbc616701d6a41a51e851cfd37c4")
+        set(WEBVIEW_ABI "armeabi-v7a")
+    endif()
     if(NOT EXISTS "${WEBVIEW_PROVIDER}")
         message(FATAL_ERROR
-            "The required ARM64 WebView provider is missing: ${WEBVIEW_PROVIDER}. "
-            "Fetch it with tools/webview-fetch.sh --aosp-chromium-128 arm64-v8a.")
+            "The required ${WEBVIEW_ABI} WebView provider is missing: ${WEBVIEW_PROVIDER}. "
+            "Fetch it with tools/webview-fetch.sh --aosp-chromium-128 ${WEBVIEW_ABI}.")
     endif()
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${WEBVIEW_PROVIDER}")
     file(SHA256 "${WEBVIEW_PROVIDER}" local_webview_sha256)
     if(NOT local_webview_sha256 STREQUAL WEBVIEW_PROVIDER_SHA256)
-        message(FATAL_ERROR "The ARM64 WebView provider does not match the pinned AOSP Chromium 128 APK.")
+        message(FATAL_ERROR "The ${WEBVIEW_ABI} WebView provider does not match the pinned AOSP Chromium 128 APK.")
     endif()
     set(WEBVIEW_SUPPORT_STUB
         "${CMAKE_CURRENT_BINARY_DIR}/webview/libwebviewchromium_plat_support.so")
@@ -822,7 +836,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     install(CODE "
         file(SHA256 \"${WEBVIEW_PROVIDER}\" staged_webview_sha256)
         if(NOT staged_webview_sha256 STREQUAL \"${WEBVIEW_PROVIDER_SHA256}\")
-            message(FATAL_ERROR \"The ARM64 WebView provider changed after CMake configuration.\")
+            message(FATAL_ERROR \"The ${WEBVIEW_ABI} WebView provider changed after CMake configuration.\")
         endif()
     ")
     install(FILES "${WEBVIEW_PROVIDER}"

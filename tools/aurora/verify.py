@@ -160,8 +160,8 @@ def check_stage(prefix, arch, abi_file, readelf):
     if (shared / ".standalone-abi").read_text().strip() != Path(abi_file).read_text().strip():
         raise ValueError("Staged shared runtime ABI marker does not match the manager")
     check_runtime(shared, arch)
-    if arch == "aarch64" and not (shared / "app/webview/webview.apk").is_file():
-        raise ValueError("The required ARM64 Android WebView APK was not staged")
+    if not (shared / "app/webview/webview.apk").is_file():
+        raise ValueError("The required {} Android WebView APK was not staged".format(arch))
 
 
 def main():

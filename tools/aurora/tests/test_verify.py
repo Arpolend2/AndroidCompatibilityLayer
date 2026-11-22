@@ -1,8 +1,10 @@
 import importlib.util
 from pathlib import Path
+import shutil
 import struct
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 
@@ -72,6 +74,39 @@ class RuntimeAbiTests(unittest.TestCase):
             apk.writestr("lib/arm64-v8a/libwebview.so", b"native")
             apk.writestr("lib/armeabi-v7a/libwebview.so", b"native")
         verify.check_runtime(self.root, "armv7hl")
+
+    def test_armv7_stage_requires_matching_webview(self):
+        prefix = self.root / "stage"
+        manager = prefix / "bin" / verify.APP_ID
+        payload = prefix / "share" / verify.APP_ID / (verify.APP_ID + ".runtime")
+        for path in (manager, payload):
+            write_elf(path, "armv7hl")
+        manager.chmod(0o755)
+        payload.chmod(0o644)
+        shared = prefix / "share/common/ru.androidcompatibilitylayer/appmanager/android-runtime"
+        shutil.copytree(self.root / "lib", shared / "lib")
+        shutil.copytree(self.root / "framework", shared / "framework")
+        shutil.copytree(self.root / "usr", shared / "usr")
+        marker = self.root / "marker"
+        marker.write_text("test")
+        (shared / ".standalone-abi").write_text("test")
+        webview = shared / "app/webview/webview.apk"
+        with mock.patch.object(verify.subprocess, "check_output",
+                               side_effect=["(NEEDED) libcef.so\n(NEEDED) libaurorawebview.so", ""]):
+            with self.assertRaisesRegex(ValueError, "armv7hl Android WebView APK was not staged"):
+                verify.check_stage(prefix, "armv7hl", marker, "readelf")
+        webview.parent.mkdir(parents=True)
+        with zipfile.ZipFile(str(webview), "w") as apk:
+            apk.writestr("lib/arm64-v8a/libwebview.so", b"native")
+        with mock.patch.object(verify.subprocess, "check_output",
+                               side_effect=["(NEEDED) libcef.so\n(NEEDED) libaurorawebview.so", ""]):
+            with self.assertRaisesRegex(ValueError, "foreign Android ABIs"):
+                verify.check_stage(prefix, "armv7hl", marker, "readelf")
+        with zipfile.ZipFile(str(webview), "w") as apk:
+            apk.writestr("lib/armeabi-v7a/libwebview.so", b"native")
+        with mock.patch.object(verify.subprocess, "check_output",
+                               side_effect=["(NEEDED) libcef.so\n(NEEDED) libaurorawebview.so", ""]):
+            verify.check_stage(prefix, "armv7hl", marker, "readelf")
 
     def test_android_softfp_is_not_an_aurora_hardfloat_sdk(self):
         path = self.root / "lib/libjavacore.so"

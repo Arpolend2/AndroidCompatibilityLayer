@@ -1,5 +1,6 @@
 #include "preview.h"
 #include "google_services_runtime.h"
+#include "shared_microg_apk_metadata.h"
 #include "../core/src/drivers/mg_java.h"
 
 #include <QCoreApplication>
@@ -179,7 +180,10 @@ void PreviewPlayer::start()
         const QString package = QString::fromUtf8(info.package);
         mg_apk_info_free(&info);
         m_sharedMicrog.reset(new SharedMicrogClientChannel);
-        if (!m_sharedMicrog->openClient(package, &googleError)) {
+        const QByteArray metadata = readSharedMicrogApkMetadata(
+            QString::fromUtf8(m_apkUtf8), package, &googleError);
+        if (metadata.isEmpty() ||
+            !m_sharedMicrog->openClientWithMetadata(package, metadata, &googleError)) {
             setStatus(tr("Shared microG: %1").arg(googleError));
             ErrorLog::record(QStringLiteral("Android"), m_status, true);
             return;

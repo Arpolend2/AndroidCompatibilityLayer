@@ -31,7 +31,7 @@ public:
     // Use on one Qt thread. Reentrant close cancels open without dropping its pending D-Bus call.
     bool open(QString *error)
     {
-        return openImpl(QString(), error);
+        return openImpl(QString(), QString(), QByteArray(), error);
     }
 
     bool openClient(const QString &expectedPackage, QString *error)
@@ -40,7 +40,26 @@ public:
             if (error) *error = QStringLiteral("The client package is required.");
             return false;
         }
-        return openImpl(expectedPackage, error);
+        return openImpl(expectedPackage, QString(), QByteArray(), error);
+    }
+
+    bool openClient(const QString &expectedPackage, const QString &apkPath, QString *error)
+    {
+        if (expectedPackage.isEmpty() || apkPath.isEmpty()) {
+            if (error) *error = QStringLiteral("The client package and APK path are required.");
+            return false;
+        }
+        return openImpl(expectedPackage, apkPath, QByteArray(), error);
+    }
+
+    bool openClientWithMetadata(const QString &expectedPackage, const QByteArray &metadata,
+                                QString *error)
+    {
+        if (expectedPackage.isEmpty() || metadata.isEmpty() || metadata.size() > 1024 * 1024) {
+            if (error) *error = QStringLiteral("The client package and bounded APK metadata are required.");
+            return false;
+        }
+        return openImpl(expectedPackage, QString(), metadata, error);
     }
 
     int uid() const { return m_uid; }
@@ -48,7 +67,8 @@ public:
     QString package() const { return m_package; }
 
 private:
-    bool openImpl(const QString &expectedPackage, QString *error)
+    bool openImpl(const QString &expectedPackage, const QString &apkPath,
+                  const QByteArray &metadata, QString *error)
     {
         if (error) error->clear();
         if (m_opening || m_opened || m_closed) {
@@ -67,7 +87,12 @@ private:
             QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
             QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
             QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"),
-            expectedPackage.isEmpty() ? QStringLiteral("OpenChannel") : QStringLiteral("OpenClientChannel"));
+            expectedPackage.isEmpty() ? QStringLiteral("OpenChannel")
+                : !metadata.isEmpty() ? QStringLiteral("OpenClientChannelWithMetadata")
+                : apkPath.isEmpty() ? QStringLiteral("OpenClientChannel")
+                                    : QStringLiteral("OpenClientChannelWithApk"));
+        if (!apkPath.isEmpty()) request << apkPath;
+        if (!metadata.isEmpty()) request << metadata;
         request.setAutoStartService(true);
         QDBusUnixFileDescriptor descriptor;
         QString requestError;
@@ -75,11 +100,28 @@ private:
         QString package, managerSender;
         m_opening = true;
         {
-            QDBusPendingCallWatcher watcher(m_bus->asyncCall(request, 15000));
-            if (!watcher.isFinished()) {
-                QEventLoop loop;
-                QObject::connect(&watcher, &QDBusPendingCallWatcher::finished, &loop, &QEventLoop::quit);
-                loop.exec();
+            std::unique_ptr<QDBusPendingCallWatcher> watcher(
+                new QDBusPendingCallWatcher(m_bus->asyncCall(request, 15000)));
+            auto waitForCall = [&]() {
+                if (!watcher->isFinished()) {
+                    QEventLoop loop;
+                    QObject::connect(watcher.get(), &QDBusPendingCallWatcher::finished, &loop, &QEventLoop::quit);
+                    loop.exec();
+                }
+            };
+            waitForCall();
+            if (!m_closed && (!apkPath.isEmpty() || !metadata.isEmpty()) && watcher->isFinished() &&
+                watcher->reply().type() == QDBusMessage::ErrorMessage &&
+                (watcher->reply().errorName() == QLatin1String("org.freedesktop.DBus.Error.UnknownMethod") ||
+                 watcher->reply().errorName() == QLatin1String("org.freedesktop.DBus.Error.UnknownInterface"))) {
+                QDBusMessage legacyRequest = QDBusMessage::createMethodCall(
+                    QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+                    QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+                    QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"),
+                    QStringLiteral("OpenClientChannel"));
+                legacyRequest.setAutoStartService(true);
+                watcher.reset(new QDBusPendingCallWatcher(m_bus->asyncCall(legacyRequest, 15000)));
+                waitForCall();
             }
             m_opening = false;
             if (m_closed) {
@@ -87,18 +129,18 @@ private:
                 dispose();
                 return false;
             }
-            if (!watcher.isFinished()) {
+            if (!watcher->isFinished()) {
                 requestError = QStringLiteral("The manager channel request timed out.");
             } else {
-                managerSender = watcher.reply().service();
+                managerSender = watcher->reply().service();
                 if (expectedPackage.isEmpty()) {
-                    QDBusPendingReply<QDBusUnixFileDescriptor> reply(watcher);
+                    QDBusPendingReply<QDBusUnixFileDescriptor> reply(*watcher);
                     if (reply.isError())
                         requestError = reply.error().name() + QStringLiteral(": ") + reply.error().message();
                     else
                         descriptor = reply.value();
                 } else {
-                    QDBusPendingReply<QDBusUnixFileDescriptor, int, int, QString> reply(watcher);
+                    QDBusPendingReply<QDBusUnixFileDescriptor, int, int, QString> reply(*watcher);
                     if (reply.isError())
                         requestError = reply.error().name() + QStringLiteral(": ") + reply.error().message();
                     else {
