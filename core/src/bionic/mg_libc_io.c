@@ -185,6 +185,8 @@ static void mounts_drop(int kind)
 
 void mg_fs_mount(const char *guest_prefix, const char *host_dir) { mount_put(guest_prefix, host_dir, 0); }
 
+void mg_fs_mount_read_only(const char *guest_prefix, const char *host_dir) { mount_put(guest_prefix, host_dir, MOUNT_READ_ONLY); }
+
 void mg_fs_mount_host_file(const char *guest_path, const char *host_file) { mount_put(guest_path, host_file, MOUNT_READ_ONLY | MOUNT_HOST_FILE); }
 
 /* Whether a font's `lang` may go into the list as it is: tags of letters, digits and '-', with spaces between. */
@@ -1403,6 +1405,41 @@ int mg_fd_open_host(const char *host_path, int host_flags)
     return fd;
 }
 
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+int mg_fd_dup_native_regular(int fd)
+{
+    gobj *o = fd_get(fd);
+    int native, error = GE_OPNOTSUPP;
+    if (!o) { mg_set_errno(GE_BADF); return -1; }
+    native = o->type == OBJ_FILE ? mg_file_dup_native_regular(o->file, &error) : -1;
+    fd_put(o);
+    if (native < 0) mg_set_errno(error);
+    return native;
+}
+
+int mg_fd_import_native_regular(int fd)
+{
+    int flags, guest, error = 0;
+    mg_file *file = mg_file_from_native_regular(fd, &flags, &error);
+    gobj *o;
+    if (!file) { mg_set_errno(error); return -1; }
+    o = (gobj *)mg_alloc(sizeof(*o));
+    o->type = OBJ_FILE;
+    o->refs = 1;
+    o->file = file;
+    o->flags = (flags & MG_O_WRITE) ? ((flags & MG_O_READ) ? 2 : 1) : 0;
+    if (flags & MG_O_APPEND) o->flags |= G_O_APPEND;
+    io_init();
+    mg_lock_acquire(&g_io_lock);
+    guest = fd_alloc_locked(o, 3);
+    if (guest >= 0) g_cloexec[guest] = 1;
+    mg_lock_release(&g_io_lock);
+    if (guest < 0) mg_set_errno(GE_MFILE);
+    if (guest < 0) obj_destroy(o);
+    return guest;
+}
+#endif
+
 /*
  * The flags trace-files-<library>: each file the code of a library whose name starts with <library> opens or looks at
  * through the C library (open, openat, stat, lstat, fstatat, access, faccessat, readlink, opendir), said with the path and
@@ -1549,7 +1586,7 @@ static int g_open(const char *path, int flags, int mode)
         /* A file made read-only (chmod) is not opened for writing, whoever this process is on the host (root under qemu). */
         if (!why && !is_dir && acc && read_only) why = GE_ACCES;
         /* Nor is a file of the host's own, which Android has on a file system mounted read-only (/system). */
-        if (!why && !is_dir && (acc || (flags & G_O_TRUNC)) && in_fixed_file(g)) why = GE_ROFS;
+        if (!why && !is_dir && (acc || (flags & (G_O_TRUNC | G_O_CREAT))) && in_fixed_file(g)) why = GE_ROFS;
         if (!why && !is_dir) {
             if (acc == 0) hf = MG_O_READ;
             else if (acc == 1) hf = MG_O_WRITE;
@@ -2665,7 +2702,11 @@ static int g_fstatvfs_fn(int fd, g_statvfs *out) { (void)fd; return g_statvfs_fn
  * finds it there (EEXIST); removing or renaming one is refused as for a mount
  * point (EBUSY). 0 for any other name.
  */
-static int fixed_name(const char *g, int why) { return is_mount_point(g) || leads_to_mount(g) ? why : 0; }
+static int fixed_name(const char *g, int why)
+{
+    if (is_mount_point(g) || leads_to_mount(g)) return why;
+    return in_fixed_file(g) ? GE_ROFS : 0;
+}
 
 /* (`done`: what the watches are told once it is done, of the normalized path `g`: inotify, below.) */
 #define PATH_OP(name, fixed, call, done)            \

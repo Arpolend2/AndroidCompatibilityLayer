@@ -46,6 +46,40 @@ static bool waitUntil(const std::atomic<bool> &done, int timeout)
     return done.load();
 }
 
+static bool checkDmaBufOwnership()
+{
+    PreviewGpuState state;
+    FrameNotifier notifier;
+    bool canceled = false;
+    auto completion = [&](quint64 id, bool accepted) { canceled = id == 1 && !accepted; };
+    state.setDmaBufOwner(11, 1);
+    AuroraDmaBufFrame first;
+    first.id = 1;
+    first.channel = 11;
+    first.generation = 1;
+    if (!state.submitDmaBuf(std::move(first), &notifier, completion)) return false;
+    state.setDmaBufOwner(0, 0);
+    if (!canceled) return false;
+    AuroraDmaBufFrame closed;
+    closed.id = 2;
+    closed.channel = 11;
+    closed.generation = 1;
+    if (state.submitDmaBuf(std::move(closed), &notifier, completion)) return false;
+    state.setDmaBufOwner(11, 2);
+    AuroraDmaBufFrame stale;
+    stale.id = 3;
+    stale.channel = 11;
+    stale.generation = 1;
+    if (state.submitDmaBuf(std::move(stale), &notifier, completion)) return false;
+    AuroraDmaBufFrame current;
+    current.id = 4;
+    current.channel = 11;
+    current.generation = 2;
+    if (!state.submitDmaBuf(std::move(current), &notifier, completion)) return false;
+    state.setDmaBufOwner(0, 0);
+    return true;
+}
+
 static bool checkLayerComposition()
 {
     QQuickWindow window;
@@ -216,6 +250,11 @@ int main(int argc, char **argv)
     format.setAlphaBufferSize(8);
     QSurfaceFormat::setDefaultFormat(format);
     QGuiApplication app(argc, argv);
+    if (!checkDmaBufOwnership()) {
+        std::fprintf(stderr, "FAIL: stale DMA-BUF sign-in ownership\n");
+        return 1;
+    }
+    if (app.arguments().contains(QStringLiteral("--ownership-only"))) return 0;
     QQuickWindow window;
     window.setGeometry(0, 0, 64, 64);
     std::shared_ptr<PreviewGpuState> state = std::make_shared<PreviewGpuState>();

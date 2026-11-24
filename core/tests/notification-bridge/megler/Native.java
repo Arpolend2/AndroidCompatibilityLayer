@@ -6,8 +6,12 @@ public final class Native {
     public static int legacyCalls, warnings;
     public static String tag, title, body;
     public static final java.util.Set<String> active = new java.util.HashSet<>();
+    public static final java.util.List<String> logMessages = new java.util.ArrayList<>();
     public static String packageName() { return "org.example.app"; }
-    public static void log(int priority, String tag, String message) { warnings++; }
+    public static void log(int priority, String tag, String message) {
+        if (priority >= 5) warnings++;
+        logMessages.add(message);
+    }
     public static boolean notification(int op, String t, int i, String summary, String text) {
         calls++;
         operation = op;

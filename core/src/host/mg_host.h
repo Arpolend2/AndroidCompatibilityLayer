@@ -479,6 +479,11 @@ typedef struct mg_stat {
 
 MG_HOSTAPI mg_file *mg_file_open(const char *path, int flags, int *err);
 MG_HOSTAPI void mg_file_close(mg_file *f);
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+/* Native regular-file descriptors for authenticated Unix transports. Both functions duplicate the open file. */
+int mg_file_dup_native_regular(mg_file *f, int *error);
+mg_file *mg_file_from_native_regular(int fd, int *flags, int *error);
+#endif
 /*
  * A file reached only through handles someone else hands out (on Windows, a file the user picked, which an app container
  * may not open by its path: Windows' broker gives handles to it), under a path of the caller's: from now on mg_file_open
@@ -698,7 +703,7 @@ MG_HOSTAPI void *mg_host_open_handle(const char *path, int flags, int kind, int 
 typedef struct mg_sock mg_sock;
 
 enum { MG_AF_INET = 1, MG_AF_INET6 = 2 };
-enum { MG_SOCK_STREAM = 1, MG_SOCK_DGRAM = 2, MG_SOCK_RAW = 3 };
+enum { MG_SOCK_STREAM = 1, MG_SOCK_DGRAM = 2, MG_SOCK_RAW = 3, MG_SOCK_SEQPACKET = 5 };
 
 typedef struct mg_sockaddr {
     int family;                        /* MG_AF_INET, MG_AF_INET6; 0: no address */
@@ -743,6 +748,9 @@ MG_HOSTAPI mg_sock *mg_sock_open(int family, int type, int protocol, int *err);
 #if !defined(_WIN32) && !defined(MG_CORE_ELF)
 /* Duplicate a connected Unix stream for the guest; the caller retains fd. */
 mg_sock *mg_sock_dup_unix_stream(int fd, int *err);
+mg_sock *mg_sock_dup_unix_seqpacket(int fd, int *err);
+int mg_sock_dup_native_unix_stream(mg_sock *sock, int *error);
+int mg_sock_dup_native_unix_socket(mg_sock *sock, int *error);
 #endif
 MG_HOSTAPI void mg_sock_close(mg_sock *s);
 MG_HOSTAPI bool mg_sock_bind(mg_sock *s, const mg_sockaddr *a, int *err);

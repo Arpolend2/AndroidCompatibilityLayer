@@ -3,6 +3,7 @@ package megler;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.net.Uri;
 import android.os.Binder;
 import android.os.IBinder;
 import android.os.Parcel;
@@ -21,18 +22,38 @@ public final class SharedMicrogClientRouterTest {
     private static final class Root extends Binder {
         final IBinder service = new Binder();
         final List<Integer> unbound = new ArrayList<>();
+        IBinder broadcastCallback;
         int binds;
         int lastId;
         String lastAction;
         String lastComponent;
+        Intent lastIntent;
         String replyClass = "megler.test.gmsbroker.Broker";
+        String startedClass = "megler.test.gmsbroker.Started";
         boolean noService;
         boolean nullService;
         boolean failBind;
+        boolean stopResult = true;
+        int starts;
+        int stops;
+        int broadcasts;
 
         @Override protected boolean onTransact(int code, Parcel data, Parcel reply, int flags)
                 throws RemoteException {
             if (flags != 0 || reply == null) throw new RemoteException("synchronous request required");
+            if (code == SharedMicrogServiceRouter.REGISTER_CLIENT_CALLBACK) {
+                broadcastCallback = data.readStrongBinder();
+                if (broadcastCallback == null || data.dataAvail() != 0)
+                    throw new RemoteException("invalid callback");
+                reply.writeNoException();
+                return true;
+            }
+            if (code == SharedMicrogServiceRouter.UNREGISTER_CLIENT_CALLBACK) {
+                if (data.dataAvail() != 0) throw new RemoteException("invalid callback removal");
+                broadcastCallback = null;
+                reply.writeNoException();
+                return true;
+            }
             if (code == 1) {
                 binds++;
                 lastId = data.readInt();
@@ -42,6 +63,35 @@ public final class SharedMicrogClientRouterTest {
                 reply.writeNoException();
                 reply.writeString(noService ? null : replyClass);
                 reply.writeStrongBinder(noService || nullService ? null : service);
+                return true;
+            }
+            if (code == SharedMicrogServiceRouter.BIND_INTENT) {
+                binds++;
+                lastId = data.readInt();
+                lastIntent = data.readParcelable(Intent.class.getClassLoader());
+                reply.writeNoException();
+                reply.writeString(replyClass);
+                reply.writeStrongBinder(service);
+                return true;
+            }
+            if (code == SharedMicrogServiceRouter.START_SERVICE) {
+                lastIntent = data.readParcelable(Intent.class.getClassLoader());
+                starts++;
+                reply.writeNoException();
+                reply.writeString(startedClass);
+                return true;
+            }
+            if (code == SharedMicrogServiceRouter.STOP_SERVICE) {
+                lastIntent = data.readParcelable(Intent.class.getClassLoader());
+                stops++;
+                reply.writeNoException();
+                reply.writeInt(stopResult ? 1 : 0);
+                return true;
+            }
+            if (code == SharedMicrogServiceRouter.SEND_BROADCAST) {
+                lastIntent = data.readParcelable(Intent.class.getClassLoader());
+                broadcasts++;
+                reply.writeNoException();
                 return true;
             }
             if (code == 2) {
@@ -66,6 +116,7 @@ public final class SharedMicrogClientRouterTest {
     private static void normalBindAndUnbind() {
         Root root = new Root();
         SharedMicrogClientRouter router = new SharedMicrogClientRouter(root, Runnable::run);
+        check(root.broadcastCallback != null, "worker broadcast callback registered");
         IBinder[] service = new IBinder[1];
         ComponentName[] name = new ComponentName[1];
         ServiceConnection connection = connection(service, name);
@@ -93,6 +144,7 @@ public final class SharedMicrogClientRouterTest {
         catch (IllegalArgumentException expected) { unknownRejected = true; }
         check(unknownRejected, "unknown local binding rejected");
         router.close();
+        check(root.broadcastCallback == null, "worker broadcast callback unregistered");
     }
 
     private static void explicitComponentAndUnsupportedIntent() {
@@ -112,10 +164,48 @@ public final class SharedMicrogClientRouterTest {
         Intent mismatchedComponent = new Intent().setPackage("example.other")
             .setComponent(new ComponentName(PACKAGE, "megler.test.gmsbroker.Broker"));
         check(!SharedMicrogClientRouter.canRoute(mismatchedComponent), "package/component mismatch remains local");
-        Intent categorized = new Intent(ACTION).setPackage(PACKAGE).addCategory("example.category");
-        check(!SharedMicrogClientRouter.canRoute(categorized) &&
-              !router.bind(categorized, connection), "unsupported intent fields are not discarded");
-        check(root.binds == count, "unsupported requests never reach the root");
+        Intent categorized = new Intent(ACTION).setPackage(PACKAGE)
+            .setDataAndType(Uri.parse("content://example/item"), "application/octet-stream")
+            .addCategory("example.category").putExtra("request", "preserved");
+        check(SharedMicrogClientRouter.canRoute(categorized) &&
+              router.bind(categorized, connection), "supported intent fields are routed");
+        check(root.lastIntent != null && categorized.getData().equals(root.lastIntent.getData()) &&
+              categorized.getType().equals(root.lastIntent.getType()) &&
+              categorized.getCategories().equals(root.lastIntent.getCategories()) &&
+              "preserved".equals(root.lastIntent.getStringExtra("request")),
+              "full bind intent is preserved");
+        router.unbind(connection);
+        Intent selected = new Intent(ACTION).setPackage(PACKAGE);
+        selected.setSelector(new Intent("example.selector"));
+        check(!SharedMicrogClientRouter.canRoute(selected) &&
+              !router.bind(selected, connection), "unsupported fields are rejected, not discarded");
+        check(root.binds == count + 1, "unsupported requests never reach the root");
+        router.close();
+    }
+
+    private static void startStopAndBroadcast() {
+        Root root = new Root();
+        SharedMicrogClientRouter router = new SharedMicrogClientRouter(root, Runnable::run);
+        Intent service = new Intent(ACTION).setPackage(PACKAGE).putExtra("request", "start-data");
+        ComponentName started = router.startService(service);
+        check(root.starts == 1 && "start-data".equals(root.lastIntent.getStringExtra("request")) &&
+              started != null && PACKAGE.equals(started.getPackageName()) &&
+              root.startedClass.equals(started.getClassName()), "startService transfers intent and result");
+        check(router.stopService(service) && root.stops == 1, "stopService result is returned");
+        root.stopResult = false;
+        check(!router.stopService(service), "stopService false result is preserved");
+        router.sendBroadcast(service);
+        check(root.broadcasts == 1 && "start-data".equals(root.lastIntent.getStringExtra("request")),
+              "targeted broadcast transfers its intent");
+        Services.setSharedMicrogClientRouter(router);
+        Broadcasts.send(null, service);
+        check(root.broadcasts == 2, "Broadcasts uses the shared route for GMS-targeted requests");
+        boolean permissionFilterRejected = false;
+        try { Broadcasts.send(null, service, "fixture.permission"); }
+        catch (UnsupportedOperationException expected) { permissionFilterRejected = true; }
+        check(permissionFilterRejected && root.broadcasts == 2,
+              "unsupported broadcast permission filters fail without being dropped");
+        Services.setSharedMicrogClientRouter(null);
         router.close();
     }
 
@@ -173,8 +263,9 @@ public final class SharedMicrogClientRouterTest {
     public static void main(String[] args) {
         normalBindAndUnbind();
         explicitComponentAndUnsupportedIntent();
+        startStopAndBroadcast();
         failedAndNullBindings();
         closeReleasesBindings();
-        System.out.println("SharedMicrogClientRouterTest: PASS bind, unbind, opt-in, errors and close");
+        System.out.println("SharedMicrogClientRouterTest: PASS service intents, start/stop, broadcasts, unbind and close");
     }
 }

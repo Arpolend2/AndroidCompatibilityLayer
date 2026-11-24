@@ -8,16 +8,11 @@
  * Surface made from a SurfaceTexture, which it then draws from as an OpenGL
  * "external" texture.
  *
- * Here the file is decoded whole by the shell (megler_media_host: on a phone,
- * Windows' own H.264 and AAC decoders), and the two halves are a show put on
- * for the engine: the "compressed sample" the extractor hands out is a
- * ticket saying which file and which sample, and the codec that is given a
- * ticket asks the shell for the next decoded picture or the next block of
- * sound. That is all an engine can tell: it never looks inside a sample.
- * What it does notice is timing and order, so those are kept as Android has
- * them: a format-changed notice before the first output, a time on every
- * buffer, an end-of-stream flag that travels from the extractor through the
- * codec's input to its output.
+ * A registered demuxer hands out real compressed samples, which the shared
+ * packet codec decodes. Older shells without one retain their file-decoder
+ * path: the extractor hands out tickets identifying the file and sample,
+ * and the codec asks the shell for decoded pictures or sound. Both paths
+ * provide format changes, timestamps and end-of-stream notices.
  *
  * A file is copied out of wherever the app keeps it (a range of the APK, by
  * descriptor; a data source that calls back into the app) to a file of its
@@ -36,6 +31,7 @@
 
 #include "../bionic/mg_bionic.h"
 #include "../bionic/mg_fd.h"
+#include "../drivers/mg_java.h"
 #include "../host/mg_host.h"
 #include "../jni/mg_jni.h"
 #include "../jni/mg_jni_loop.h"
@@ -229,10 +225,14 @@ typedef struct g_media {
     megler_media_info info;
     char *path;                        /* the copy of the file, deleted with the last reference */
     mg_lock lock;                      /* one read of the shell's decoder at a time */
+    const mg_demux_host *demux_host;
+    void *demux;
 } g_media;
 
 static const megler_media_host *g_test_host;
+static const mg_demux_host *g_demux_host;
 void mg_media_set_host(const struct megler_media_host *h) { g_test_host = h; }
+void mg_media_set_demux_host(const mg_demux_host *h) { g_demux_host = h; }
 
 static const megler_media_host *host(void)
 {
@@ -246,6 +246,7 @@ static void media_release(g_media *m)
     const megler_media_host *h = host();
     int err = 0;
     if (!m || mg_atomic_add(&m->refs, -1) > 0) return;
+    if (m->demux && m->demux_host) m->demux_host->close(m->demux);
     if (m->handle && h && h->close) h->close(h->user, m->handle);
     if (m->path) mg_path_remove(m->path, &err);
     free(m->path);
@@ -266,7 +267,7 @@ static g_media *media_open(source_read read, void *user, i64 size)
     i64 at = 0;
     int err = 0;
     g_media *m;
-    if (!h || !h->open) {
+    if ((!h || !h->open) && !g_demux_host) {
         mg_note_once("media: the shell has no decoder for films; the app is told the file cannot be opened");
         return NULL;
     }
@@ -303,14 +304,20 @@ static g_media *media_open(source_read read, void *user, i64 size)
     m->refs = 1;
     m->path = path;
     mg_lock_init(&m->lock);
-    m->handle = h->open(h->user, path, &m->info);
-    if (!m->handle) {
+    if (g_demux_host && g_demux_host->open && g_demux_host->close && g_demux_host->track_count &&
+        g_demux_host->track && g_demux_host->read && g_demux_host->seek) {
+        m->demux_host = g_demux_host;
+        m->demux = g_demux_host->open(path);
+    }
+    if (!m->demux && h && h->open) m->handle = h->open(h->user, path, &m->info);
+    if (!m->handle && !m->demux) {
         mg_warn("media: the shell's decoder could not open the film (%lld bytes)", (long long)size);
         media_release(m);
         return NULL;
     }
-    mg_info("media: a film of %dx%d at %d/%d frames a second, sound %d Hz in %d channels, %lld ms long", m->info.width, m->info.height, m->info.frame_rate_num,
-            m->info.frame_rate_den, m->info.sample_rate, m->info.channels, (long long)(m->info.duration_us / 1000));
+    if (m->demux) mg_info("media: opened %lld bytes with the compressed-sample demuxer", (long long)size);
+    else mg_info("media: a film of %dx%d at %d/%d frames a second, sound %d Hz in %d channels, %lld ms long", m->info.width, m->info.height, m->info.frame_rate_num,
+                 m->info.frame_rate_den, m->info.sample_rate, m->info.channels, (long long)(m->info.duration_us / 1000));
     return m;
 }
 
@@ -345,8 +352,10 @@ typedef struct g_track {
 
 typedef struct g_extractor {
     g_media *media;
-    g_track tracks[2];
+    g_track tracks[32];
     int ntracks;
+    mg_demux_sample sample;
+    bool have_sample, demux_ended, demux_failed;
 } g_extractor;
 
 /* What a sample's bytes are here: which file, which track, which sample. */
@@ -364,11 +373,37 @@ static i64 sample_time(const g_extractor *ex, const g_track *t, u64 index)
 }
 
 /* The selected track whose next sample comes first, or -1 when every one of them has run out. */
-static int current_track(const g_extractor *ex)
+static int current_track(g_extractor *ex)
 {
     int i, best = -1;
     i64 best_time = 0;
     if (!ex || !ex->media) return -1;
+    if (ex->media->demux) {
+        const mg_demux_host *h = ex->media->demux_host;
+        bool selected = false;
+        int rc;
+        for (i = 0; i < ex->ntracks; i++) selected |= ex->tracks[i].selected;
+        if (!selected) return -1;
+        if (ex->have_sample && ex->sample.track >= 0 && ex->sample.track < ex->ntracks &&
+            ex->tracks[ex->sample.track].selected) return ex->sample.track;
+        ex->have_sample = false;
+        while (!ex->demux_ended) {
+            rc = h->read(ex->media->demux, &ex->sample);
+            if (rc <= 0) {
+                if (rc < 0) {
+                    mg_warn("media: demuxer failed to read a compressed sample");
+                    ex->demux_failed = true;
+                }
+                ex->demux_ended = true;
+                break;
+            }
+            if (ex->sample.track >= 0 && ex->sample.track < ex->ntracks && ex->tracks[ex->sample.track].selected) {
+                ex->have_sample = true;
+                return ex->sample.track;
+            }
+        }
+        return -1;
+    }
     for (i = 0; i < ex->ntracks; i++) {
         const g_track *t = &ex->tracks[i];
         i64 time;
@@ -399,6 +434,34 @@ static int extractor_opened(g_extractor *ex, g_media *m)
     const megler_media_info *in;
     if (!m) return AMEDIA_ERROR_UNKNOWN;
     ex->media = m;
+    if (m->demux) {
+        const mg_demux_host *h = m->demux_host;
+        int i, count = h->track_count(m->demux);
+        if (count < 1 || count > 32) return AMEDIA_ERROR_UNSUPPORTED;
+        for (i = 0; i < count; i++) {
+            mg_demux_track in_track;
+            g_track *t = &ex->tracks[ex->ntracks];
+            memset(&in_track, 0, sizeof(in_track));
+            if (!h->track(m->demux, i, &in_track) || !in_track.mime) return AMEDIA_ERROR_UNSUPPORTED;
+            t->video = !strncmp(in_track.mime, "video/", 6);
+            t->format = g_AMediaFormat_new();
+            fmt_set_str(t->format, "mime", in_track.mime);
+            fmt_set_i64(t->format, "durationUs", in_track.duration_us);
+            fmt_set_i32(t->format, "max-input-size", 1048576);
+            if (t->video) {
+                fmt_set_i32(t->format, "width", in_track.width);
+                fmt_set_i32(t->format, "height", in_track.height);
+            } else {
+                fmt_set_i32(t->format, "sample-rate", in_track.sample_rate);
+                fmt_set_i32(t->format, "channel-count", in_track.channels);
+            }
+            if (in_track.config && in_track.config_size)
+                g_AMediaFormat_setBuffer(t->format, "csd-0", in_track.config, in_track.config_size);
+            ex->ntracks++;
+        }
+        SAY("extractor: %d compressed tracks", ex->ntracks);
+        return AMEDIA_OK;
+    }
     in = &m->info;
     if (in->width > 0 && in->height > 0) {
         g_track *t = &ex->tracks[ex->ntracks++];
@@ -493,7 +556,9 @@ static g_format *g_AMediaExtractor_getTrackFormat(g_extractor *ex, size_t index)
         if (e->type == 'i') fmt_set_i32(copy, e->key, e->i);
         else if (e->type == 'l') fmt_set_i64(copy, e->key, e->l);
         else if (e->type == 's') fmt_set_str(copy, e->key, e->s);
+        else if (e->type == 'b') g_AMediaFormat_setBuffer(copy, e->key, e->data, e->size);
     }
+    if (!ex->media->demux) fmt_set_i32(copy, "megler-ticket", 1);
     SAY("extractor: track %u is %s", (unsigned)index, g_AMediaFormat_toString(copy));
     return copy;
 }
@@ -517,6 +582,12 @@ static gssize g_AMediaExtractor_readSampleData(g_extractor *ex, u8 *buffer, size
 {
     int k = current_track(ex);
     ticket t;
+    if (ex && ex->media && ex->media->demux) {
+        if (k < 0) return ex->demux_failed ? AMEDIA_ERROR_UNKNOWN : -1;
+        if (!buffer || capacity < ex->sample.size) return AMEDIA_ERROR_INVALID_PARAMETER;
+        memcpy(buffer, ex->sample.data, ex->sample.size);
+        return (gssize)ex->sample.size;
+    }
     if (k < 0 || !buffer || capacity < sizeof(t)) return -1;
     memset(&t, 0, sizeof(t));
     t.magic = TICKET_MAGIC;
@@ -527,19 +598,24 @@ static gssize g_AMediaExtractor_readSampleData(g_extractor *ex, u8 *buffer, size
     return (gssize)sizeof(t);
 }
 
-static u32 g_AMediaExtractor_getSampleFlags(g_extractor *ex) { return current_track(ex) >= 0 ? 1u : 0u; }   /* every sample a sync sample */
+static u32 g_AMediaExtractor_getSampleFlags(g_extractor *ex)
+{
+    if (current_track(ex) < 0) return 0;
+    return ex->media->demux ? ex->sample.flags : 1u;
+}
 static int g_AMediaExtractor_getSampleTrackIndex(g_extractor *ex) { return current_track(ex); }
 static i64 g_AMediaExtractor_getSampleTime(g_extractor *ex)
 {
     int k = current_track(ex);
-    return k < 0 ? -1 : sample_time(ex, &ex->tracks[k], ex->tracks[k].index);
+    return k < 0 ? -1 : ex->media->demux ? ex->sample.time_us : sample_time(ex, &ex->tracks[k], ex->tracks[k].index);
 }
 
 static u8 g_AMediaExtractor_advance(g_extractor *ex)
 {
     int k = current_track(ex);
     if (k < 0) return 0;
-    ex->tracks[k].index++;
+    if (ex->media->demux) ex->have_sample = false;
+    else ex->tracks[k].index++;
     return current_track(ex) >= 0;
 }
 
@@ -550,6 +626,11 @@ static int g_AMediaExtractor_seekTo(g_extractor *ex, i64 time_us, int mode)
     (void)mode;
     if (!ex || !ex->media) return AMEDIA_ERROR_INVALID_OBJECT;
     if (time_us < 0) time_us = 0;
+    if (ex->media->demux) {
+        if (!ex->media->demux_host->seek(ex->media->demux, time_us, mode)) return AMEDIA_ERROR_UNKNOWN;
+        ex->have_sample = ex->demux_ended = ex->demux_failed = false;
+        return AMEDIA_OK;
+    }
     SAY("extractor: seek to %lld ms", (long long)(time_us / 1000));
     mg_lock_acquire(&ex->media->lock);
     if (h && h->seek) h->seek(h->user, ex->media->handle, time_us);
@@ -765,6 +846,7 @@ void mg_media_install(void)
 /* -------------------------------------------------------------- AMediaCodec */
 
 enum { OUT_SLOTS = 4 };
+enum { CODEC_INPUT_SIZE = 1024 * 1024 };
 
 typedef struct g_buffer_info {
     i32 offset, size;
@@ -776,8 +858,17 @@ typedef struct out_slot {
     u8 *data;
     u32 capacity, size;
     i64 time_us;
+    i32 width, height;
     bool held;                         /* handed to the app and not yet released */
 } out_slot;
+
+typedef struct packet_output {
+    u8 *data;
+    size_t size;
+    i64 time_us;
+    i32 width, height, rate, channels;
+    struct packet_output *next;
+} packet_output;
 
 typedef struct g_codec {
     bool video;
@@ -790,7 +881,14 @@ typedef struct g_codec {
     u32 decoded;                       /* how many have been, for the log */
     bool input_ended, output_ended, format_said, started;
     out_slot out[OUT_SLOTS];
-    u8 input[64];
+    u8 *input;
+    char *mime;
+    mg_mcodec *packet_codec;
+    packet_output *packet_first, **packet_tail;
+    u32 packet_count;
+    size_t packet_bytes;
+    i32 width, height, rate, channels;
+    bool packet_mode, packet_failed;
     g_format *format;
 } g_codec;
 
@@ -802,6 +900,9 @@ static g_codec *g_AMediaCodec_createDecoderByType(const char *mime)
     if (!video && !audio) return NULL;
     c = (g_codec *)mg_alloc(sizeof(*c));
     c->video = video;
+    c->input = (u8 *)mg_alloc(CODEC_INPUT_SIZE);
+    c->mime = mg_strdup(mime);
+    c->packet_tail = &c->packet_first;
     mg_lock_init(&c->lock);
     return c;
 }
@@ -811,6 +912,10 @@ static g_codec *g_AMediaCodec_createCodecByName(const char *name)
     /* Android's names: "OMX.qcom.video.decoder.avc", "c2.android.aac.decoder"... */
     bool video = name && (strstr(name, "video") || strstr(name, "avc") || strstr(name, "h264") || strstr(name, "hevc") || strstr(name, "vp"));
     if (name && strstr(name, "encoder")) return NULL;
+    if (name && (strstr(name, "hevc") || strstr(name, "h265"))) return g_AMediaCodec_createDecoderByType("video/hevc");
+    if (name && (strstr(name, "vp9"))) return g_AMediaCodec_createDecoderByType("video/x-vnd.on2.vp9");
+    if (name && (strstr(name, "vp8"))) return g_AMediaCodec_createDecoderByType("video/x-vnd.on2.vp8");
+    if (name && strstr(name, "mp3")) return g_AMediaCodec_createDecoderByType("audio/mpeg");
     return g_AMediaCodec_createDecoderByType(video ? "video/avc" : "audio/mp4a-latm");
 }
 
@@ -824,6 +929,15 @@ static int g_AMediaCodec_delete(g_codec *c)
 {
     int i;
     if (!c) return AMEDIA_OK;
+    while (c->packet_first) {
+        packet_output *p = c->packet_first;
+        c->packet_first = p->next;
+        free(p->data);
+        free(p);
+    }
+    mg_mcodec_destroy(c->packet_codec);
+    free(c->input);
+    free(c->mime);
     for (i = 0; i < OUT_SLOTS; i++) free(c->out[i].data);
     g_AMediaFormat_delete(c->format);
     media_release(c->media);
@@ -833,9 +947,50 @@ static int g_AMediaCodec_delete(g_codec *c)
 
 static int g_AMediaCodec_configure(g_codec *c, const g_format *format, void *window, void *crypto, u32 flags)
 {
-    (void)format; (void)crypto;
+    const u8 *csd[3] = { NULL, NULL, NULL };
+    size_t csd_size[3] = { 0, 0, 0 };
+    const char *keys[3] = { "csd-0", "csd-1", "csd-2" };
+    const char *mime = NULL;
+    i32 ticket_mode = 0;
+    int i;
     if (!c) return AMEDIA_ERROR_INVALID_OBJECT;
     if (flags & 1) return AMEDIA_ERROR_UNSUPPORTED;          /* an encoder */
+    if (c->started) return AMEDIA_ERROR_INVALID_OBJECT;
+    media_release(c->media);
+    c->media = NULL;
+    if (c->packet_codec) {
+        mg_mcodec_destroy(c->packet_codec);
+        c->packet_codec = NULL;
+        c->packet_mode = false;
+    }
+    if (format) {
+        if (!g_AMediaFormat_getString((g_format *)format, "mime", &mime)) mime = c->mime;
+        g_AMediaFormat_getInt32((g_format *)format, "megler-ticket", &ticket_mode);
+        if (!ticket_mode) {
+            if (crypto) return AMEDIA_ERROR_UNSUPPORTED;
+            if ((!strncmp(mime, "video/", 6)) != c->video) return AMEDIA_ERROR_INVALID_PARAMETER;
+            if (!mg_mcodec_supported(mime)) return AMEDIA_ERROR_UNSUPPORTED;
+            c->packet_codec = mg_mcodec_create(mime);
+            if (!c->packet_codec) return AMEDIA_ERROR_UNSUPPORTED;
+            g_AMediaFormat_getInt32((g_format *)format, "width", &c->width);
+            g_AMediaFormat_getInt32((g_format *)format, "height", &c->height);
+            g_AMediaFormat_getInt32((g_format *)format, "sample-rate", &c->rate);
+            g_AMediaFormat_getInt32((g_format *)format, "channel-count", &c->channels);
+            for (i = 0; i < 3; i++) {
+                fmt_entry *entry = fmt_find(format, keys[i], 'b');
+                if (entry) {
+                    csd[i] = (const u8 *)entry->data;
+                    csd_size[i] = entry->size;
+                }
+            }
+            if (!mg_mcodec_configure(c->packet_codec, c->width, c->height, c->rate, c->channels, csd, csd_size)) {
+                mg_mcodec_destroy(c->packet_codec);
+                c->packet_codec = NULL;
+                return AMEDIA_ERROR_UNKNOWN;
+            }
+            c->packet_mode = true;
+        }
+    }
     c->surface = surface_of_window(window);
     SAY("codec: configured, %s", !c->video ? "sound" : c->surface ? "pictures onto a SurfaceTexture" : window ? "pictures onto a window that is no SurfaceTexture" : "pictures into buffers");
     return AMEDIA_OK;
@@ -854,6 +1009,17 @@ static void codec_reset(g_codec *c)
     mg_lock_acquire(&c->lock);
     c->pending = 0;
     c->input_ended = c->output_ended = false;
+    c->packet_failed = false;
+    while (c->packet_first) {
+        packet_output *p = c->packet_first;
+        c->packet_first = p->next;
+        free(p->data);
+        free(p);
+    }
+    c->packet_tail = &c->packet_first;
+    c->packet_count = 0;
+    c->packet_bytes = 0;
+    if (c->packet_codec) mg_mcodec_flush(c->packet_codec);
     for (i = 0; i < OUT_SLOTS; i++) c->out[i].held = false;
     c->room++;
     mg_lock_release(&c->lock);
@@ -865,6 +1031,7 @@ static int g_AMediaCodec_stop(g_codec *c)
     if (!c) return AMEDIA_ERROR_INVALID_OBJECT;
     codec_reset(c);
     c->started = false;
+    c->format_said = false;
     return AMEDIA_OK;
 }
 
@@ -886,6 +1053,67 @@ static int g_AMediaCodec_flush(g_codec *c)
  */
 enum { VIDEO_AHEAD = 8, AUDIO_AHEAD = 16 };
 
+static bool packet_fill(g_codec *c)
+{
+    u32 limit = c->video ? VIDEO_AHEAD : AUDIO_AHEAD;
+    while (c->packet_count < limit && c->packet_bytes < 64 * 1024 * 1024) {
+        i64 info[3] = { 0, 0, 0 };
+        packet_output *p;
+        if (c->video) {
+            mg_mframe *frame = mg_mcodec_next_frame(c->packet_codec, info);
+            const megler_codec_picture *picture;
+            size_t size, i;
+            if (!frame) break;
+            if (info[1] <= 0 || info[2] <= 0 || info[1] > 8192 || info[2] > 8192) {
+                mg_warn("media: invalid decoded picture dimensions");
+                mg_mcodec_free_frame(frame);
+                return false;
+            }
+            size = (size_t)info[1] * (size_t)info[2] * 4;
+            if (size > 64 * 1024 * 1024) {
+                mg_warn("media: decoded picture exceeds the NDK buffer limit");
+                mg_mcodec_free_frame(frame);
+                return false;
+            }
+            p = (packet_output *)mg_alloc(sizeof(*p));
+            p->data = (u8 *)mg_alloc(size);
+            p->size = size;
+            p->time_us = info[0];
+            p->width = (i32)info[1];
+            p->height = (i32)info[2];
+            picture = mg_mcodec_frame_picture(frame);
+            if (!picture || !mg_mcodec_render(picture, p->data, p->width, p->height, p->width * 4)) {
+                mg_warn("media: cannot copy decoded picture into an NDK buffer");
+                mg_mcodec_free_frame(frame);
+                free(p->data);
+                free(p);
+                return false;
+            }
+            mg_mcodec_free_frame(frame);
+            for (i = 0; i < size; i += 4) {
+                u8 red = p->data[i];
+                p->data[i] = p->data[i + 2];
+                p->data[i + 2] = red;
+            }
+        } else {
+            size_t size = 0;
+            u8 *data = mg_mcodec_next_pcm(c->packet_codec, info, &size);
+            if (!data) break;
+            p = (packet_output *)mg_alloc(sizeof(*p));
+            p->data = data;
+            p->size = size;
+            p->time_us = info[0];
+            p->rate = (i32)info[1];
+            p->channels = (i32)info[2];
+        }
+        *c->packet_tail = p;
+        c->packet_tail = &p->next;
+        c->packet_count++;
+        c->packet_bytes += p->size;
+    }
+    return true;
+}
+
 /* There is one input buffer, free again the moment it has been queued (nothing is kept of what it held) unless the decoder is full. */
 /* (Buffer indexes are size_t's, and a dequeue's answer a ssize_t: an index, or a negative INFO_*.) */
 static gssize g_AMediaCodec_dequeueInputBuffer(g_codec *c, i64 timeout_us)
@@ -897,13 +1125,19 @@ static gssize g_AMediaCodec_dequeueInputBuffer(g_codec *c, i64 timeout_us)
     limit = c->video ? VIDEO_AHEAD : AUDIO_AHEAD;
     mg_lock_acquire(&c->lock);
     seen = c->room;
-    if (c->pending >= limit && timeout_us != 0) {
+    if (((c->packet_mode ? c->packet_count : c->pending) >= limit ||
+         (c->packet_mode && c->packet_bytes >= 64 * 1024 * 1024)) && timeout_us != 0) {
         u64 wait = timeout_us < 0 || timeout_us > 20000 ? 20000000ull : (u64)timeout_us * 1000ull;
         mg_lock_release(&c->lock);
         mg_gwait(&c->room, seen, wait);
         mg_lock_acquire(&c->lock);
     }
-    full = c->pending >= limit;
+    full = (c->packet_mode ? c->packet_count : c->pending) >= limit ||
+           (c->packet_mode && c->packet_bytes >= 64 * 1024 * 1024) || c->input_ended || c->packet_failed;
+    if (c->packet_failed) {
+        mg_lock_release(&c->lock);
+        return AMEDIA_ERROR_UNKNOWN;
+    }
     mg_lock_release(&c->lock);
     return full ? INFO_TRY_AGAIN_LATER : 0;
 }
@@ -911,17 +1145,25 @@ static gssize g_AMediaCodec_dequeueInputBuffer(g_codec *c, i64 timeout_us)
 static u8 *g_AMediaCodec_getInputBuffer(g_codec *c, size_t index, size_t *size)
 {
     if (!c || index != 0) return NULL;
-    if (size) *size = sizeof(c->input);
+    if (size) *size = CODEC_INPUT_SIZE;
     return c->input;
 }
 
 static int g_AMediaCodec_queueInputBuffer(g_codec *c, size_t index, goff offset, size_t size, u64 time_us, u32 flags)
 {
     ticket t;
-    (void)time_us;
-    if (!c || index != 0) return AMEDIA_ERROR_INVALID_PARAMETER;
+    if (!c || index != 0 || offset < 0 || (size_t)offset > CODEC_INPUT_SIZE || size > CODEC_INPUT_SIZE - (size_t)offset)
+        return AMEDIA_ERROR_INVALID_PARAMETER;
     mg_lock_acquire(&c->lock);
-    if (size >= sizeof(t) && offset >= 0 && (size_t)offset + sizeof(t) <= sizeof(c->input)) {
+    if (c->packet_mode) {
+        if (c->packet_failed || c->input_ended || !mg_mcodec_decode(c->packet_codec, c->input + offset, size, (i64)time_us, (i32)flags) || !packet_fill(c)) {
+            c->packet_failed = true;
+            c->wake++;
+            mg_lock_release(&c->lock);
+            mg_futex_wake(&c->wake, true);
+            return AMEDIA_ERROR_UNKNOWN;
+        }
+    } else if (size >= sizeof(t)) {
         memcpy(&t, c->input + offset, sizeof(t));
         if (t.magic == TICKET_MAGIC && t.media) {
             if (!c->media) {
@@ -929,7 +1171,13 @@ static int g_AMediaCodec_queueInputBuffer(g_codec *c, size_t index, goff offset,
                 mg_atomic_add(&t.media->refs, 1);
             }
             c->pending++;
+        } else {
+            mg_lock_release(&c->lock);
+            return AMEDIA_ERROR_UNSUPPORTED;
         }
+    } else if (size) {
+        mg_lock_release(&c->lock);
+        return AMEDIA_ERROR_UNSUPPORTED;
     }
     if (flags & BUFFER_FLAG_END_OF_STREAM) c->input_ended = true;
     c->wake++;
@@ -944,15 +1192,15 @@ static g_format *output_format(g_codec *c)
     const megler_media_info *in = c->media ? &c->media->info : NULL;
     if (c->video) {
         fmt_set_str(f, "mime", "video/raw");
-        fmt_set_i32(f, "width", in ? in->width : 0);
-        fmt_set_i32(f, "height", in ? in->height : 0);
-        fmt_set_i32(f, "stride", in ? in->width : 0);
-        fmt_set_i32(f, "slice-height", in ? in->height : 0);
-        fmt_set_i32(f, "color-format", 0x7F000789);           /* COLOR_FormatSurface */
+        fmt_set_i32(f, "width", in ? in->width : c->width);
+        fmt_set_i32(f, "height", in ? in->height : c->height);
+        fmt_set_i32(f, "stride", in ? in->width : c->width);
+        fmt_set_i32(f, "slice-height", in ? in->height : c->height);
+        fmt_set_i32(f, "color-format", c->packet_mode && !c->surface ? 0x7F00A000 : 0x7F000789);
     } else {
         fmt_set_str(f, "mime", "audio/raw");
-        fmt_set_i32(f, "sample-rate", in ? in->sample_rate : 44100);
-        fmt_set_i32(f, "channel-count", in ? in->channels : 2);
+        fmt_set_i32(f, "sample-rate", in ? in->sample_rate : c->rate);
+        fmt_set_i32(f, "channel-count", in ? in->channels : c->channels);
         fmt_set_i32(f, "pcm-encoding", 2);                    /* 16-bit */
     }
     return f;
@@ -969,17 +1217,34 @@ static gssize g_AMediaCodec_dequeueOutputBuffer(g_codec *c, g_buffer_info *info,
     if (!c || !info) return AMEDIA_ERROR_INVALID_PARAMETER;
     memset(info, 0, sizeof(*info));
     mg_lock_acquire(&c->lock);
+    if (c->packet_mode && !c->packet_failed && !packet_fill(c)) c->packet_failed = true;
     seen = c->wake;
-    if (!c->pending && !c->input_ended && timeout_us != 0) {
+    if (!(c->packet_mode ? c->packet_count : c->pending) && !c->input_ended && !c->packet_failed && timeout_us != 0) {
         /* Nothing to decode yet: wait for input, as long as asked (and never for good: the caller polls). */
         u64 wait = timeout_us < 0 || timeout_us > 20000 ? 20000000ull : (u64)timeout_us * 1000ull;
         mg_lock_release(&c->lock);
         mg_gwait(&c->wake, seen, wait);
         mg_lock_acquire(&c->lock);
     }
-    if (c->output_ended || !c->media || (!c->pending && !c->input_ended)) {
+    if (c->packet_failed) {
+        mg_lock_release(&c->lock);
+        return AMEDIA_ERROR_UNKNOWN;
+    }
+    if (c->output_ended || (!c->packet_mode && !c->media) ||
+        (!(c->packet_mode ? c->packet_count : c->pending) && !c->input_ended)) {
         mg_lock_release(&c->lock);
         return INFO_TRY_AGAIN_LATER;
+    }
+    if (c->packet_mode && c->packet_first) {
+        packet_output *p = c->packet_first;
+        if ((c->video && (c->width != p->width || c->height != p->height)) ||
+            (!c->video && (c->rate != p->rate || c->channels != p->channels))) {
+            c->width = p->width;
+            c->height = p->height;
+            c->rate = p->rate;
+            c->channels = p->channels;
+            c->format_said = false;
+        }
     }
     if (!c->format_said) {
         c->format_said = true;
@@ -997,7 +1262,7 @@ static gssize g_AMediaCodec_dequeueOutputBuffer(g_codec *c, g_buffer_info *info,
         mg_lock_release(&c->lock);
         return INFO_TRY_AGAIN_LATER;           /* the app holds every buffer */
     }
-    if (!c->pending) {
+    if (!(c->packet_mode ? c->packet_count : c->pending)) {
         /* The input has ended and everything queued has been decoded. */
         c->output_ended = true;
         slot->held = true;
@@ -1005,6 +1270,35 @@ static gssize g_AMediaCodec_dequeueOutputBuffer(g_codec *c, g_buffer_info *info,
         info->flags = BUFFER_FLAG_END_OF_STREAM;
         mg_lock_release(&c->lock);
         SAY("codec: %s output has ended after %u samples", c->video ? "picture" : "sound", (unsigned)c->decoded);
+        return index;
+    }
+    if (c->packet_mode) {
+        packet_output *p = c->packet_first;
+        c->packet_first = p->next;
+        if (!c->packet_first) c->packet_tail = &c->packet_first;
+        c->packet_count--;
+        c->packet_bytes -= p->size;
+        free(slot->data);
+        slot->data = p->data;
+        slot->size = slot->capacity = (u32)p->size;
+        slot->time_us = p->time_us;
+        slot->width = p->width;
+        slot->height = p->height;
+        slot->held = true;
+        if (c->video) {
+            c->width = p->width;
+            c->height = p->height;
+        } else {
+            c->rate = p->rate;
+            c->channels = p->channels;
+        }
+        info->size = (i32)p->size;
+        info->time_us = p->time_us;
+        c->decoded++;
+        c->room++;
+        free(p);
+        mg_lock_release(&c->lock);
+        mg_futex_wake(&c->room, true);
         return index;
     }
     c->pending--;
@@ -1057,9 +1351,15 @@ static int g_AMediaCodec_releaseOutputBuffer(g_codec *c, size_t index, u8 render
 {
     out_slot *slot;
     if (!c || index >= OUT_SLOTS) return AMEDIA_ERROR_INVALID_PARAMETER;
+    mg_lock_acquire(&c->lock);
     slot = &c->out[index];
-    if (slot->held && render && c->video && c->surface && slot->size && c->media) surface_push(c->surface, slot->data, c->media->info.width, c->media->info.height, slot->time_us);
+    if (slot->held && render && c->video && c->surface && slot->size && (c->media || c->packet_mode))
+        surface_push(c->surface, slot->data, c->packet_mode ? slot->width : c->media->info.width,
+                     c->packet_mode ? slot->height : c->media->info.height, slot->time_us);
     slot->held = false;
+    c->wake++;
+    mg_lock_release(&c->lock);
+    mg_futex_wake(&c->wake, true);
     return AMEDIA_OK;
 }
 

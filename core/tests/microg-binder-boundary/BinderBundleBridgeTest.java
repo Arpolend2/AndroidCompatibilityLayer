@@ -73,6 +73,23 @@ public class BinderBundleBridgeTest {
                       "bundle numbers");
                 check(bundle.getBoolean("enabled"), "bundle boolean");
                 check(Arrays.equals(bundle.getByteArray("bytes"), new byte[] {1, 2, 3}), "bundle bytes");
+                check(bundle.getByte("byte") == -3 && bundle.getShort("short") == -1234 &&
+                      bundle.getChar("char") == '\u263a' && bundle.getFloat("float") == 1.25f &&
+                      bundle.getDouble("double") == -4.5, "bundle primitive values");
+                check(Arrays.equals(bundle.getBooleanArray("booleans"), new boolean[] {true, false}) &&
+                      Arrays.equals(bundle.getShortArray("shorts"), new short[] {-1, 2}) &&
+                      Arrays.equals(bundle.getCharArray("chars"), new char[] {'x', '\u263a'}) &&
+                      Arrays.equals(bundle.getIntArray("ints"), new int[] {Integer.MIN_VALUE, 3}) &&
+                      Arrays.equals(bundle.getLongArray("longs"), new long[] {Long.MIN_VALUE, 5}) &&
+                      Arrays.equals(bundle.getFloatArray("floats"), new float[] {1.5f, -2f, Float.NaN}) &&
+                      Arrays.equals(bundle.getDoubleArray("doubles"), new double[] {1.5, -2.0}) &&
+                      Arrays.equals(bundle.getStringArray("strings"), new String[] {"text", null, ""}),
+                      "bundle arrays");
+                check(bundle.getStringArrayList("stringList").equals(Arrays.asList("a", null, "")) &&
+                      bundle.getIntegerArrayList("intList").equals(Arrays.asList(1, null, -2)),
+                      "bundle string and integer lists");
+                check(Float.floatToRawIntBits(bundle.getFloatArray("floats")[2]) == 0x7fc00001,
+                      "NaN payload preserved");
                 Bundle nested = bundle.getBundle("nested");
                 check(nested != null && "inside".equals(nested.getString("value")), "nested bundle");
                 IBinder callback = nested.getBinder("callback");
@@ -115,6 +132,21 @@ public class BinderBundleBridgeTest {
             bundle.putLong("large", 123456789012L);
             bundle.putBoolean("enabled", true);
             bundle.putByteArray("bytes", new byte[] {1, 2, 3});
+            bundle.putByte("byte", (byte) -3);
+            bundle.putShort("short", (short) -1234);
+            bundle.putChar("char", '\u263a');
+            bundle.putFloat("float", 1.25f);
+            bundle.putDouble("double", -4.5);
+            bundle.putBooleanArray("booleans", new boolean[] {true, false});
+            bundle.putShortArray("shorts", new short[] {-1, 2});
+            bundle.putCharArray("chars", new char[] {'x', '\u263a'});
+            bundle.putIntArray("ints", new int[] {Integer.MIN_VALUE, 3});
+            bundle.putLongArray("longs", new long[] {Long.MIN_VALUE, 5});
+            bundle.putFloatArray("floats", new float[] {1.5f, -2f, Float.intBitsToFloat(0x7fc00001)});
+            bundle.putDoubleArray("doubles", new double[] {1.5, -2.0});
+            bundle.putStringArray("strings", new String[] {"text", null, ""});
+            bundle.putStringArrayList("stringList", new java.util.ArrayList<>(Arrays.asList("a", null, "")));
+            bundle.putIntegerArrayList("intList", new java.util.ArrayList<>(Arrays.asList(1, null, -2)));
             bundle.putBundle("nested", nested);
             Parcel data = Parcel.obtain(), reply = Parcel.obtain();
             try {
@@ -123,7 +155,67 @@ public class BinderBundleBridgeTest {
                 Bundle returned = reply.readBundle();
                 check(returned != bundle && "example".equals(returned.getString("name")), "bundle copied");
                 check(returned.getBundle("nested").getBinder("callback") == callback, "callback identity");
+                check(returned.getChar("char") == '\u263a' &&
+                      Arrays.equals(returned.getStringArray("strings"), new String[] {"text", null, ""}) &&
+                      Arrays.equals(returned.getLongArray("longs"), new long[] {Long.MIN_VALUE, 5}) &&
+                      returned.getIntegerArrayList("intList").equals(Arrays.asList(1, null, -2)),
+                      "primitive values and arrays survive the return trip");
             } finally { data.recycle(); reply.recycle(); }
+
+            Parcel oversizedPrimitiveArray = Parcel.obtain();
+            try {
+                oversizedPrimitiveArray.writeStrongBinder(callback);
+                Bundle oversized = new Bundle();
+                oversized.putIntArray("array", new int[4096]);
+                oversizedPrimitiveArray.writeBundle(oversized);
+                int[] exported = {0};
+                boolean rejected = false;
+                try { oversizedPrimitiveArray.meglerMarshallBinders(b -> { exported[0]++; return 1; }); }
+                catch (IllegalArgumentException expected) { rejected = true; }
+                check(rejected && exported[0] == 0, "oversized primitive array rejected before export");
+            } finally { oversizedPrimitiveArray.recycle(); }
+
+            Parcel malformedPrimitiveArray = Parcel.obtain();
+            try {
+                malformedPrimitiveArray.writeStrongBinder(callback);
+                malformedPrimitiveArray.writeValue(new boolean[] {true});
+                byte[] wire = malformedPrimitiveArray.meglerMarshallBinders(b -> 1);
+                java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(wire);
+                int tag = 12 + buffer.getInt(4) + 4 + 1 + 8 + 4;
+                check(wire[tag] == 16, "primitive array wire tag");
+                wire[tag + 6] = 2;
+                int[] imported = {0};
+                boolean rejected = false;
+                try { Parcel.meglerUnmarshallBinders(wire, h -> { imported[0]++; return callback; }); }
+                catch (IllegalArgumentException expected) { rejected = true; }
+                check(rejected && imported[0] == 0, "invalid primitive array rejected before import");
+            } finally { malformedPrimitiveArray.recycle(); }
+
+            Parcel mixedList = Parcel.obtain();
+            try {
+                mixedList.writeStrongBinder(callback);
+                mixedList.writeValue(new java.util.ArrayList<>(Arrays.asList("a", 1)));
+                int[] exported = {0};
+                boolean rejected = false;
+                try { mixedList.meglerMarshallBinders(b -> { exported[0]++; return 1; }); }
+                catch (IllegalArgumentException expected) { rejected = true; }
+                check(rejected && exported[0] == 0, "mixed list rejected before export");
+            } finally { mixedList.recycle(); }
+
+            Parcel malformedList = Parcel.obtain();
+            try {
+                malformedList.writeStrongBinder(callback);
+                malformedList.writeValue(new java.util.ArrayList<>(Arrays.asList("x")));
+                byte[] wire = malformedList.meglerMarshallBinders(b -> 1);
+                int tag = 12 + java.nio.ByteBuffer.wrap(wire).getInt(4) + 4 + 1 + 8 + 4;
+                check(wire[tag] == 17, "list wire tag");
+                wire[tag + 6] = 2;
+                int[] imported = {0};
+                boolean rejected = false;
+                try { Parcel.meglerUnmarshallBinders(wire, h -> { imported[0]++; return callback; }); }
+                catch (IllegalArgumentException expected) { rejected = true; }
+                check(rejected && imported[0] == 0, "invalid list rejected before import");
+            } finally { malformedList.recycle(); }
 
             Parcel typed = Parcel.obtain(), typedReply = Parcel.obtain();
             try {
@@ -312,7 +404,7 @@ public class BinderBundleBridgeTest {
             Parcel unsupported = Parcel.obtain();
             try {
                 Bundle b = new Bundle();
-                b.putFloat("unsupported", 1.0f);
+                b.putSerializable("unsupported", new java.util.Date());
                 unsupported.writeBundle(b);
                 boolean rejected = false;
                 try { unsupported.meglerMarshallBinders(ignored -> 1); }

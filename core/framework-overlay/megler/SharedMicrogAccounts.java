@@ -112,9 +112,17 @@ public final class SharedMicrogAccounts {
     }
 
     public static final class Client implements AutoCloseable {
+        private static final class Pending {
+            final IAccountAuthenticatorResponse callback;
+            final boolean accountResult;
+            Pending(IAccountAuthenticatorResponse callback, boolean accountResult) {
+                this.callback = callback;
+                this.accountResult = accountResult;
+            }
+        }
         private final IBinder remote;
         private final AtomicInteger nextId = new AtomicInteger(1);
-        private final HashMap<Integer, IAccountAuthenticatorResponse> pending = new HashMap<>();
+        private final HashMap<Integer, Pending> pending = new HashMap<>();
         private final ArrayList<Runnable> closeListeners = new ArrayList<>();
         private final IBinder.DeathRecipient death = this::close;
         private boolean closed;
@@ -185,7 +193,7 @@ public final class SharedMicrogAccounts {
                     candidate = nextId.getAndUpdate(value -> value == Integer.MAX_VALUE ? 1 : value + 1);
                 } while (pending.containsKey(candidate));
                 id = candidate;
-                pending.put(id, callback);
+                pending.put(id, new Pending(callback, operation == OP_ADD || operation == OP_TOKEN));
             }
             IAccountAuthenticatorResponse response = new IAccountAuthenticatorResponse.Stub() {
                 @Override public void onResult(Bundle result) { deliver(id, result, 0, null); }
@@ -204,7 +212,10 @@ public final class SharedMicrogAccounts {
                 transact(operation, data, reply);
                 return id;
             } catch (RemoteException | RuntimeException e) {
-                synchronized (pending) { pending.remove(id); }
+                Pending removed;
+                synchronized (pending) { removed = pending.remove(id); }
+                if (removed != null && removed.accountResult)
+                    System.err.println("Shared microG client account result: failed");
                 throw e;
             } finally { data.recycle(); reply.recycle(); }
         }
@@ -228,19 +239,23 @@ public final class SharedMicrogAccounts {
         }
 
         private void deliver(int id, Bundle result, int code, String message) {
-            IAccountAuthenticatorResponse callback;
-            synchronized (pending) { callback = pending.remove(id); }
-            if (callback == null) return;
+            Pending request;
+            synchronized (pending) { request = pending.remove(id); }
+            if (request == null) return;
+            if (request.accountResult)
+                System.err.println(result != null ? "Shared microG client account result: success" :
+                    code == AccountManager.ERROR_CODE_CANCELED ? "Shared microG client account result: cancelled" :
+                    "Shared microG client account result: failed");
             try {
-                if (result != null) callback.onResult(result);
-                else callback.onError(code, message);
+                if (result != null) request.callback.onResult(result);
+                else request.callback.onError(code, message);
             } catch (RemoteException e) {
                 System.err.println("Shared microG client account callback failed");
             }
         }
 
         @Override public void close() {
-            ArrayList<IAccountAuthenticatorResponse> callbacks;
+            ArrayList<Pending> callbacks;
             ArrayList<Runnable> listeners;
             synchronized (pending) {
                 if (closed) return;
@@ -255,8 +270,10 @@ public final class SharedMicrogAccounts {
                 try { listener.run(); }
                 catch (RuntimeException e) { System.err.println("Shared microG account close listener failed"); }
             }
-            for (IAccountAuthenticatorResponse callback : callbacks) {
-                try { callback.onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION, "Account channel closed"); }
+            for (Pending request : callbacks) {
+                if (request.accountResult)
+                    System.err.println("Shared microG client account result: failed");
+                try { request.callback.onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION, "Account channel closed"); }
                 catch (RemoteException e) { System.err.println("Shared microG client account callback failed"); }
             }
         }
@@ -269,8 +286,8 @@ public final class SharedMicrogAccounts {
     }
 
     interface Foreground {
-        boolean launch(long channelId, Intent intent);
-        void dismiss(long channelId);
+        long launch(long channelId, Intent intent);
+        void dismiss(long channelId, long generation);
     }
 
     static final class Server implements AutoCloseable {
@@ -371,7 +388,7 @@ public final class SharedMicrogAccounts {
             final IAccountAuthenticatorResponse response;
             final AccountAuthenticatorResponse authenticatorResponse;
             boolean finished;
-            boolean uiLaunched;
+            long uiGeneration;
             AutoCloseable operation;
             ScheduledFuture<?> timeout;
 
@@ -432,8 +449,9 @@ public final class SharedMicrogAccounts {
                     synchronized (this) {
                         if (finished) return;
                         try {
-                            if (foreground.launch(channelId, intent)) {
-                                uiLaunched = true;
+                            long generation = foreground.launch(channelId, intent);
+                            if (generation != 0) {
+                                uiGeneration = generation;
                                 return;
                             }
                         }
@@ -441,7 +459,8 @@ public final class SharedMicrogAccounts {
                             System.err.println("Shared microG account screen launch failed");
                         }
                     }
-                    fail(AccountManager.ERROR_CODE_REMOTE_EXCEPTION, "Trusted account screen unavailable");
+                    fail(AccountManager.ERROR_CODE_REMOTE_EXCEPTION,
+                        "Another Google sign-in is active or the account screen is unavailable");
                     return;
                 }
                 if (value.containsKey(AccountManager.KEY_ERROR_CODE)) {
@@ -482,20 +501,20 @@ public final class SharedMicrogAccounts {
 
             void complete(Bundle value, int code, String message, Outcome outcome) {
                 AutoCloseable toClose;
-                boolean dismissUi;
+                long dismissGeneration;
                 synchronized (this) {
                     if (finished) return;
                     finished = true;
                     if (timeout != null) timeout.cancel(false);
                     toClose = operation;
                     operation = null;
-                    dismissUi = uiLaunched;
-                    uiLaunched = false;
+                    dismissGeneration = uiGeneration;
+                    uiGeneration = 0;
                 }
                 synchronized (pending) { pending.remove(id, this); }
                 System.err.println("Shared microG account outcome: operation=" + operationCode + " outcome=" + outcome);
                 closeOperation(toClose);
-                if (dismissUi) foreground.dismiss(channelId);
+                if (dismissGeneration != 0) foreground.dismiss(channelId, dismissGeneration);
                 try {
                     if (value != null) response.onResult(value);
                     else response.onError(code, message);

@@ -1,0 +1,141 @@
+--- a/libavcodec/droidmediadec.c
++++ b/libavcodec/droidmediadec.c
+@@ -16,7 +16,8 @@
+ #include <errno.h>
+ #include <limits.h>
+ #include <pthread.h>
+ #include <stdatomic.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <time.h>
+ 
+@@ -43,6 +44,57 @@
+ #define DM_COLOR_YUV420_SEMIPLANAR    0x15
+ #define DM_COLOR_YV12                 0x32315679
+ 
++static pthread_mutex_t test_lock = PTHREAD_MUTEX_INITIALIZER;
++static int test_started, test_finished, test_active, test_late, test_eos, test_errors, test_stops, test_stopped;
++
++void av_acl_droidmedia_test_snapshot(int out[8]);
++void av_acl_droidmedia_test_snapshot(int out[8])
++{
++    pthread_mutex_lock(&test_lock);
++    out[0] = test_started; out[1] = test_finished; out[2] = test_active; out[3] = test_late;
++    out[4] = test_eos; out[5] = test_errors; out[6] = test_stops; out[7] = test_stopped;
++    pthread_mutex_unlock(&test_lock);
++}
++
++static void test_callback_begin(const char *name, void *opaque)
++{
++    pthread_mutex_lock(&test_lock);
++    test_started++; test_active++;
++    if (test_stopped) test_late++;
++    if (!strcmp(name, "eos")) test_eos++;
++    if (!strcmp(name, "error")) test_errors++;
++    fprintf(stderr, "DROIDTEST callback-begin %s %p stopped=%d\n", name, opaque, test_stopped);
++    pthread_mutex_unlock(&test_lock);
++}
++
++static void test_callback_end(const char *name, void *opaque)
++{
++    pthread_mutex_lock(&test_lock);
++    test_finished++; test_active--;
++    fprintf(stderr, "DROIDTEST callback-end %s %p\n", name, opaque);
++    pthread_mutex_unlock(&test_lock);
++}
++
++static void test_stop_begin(void *opaque)
++{
++    fprintf(stderr, "DROIDTEST stop-begin %p\n", opaque);
++}
++
++static void test_stop_end(void *opaque)
++{
++    pthread_mutex_lock(&test_lock);
++    test_stops++; test_stopped = 1;
++    fprintf(stderr, "DROIDTEST stop-end %p active=%d\n", opaque, test_active);
++    pthread_mutex_unlock(&test_lock);
++}
++
++static void test_new_start(void)
++{
++    pthread_mutex_lock(&test_lock);
++    test_stopped = 0;
++    pthread_mutex_unlock(&test_lock);
++}
++
+ typedef struct DroidMediaDecState {
+     AVRational pkt_timebase;
+     const DroidMediaAPI *api;
+@@ -347,9 +399,11 @@ static void data_available(void *opaque, DroidMediaCodecData *decoded)
+     AVFrame *frame;
+     int ret;
+ 
++    test_callback_begin("data", opaque);
+     pthread_mutex_lock(&s->lock);
+     if (s->closing) {
+         pthread_mutex_unlock(&s->lock);
++        test_callback_end("data", opaque);
+         return;
+     }
+     s->data_callbacks++;
+@@ -372,6 +426,7 @@ static void data_available(void *opaque, DroidMediaCodecData *decoded)
+     s->data_callbacks--;
+     pthread_cond_broadcast(&s->cond);
+     pthread_mutex_unlock(&s->lock);
++    test_callback_end("data", opaque);
+ }
+ 
+ static void hardware_frame_free(void *opaque, uint8_t *data)
+@@ -481,25 +536,31 @@ static void signal_eos(void *opaque)
+ {
+     DroidMediaDecState *s = opaque;
+ 
++    test_callback_begin("eos", opaque);
+     pthread_mutex_lock(&s->lock);
+     s->eos = 1;
+     pthread_cond_signal(&s->cond);
+     pthread_mutex_unlock(&s->lock);
++    test_callback_end("eos", opaque);
+ }
+ 
+ static void codec_error(void *opaque, int err)
+ {
+     DroidMediaDecState *s = opaque;
+ 
++    test_callback_begin("error", opaque);
+     av_log(NULL, AV_LOG_ERROR, "ACL codec: droidmedia asynchronous error\n");
+     pthread_mutex_lock(&s->lock);
+     s->error = err ? err : AVERROR_EXTERNAL;
+     pthread_cond_signal(&s->cond);
+     pthread_mutex_unlock(&s->lock);
++    test_callback_end("error", opaque);
+ }
+ 
+ static int size_changed(void *opaque, int32_t width, int32_t height)
+ {
++    test_callback_begin("size", opaque);
++    test_callback_end("size", opaque);
+     return 0;
+ }
+ 
+@@ -624,8 +685,9 @@ static av_cold int create_state(AVCodecContext *avctx)
+         goto fail;
+     }
+ 
++    test_new_start();
+     if (!s->api->start(s->codec)) {
+         av_log(avctx, AV_LOG_ERROR, "ACL codec: droidmedia start failed\n");
+         goto fail;
+     }
+ 
+@@ -782,7 +844,9 @@ static void *stop_thread(void *opaque)
+     while (s->queue_calls || s->data_callbacks)
+         pthread_cond_wait(&s->cond, &s->lock);
+     pthread_mutex_unlock(&s->lock);
++    test_stop_begin(s);
+     s->api->stop(s->codec);
++    test_stop_end(s);
+     s->stopped = 1;
+ 
+     pthread_mutex_lock(&job->lock);

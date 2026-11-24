@@ -133,6 +133,17 @@ public final class ViewRoot implements ViewParent {
     public static Handler mainHandler() { if (sMain == null) sMain = new Handler(Looper.getMainLooper()); return sMain; }
     public static synchronized int nextViewId() { return sNextViewId++; }
     public static ViewRoot of(View v) { for (ViewRoot r : sRoots) if (r.mView == v) return r; return null; }
+    static boolean sharedMicrogOwnsInputToken(android.os.IBinder token) {
+        if (token == null || Looper.myLooper() != Looper.getMainLooper()) return false;
+        long channel = SharedMicrogWorker.frameChannel();
+        long generation = channel != 0 ? SharedMicrogWorker.frameGeneration(channel) : 0;
+        if (generation == 0) return false;
+        for (ViewRoot root : sRoots) {
+            if (root.mToken == token && !root.mRemoved && !root.mOwnerStopped)
+                return SharedMicrogWorker.frameOwnedBy(activityOf(root.mView.getContext()), channel, generation);
+        }
+        return false;
+    }
     public static ArrayList<ViewRoot> roots() { return sRoots; }
     public View getView() { return mView; }
 
@@ -338,6 +349,12 @@ public final class ViewRoot implements ViewParent {
         return n;
     }
 
+    static void removeSharedMicrogWindows(long channel, long generation) {
+        for (ViewRoot root : new ArrayList<>(sRoots))
+            if (SharedMicrogWorker.frameOwnedBy(activityOf(root.mView.getContext()), channel, generation))
+                root.remove();
+    }
+
     /* One of an activity's windows besides its own: a dialog (an application window) or a panel or popup (a sub-window), which
        go with the activity's token on Android -- not a system window such as a toast, which outlives the activity. */
     private boolean ofToken() { return mLp.type > WindowManager.LayoutParams.TYPE_BASE_APPLICATION && mLp.type < WindowManager.LayoutParams.FIRST_SYSTEM_WINDOW; }
@@ -509,7 +526,7 @@ public final class ViewRoot implements ViewParent {
                 if (mView instanceof DecorView) ((DecorView) mView).meglerHideBars(types, false);
             }
             public void hide(int types) {
-                if ((types & WindowInsets.Type.ime()) != 0) InputMethods.hide();
+                if ((types & WindowInsets.Type.ime()) != 0) InputMethods.hideFromWindow(mToken);
                 if (mView instanceof DecorView) ((DecorView) mView).meglerHideBars(types, true);
             }
             public void setSystemBarsAppearance(int a, int mask) {
@@ -688,6 +705,8 @@ public final class ViewRoot implements ViewParent {
     /* The host's window is hidden whole (AppRunner.hostPause: minimized, the screen off): nothing is laid out or drawn until
        it comes back, as Android neither lays out nor draws a stopped app's windows; the whole screen is drawn again then. */
     private static boolean sHostHidden;
+    private static long sSharedFrameChannel, sSharedFrameGeneration;
+    private static boolean sSharedFrameRejected;
     public static void hostHidden(boolean hidden) {
         if (sHostHidden == hidden) return;
         sHostHidden = hidden;
@@ -963,7 +982,54 @@ public final class ViewRoot implements ViewParent {
             if (mView.findFocus() == null && mView instanceof ViewGroup) { /* the first focusable view takes focus when it asks; nothing forced */ }
         }
     }
+    static boolean sharedMicrogOwnsInput(long channel, long generation) {
+        boolean visible = false;
+        for (ViewRoot r : sRoots) {
+            if (r.mRemoved || r.mOwnerStopped || r.mView.getVisibility() != View.VISIBLE) continue;
+            visible = true;
+            if (!SharedMicrogWorker.frameOwnedBy(activityOf(r.mView.getContext()), channel, generation))
+                return false;
+        }
+        View focus = InputMethods.focused();
+        return visible && SharedMicrogWorker.frameOwnedBy(AppRunner.top(), channel, generation) &&
+            (focus == null ||
+            SharedMicrogWorker.frameOwnedBy(activityOf(focus.getContext()), channel, generation));
+    }
+
     private static void drawAll(ArrayList<ViewRoot> roots) {
+        if (SharedMicrogWorker.isActive()) {
+            long channel = SharedMicrogWorker.frameChannel();
+            long generation = channel != 0 ? SharedMicrogWorker.frameGeneration(channel) : 0;
+            boolean visible = false, owned = channel != 0 && generation != 0;
+            for (ViewRoot r : roots) {
+                if (r.mRemoved || r.mOwnerStopped || r.mView.getVisibility() != View.VISIBLE) continue;
+                visible = true;
+                if (!SharedMicrogWorker.frameOwnedBy(activityOf(r.mView.getContext()), channel, generation))
+                    owned = false;
+            }
+            if (!owned || !visible) {
+                if (visible && channel != 0 && !sSharedFrameRejected) {
+                    android.util.Log.w("ViewRoot", "Shared microG frame suppressed: window ownership is unavailable");
+                    sSharedFrameRejected = true;
+                }
+                SharedMicrogWorker.suppressFrames();
+                sSharedFrameChannel = sSharedFrameGeneration = 0;
+                fullRedraw("shared microG frame ownership changed");
+                return;
+            }
+            Gfx.frameWait();
+            if (!SharedMicrogWorker.permitFrame(channel, generation)) {
+                sSharedFrameChannel = sSharedFrameGeneration = 0;
+                fullRedraw("shared microG frame ownership changed");
+                return;
+            }
+            sSharedFrameRejected = false;
+            if (sSharedFrameChannel != channel || sSharedFrameGeneration != generation) {
+                fullRedraw("shared microG frame ownership changed");
+                sSharedFrameChannel = channel;
+                sSharedFrameGeneration = generation;
+            }
+        }
         int sw = screenW(), sh = screenH();
         boolean whole = sFullRedraw;
         if (sScreen == null || sScreen.getWidth() != sw || sScreen.getHeight() != sh) {
@@ -1250,7 +1316,7 @@ public final class ViewRoot implements ViewParent {
         }
         return false;
     }
-    private static android.app.Activity activityOf(android.content.Context c) {
+    static android.app.Activity activityOf(android.content.Context c) {
         while (c instanceof android.content.ContextWrapper) {
             if (c instanceof android.app.Activity) return (android.app.Activity) c;
             c = ((android.content.ContextWrapper) c).getBaseContext();

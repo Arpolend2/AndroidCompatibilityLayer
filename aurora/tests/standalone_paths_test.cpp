@@ -56,7 +56,7 @@ int main(int argc, char **argv)
         paths.locale != QStringLiteral("zh-Hant-TW") || paths.theme != QStringLiteral("dark") ||
         paths.location != QStringLiteral("55.5,37.5") ||
         paths.data != QDir(storage).filePath(QStringLiteral("apps/org.example.app/data")) ||
-        paths.standaloneSnapshots || paths.fileDiagnostics || paths.sharedMicrog || QFileInfo::exists(storage)) return 1;
+        paths.standaloneSnapshots || paths.fileDiagnostics || !paths.sharedMicrog || QFileInfo::exists(storage)) return 1;
     {
         QFile file(metadataPath);
         if (!file.open(QIODevice::ReadOnly)) return 1;
@@ -69,6 +69,23 @@ int main(int argc, char **argv)
         file.close();
         if (!standalonePaths(appId, appId, root, storage, &paths, &error) ||
             !paths.standaloneSnapshots || paths.fileDiagnostics || !paths.sharedMicrog) return 1;
+        object.insert(QStringLiteral("sharedMicrog"), false);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            file.write(QJsonDocument(object).toJson()) < 0) return 1;
+        file.close();
+        if (!standalonePaths(appId, appId, root, storage, &paths, &error) || !paths.sharedMicrog) return 1;
+        const QString gmsPackage = QStringLiteral("com.google.android.gms");
+        const QString gmsId = QStringLiteral("ru.androidcompatibilitylayer.Android") + QString::fromLatin1(
+            QCryptographicHash::hash(gmsPackage.toUtf8(), QCryptographicHash::Sha256).toHex().left(24));
+        object.insert(QStringLiteral("appId"), gmsId);
+        object.insert(QStringLiteral("package"), gmsPackage);
+        object.insert(QStringLiteral("sharedMicrog"), true);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            file.write(QJsonDocument(object).toJson()) < 0) return 1;
+        file.close();
+        if (!standalonePaths(gmsId, gmsId, root, storage, &paths, &error) || paths.sharedMicrog) return 1;
+        object.insert(QStringLiteral("appId"), appId);
+        object.insert(QStringLiteral("package"), package);
         object.insert(QStringLiteral("sharedMicrog"), QStringLiteral("yes"));
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
             file.write(QJsonDocument(object).toJson()) < 0) return 1;

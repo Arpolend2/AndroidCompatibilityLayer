@@ -4,6 +4,7 @@ import android.os.IBinder;
 import android.os.IInterface;
 import android.os.Binder;
 import android.os.Parcel;
+import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -33,10 +34,12 @@ public final class BinderBridge implements AutoCloseable {
     private static final int MAX_FRAME = 1100000, MAX_BINDERS = 4096, MAX_PENDING = 128;
     private static final int MAX_ONEWAY = 128, MAX_ONEWAY_BYTES = 4 * 1024 * 1024;
     private static final int MAX_DEATH_RECIPIENTS = 4096;
+    private static final int MAX_FDS = 16;
     private static final long TIMEOUT_SECONDS = 15;
     private final DataInputStream input;
     private final DataOutputStream output;
     private final Closeable shutdownTransport;
+    private final MarkerTransport markerTransport;
     private final int peerUid, peerPid;
     private final Object state = new Object();
     private final IdentityHashMap<IBinder, Long> localIds = new IdentityHashMap<>();
@@ -55,16 +58,92 @@ public final class BinderBridge implements AutoCloseable {
     private static final class Pending {
         final CountDownLatch done = new CountDownLatch(1);
         volatile int status;
-        volatile byte[] payload;
+        volatile FramePayload payload;
     }
 
     private static final class OneWayCall {
         final int code;
-        final byte[] payload;
-        OneWayCall(int code, byte[] payload) {
+        final FramePayload payload;
+        OneWayCall(int code, FramePayload payload) {
             this.code = code;
             this.payload = payload;
         }
+    }
+
+    interface MarkerTransport {
+        void send(int[] descriptors) throws IOException;
+        int[] receive() throws IOException;
+    }
+
+    private static final class DescriptorBatch implements AutoCloseable {
+        private final ArrayList<ParcelFileDescriptor> descriptors = new ArrayList<>();
+        private final IdentityHashMap<ParcelFileDescriptor, Boolean> returned = new IdentityHashMap<>();
+        private boolean[] used;
+
+        static DescriptorBatch receive(int[] values) {
+            if (values == null) return null;
+            DescriptorBatch batch = new DescriptorBatch();
+            for (int value : values) batch.descriptors.add(ParcelFileDescriptor.adoptFd(value));
+            batch.used = new boolean[values.length];
+            return batch;
+        }
+
+        int add(ParcelFileDescriptor value) {
+            if (descriptors.size() >= MAX_FDS) throw new IllegalArgumentException("Binder descriptor limit exceeded");
+            try { descriptors.add(value.dup()); }
+            catch (IOException e) { throw new IllegalArgumentException("Cannot duplicate Binder descriptor", e); }
+            return descriptors.size() - 1;
+        }
+
+        int[] numbers() {
+            int[] numbers = new int[descriptors.size()];
+            for (int i = 0; i < numbers.length; i++) numbers[i] = descriptors.get(i).getFd();
+            return numbers;
+        }
+
+        void validate(int index) {
+            if (used == null || index < 0 || index >= used.length || used[index])
+                throw new IllegalArgumentException("Invalid or duplicate Binder descriptor index");
+            used[index] = true;
+        }
+
+        void finishValidation() {
+            if (used != null) for (boolean value : used)
+                if (!value) throw new IllegalArgumentException("Unreferenced Binder descriptor");
+        }
+
+        ParcelFileDescriptor take(int index) {
+            ParcelFileDescriptor value = descriptors.get(index);
+            if (value == null) throw new IllegalArgumentException("Binder descriptor already consumed");
+            descriptors.set(index, null);
+            return value;
+        }
+
+        void complete() {
+            for (ParcelFileDescriptor value : returned.keySet()) {
+                try { value.meglerCloseAfterTransfer(); }
+                catch (IOException e) { System.err.println("Binder returned descriptor close failed: " + e.getMessage()); }
+            }
+            returned.clear();
+        }
+
+        @Override public void close() {
+            for (ParcelFileDescriptor value : descriptors) {
+                if (value != null) try { value.close(); }
+                catch (IOException e) { System.err.println("Binder descriptor close failed: " + e.getMessage()); }
+            }
+            descriptors.clear();
+        }
+    }
+
+    private static final class FramePayload implements AutoCloseable {
+        final byte[] bytes;
+        final DescriptorBatch descriptors;
+        FramePayload(byte[] bytes, DescriptorBatch descriptors) {
+            this.bytes = bytes;
+            this.descriptors = descriptors;
+        }
+        @Override public void close() { descriptors.close(); }
     }
 
     private static final class DeathNotice {
@@ -94,12 +173,26 @@ public final class BinderBridge implements AutoCloseable {
      */
     public BinderBridge(InputStream in, OutputStream out, IBinder root, Closeable shutdownTransport,
                         int peerUid, int peerPid) {
+        this(in, out, root, shutdownTransport, peerUid, peerPid, null);
+    }
+
+    static MarkerTransport descriptorTransport(int descriptor) {
+        if (descriptor < 0) throw new IllegalArgumentException("Invalid Binder transport descriptor");
+        return new MarkerTransport() {
+            @Override public void send(int[] fds) throws IOException { SharedMicrogFdTransport.sendMarker(descriptor, fds); }
+            @Override public int[] receive() throws IOException { return SharedMicrogFdTransport.receiveMarker(descriptor); }
+        };
+    }
+
+    BinderBridge(InputStream in, OutputStream out, IBinder root, Closeable shutdownTransport,
+                 int peerUid, int peerPid, MarkerTransport markerTransport) {
         if (in == null || out == null) throw new IllegalArgumentException("Duplex streams required");
         if ((peerUid < 0 || peerPid <= 0) && (peerUid != -1 || peerPid != 0))
             throw new IllegalArgumentException("Invalid peer identity");
         input = new DataInputStream(in);
         output = new DataOutputStream(out);
         this.shutdownTransport = shutdownTransport;
+        this.markerTransport = markerTransport;
         this.peerUid = peerUid;
         this.peerPid = peerPid;
         if (root != null) register(root);
@@ -169,70 +262,126 @@ public final class BinderBridge implements AutoCloseable {
         return binder;
     }
 
-    private void send(byte[] frame) throws IOException {
+    private void send(byte[] frame, DescriptorBatch descriptors) throws IOException {
         if (frame.length > MAX_FRAME) throw new IOException("Binder frame too large");
         synchronized (output) {
             if (closed) throw new IOException("Binder bridge closed");
+            if (markerTransport != null) markerTransport.send(descriptors.numbers());
+            else if (!descriptors.descriptors.isEmpty()) throw new IOException("Binder descriptor transport unavailable");
             output.writeInt(frame.length);
             output.write(frame);
             output.flush();
+            if (!descriptors.descriptors.isEmpty())
+                System.out.println("Shared microG Binder descriptors sent");
+            descriptors.complete();
         }
     }
 
-    private void respond(long request, int status, byte[] payload) throws IOException {
+    private void respond(long request, int status, FramePayload payload) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         DataOutputStream frame = new DataOutputStream(bytes);
         frame.writeByte(RESPONSE);
         frame.writeLong(request);
         frame.writeInt(status);
-        frame.writeInt(payload.length);
-        frame.write(payload);
-        send(bytes.toByteArray());
+        frame.writeInt(payload.bytes.length);
+        frame.write(payload.bytes);
+        send(bytes.toByteArray(), payload.descriptors);
+    }
+
+    private FramePayload encode(Parcel parcel) {
+        DescriptorBatch descriptors = new DescriptorBatch();
+        try {
+            byte[] bytes = parcel.meglerMarshallBinders(new Parcel.MeglerBinderExporter() {
+                @Override public long exportBinder(IBinder binder) { return BinderBridge.this.exportBinder(binder); }
+                @Override public int exportFileDescriptor(ParcelFileDescriptor fd) {
+                    if (markerTransport == null) throw new IllegalArgumentException("Binder descriptor transport unavailable");
+                    return descriptors.add(fd);
+                }
+                @Override public void exportReturningFileDescriptor(ParcelFileDescriptor fd) {
+                    if (markerTransport == null) throw new IllegalArgumentException("Binder descriptor transport unavailable");
+                    descriptors.returned.put(fd, Boolean.TRUE);
+                }
+            });
+            return new FramePayload(bytes, descriptors);
+        } catch (RuntimeException | Error failure) {
+            descriptors.close();
+            throw failure;
+        }
+    }
+
+    private Parcel decode(FramePayload payload) {
+        DescriptorBatch descriptors = payload.descriptors;
+        Parcel result = Parcel.meglerUnmarshallBinders(payload.bytes, new Parcel.MeglerBinderImporter() {
+            @Override public IBinder importBinder(long handle) { return BinderBridge.this.importBinder(handle); }
+            @Override public void validateFileDescriptor(int index) { descriptors.validate(index); }
+            @Override public void finishValidation() { descriptors.finishValidation(); }
+            @Override public ParcelFileDescriptor importFileDescriptor(int index) { return descriptors.take(index); }
+        });
+        if (!descriptors.descriptors.isEmpty())
+            System.out.println("Shared microG Binder descriptors received");
+        return result;
+    }
+
+    private static FramePayload emptyPayload() {
+        return new FramePayload(new byte[0], new DescriptorBatch());
     }
 
     private void readLoop() {
         try {
             while (!closed) {
-                int size = input.readInt();
-                if (size < 1 || size > MAX_FRAME) throw new IOException("Invalid Binder frame size");
-                byte[] bytes = new byte[size];
-                input.readFully(bytes);
-                DataInputStream frame = new DataInputStream(new ByteArrayInputStream(bytes));
-                int kind = frame.readUnsignedByte();
-                long request = frame.readLong();
-                if (request <= 0) throw new IOException("Invalid Binder request id");
-                if (kind == RESPONSE) {
-                    int status = frame.readInt(), length = frame.readInt();
-                    if (status < 0 || status > 2 || length < 0 || length != frame.available())
-                        throw new IOException("Invalid Binder response");
-                    byte[] payload = new byte[length];
-                    frame.readFully(payload);
-                    synchronized (state) {
-                        Pending call = pending.remove(request);
-                        if (call != null) {
-                            call.status = status;
-                            call.payload = payload;
-                            call.done.countDown();
+                DescriptorBatch descriptors = markerTransport == null ? new DescriptorBatch() :
+                    DescriptorBatch.receive(markerTransport.receive());
+                if (descriptors == null) throw new java.io.EOFException();
+                boolean transferred = false;
+                try {
+                    int size = input.readInt();
+                    if (size < 1 || size > MAX_FRAME) throw new IOException("Invalid Binder frame size");
+                    byte[] bytes = new byte[size];
+                    input.readFully(bytes);
+                    DataInputStream frame = new DataInputStream(new ByteArrayInputStream(bytes));
+                    int kind = frame.readUnsignedByte();
+                    long request = frame.readLong();
+                    if (request <= 0) throw new IOException("Invalid Binder request id");
+                    if (kind == RESPONSE) {
+                        int status = frame.readInt(), length = frame.readInt();
+                        if (status < 0 || status > 2 || length < 0 || length != frame.available() ||
+                                (status == 2 && !descriptors.descriptors.isEmpty()))
+                            throw new IOException("Invalid Binder response");
+                        byte[] payload = new byte[length];
+                        frame.readFully(payload);
+                        synchronized (state) {
+                            Pending call = pending.remove(request);
+                            if (call != null) {
+                                call.status = status;
+                                call.payload = new FramePayload(payload, descriptors);
+                                transferred = true;
+                                call.done.countDown();
+                            }
                         }
-                    }
-                } else if (kind == REQUEST) {
-                    long target = frame.readLong();
-                    int code = frame.readInt(), flags = frame.readInt(), length = frame.readInt();
-                    if (target <= 0 || (flags != 0 && flags != IBinder.FLAG_ONEWAY) ||
-                        length < 0 || length != frame.available())
-                        throw new IOException("Invalid Binder request");
-                    byte[] payload = new byte[length];
-                    frame.readFully(payload);
-                    if (flags == IBinder.FLAG_ONEWAY) {
-                        enqueueOneWay(target, code, payload);
-                    } else {
-                        try {
-                            workers.execute(() -> dispatch(request, target, code, payload));
-                        } catch (java.util.concurrent.RejectedExecutionException e) {
-                            respond(request, 2, new byte[0]);
+                    } else if (kind == REQUEST) {
+                        long target = frame.readLong();
+                        int code = frame.readInt(), flags = frame.readInt(), length = frame.readInt();
+                        if (target <= 0 || (flags != 0 && flags != IBinder.FLAG_ONEWAY) ||
+                            length < 0 || length != frame.available())
+                            throw new IOException("Invalid Binder request");
+                        byte[] payload = new byte[length];
+                        frame.readFully(payload);
+                        FramePayload owned = new FramePayload(payload, descriptors);
+                        if (flags == IBinder.FLAG_ONEWAY) {
+                            enqueueOneWay(target, code, owned);
+                            transferred = true;
+                        } else {
+                            try {
+                                workers.execute(new DispatchTask(request, target, code, owned));
+                                transferred = true;
+                            } catch (java.util.concurrent.RejectedExecutionException e) {
+                                try (FramePayload empty = emptyPayload()) { respond(request, 2, empty); }
+                            }
                         }
-                    }
-                } else throw new IOException("Unknown Binder frame type");
+                    } else throw new IOException("Unknown Binder frame type");
+                } finally {
+                    if (!transferred) descriptors.close();
+                }
             }
         } catch (java.io.EOFException e) {
             // The peer closed its stream; pending callers are failed by close().
@@ -243,10 +392,10 @@ public final class BinderBridge implements AutoCloseable {
         }
     }
 
-    private void enqueueOneWay(long target, int code, byte[] payload) throws IOException {
+    private void enqueueOneWay(long target, int code, FramePayload payload) throws IOException {
         synchronized (state) {
             if (closed) throw new IOException("Binder bridge closed");
-            if (oneWayCount >= MAX_ONEWAY || payload.length > MAX_ONEWAY_BYTES - oneWayBytes)
+            if (oneWayCount >= MAX_ONEWAY || payload.bytes.length > MAX_ONEWAY_BYTES - oneWayBytes)
                 throw new IOException("Binder one-way queue limit exceeded");
             ArrayDeque<OneWayCall> queue = oneWayQueues.get(target);
             if (queue == null) {
@@ -261,7 +410,7 @@ public final class BinderBridge implements AutoCloseable {
             }
             queue.addLast(new OneWayCall(code, payload));
             ++oneWayCount;
-            oneWayBytes += payload.length;
+            oneWayBytes += payload.bytes.length;
         }
     }
 
@@ -285,7 +434,7 @@ public final class BinderBridge implements AutoCloseable {
             } finally {
                 synchronized (state) {
                     --oneWayCount;
-                    oneWayBytes -= call.payload.length;
+                    oneWayBytes -= call.payload.bytes.length;
                 }
             }
         }
@@ -297,32 +446,48 @@ public final class BinderBridge implements AutoCloseable {
             IBinder binder;
             synchronized (state) { binder = local.get(target); }
             if (binder == null) throw new IllegalArgumentException("Unknown Binder target");
-            data = Parcel.meglerUnmarshallBinders(call.payload, this::importBinder);
+            data = decode(call.payload);
             transactLocal(binder, call.code, data, null, IBinder.FLAG_ONEWAY);
         } catch (RemoteException | RuntimeException e) {
             System.err.println("Binder one-way dispatch failed: " + e.getClass().getName());
         } finally {
             if (data != null) data.recycle();
+            call.payload.close();
         }
     }
 
-    private void dispatch(long request, long target, int code, byte[] payload) {
+    private final class DispatchTask implements Runnable {
+        final long request, target;
+        final int code;
+        final FramePayload payload;
+        DispatchTask(long request, long target, int code, FramePayload payload) {
+            this.request = request; this.target = target; this.code = code; this.payload = payload;
+        }
+        @Override public void run() { dispatch(request, target, code, payload); }
+    }
+
+    private void dispatch(long request, long target, int code, FramePayload payload) {
         Parcel data = null, reply = Parcel.obtain();
+        reply.meglerEnableDeferredFdReturns();
         try {
             IBinder binder;
             synchronized (state) { binder = local.get(target); }
             if (binder == null) throw new IllegalArgumentException("Unknown Binder target");
-            data = Parcel.meglerUnmarshallBinders(payload, this::importBinder);
+            data = decode(payload);
             boolean result = transactLocal(binder, code, data, reply, 0);
-            respond(request, result ? 1 : 0, reply.meglerMarshallBinders(this::exportBinder));
-        } catch (RemoteException | IOException | RuntimeException e) {
+            try (FramePayload encoded = encode(reply)) { respond(request, result ? 1 : 0, encoded); }
+        } catch (IOException e) {
+            System.err.println("Binder response failed: " + e);
+            close();
+        } catch (RemoteException | RuntimeException e) {
             System.err.println("Binder dispatch failed: " + e);
             e.printStackTrace();
-            try { respond(request, 2, new byte[0]); }
+            try (FramePayload empty = emptyPayload()) { respond(request, 2, empty); }
             catch (IOException sendError) { close(); }
         } finally {
             if (data != null) data.recycle();
             reply.recycle();
+            payload.close();
         }
     }
 
@@ -336,15 +501,20 @@ public final class BinderBridge implements AutoCloseable {
         boolean oneWay = flags == IBinder.FLAG_ONEWAY;
         if ((flags != 0 && !oneWay) || data == null || (!oneWay && reply == null))
             throw new RemoteException("Unsupported Binder flags or missing parcel");
-        final byte[] payload;
-        try { payload = data.meglerMarshallBinders(this::exportBinder); }
+        final FramePayload payload;
+        try { payload = encode(data); }
         catch (RuntimeException e) { throw new RemoteException("Unsupported Binder parcel: " + e.getMessage()); }
         long id = sequence.incrementAndGet();
-        if (id <= 0) throw new RemoteException("Binder request ids exhausted");
+        if (id <= 0) {
+            payload.close();
+            throw new RemoteException("Binder request ids exhausted");
+        }
         Pending call = oneWay ? null : new Pending();
         synchronized (state) {
-            if (closed || (!oneWay && pending.size() >= MAX_PENDING))
+            if (closed || (!oneWay && pending.size() >= MAX_PENDING)) {
+                payload.close();
                 throw new RemoteException("Binder bridge unavailable");
+            }
             if (!oneWay) pending.put(id, call);
         }
         try {
@@ -355,15 +525,15 @@ public final class BinderBridge implements AutoCloseable {
             frame.writeLong(target);
             frame.writeInt(code);
             frame.writeInt(flags);
-            frame.writeInt(payload.length);
-            frame.write(payload);
-            send(bytes.toByteArray());
+            frame.writeInt(payload.bytes.length);
+            frame.write(payload.bytes);
+            send(bytes.toByteArray(), payload.descriptors);
             if (oneWay) return true;
             if (!call.done.await(TIMEOUT_SECONDS, TimeUnit.SECONDS))
                 throw new RemoteException("Binder transaction timed out");
             if (call.payload == null || call.status == 2) throw new RemoteException("Remote Binder transaction failed");
             Parcel received;
-            try { received = Parcel.meglerUnmarshallBinders(call.payload, this::importBinder); }
+            try { received = decode(call.payload); }
             catch (RuntimeException e) { throw new RemoteException("Invalid Binder reply: " + e.getMessage()); }
             try {
                 reply.setDataSize(0);
@@ -379,7 +549,16 @@ public final class BinderBridge implements AutoCloseable {
             Thread.currentThread().interrupt();
             throw new RemoteException("Binder transaction interrupted");
         } finally {
-            if (!oneWay) synchronized (state) { pending.remove(id); }
+            payload.close();
+            if (!oneWay) {
+                FramePayload received;
+                synchronized (state) {
+                    pending.remove(id);
+                    received = call.payload;
+                    call.payload = null;
+                }
+                if (received != null) received.close();
+            }
         }
     }
 
@@ -398,6 +577,8 @@ public final class BinderBridge implements AutoCloseable {
             }
             deathRecipientCount = 0;
             remote.clear();
+            for (ArrayDeque<OneWayCall> queue : oneWayQueues.values())
+                for (OneWayCall call : queue) call.payload.close();
             oneWayQueues.clear();
         }
         if (!notices.isEmpty()) {
@@ -412,7 +593,8 @@ public final class BinderBridge implements AutoCloseable {
             notifier.setDaemon(true);
             notifier.start();
         }
-        workers.shutdownNow();
+        for (Runnable task : workers.shutdownNow())
+            if (task instanceof BinderBridge.DispatchTask) ((DispatchTask) task).payload.close();
         oneWayWorkers.shutdownNow();
         if (shutdownTransport != null) {
             try { shutdownTransport.close(); }

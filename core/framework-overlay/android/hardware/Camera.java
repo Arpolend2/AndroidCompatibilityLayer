@@ -18,8 +18,8 @@
 // (setPreviewTexture) as Android shows it: a front camera's picture mirrored, then turned by setDisplayOrientation, then
 // scaled to the surface. A thread of the camera's own ("Camera preview N") takes the pictures, shows them and copies them.
 //
-// takePicture: the preview's next frame at the preview's size (not the sensor's), turned by the "rotation" parameter, a JPEG of
-// "jpeg-quality" with no Exif or thumbnail, from the shutter and jpeg callbacks only (no raw or postview); the preview goes on.
+// takePicture: the backend's reported still-image resolution and JPEG encoder, with the requested quality and EXIF rotation,
+// from the shutter and jpeg callbacks only (no raw or postview); the preview goes on.
 //
 // Not done: zoom, exposure compensation, focus and metering
 // areas (none offered, which Android allows), face detection (refused as Android refuses it where there is none), the
@@ -346,11 +346,13 @@ public class Camera {
     public final void takePicture(ShutterCallback shutter, PictureCallback raw, PictureCallback jpeg) { takePicture(shutter, raw, null, jpeg); }
     public final void takePicture(ShutterCallback shutter, PictureCallback raw, PictureCallback postview, PictureCallback jpeg) {
         handle();
-        // The shell has the preview's frames only, so the picture is the preview's next frame at its size (not the sensor's full
-        // size, whatever picture-size says), turned by the "rotation" parameter and written as a JPEG of "jpeg-quality" with no
-        // Exif and no thumbnail. The preview goes on running (Android stops it; startPreview then is a no-op here).
         if (mPreview == null || jpeg == null && raw == null && postview == null && shutter == null) throw new RuntimeException("takePicture failed");
+        if (raw != null || postview != null)
+            throw new RuntimeException("takePicture failed: raw and postview callbacks are unsupported");
         int rotation = 0, quality = 95;
+        Size pictureSize = mParams.getPictureSize();
+        if (pictureSize == null || pictureSize.width <= 0 || pictureSize.height <= 0)
+            throw new RuntimeException("takePicture failed: no supported still-image size");
         try {
             rotation = Integer.parseInt(mParams.get("rotation"));
         } catch (RuntimeException e) {
@@ -363,25 +365,28 @@ public class Camera {
         }
         synchronized (mLock) {
             if (mShot != null) throw new RuntimeException("takePicture failed");
-            mShot = new Shot(shutter, jpeg, ((rotation % 360) + 360) % 360 / 90 * 90, Math.max(1, Math.min(100, quality)));
+            mShot = new Shot(shutter, jpeg, pictureSize.width, pictureSize.height,
+                    ((rotation % 360) + 360) % 360 / 90 * 90, Math.max(1, Math.min(100, quality)));
         }
     }
 
-    /** A picture asked for: its callbacks, how far to turn it, and the JPEG's quality. */
+    /** A still image asked for: its callbacks, dimensions, EXIF rotation, and JPEG quality. */
     private static final class Shot {
         final ShutterCallback shutter;
         final PictureCallback jpeg;
-        final int rotation, quality;
+        final int width, height, rotation, quality;
 
-        Shot(ShutterCallback shutter, PictureCallback jpeg, int rotation, int quality) {
+        Shot(ShutterCallback shutter, PictureCallback jpeg, int width, int height, int rotation, int quality) {
             this.shutter = shutter;
             this.jpeg = jpeg;
+            this.width = width;
+            this.height = height;
             this.rotation = rotation;
             this.quality = quality;
         }
     }
 
-    /** The preview thread's, with a frame just held: the asked picture turned, then written as a JPEG on a thread of its own. */
+    /** Captures the requested still image after the next preview frame, then delivers its callbacks on the camera looper. */
     private void shoot(long h) {
         final Shot s;
         synchronized (mLock) {
@@ -389,32 +394,15 @@ public class Camera {
             mShot = null;
         }
         if (s == null) return;
-        int size = megler.CameraNative.frameSize(h), fw = size >>> 16, fh = size & 0xffff;
-        boolean turned = s.rotation % 180 != 0;
-        final Bitmap b = fw > 0 && fh > 0 ? Bitmap.createBitmap(turned ? fh : fw, turned ? fw : fh, Bitmap.Config.ARGB_8888) : null;
-        if (b == null || !megler.CameraNative.render(h, b, s.rotation, false)) {
-            Log.e(TAG, "takePicture: the frame could not be taken");
+        byte[] jpeg = megler.CameraNative.capture(h, s.width, s.height, s.quality, s.rotation);
+        if (jpeg == null || jpeg.length < 4) {
+            Log.e(TAG, "takePicture: the backend could not capture a full-resolution JPEG");
             if (mEventHandler != null) mEventHandler.obtainMessage(CAMERA_MSG_ERROR, CAMERA_ERROR_UNKNOWN, 0).sendToTarget();
             return;
         }
         if (mEventHandler != null) mEventHandler.obtainMessage(CAMERA_MSG_SHUTTER, s).sendToTarget();
-        Thread t = new Thread("Camera picture") {
-            @Override public void run() {
-                java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(256 * 1024);
-                boolean ok;
-                try {
-                    ok = b.compress(Bitmap.CompressFormat.JPEG, s.quality, out);
-                } catch (RuntimeException e) {
-                    Log.e(TAG, "takePicture: the JPEG could not be written", e);
-                    ok = false;
-                }
-                if (mEventHandler == null) return;
-                if (ok) mEventHandler.obtainMessage(CAMERA_MSG_COMPRESSED_IMAGE, new Object[] { s, out.toByteArray() }).sendToTarget();
-                else mEventHandler.obtainMessage(CAMERA_MSG_ERROR, CAMERA_ERROR_UNKNOWN, 0).sendToTarget();
-            }
-        };
-        t.setDaemon(true);
-        t.start();
+        if (mEventHandler != null)
+            mEventHandler.obtainMessage(CAMERA_MSG_COMPRESSED_IMAGE, new Object[] { s, jpeg }).sendToTarget();
     }
 
     public final void startSmoothZoom(int value) { handle(); throw new RuntimeException("start smooth zoom failed"); }
@@ -523,9 +511,18 @@ public class Camera {
     /** The parameters a camera's driver would start with, made of what the shell says the camera does. */
     private String defaults() {
         int n = sizeCount();
-        StringBuilder sizes = new StringBuilder();
+        StringBuilder sizes = new StringBuilder(), pictureSizes = new StringBuilder();
+        int[] stillSizes = megler.CameraNative.pictureSizes(mNative);
+        String pictureSize = null;
         int preview = -1, video = -1, minFps = Integer.MAX_VALUE, maxFps = 0;
         java.util.TreeSet<Integer> rates = new java.util.TreeSet<>();
+        for (int i = 0; stillSizes != null && i + 1 < stillSizes.length; i += 2) {
+            int width = stillSizes[i], height = stillSizes[i + 1];
+            if (width <= 0 || height <= 0) continue;
+            if (pictureSizes.length() > 0) pictureSizes.append(',');
+            pictureSizes.append(width).append('x').append(height);
+            if (pictureSize == null) pictureSize = width + "x" + height;
+        }
         for (int i = 0; i < n; i++) {
             if (sizes.length() > 0) sizes.append(',');
             sizes.append(sizeW(i)).append('x').append(sizeH(i));
@@ -549,7 +546,6 @@ public class Camera {
         if (video < 0) video = preview;
         String previewSize = n > 0 ? sizeW(preview) + "x" + sizeH(preview) : "640x480";
         String videoSize = n > 0 ? sizeW(video) + "x" + sizeH(video) : "640x480";
-        String pictureSize = n > 0 ? sizeW(0) + "x" + sizeH(0) : "640x480";
         StringBuilder rateList = new StringBuilder(), ranges = new StringBuilder();
         for (int r : rates) {
             if (rateList.length() > 0) rateList.append(',');
@@ -571,10 +567,14 @@ public class Camera {
         p.append("preview-frame-rate-values=").append(rateList).append(';');
         p.append("preview-fps-range=").append(minFps * 1000).append(',').append(maxFps * 1000).append(';');
         p.append("preview-fps-range-values=").append(ranges).append(';');
-        p.append("picture-size=").append(pictureSize).append(';');
-        p.append("picture-size-values=").append(sizes).append(';');
-        p.append("picture-format=jpeg;picture-format-values=jpeg;jpeg-quality=95;");
-        p.append("jpeg-thumbnail-width=320;jpeg-thumbnail-height=240;jpeg-thumbnail-quality=90;jpeg-thumbnail-size-values=320x240,0x0;");
+        p.append("picture-size-values=").append(pictureSizes).append(';');
+        if (pictureSize != null) {
+            p.append("picture-size=").append(pictureSize).append(';');
+            p.append("picture-format=jpeg;picture-format-values=jpeg;jpeg-quality=95;");
+            p.append("jpeg-thumbnail-width=0;jpeg-thumbnail-height=0;jpeg-thumbnail-quality=0;jpeg-thumbnail-size-values=0x0;");
+        } else {
+            p.append("picture-format-values=;");
+        }
         if (capFocus()) {
             p.append("focus-mode=auto;focus-mode-values=auto,continuous-picture,continuous-video").append(capMacro() ? ",macro" : "").append(';');
             p.append("focus-distances=0.10,1.20,Infinity;");

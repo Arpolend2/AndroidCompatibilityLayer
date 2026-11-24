@@ -4466,6 +4466,19 @@ static int drain_frames(mg_mcodec *c, int *times, int max, bool *grey)
 /* Decode order of a stream with two B-pictures between references, as the test streams have it: 0 3 1 2 6 4 5 9 7 8. */
 static const int k_decode_order[10] = { 0, 3, 1, 2, 6, 4, 5, 9, 7, 8 };
 
+static MEGLER_CB bool codec_fail_second(void *user, void *decoder, const u8 *data, size_t size, i64 time_us)
+{
+    if (time_us == 1) return false;
+    return mg_codec_standin()->push(user, decoder, data, size, time_us);
+}
+
+static MEGLER_CB bool codec_fail_drain(void *user, void *decoder)
+{
+    (void)user;
+    (void)decoder;
+    return false;
+}
+
 /*
  * Pictures through the codec (mg_java_media.c) and the stand-in for the shell's decoders (mg_codec_standin.c), which takes
  * units only as a decoder must have them, and hands pictures out in decode order: the codec gives them in display order,
@@ -4614,10 +4627,75 @@ static void test_codec_pictures(void)
         mg_codec_standin_counts_get(&before);
         CHECK(mg_mcodec_configure(c, 32, 32, 0, 0, csd, size));
         put_avc_nal(unit, &nu, 0x65, false);
-        mg_mcodec_decode(c, unit, nu, 0, 4);
+        CHECK(!mg_mcodec_decode(c, unit, nu, 0, 4));
         mg_codec_standin_counts_get(&after);
         CHECK(drain_frames(c, times, 16, &grey) == 0 && after.refused - before.refused == 1);
+        CHECK_INT(after.drained - before.drained, 0);
+        CHECK(!mg_mcodec_decode(c, unit, nu, 1, 0));
+        mg_codec_standin_counts_get(&after);
+        CHECK_INT(after.pushed - before.pushed, 1);
+        mg_mcodec_flush(c);
+        {
+            u8 config[32];
+            size_t nc = 0;
+            put_avc_nal(config, &nc, 0x67, false);
+            put_avc_nal(config, &nc, 0x68, false);
+            CHECK(mg_mcodec_decode(c, config, nc, 0, 2));
+            CHECK(mg_mcodec_decode(c, unit, nu, 2, 4));
+            mg_codec_standin_counts_get(&after);
+            CHECK_INT(after.drained - before.drained, 1);
+            CHECK_INT(drain_frames(c, times, 16, &grey), 1);
+        }
         mg_mcodec_destroy(c);
+    }
+    {
+        static megler_codec_host failing;
+        mg_mcodec *c;
+        u8 sps[16], pps[16], unit[32];
+        size_t ns = 0, np = 0, nu = 0, sizes[3] = { 0, 0, 0 };
+        const u8 *csd[3] = { NULL, NULL, NULL };
+        mg_codec_standin_counts before, after;
+        put_avc_nal(sps, &ns, 0x67, false);
+        put_avc_nal(pps, &np, 0x68, false);
+        put_avc_nal(unit, &nu, 0x65, false);
+        csd[0] = sps; sizes[0] = ns; csd[1] = pps; sizes[1] = np;
+        failing = *mg_codec_standin();
+        failing.push = codec_fail_second;
+        mg_java_media_set_host(&failing);
+        mg_codec_standin_counts_get(&before);
+        c = mg_mcodec_create("video/avc");
+        CHECK(c && mg_mcodec_configure(c, 32, 32, 0, 0, csd, sizes));
+        if (c) {
+            CHECK(mg_mcodec_decode(c, unit, nu, 0, 0));
+            CHECK(!mg_mcodec_decode(c, unit, nu, 1, 4));
+            CHECK(!mg_mcodec_decode(c, unit, nu, 2, 4));
+            mg_codec_standin_counts_get(&after);
+            CHECK_INT(after.pushed - before.pushed, 1);
+            CHECK_INT(after.drained - before.drained, 0);
+            mg_mcodec_destroy(c);
+        }
+        mg_java_media_set_host(mg_codec_standin());
+    }
+    {
+        mg_mcodec *c = mg_mcodec_create("video/avc");
+        u8 sps[16], pps[16], unit[32];
+        size_t ns = 0, np = 0, nu = 0, sizes[3] = { 0, 0, 0 };
+        const u8 *csd[3] = { NULL, NULL, NULL };
+        put_avc_nal(sps, &ns, 0x67, false);
+        put_avc_nal(pps, &np, 0x68, false);
+        put_avc_nal(unit, &nu, 0x65, false);
+        csd[0] = sps; sizes[0] = ns; csd[1] = pps; sizes[1] = np;
+        mg_java_media_set_checked_drain(codec_fail_drain);
+        CHECK(c && mg_mcodec_configure(c, 32, 32, 0, 0, csd, sizes));
+        if (c) {
+            CHECK(!mg_mcodec_decode(c, unit, nu, 0, 4));
+            CHECK(!mg_mcodec_decode(c, unit, nu, 1, 0));
+            mg_mcodec_flush(c);
+            mg_java_media_set_checked_drain(NULL);
+            CHECK(mg_mcodec_decode(c, unit, nu, 2, 4));
+            mg_mcodec_destroy(c);
+        }
+        mg_java_media_set_checked_drain(NULL);
     }
 }
 
@@ -4712,6 +4790,27 @@ static void test_codec_sound(void)
     mg_codec_standin_counts_get(&after);
     CHECK_INT(after.refused - before.refused, 0);
     CHECK_INT(after.opened - before.opened, after.closed - before.closed);
+    {
+        static megler_codec_host failing;
+        size_t n = 0;
+        failing = *mg_codec_standin();
+        failing.push = codec_fail_second;
+        mg_java_media_set_host(&failing);
+        c = mg_mcodec_create("audio/mp4a-latm");
+        CHECK(c && mg_mcodec_configure(c, 0, 0, 44100, 2, csd, size));
+        if (c) {
+            n += put_adts(packet + n, 80);
+            n += put_adts(packet + n, 80);
+            n += put_adts(packet + n, 80);
+            mg_codec_standin_counts_get(&before);
+            CHECK(!mg_mcodec_decode(c, packet, n, -23218, 4));
+            mg_codec_standin_counts_get(&after);
+            CHECK_INT(after.pushed - before.pushed, 1);
+            CHECK_INT(after.drained - before.drained, 0);
+            mg_mcodec_destroy(c);
+        }
+        mg_java_media_set_host(mg_codec_standin());
+    }
 }
 
 /* NV12 to the bitmaps' colours: red in BT.601 and BT.709 at video range, and at full range; and RGBA as it is. */
@@ -4746,6 +4845,231 @@ static void test_codec_colours(void)
     CHECK(mg_mcodec_render(&p, out, 1, 1, 4) && out[0] == 30 && out[1] == 20 && out[2] == 10 && out[3] == 255);
 }
 
+static const u8 ndk_demux_config[] = { 0, 0, 0, 1, 0x67, 1 };
+static const u8 ndk_demux_data[] = { 0, 0, 0, 1, 0x65, 1, 2 };
+
+static void *ndk_demux_open(const char *path)
+{
+    (void)path;
+    return mg_alloc(sizeof(int));
+}
+static void ndk_demux_close(void *demux) { free(demux); }
+static int ndk_demux_count(void *demux) { (void)demux; return 1; }
+static bool ndk_demux_track(void *demux, int index, mg_demux_track *track)
+{
+    (void)demux;
+    if (index != 0) return false;
+    memset(track, 0, sizeof(*track));
+    track->mime = "video/avc";
+    track->width = 64;
+    track->height = 48;
+    track->config = ndk_demux_config;
+    track->config_size = sizeof(ndk_demux_config);
+    return true;
+}
+static int ndk_demux_read(void *demux, mg_demux_sample *sample)
+{
+    int *index = (int *)demux;
+    if (*index == 4) return -1;
+    if (*index == 3) return 0;
+    memset(sample, 0, sizeof(*sample));
+    sample->data = ndk_demux_data;
+    sample->size = sizeof(ndk_demux_data);
+    sample->time_us = (i64)*index * 1000;
+    sample->flags = *index == 0 ? 1 : 0;
+    ++*index;
+    return 1;
+}
+static bool ndk_demux_seek(void *demux, i64 time, int mode)
+{
+    if (mode < 0 || mode > 2 || time < 0 || time > 2000) return false;
+    if (mode == 2 && time == 1) {
+        *(int *)demux = 4;
+        return true;
+    }
+    *(int *)demux = (int)(time / 1000);
+    return true;
+}
+
+static void test_ndk_demux(const char *scratch)
+{
+    static const mg_demux_host demux = { ndk_demux_open, ndk_demux_close, ndk_demux_count,
+                                        ndk_demux_track, ndk_demux_read, ndk_demux_seek };
+    void *(*ex_new)(void) = (void *(*)(void))mg_bionic_find("AMediaExtractor_new");
+    int (*ex_fd)(void *, int, i64, i64) = (int (*)(void *, int, i64, i64))mg_bionic_find("AMediaExtractor_setDataSourceFd");
+    u32 (*ex_count)(void *) = (u32 (*)(void *))mg_bionic_find("AMediaExtractor_getTrackCount");
+    void *(*ex_format)(void *, u32) = (void *(*)(void *, u32))mg_bionic_find("AMediaExtractor_getTrackFormat");
+    int (*ex_select)(void *, size_t) = (int (*)(void *, size_t))mg_bionic_find("AMediaExtractor_selectTrack");
+    gssize (*ex_read)(void *, u8 *, size_t) = (gssize (*)(void *, u8 *, size_t))mg_bionic_find("AMediaExtractor_readSampleData");
+    i64 (*ex_time)(void *) = (i64 (*)(void *))mg_bionic_find("AMediaExtractor_getSampleTime");
+    u32 (*ex_flags)(void *) = (u32 (*)(void *))mg_bionic_find("AMediaExtractor_getSampleFlags");
+    u8 (*ex_advance)(void *) = (u8 (*)(void *))mg_bionic_find("AMediaExtractor_advance");
+    int (*ex_seek)(void *, i64, int) = (int (*)(void *, i64, int))mg_bionic_find("AMediaExtractor_seekTo");
+    int (*ex_delete)(void *) = (int (*)(void *))mg_bionic_find("AMediaExtractor_delete");
+    u8 (*get_buffer)(void *, const char *, void **, size_t *) = (u8 (*)(void *, const char *, void **, size_t *))mg_bionic_find("AMediaFormat_getBuffer");
+    int (*format_delete)(void *) = (int (*)(void *))mg_bionic_find("AMediaFormat_delete");
+    char *path = mg_sprintf("%s/demux-source", scratch);
+    u8 sample[32];
+    void *ex, *format, *config = NULL;
+    size_t size = 0;
+    int fd;
+    CHECK(mg_file_write_all(path, ndk_demux_data, sizeof(ndk_demux_data)));
+    fd = mg_fd_open_host(path, MG_O_READ);
+    mg_media_set_demux_host(&demux);
+    ex = ex_new();
+    CHECK_INT(ex_fd(ex, fd, 0, sizeof(ndk_demux_data)), 0);
+    CHECK_INT(ex_count(ex), 1);
+    format = ex_format(ex, 0);
+    CHECK(get_buffer(format, "csd-0", &config, &size) && size == sizeof(ndk_demux_config) &&
+          !memcmp(config, ndk_demux_config, size));
+    format_delete(format);
+    CHECK_INT(ex_select(ex, 0), 0);
+    CHECK_INT(ex_read(ex, sample, sizeof(sample)), sizeof(ndk_demux_data));
+    CHECK(!memcmp(sample, ndk_demux_data, sizeof(ndk_demux_data)) && ex_time(ex) == 0 && ex_flags(ex) == 1);
+    CHECK(ex_advance(ex) && ex_time(ex) == 1000 && ex_flags(ex) == 0);
+    CHECK_INT(ex_seek(ex, 2000, 0), 0);
+    CHECK(ex_time(ex) == 2000 && !ex_advance(ex) && ex_time(ex) == -1);
+    CHECK_INT(ex_seek(ex, 0, 0), 0);
+    CHECK(ex_time(ex) == 0);
+    CHECK_INT(ex_seek(ex, 1, 2), 0);
+    CHECK_INT(ex_read(ex, sample, sizeof(sample)), -10000);
+    CHECK_INT(ex_seek(ex, 0, 0), 0);
+    CHECK(ex_time(ex) == 0);
+    ex_delete(ex);
+    mg_media_set_demux_host(NULL);
+    mg_fd_close(fd);
+    free(path);
+}
+
+static void test_ndk_packet_codec(void)
+{
+    typedef struct { i32 offset, size; i64 time_us; u32 flags; } buffer_info;
+    void *(*format_new)(void) = (void *(*)(void))mg_bionic_find("AMediaFormat_new");
+    void (*set_string)(void *, const char *, const char *) = (void (*)(void *, const char *, const char *))mg_bionic_find("AMediaFormat_setString");
+    void (*set_int)(void *, const char *, i32) = (void (*)(void *, const char *, i32))mg_bionic_find("AMediaFormat_setInt32");
+    void (*set_buffer)(void *, const char *, const void *, size_t) = (void (*)(void *, const char *, const void *, size_t))mg_bionic_find("AMediaFormat_setBuffer");
+    int (*format_delete)(void *) = (int (*)(void *))mg_bionic_find("AMediaFormat_delete");
+    void *(*codec_new)(const char *) = (void *(*)(const char *))mg_bionic_find("AMediaCodec_createDecoderByType");
+    int (*configure)(void *, void *, void *, void *, u32) = (int (*)(void *, void *, void *, void *, u32))mg_bionic_find("AMediaCodec_configure");
+    int (*start)(void *) = (int (*)(void *))mg_bionic_find("AMediaCodec_start");
+    int (*flush)(void *) = (int (*)(void *))mg_bionic_find("AMediaCodec_flush");
+    gssize (*dequeue_input)(void *, i64) = (gssize (*)(void *, i64))mg_bionic_find("AMediaCodec_dequeueInputBuffer");
+    u8 *(*input)(void *, size_t, size_t *) = (u8 *(*)(void *, size_t, size_t *))mg_bionic_find("AMediaCodec_getInputBuffer");
+    int (*queue)(void *, size_t, goff, size_t, u64, u32) = (int (*)(void *, size_t, goff, size_t, u64, u32))mg_bionic_find("AMediaCodec_queueInputBuffer");
+    gssize (*output)(void *, buffer_info *, i64) = (gssize (*)(void *, buffer_info *, i64))mg_bionic_find("AMediaCodec_dequeueOutputBuffer");
+    u8 *(*output_buffer)(void *, size_t, size_t *) = (u8 *(*)(void *, size_t, size_t *))mg_bionic_find("AMediaCodec_getOutputBuffer");
+    int (*release)(void *, size_t, u8) = (int (*)(void *, size_t, u8))mg_bionic_find("AMediaCodec_releaseOutputBuffer");
+    int (*destroy)(void *) = (int (*)(void *))mg_bionic_find("AMediaCodec_delete");
+    static megler_codec_host failing;
+    u8 sps[16], pps[16], unit[64];
+    size_t ns = 0, np = 0, nu = 0, capacity;
+    void *format, *codec;
+    buffer_info info;
+    int i, slot;
+    put_avc_nal(sps, &ns, 0x67, false);
+    put_avc_nal(pps, &np, 0x68, false);
+    put_avc_nal(unit, &nu, 0x65, false);
+    format = format_new();
+    set_string(format, "mime", "video/avc");
+    set_int(format, "width", 64);
+    set_int(format, "height", 48);
+    set_buffer(format, "csd-0", sps, ns);
+    set_buffer(format, "csd-1", pps, np);
+    codec = codec_new("video/avc");
+    CHECK(codec && configure(codec, format, NULL, NULL, 0) == 0 && start(codec) == 0);
+    if (codec) {
+        u8 *buffer = input(codec, 0, &capacity);
+        CHECK(buffer && capacity >= nu);
+        for (i = 0; i < 3; i++) {
+            memcpy(buffer, unit, nu);
+            CHECK_INT(queue(codec, 0, 0, nu, (u64)i * 33333, i == 2 ? 4 : 0), 0);
+        }
+        CHECK_INT(output(codec, &info, 0), -2);
+        for (i = 0; i < 3; i++) {
+            slot = (int)output(codec, &info, 0);
+            CHECK(slot >= 0 && info.size == 64 * 48 * 4 && info.time_us == (i64)i * 33333 && !info.flags);
+            if (slot >= 0) {
+                CHECK(output_buffer(codec, (size_t)slot, &capacity) != NULL && capacity == 64 * 48 * 4);
+                release(codec, (size_t)slot, 0);
+            }
+        }
+        slot = (int)output(codec, &info, 0);
+        CHECK(slot >= 0 && !info.size && info.flags == 4);
+        if (slot >= 0) release(codec, (size_t)slot, 0);
+        CHECK_INT(flush(codec), 0);
+        memcpy(buffer, unit, nu);
+        CHECK_INT(queue(codec, 0, 0, nu, 100000, 4), 0);
+        slot = (int)output(codec, &info, 0);
+        CHECK(slot >= 0 && info.time_us == 100000 && !info.flags);
+        if (slot >= 0) release(codec, (size_t)slot, 0);
+        destroy(codec);
+    }
+    failing = *mg_codec_standin();
+    failing.push = codec_fail_second;
+    failing.reorder = 0;
+    mg_java_media_set_host(&failing);
+    codec = codec_new("video/avc");
+    CHECK(codec && configure(codec, format, NULL, NULL, 0) == 0 && start(codec) == 0);
+    if (codec) {
+        u8 *buffer = input(codec, 0, &capacity);
+        memcpy(buffer, unit, nu);
+        CHECK_INT(queue(codec, 0, 0, nu, 0, 0), 0);
+        CHECK_INT(output(codec, &info, 0), -2);
+        slot = (int)output(codec, &info, 0);
+        CHECK(slot >= 0 && info.size > 0 && !info.flags);
+        if (slot >= 0) release(codec, (size_t)slot, 0);
+        memcpy(buffer, unit, nu);
+        CHECK_INT(queue(codec, 0, 0, nu, 1, 4), -10000);
+        CHECK_INT(output(codec, &info, 0), -10000);
+        CHECK_INT(dequeue_input(codec, 0), -10000);
+        destroy(codec);
+    }
+    mg_java_media_set_host(mg_codec_standin());
+    mg_java_media_set_checked_drain(codec_fail_drain);
+    codec = codec_new("video/avc");
+    CHECK(codec && configure(codec, format, NULL, NULL, 0) == 0 && start(codec) == 0);
+    if (codec) {
+        u8 *buffer = input(codec, 0, &capacity);
+        memcpy(buffer, unit, nu);
+        CHECK_INT(queue(codec, 0, 0, nu, 0, 4), -10000);
+        CHECK_INT(output(codec, &info, 0), -10000);
+        destroy(codec);
+    }
+    mg_java_media_set_checked_drain(NULL);
+    format_delete(format);
+    mg_java_media_set_host(mg_codec_standin());
+    format = format_new();
+    set_string(format, "mime", "audio/mp4a-latm");
+    set_int(format, "sample-rate", 48000);
+    set_int(format, "channel-count", 1);
+    {
+        static const u8 asc[] = { 0x11, 0x88 };
+        set_buffer(format, "csd-0", asc, sizeof(asc));
+    }
+    codec = codec_new("audio/mp4a-latm");
+    CHECK(codec && configure(codec, format, NULL, NULL, 0) == 0 && start(codec) == 0);
+    if (codec) {
+        u8 *buffer = input(codec, 0, &capacity);
+        memset(buffer, 1, 16);
+        CHECK_INT(queue(codec, 0, 0, 16, 12345, 4), 0);
+        CHECK_INT(output(codec, &info, 0), -2);
+        slot = (int)output(codec, &info, 0);
+        CHECK(slot >= 0 && info.time_us == 12345 && info.size == 1024 * 2 && !info.flags);
+        if (slot >= 0) release(codec, (size_t)slot, 0);
+        slot = (int)output(codec, &info, 0);
+        CHECK(slot >= 0 && info.size == 0 && info.flags == 4);
+        if (slot >= 0) release(codec, (size_t)slot, 0);
+        destroy(codec);
+    }
+    format_delete(format);
+    format = format_new();
+    set_string(format, "mime", "video/x-vnd.on2.vp9");
+    codec = codec_new("video/x-vnd.on2.vp9");
+    CHECK(codec && configure(codec, format, NULL, NULL, 0) == -10002);
+    if (codec) destroy(codec);
+    format_delete(format);
+}
+
 static void test_codecs(void)
 {
     say("the decoders behind a Java app's MediaCodec, over a stand-in for the shell's");
@@ -4757,6 +5081,7 @@ static void test_codecs(void)
     test_codec_pictures();
     test_codec_sound();
     test_codec_colours();
+    test_ndk_packet_codec();
     mg_java_media_set_host(NULL);
 }
 
@@ -7284,6 +7609,7 @@ int mg_tests_run(const char *libdir, const char *scratch, mg_test_sink sink, voi
     test_sqlite(scratch);
     test_textures();
     test_media(scratch);
+    test_ndk_demux(scratch);
     test_codecs();
     test_camera();
     test_battery();

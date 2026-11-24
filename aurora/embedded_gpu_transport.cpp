@@ -26,7 +26,7 @@
 
 namespace {
 const quint32 wireMagic = 0x41434c47;
-const quint16 wireVersion = 1;
+const quint16 wireVersion = 2;
 const int maxPlanes = 4;
 const int maxDimension = 4096;
 const quint64 maxFramePixels = (32 * 1024 * 1024) / 4;
@@ -51,6 +51,8 @@ struct WirePacket {
     quint16 version;
     quint16 type;
     quint64 id;
+    quint64 channel;
+    quint64 generation;
     qint32 width;
     qint32 height;
     qint32 fourcc;
@@ -245,7 +247,7 @@ bool validFrameMetadata(const WirePacket &packet, int fdCount)
         packet.height <= 0 || packet.width > maxDimension || packet.height > maxDimension ||
         quint64(packet.width) * quint64(packet.height) > maxFramePixels ||
         packet.fourcc <= 0 || !packet.planeCount || packet.planeCount > maxPlanes ||
-        fdCount != int(packet.planeCount))
+        fdCount != int(packet.planeCount) || bool(packet.channel) != bool(packet.generation))
         return false;
     for (uint32_t i = 0; i < packet.planeCount; ++i)
         if (packet.strides[i] <= 0 || packet.offsets[i] < 0)
@@ -329,6 +331,8 @@ AuroraDmaBufFrame &AuroraDmaBufFrame::operator=(AuroraDmaBufFrame &&other) noexc
     if (this == &other) return *this;
     close();
     id = other.id;
+    channel = other.channel;
+    generation = other.generation;
     probeOnly = other.probeOnly;
     width = other.width;
     height = other.height;
@@ -342,6 +346,7 @@ AuroraDmaBufFrame &AuroraDmaBufFrame::operator=(AuroraDmaBufFrame &&other) noexc
         other.fds[i] = -1;
     }
     other.id = 0;
+    other.channel = other.generation = 0;
     other.planeCount = 0;
     return *this;
 }
@@ -436,6 +441,37 @@ bool EmbeddedGpuTransport::connectTo(const QString &path, qint64 expectedPeerPid
     }
     m_server = false;
     return setPeer(fd, expectedPeerPid, error);
+}
+
+bool EmbeddedGpuTransport::adoptInheritedSocket(int fd, bool receiveFrames, QString *error)
+{
+    close();
+    int type = 0;
+    socklen_t typeSize = sizeof(type);
+    sockaddr_storage local = {}, peer = {};
+    socklen_t localSize = sizeof(local), peerSize = sizeof(peer);
+    const int flags = fd >= 0 ? fcntl(fd, F_GETFL) : -1;
+    if (fd < 0 || flags < 0 ||
+        getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &typeSize) != 0 ||
+        type != SOCK_SEQPACKET ||
+        getsockname(fd, reinterpret_cast<sockaddr *>(&local), &localSize) != 0 ||
+        getpeername(fd, reinterpret_cast<sockaddr *>(&peer), &peerSize) != 0 ||
+        local.ss_family != AF_UNIX || peer.ss_family != AF_UNIX ||
+        fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        if (fd >= 0) ::close(fd);
+        setError(error, tr("The inherited GPU channel is invalid."));
+        return false;
+    }
+    {
+        QMutexLocker lock(&m_mutex);
+        m_peer = fd;
+    }
+    if (receiveFrames) {
+        m_peerNotifier = new QSocketNotifier(fd, QSocketNotifier::Read, this);
+        connect(m_peerNotifier, &QSocketNotifier::activated, this, &EmbeddedGpuTransport::readAvailable);
+    }
+    return true;
 }
 
 bool EmbeddedGpuTransport::setPeer(int fd, qint64 expectedPeerPid, QString *error)
@@ -567,13 +603,16 @@ bool EmbeddedGpuTransport::sendFramePacket(int socket, const AuroraDmaBufFrame &
     if (socket < 0 || !frame.id || frame.width <= 0 || frame.height <= 0 ||
         frame.width > maxDimension || frame.height > maxDimension ||
         quint64(frame.width) * quint64(frame.height) > maxFramePixels ||
-        frame.fourcc <= 0 || frame.planeCount <= 0 || frame.planeCount > maxPlanes)
+        frame.fourcc <= 0 || frame.planeCount <= 0 || frame.planeCount > maxPlanes ||
+        bool(frame.channel) != bool(frame.generation))
         return false;
     WirePacket packet = {};
     packet.magic = wireMagic;
     packet.version = wireVersion;
     packet.type = frame.probeOnly ? ProbePacket : FramePacket;
     packet.id = frame.id;
+    packet.channel = frame.channel;
+    packet.generation = frame.generation;
     packet.width = frame.width;
     packet.height = frame.height;
     packet.fourcc = frame.fourcc;
@@ -602,6 +641,8 @@ bool EmbeddedGpuTransport::receiveFramePacket(int socket, AuroraDmaBufFrame *fra
     }
     AuroraDmaBufFrame incoming;
     incoming.id = packet.id;
+    incoming.channel = packet.channel;
+    incoming.generation = packet.generation;
     incoming.probeOnly = packet.type == ProbePacket;
     incoming.width = packet.width;
     incoming.height = packet.height;
@@ -801,7 +842,8 @@ bool aurora_copy_gpu_texture(GLuint source, GLuint target, int width, int height
 }
 
 static QString processGbmRenderTarget(int width, int height, GLuint source,
-    const std::function<bool(const AuroraDmaBufFrame &, QString *)> &consume, bool *success)
+    const std::function<bool(const AuroraDmaBufFrame &, QString *)> &consume, bool *success,
+    quint64 channel = 0, quint64 generation = 0)
 {
     if (success) *success = false;
     if (width <= 0 || height <= 0 || width > maxDimension || height > maxDimension ||
@@ -818,6 +860,8 @@ static QString processGbmRenderTarget(int width, int height, GLuint source,
 #ifndef ACL_HAVE_GBM_HEADER
     Q_UNUSED(source)
     Q_UNUSED(consume)
+    Q_UNUSED(channel)
+    Q_UNUSED(generation)
     return QStringLiteral("unavailable: build SDK lacks the GBM API header");
 #else
     QLibrary gbm(QStringLiteral("libgbm.so.1"));
@@ -937,6 +981,8 @@ static QString processGbmRenderTarget(int width, int height, GLuint source,
                         return producer + QStringLiteral("; parent import and presentation not tested");
                     }
                     frame.id = nextFrameId();
+                    frame.channel = channel;
+                    frame.generation = generation;
                     frame.probeOnly = !source;
                     QString parentError;
                     if (!consume(frame, &parentError))
@@ -963,9 +1009,10 @@ QString EmbeddedGpuTransport::probeGbmRenderTarget(int width, int height,
     return processGbmRenderTarget(width, height, 0, verifyParent, available);
 }
 
-bool EmbeddedGpuTransport::presentGbmTexture(GLuint texture, int width, int height, QString *error)
+bool EmbeddedGpuTransport::presentGbmTexture(GLuint texture, int width, int height, QString *error,
+                                             quint64 channel, quint64 generation)
 {
-    if (!texture) {
+    if (!texture || bool(channel) != bool(generation)) {
         setError(error, tr("The GPU source texture is invalid."));
         return false;
     }
@@ -973,15 +1020,16 @@ bool EmbeddedGpuTransport::presentGbmTexture(GLuint texture, int width, int heig
     const QString result = processGbmRenderTarget(width, height, texture,
         [this](const AuroraDmaBufFrame &frame, QString *reason) {
             return sendFrame(frame, reason);
-        }, &success);
+        }, &success, channel, generation);
     if (!success) setError(error, result);
     return success;
 }
 
-bool EmbeddedGpuTransport::presentTexture(GLuint texture, int width, int height, QString *error)
+bool EmbeddedGpuTransport::presentTexture(GLuint texture, int width, int height, QString *error,
+                                          quint64 channel, quint64 generation)
 {
     if (!texture || width <= 0 || height <= 0 || width > maxDimension || height > maxDimension ||
-        quint64(width) * quint64(height) > maxFramePixels) {
+        quint64(width) * quint64(height) > maxFramePixels || bool(channel) != bool(generation)) {
         setError(error, tr("The GPU texture dimensions are invalid."));
         return false;
     }
@@ -1013,6 +1061,8 @@ bool EmbeddedGpuTransport::presentTexture(GLuint texture, int width, int height,
     if (ok) ok = exportImage(display, image, fds, strides, offsets);
     AuroraDmaBufFrame exported;
     exported.id = nextFrameId();
+    exported.channel = channel;
+    exported.generation = generation;
     exported.width = width;
     exported.height = height;
     exported.fourcc = fourcc;

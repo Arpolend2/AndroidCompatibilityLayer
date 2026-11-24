@@ -34,6 +34,7 @@ public:
     int submit(EGLDisplay display, EGLSurface surface, int width, int height, QObject *notifier, int layer = -1);
     bool submitDmaBuf(AuroraDmaBufFrame &&frame, QObject *notifier,
                       const std::function<void(quint64, bool)> &completion);
+    void setDmaBufOwner(quint64 channel, quint64 generation);
     bool setViews(const void *pixels, int width, int height, int stride, QObject *notifier);
     void place(int layer, int x, int y, int width, int height, int flags, QObject *notifier);
     EGLDisplay qtDisplay() const;
@@ -91,6 +92,9 @@ private:
     AuroraDmaBufFrame dmaBufFrame;
     std::function<void(quint64, bool)> dmaBufCompletion;
     bool dmaBufPending = false;
+    bool dmaBufOwnerRequired = false;
+    quint64 dmaBufOwnerChannel = 0;
+    quint64 dmaBufOwnerGeneration = 0;
     bool frameCaptureRequested = false;
     bool frameCaptureActive = false;
     bool frameCaptureAwaitingRender = false;

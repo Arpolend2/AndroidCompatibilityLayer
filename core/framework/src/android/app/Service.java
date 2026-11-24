@@ -20,12 +20,14 @@ public abstract class Service extends android.content.ContextWrapper implements 
         }
     }
     private synchronized void meglerCleanupForeground() {
+        boolean wasActive = mForegroundActive;
         if (mForegroundId != 0)
             ((NotificationManager) getSystemService(NOTIFICATION_SERVICE))
                     .meglerStopForeground(mForegroundId, mForegroundActive, true);
         mForegroundId = 0;
         mForegroundServiceType = 0;
         mForegroundActive = false;
+        if (wasActive) android.util.Log.i("ACL", "ACL background: foreground service stopped");
     }
     public void onConfigurationChanged(android.content.res.Configuration c) {}
     public void onLowMemory() {}
@@ -53,10 +55,12 @@ public abstract class Service extends android.content.ContextWrapper implements 
         if (id == 0 || n == null) throw new IllegalArgumentException("foreground notification requires a nonzero id and notification");
         NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         n.flags |= Notification.FLAG_FOREGROUND_SERVICE | Notification.FLAG_ONGOING_EVENT;
+        boolean wasActive = mForegroundActive;
         manager.meglerStartForeground(mForegroundId, mForegroundActive, id, n);
         mForegroundId = id;
         mForegroundServiceType = type;
         mForegroundActive = true;
+        if (!wasActive) android.util.Log.i("ACL", "ACL background: foreground service started");
     }
     public final void stopForeground(boolean remove) { stopForeground(remove ? STOP_FOREGROUND_REMOVE : STOP_FOREGROUND_LEGACY); }
     public final synchronized void stopForeground(int flags) {
@@ -71,6 +75,7 @@ public abstract class Service extends android.content.ContextWrapper implements 
         }
         mForegroundActive = false;
         mForegroundServiceType = 0;
+        android.util.Log.i("ACL", "ACL background: foreground service stopped");
     }
     public final synchronized int getForegroundServiceType() { return mForegroundServiceType; }
     protected void dump(java.io.FileDescriptor fd, java.io.PrintWriter w, String[] args) {}

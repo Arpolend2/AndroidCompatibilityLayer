@@ -5,17 +5,27 @@
 #include <QCamera>
 #include <QCameraExposure>
 #include <QCameraFocus>
+#include <QCameraImageCapture>
 #include <QCameraInfo>
 #include <QCameraViewfinderSettings>
+#include <QBuffer>
+#include <QDir>
 #include <QDebug>
+#include <QFile>
+#include <QFileInfo>
 #include <QGuiApplication>
+#include <QImageEncoderSettings>
+#include <QImageWriter>
+#include <QIODevice>
 #include <QScreen>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QHash>
 #include <QSet>
 #include <QThread>
+#include <QTemporaryDir>
 #include <QTimer>
 #include <QVideoFrame>
 #include <QVideoSurfaceFormat>
@@ -103,12 +113,21 @@ public:
         probing = false;
     }
 
-    void enable(megler_camera_frame_fn fn, void *core, int width, int height)
+    QSize nativeSize()
+    {
+        QMutexLocker lock(&mutex);
+        return lastNativeSize;
+    }
+
+    void enable(megler_camera_frame_fn fn, void *core, int width, int height, const QSize &stillSize = QSize())
     {
         QMutexLocker lock(&mutex);
         callback = fn;
         callbackCore = core;
         expected = QSize(width, height);
+        snapshotSize = stillSize;
+        snapshot.clear();
+        nextSnapshotMs = 0;
         clock.start();
     }
 
@@ -117,6 +136,16 @@ public:
         QMutexLocker lock(&mutex);
         callback = nullptr;
         callbackCore = nullptr;
+        snapshot.clear();
+        snapshotSize = QSize();
+    }
+
+    bool latestSnapshot(const QSize &size, std::vector<uint8_t> *out)
+    {
+        QMutexLocker lock(&mutex);
+        if (!out || size != snapshotSize || snapshot.empty()) return false;
+        *out = snapshot;
+        return true;
     }
 
     void fail(const char *reason)
@@ -134,6 +163,12 @@ public:
         QVideoFrame frame(input);
         QMutexLocker lock(&mutex);
         if (!callback && !probing) return true;
+        // Some backends deliver empty placeholder frames first; wait for a real one.
+        if (!frame.isValid() || frame.size().isEmpty() || frame.pixelFormat() == QVideoFrame::Format_Invalid) {
+            if (++emptyFrames == 1 || emptyFrames % 100 == 0)
+                qWarning() << "camera: ignoring an empty viewfinder frame, count" << emptyFrames;
+            return true;
+        }
         const int factor = outputFactor(frame.size());
         const QSize outSize = factor ? frame.size() / factor : QSize();
         const bool sizeOk = factor > 0;
@@ -169,10 +204,25 @@ public:
             endWithError("unsupported frame layout or invalid plane bounds");
             return false;
         }
+        lastNativeSize = frame.size();
         if (probing) {
             probe.observe(outSize, clock.nsecsElapsed() / 1000);
             frame.unmap();
             return true;
+        }
+        if (!snapshotSize.isEmpty()) {
+            if (snapshotSize != frame.size()) {
+                if (!snapshot.empty())
+                    qWarning() << "camera: native viewfinder size changed; discarding the still frame";
+                snapshot.clear();
+            } else if (clock.elapsed() >= nextSnapshotMs) {
+                if (factor == 1) snapshot = pixels;
+                else if (!aurora_camera::copyMappedFrame(frame, &snapshot, 1)) {
+                    snapshot.clear();
+                    qWarning() << "camera: could not copy the full-size viewfinder frame for a still";
+                }
+                nextSnapshotMs = clock.elapsed() + 250;
+            }
         }
         megler_camera_frame picture = {};
         picture.width = outSize.width();
@@ -206,19 +256,29 @@ private:
     QSize expected;
     QElapsedTimer clock;
     std::vector<uint8_t> pixels;
+    std::vector<uint8_t> snapshot;
+    QSize snapshotSize;
+    QSize lastNativeSize;
+    qint64 nextSnapshotMs = 0;
     ProbeStats probe;
     QString probeError;
     bool probing = false;
+    int emptyFrames = 0;
 };
 
 struct Camera {
     QCamera *device = nullptr;
     Surface *surface = nullptr;
+    QCameraImageCapture *imageCapture = nullptr;
     QString name;
+    QString jpegCodec;
     QList<QCameraViewfinderSettings> settings;
+    QList<QSize> pictureSizes;
     megler_camera_caps caps = {};
     bool streaming = false;
     bool observedDefault = false;
+    bool stillSwitchFailed = false;
+    QSize viewfinderStillSize;
     megler_camera_focus_fn focusDone = nullptr;
     void *focusCore = nullptr;
     int focusMode = MEGLER_CAMERA_FOCUS_NONE;
@@ -248,8 +308,12 @@ int outputFactor(const QSize &native)
 bool capsFromProbe(const ProbeStats &stats, megler_camera_caps *caps)
 {
     // This is an observed delivery rate, not a claim about hardware frame-rate ranges.
-    const int fps = stats.observedFps();
+    int fps = stats.observedFps();
     if (!fps || !validSize(stats.size)) return false;
+    // Measured rates jitter (31 for a 30 fps sensor); apps pick from standard ranges.
+    if (fps >= 28 && fps <= 32) fps = 30;
+    else if (fps >= 14 && fps <= 16) fps = 15;
+    else if (fps >= 23 && fps <= 26) fps = 24;
     caps->size_count = 1;
     caps->sizes[0] = {stats.size.width(), stats.size.height(), fps, fps};
     return true;
@@ -267,7 +331,6 @@ const char *settingRejection(const QCameraViewfinderSettings &s)
         return "frame rate has no whole-fps value";
     return nullptr;
 }
-
 void collectCaps(QList<QCameraViewfinderSettings> *settings, megler_camera_caps *caps)
 {
     std::sort(settings->begin(), settings->end(), [](const QCameraViewfinderSettings &a,
@@ -299,6 +362,127 @@ void collectCaps(QList<QCameraViewfinderSettings> *settings, megler_camera_caps 
             entry.max_fps = maxFps;
         }
     }
+}
+
+bool validPictureSize(const QSize &size)
+{
+    return size.width() > 0 && size.height() > 0 && size.width() <= 16384 && size.height() <= 16384 &&
+           static_cast<qint64>(size.width()) * size.height() <= 100000000;
+}
+
+QList<QSize> normalizePictureSizes(const QList<QSize> &reported)
+{
+    QList<QSize> sizes;
+    for (const QSize &size : reported)
+        if (validPictureSize(size) && !sizes.contains(size)) sizes.append(size);
+    std::sort(sizes.begin(), sizes.end(), [](const QSize &a, const QSize &b) {
+        const qint64 areaA = static_cast<qint64>(a.width()) * a.height();
+        const qint64 areaB = static_cast<qint64>(b.width()) * b.height();
+        return areaA == areaB ? a.width() > b.width() : areaA > areaB;
+    });
+    while (sizes.size() > MEGLER_CAMERA_MAX_SIZES) sizes.removeLast();
+    return sizes;
+}
+
+QList<QSize> collectPictureSizes(QCameraImageCapture *capture, QString *codec)
+{
+    QList<QSize> sizes;
+    if (!capture || !capture->isAvailable()) return sizes;
+    const QStringList codecs = capture->supportedImageCodecs();
+    for (const QString &available : codecs) {
+        const QString normalized = available.toLower();
+        if (normalized == QStringLiteral("jpeg") || normalized == QStringLiteral("jpg")) {
+            *codec = available;
+            break;
+        }
+    }
+    if (codec->isEmpty()) {
+        qWarning() << "camera: still capture has no supported JPEG codec";
+        return sizes;
+    }
+    QImageEncoderSettings encoding;
+    encoding.setCodec(*codec);
+    bool continuous = false;
+    const QList<QSize> reported = capture->supportedResolutions(encoding, &continuous);
+    if (continuous)
+        qWarning() << "camera: backend reports continuous still resolutions; only its explicit sizes are advertised";
+    for (const QSize &size : reported)
+        qWarning() << "camera: Qt still resolution" << size << (validPictureSize(size) ? "usable" : "rejected");
+    sizes = normalizePictureSizes(reported);
+    return sizes;
+}
+
+bool forwardJpeg(QIODevice *file, int rotation, megler_camera_jpeg_write_fn write, void *context)
+{
+    uint8_t exif[36] = {
+        0xff, 0xe1, 0x00, 0x22,
+        'E', 'x', 'i', 'f', 0x00, 0x00,
+        'I', 'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00,
+        0x01, 0x00,
+        0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+    const qint64 size = file->size();
+    const qint64 added = static_cast<qint64>(sizeof(exif));
+    char start[2], end[2], buffer[65536];
+    if (!write || !file->isOpen() || size < 4 ||
+        size > static_cast<qint64>(MEGLER_CAMERA_MAX_JPEG_BYTES) - added ||
+        !file->seek(0) || file->read(start, sizeof(start)) != sizeof(start) ||
+        !file->seek(size - 2) || file->read(end, sizeof(end)) != sizeof(end) ||
+        static_cast<uint8_t>(start[0]) != 0xff || static_cast<uint8_t>(start[1]) != 0xd8 ||
+        static_cast<uint8_t>(end[0]) != 0xff || static_cast<uint8_t>(end[1]) != 0xd9)
+        return false;
+    switch (rotation) {
+    case 0: exif[28] = 1; break;
+    case 90: exif[28] = 6; break;
+    case 180: exif[28] = 3; break;
+    case 270: exif[28] = 8; break;
+    default: return false;
+    }
+    if (!file->seek(0) || file->read(start, sizeof(start)) != sizeof(start) ||
+        !write(context, reinterpret_cast<const uint8_t *>(start), sizeof(start)) ||
+        !write(context, exif, sizeof(exif)) || !file->seek(2))
+        return false;
+    for (;;) {
+        const qint64 read = file->read(buffer, sizeof(buffer));
+        if (read < 0) return false;
+        if (!read) break;
+        if (!write(context, reinterpret_cast<const uint8_t *>(buffer), static_cast<size_t>(read))) return false;
+    }
+    return file->atEnd();
+}
+
+bool encodeViewfinderJpeg(const std::vector<uint8_t> &nv12, const QSize &size, int quality, int rotation,
+                          megler_camera_jpeg_write_fn write, void *context)
+{
+    const int width = size.width(), height = size.height();
+    if (outputFactor(size) == 0 || quality < 1 || quality > 100 ||
+        nv12.size() != static_cast<size_t>(width) * height * 3 / 2)
+        return false;
+    QImage image(size, QImage::Format_RGB32);
+    if (image.isNull()) return false;
+    const size_t chroma = static_cast<size_t>(width) * height;
+    for (int y = 0; y < height; ++y) {
+        QRgb *row = reinterpret_cast<QRgb *>(image.scanLine(y));
+        for (int x = 0; x < width; ++x) {
+            const size_t pair = chroma + static_cast<size_t>(y / 2) * width + (x & ~1);
+            const int u = nv12[pair] - 128, v = nv12[pair + 1] - 128;
+            const int l = 298 * (nv12[static_cast<size_t>(y) * width + x] - 16) + 128;
+            row[x] = qRgb(qBound(0, (l + 409 * v) >> 8, 255),
+                          qBound(0, (l - 100 * u - 208 * v) >> 8, 255),
+                          qBound(0, (l + 516 * u) >> 8, 255));
+        }
+    }
+    QBuffer jpeg;
+    if (!jpeg.open(QIODevice::ReadWrite)) return false;
+    QImageWriter writer(&jpeg, "jpeg");
+    writer.setQuality(quality);
+    if (!writer.write(image)) {
+        qWarning() << "camera: viewfinder JPEG encoding failed:" << writer.errorString();
+        return false;
+    }
+    return forwardJpeg(&jpeg, rotation, write, context);
 }
 
 class Worker : public QObject {
@@ -366,7 +550,10 @@ public:
         return available;
     }
 
-    bool waitFor(QCamera *camera, QCamera::Status wanted)
+    QHash<QString, megler_camera_caps> defaultCaps;
+    QHash<QString, QSize> defaultNativeSizes;
+
+    bool waitFor(QCamera *camera, QCamera::Status wanted, int timeoutMs = 10000)
     {
         if (camera->status() == wanted) return true;
         if (camera->error() != QCamera::NoError) return false;
@@ -379,11 +566,19 @@ public:
         });
         connect(camera, static_cast<void (QCamera::*)(QCamera::Error)>(&QCamera::error),
                 &loop, &QEventLoop::quit);
-        timer.start(10000);
+        timer.start(timeoutMs);
         loop.exec();
         return camera->status() == wanted && camera->error() == QCamera::NoError;
     }
 
+    // Reads the still capabilities without touching the pipeline: no capture-mode switch, no start/stop.
+    // Switching a Rockchip camera between viewfinder and 4K still has wedged the system 3A (ISP) server.
+    void probeStillCapture(Camera *camera)
+    {
+        camera->imageCapture = new QCameraImageCapture(camera->device, camera->device);
+        camera->pictureSizes = collectPictureSizes(camera->imageCapture, &camera->jpegCodec);
+        qWarning() << "camera: usable JPEG still sizes (read without starting the camera):" << camera->pictureSizes.size();
+    }
     bool probeDefault(Camera *c, megler_camera_caps *caps)
     {
         qWarning() << "camera: trying the backend's default viewfinder; no capability is assumed";
@@ -431,6 +626,7 @@ public:
             return false;
         }
         c->observedDefault = true;
+        defaultNativeSizes.insert(c->name, c->surface->nativeSize());
         qWarning() << "camera: default viewfinder observed" << stats.size << "approximately" << fps
                    << "fps from" << stats.frames << "frames; other modes and rates remain unknown";
         return true;
@@ -461,11 +657,12 @@ public:
             const QByteArray why = c->device->errorString().toUtf8();
             std::snprintf(caps->why, sizeof(caps->why), "Camera load failed or timed out: %s", why.constData());
             qWarning() << "camera:" << caps->why;
-            delete c->device;
+            unloadDevice(c->device);
             delete c->surface;
             delete c;
             return nullptr;
         }
+        probeStillCapture(c);
         c->settings = c->device->supportedViewfinderSettings();
         qWarning() << "camera: Qt reported" << c->settings.size() << "viewfinder settings";
         for (const QCameraViewfinderSettings &s : c->settings) {
@@ -475,11 +672,32 @@ public:
         }
         collectCaps(&c->settings, caps);
         qWarning() << "camera: usable reported modes:" << caps->size_count;
-        if (!caps->size_count && !probeDefault(c, caps)) {
-            delete c->device;
-            delete c->surface;
-            delete c;
-            return nullptr;
+        if (!caps->size_count) {
+            const auto known = defaultCaps.constFind(c->name);
+            if (known != defaultCaps.constEnd()) {
+                *caps = *known;
+                c->observedDefault = true;
+                qWarning() << "camera: reusing the cached default viewfinder probe";
+            } else if (!probeDefault(c, caps)) {
+                unloadDevice(c->device);
+                delete c->surface;
+                delete c;
+                return nullptr;
+            } else {
+                defaultCaps.insert(c->name, *caps);
+            }
+        }
+        if (info.position() == QCamera::FrontFace &&
+            info.description() == QStringLiteral("Rockchip front camera") && c->observedDefault) {
+            const QSize native = defaultNativeSizes.value(c->name);
+            c->pictureSizes.clear();
+            if (outputFactor(native) && QImageWriter::supportedImageFormats().contains("jpeg")) {
+                c->viewfinderStillSize = native;
+                c->pictureSizes.append(native);
+                qWarning() << "camera: Rockchip front stills use viewfinder JPEG at" << native;
+            } else {
+                qWarning() << "camera: Rockchip front viewfinder JPEG unavailable, native size" << native;
+            }
         }
         QCameraFocus *f = c->device->focus();
         QCameraExposure *e = c->device->exposure();
@@ -553,7 +771,7 @@ public:
         qWarning() << "camera: started viewfinder reports" << actual.resolution()
                    << "format" << int(actual.pixelFormat()) << "fps"
                    << actual.minimumFrameRate() << actual.maximumFrameRate();
-        c->surface->enable(frame, core, width, height);
+        c->surface->enable(frame, core, width, height, c->viewfinderStillSize);
         c->streaming = true;
         return true;
     }
@@ -599,6 +817,197 @@ public:
             return;
         }
         c->device->exposure()->setFlashMode(on ? QCameraExposure::FlashTorch : QCameraExposure::FlashOff);
+    }
+
+    int pictureSizes(Camera *c, megler_camera_picture_size *sizes, int max)
+    {
+        if (!c || !cameras.contains(c) || !sizes || max <= 0) return 0;
+        const int count = std::min(max, c->pictureSizes.size());
+        for (int i = 0; i < count; ++i) {
+            sizes[i].width = c->pictureSizes[i].width();
+            sizes[i].height = c->pictureSizes[i].height();
+        }
+        return count;
+    }
+
+    bool capture(Camera *c, int width, int height, int quality, int rotation,
+                 megler_camera_jpeg_write_fn write, void *context)
+    {
+        if (!c || !cameras.contains(c) || !c->streaming ||
+            !validPictureSize(QSize(width, height)) || quality < 1 || quality > 100)
+            return false;
+        if (!c->pictureSizes.contains(QSize(width, height))) {
+            qWarning() << "camera: still size is not in the backend's reported capabilities" << width << height;
+            return false;
+        }
+        qWarning() << "camera: still requested" << QSize(width, height) << "quality" << quality
+                   << "rotation" << rotation;
+        if (!c->viewfinderStillSize.isEmpty()) {
+            std::vector<uint8_t> frame;
+            if (!c->surface->latestSnapshot(QSize(width, height), &frame) ||
+                !encodeViewfinderJpeg(frame, QSize(width, height), quality, rotation, write, context)) {
+                qWarning() << "camera: viewfinder still could not be encoded";
+                return false;
+            }
+            qWarning() << "camera: viewfinder still JPEG captured" << QSize(width, height);
+            return true;
+        }
+        if (!c->imageCapture || c->jpegCodec.isEmpty()) return false;
+        bool switched = false;
+        if (!c->imageCapture->isReadyForCapture()) {
+            if (c->stillSwitchFailed) {
+                qWarning() << "camera: still mode switch failed earlier; not retrying";
+                return false;
+            }
+            // One controlled switch per shot, only on user request: stop, still mode, start.
+            if (!switchMode(c, QCamera::CaptureStillImage)) {
+                c->stillSwitchFailed = true;
+                qWarning() << "camera: could not enter still mode; restoring viewfinder once";
+                switchMode(c, QCamera::CaptureViewfinder);
+                return false;
+            }
+            switched = true;
+            if (!c->imageCapture->isReadyForCapture()) {
+                QEventLoop wait;
+                QTimer limit;
+                limit.setSingleShot(true);
+                connect(c->imageCapture, &QCameraImageCapture::readyForCaptureChanged, &wait, [&](bool r) { if (r) wait.quit(); });
+                connect(&limit, &QTimer::timeout, &wait, &QEventLoop::quit);
+                limit.start(3000);
+                wait.exec();
+            }
+            if (!c->imageCapture->isReadyForCapture()) {
+                qWarning() << "camera: still capture is not ready after the mode switch";
+                c->stillSwitchFailed = true;
+                switchMode(c, QCamera::CaptureViewfinder);
+                return false;
+            }
+        }
+        const bool ok = doCapture(c, width, height, quality, rotation, write, context);
+        if (switched && !switchMode(c, QCamera::CaptureViewfinder)) {
+            qWarning() << "camera: could not return to viewfinder mode";
+            c->stillSwitchFailed = true;
+        }
+        return ok;
+    }
+
+    bool switchMode(Camera *c, QCamera::CaptureModes mode)
+    {
+        c->device->stop();
+        if (!waitFor(c->device, QCamera::LoadedStatus, 5000)) return false;
+        c->device->setCaptureMode(mode);
+        c->device->start();
+        if (!waitFor(c->device, QCamera::ActiveStatus, 8000)) {
+            qWarning() << "camera: start after mode switch failed:" << c->device->errorString();
+            c->device->stop();
+            return false;
+        }
+        return true;
+    }
+
+    bool doCapture(Camera *c, int width, int height, int quality, int rotation,
+                   megler_camera_jpeg_write_fn write, void *context)
+    {
+
+        QTemporaryDir temporary(QDir::tempPath() + QStringLiteral("/megler-camera-XXXXXX"));
+        if (!temporary.isValid()) {
+            qWarning() << "camera: could not create private still-capture storage";
+            return false;
+        }
+        const QString outputPath = QDir(temporary.path()).filePath(QStringLiteral("capture.jpg"));
+        QImageEncoderSettings encoding;
+        encoding.setCodec(c->jpegCodec);
+        encoding.setResolution(QSize(width, height));
+        const QMultimedia::EncodingQuality encodingQuality =
+            quality <= 20 ? QMultimedia::VeryLowQuality :
+            quality <= 40 ? QMultimedia::LowQuality :
+            quality <= 60 ? QMultimedia::NormalQuality :
+            quality <= 80 ? QMultimedia::HighQuality : QMultimedia::VeryHighQuality;
+        encoding.setQuality(encodingQuality);
+        c->imageCapture->setEncodingSettings(encoding);
+        c->imageCapture->setCaptureDestination(QCameraImageCapture::CaptureToFile);
+
+        QEventLoop loop;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        bool done = false, saved = false, timedOut = false, pendingSaved = false;
+        int captureId = -1, pendingId = -1;
+        QString savedPath, errorText, pendingPath, pendingError;
+        QMetaObject::Connection savedConnection = connect(
+            c->imageCapture, &QCameraImageCapture::imageSaved, &loop,
+            [&](int id, const QString &path) {
+                if (captureId < 0) {
+                    pendingId = id;
+                    pendingPath = path;
+                    pendingSaved = true;
+                } else if (id == captureId) {
+                    saved = true;
+                    savedPath = path;
+                    done = true;
+                    loop.quit();
+                }
+            });
+        QMetaObject::Connection errorConnection = connect(
+            c->imageCapture,
+            static_cast<void (QCameraImageCapture::*)(int, QCameraImageCapture::Error, const QString &)>(&QCameraImageCapture::error),
+            &loop, [&](int id, QCameraImageCapture::Error, const QString &message) {
+                if (captureId < 0) {
+                    pendingId = id;
+                    pendingError = message;
+                } else if (id == captureId) {
+                    errorText = message;
+                    done = true;
+                    loop.quit();
+                }
+            });
+        connect(&timeout, &QTimer::timeout, &loop, [&] {
+            timedOut = true;
+            loop.quit();
+        });
+        timeout.start(20000);
+        captureId = c->imageCapture->capture(outputPath);
+        if (captureId >= 0 && pendingId == captureId) {
+            if (pendingSaved) {
+                saved = true;
+                savedPath = pendingPath;
+            } else {
+                errorText = pendingError;
+            }
+            done = true;
+        }
+        if (captureId < 0) {
+            qWarning() << "camera: backend refused still capture:" << c->imageCapture->errorString();
+        } else if (!done) {
+            loop.exec();
+        }
+        timeout.stop();
+        if (timedOut) c->imageCapture->cancelCapture();
+        disconnect(savedConnection);
+        disconnect(errorConnection);
+        if (timedOut) {
+            qWarning() << "camera: still capture timed out";
+            return false;
+        }
+        if (!saved) {
+            qWarning() << "camera: still capture failed:" << errorText;
+            return false;
+        }
+        const QFileInfo expectedInfo(outputPath), savedInfo(savedPath);
+        if (savedInfo.canonicalFilePath().isEmpty() ||
+            savedInfo.canonicalFilePath() != expectedInfo.canonicalFilePath()) {
+            qWarning() << "camera: backend saved still image outside its private capture file";
+            return false;
+        }
+        QFile file(outputPath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            qWarning() << "camera: captured JPEG could not be opened:" << file.errorString();
+            return false;
+        }
+        if (!forwardJpeg(&file, rotation, write, context)) {
+            qWarning() << "camera: captured JPEG failed validation or exceeded the output limit";
+            return false;
+        }
+        return true;
     }
 
     void close(Camera *c)
@@ -652,15 +1061,29 @@ private:
         if (c->device) c->device->unlock(QCamera::LockFocus);
     }
 
+    // Stops and unloads the camera so the system pipeline is released cleanly before the object goes away.
+    void unloadDevice(QCamera *device)
+    {
+        if (!device) return;
+        device->stop();
+        if (device->status() != QCamera::LoadedStatus && device->status() != QCamera::UnloadedStatus)
+            waitFor(device, QCamera::LoadedStatus, 3000);
+        device->unload();
+        waitFor(device, QCamera::UnloadedStatus, 3000);
+        delete device;
+    }
+
     void release(Camera *c)
     {
         stop(c);
-        delete c->device;
+        unloadDevice(c->device);
         c->device = nullptr;
         c->surface->disable();
         delete c->surface;
         c->surface = nullptr;
         c->settings.clear();
+        c->pictureSizes.clear();
+        c->jpegCodec.clear();
         c->name.clear();
     }
 
@@ -728,6 +1151,28 @@ bool MEGLER_CB info(void *user, int index, megler_camera_info *out)
     return result;
 }
 
+int MEGLER_CB pictureSizes(void *user, void *camera, megler_camera_picture_size *sizes, int max)
+{
+    int result = 0;
+    if (!static_cast<Worker *>(user)->call([&] {
+            result = static_cast<Worker *>(user)->pictureSizes(static_cast<Camera *>(camera), sizes, max);
+        }))
+        return 0;
+    return result;
+}
+
+bool MEGLER_CB capture(void *user, void *camera, int width, int height, int quality, int rotation,
+                       megler_camera_jpeg_write_fn write, void *context)
+{
+    bool result = false;
+    if (!static_cast<Worker *>(user)->call([&] {
+            result = static_cast<Worker *>(user)->capture(static_cast<Camera *>(camera), width, height, quality,
+                                                           rotation, write, context);
+        }))
+        return false;
+    return result;
+}
+
 void *MEGLER_CB open(void *user, int index, megler_camera_caps *caps, int *error)
 {
     if (!caps || !error) {
@@ -788,6 +1233,15 @@ megler_camera_host auroraCameraHost()
     host.focus = focus;
     host.torch = torch;
     host.close = close;
+    return host;
+}
+
+megler_camera_capture_host auroraCameraCaptureHost()
+{
+    megler_camera_capture_host host = {};
+    host.user = worker();
+    host.picture_sizes = pictureSizes;
+    host.capture = capture;
     return host;
 }
 

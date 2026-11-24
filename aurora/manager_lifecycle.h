@@ -14,12 +14,17 @@
 #include <QSet>
 #include <QTimer>
 #include <functional>
+#include <memory>
 
 class PreviewKeyboard;
 class QMouseEvent;
 class QPainter;
 class QQuickItem;
 class QRectF;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+class PreviewGpuState;
+class PreviewGpuItem;
+#endif
 
 class ManagerLifecycle : public QObject
 {
@@ -52,13 +57,19 @@ public:
     { return m_receiver.recordStoreResult(path, installed, fingerprint); }
     void setLibraryApps(const QString &contents) { m_receiver.setLibraryApps(contents); }
     bool authenticationUiActive() const { return m_authUiChannel != 0; }
-    bool authenticationFrameAvailable() const { return !m_authFrame.isNull(); }
+    bool authenticationFrameAvailable() const { return !authenticationFrameSize().isEmpty(); }
     QImage authenticationFrame() const { return m_authFrame; }
+    QSize authenticationFrameSize() const;
     void setAuthenticationKeyboard(PreviewKeyboard *keyboard);
     Q_INVOKABLE bool authenticationTouch(int phase, int x, int y);
     Q_INVOKABLE void authenticationBack();
     Q_INVOKABLE void cancelAuthentication();
     Q_INVOKABLE void setAuthenticationSurface(QObject *surface, int pixelWidth, int pixelHeight);
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    std::shared_ptr<PreviewGpuState> authenticationGpuState() const { return m_authGpuState; }
+    Q_INVOKABLE void authenticationGpuAccepted(quint64 channel, quint64 generation, quint64 revision,
+                                               int width, int height);
+#endif
     void setAuthenticationViewport(const QSize &pixels, int density, int rotation);
     void invalidateAuthenticationViewport();
     void setLaunchHandler(const std::function<void(const QString &, const std::function<void(const QString &)> &)> &handler)
@@ -91,6 +102,10 @@ private:
     bool writeClientAppsList(QString *error);
     void closeAuthenticationUi(quint64 channelId);
     void acceptAuthenticationFrame(quint64 channelId, const QImage &frame);
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    void submitPendingAuthenticationGpuFrame();
+    void rejectPendingAuthenticationGpuFrame();
+#endif
     bool sendAuthenticationText(const QString &text);
     bool sendAuthenticationTextKey(int key);
     void sendAuthenticationKeyboardClosed();
@@ -117,8 +132,18 @@ private:
     bool m_authFrameCurrent = false;
     bool m_authViewportPending = false;
     bool m_authAwaitingViewportFrame = false;
+    enum AuthenticationFramePath { NoFramePath, CpuFramePath, GpuFramePath };
+    AuthenticationFramePath m_authFramePath = NoFramePath;
     QPointer<PreviewKeyboard> m_authKeyboard;
     QPointer<QQuickItem> m_authSurface;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    std::shared_ptr<PreviewGpuState> m_authGpuState;
+    QSize m_authGpuFrameSize;
+    quint64 m_authFrameRevision = 0;
+    std::unique_ptr<AuroraDmaBufFrame> m_pendingAuthGpuFrame;
+    std::function<void(quint64, bool)> m_pendingAuthGpuCompletion;
+    QTimer m_pendingAuthGpuTimer;
+#endif
 };
 
 class SharedMicrogAuthSurface : public QQuickPaintedItem
@@ -133,6 +158,9 @@ public:
     int pageOrientation() const { return m_pageOrientation; }
     void setPageOrientation(int orientation);
     void paint(QPainter *painter) override;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    Q_INVOKABLE void requestGpuFrame();
+#endif
 
 signals:
     void hostChanged();
@@ -148,7 +176,7 @@ private:
     void scheduleViewport();
     void updateViewport();
     bool sendTouch(int phase, const QPointF &point);
-    QRectF imageTarget(const QImage &frame) const;
+    QRectF imageTarget(const QSize &frame) const;
     QPointer<ManagerLifecycle> m_host;
     QPointF m_lastTouch;
     bool m_pressed = false;
@@ -158,6 +186,9 @@ private:
     int m_rotation = 0;
     QTimer m_viewportTimer;
     QMetaObject::Connection m_screenConnection;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    PreviewGpuItem *m_gpuItem = nullptr;
+#endif
 };
 
 #endif

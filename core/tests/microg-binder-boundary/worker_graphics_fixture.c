@@ -42,6 +42,8 @@ int test_worker_graphics(const megler_gfx_host *graphics)
     active_ui_channel = 42;
     frame_sequence = 0;
     ++ui_generation;
+    frame_owner_channel = active_ui_channel;
+    frame_owner_generation = ui_generation;
     run.window.present_pixels(run.window.user, pixels, 64, 32, 64 * 4);
     size = recv(sockets[0], packet, sizeof(packet), MSG_DONTWAIT);
     close(sockets[0]);
@@ -50,7 +52,8 @@ int test_worker_graphics(const megler_gfx_host *graphics)
     active_ui_channel = 0;
     run.gfx.canvas_free(run.gfx.user, canvas);
     if (size != (ssize_t)sizeof(packet) || memcmp(packet, "MGUI", 4) ||
-        read64(packet + 8) != 42 || read64(packet + 16) != 1 ||
+        read32(packet + 4) != 2 || read64(packet + 8) != 42 || read64(packet + 16) != 1 ||
+        read64(packet + 48) != ui_generation ||
         read32(packet + 24) != 64 || read32(packet + 28) != 32 ||
         read32(packet + 32) != 64 * 4 || read32(packet + 36) != sizeof(pixels) ||
         read32(packet + 40) != 0 || read32(packet + 44) != sizeof(pixels) ||

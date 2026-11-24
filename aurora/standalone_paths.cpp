@@ -99,6 +99,7 @@ bool standalonePaths(const QString &appId, const QString &executableName,
     paths->deniedPermissions = deniedPermissions;
     paths->standaloneSnapshots = snapshotsValue.toBool(false);
     paths->fileDiagnostics = diagnosticsValue.toBool(false);
-    paths->sharedMicrog = sharedMicrogValue.toBool(false);
+    // Older exports stored the provider selection at install time; it is not a runtime opt-out.
+    paths->sharedMicrog = package != QLatin1String("com.google.android.gms");
     return true;
 }

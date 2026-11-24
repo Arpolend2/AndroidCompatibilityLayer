@@ -83,6 +83,12 @@ typedef struct mg_java_gl_share {
     void *handle, *mutex;
 } mg_java_gl_share;
 bool mg_java_gl_share_frame(void *display, void *pbuffer, mg_java_gl_share *share, int id, int width, int height);
+/* Whether the shell can copy a current native EGL pbuffer without ANGLE. */
+bool mg_java_gl_native_texture_frames(void);
+bool mg_java_gl_native_surfaces(void);
+int mg_java_gl_native_surface_configs(void *display, int version, void **configs, int capacity);
+void *mg_java_gl_native_surface_new(void *display, void *config, int width, int height, void **token);
+void mg_java_gl_native_surface_free(void *token);
 /* Whether the shell keeps pictures so (megler_gfx_host.texture_frame and draw_texture) and EGL shares pbuffers' textures. */
 bool mg_java_gl_shares_frames(void);
 /* The shell's picture of `id` let go. */

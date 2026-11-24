@@ -21,6 +21,10 @@ public final class CameraNative {
     public static native long open(int index);
     /** { focus, macro, torch, n, then width, height, min fps, max fps of each of the n sizes, the largest first }. */
     public static native int[] caps(long h);
+    /** Pairs of the still-image sizes the camera backend actually reports, largest first; empty when it has no JPEG still capture. */
+    public static native int[] pictureSizes(long h);
+    /** Captures one full-resolution JPEG, with bounded output and requested quality and EXIF rotation; null on failure. */
+    public static native byte[] capture(long h, int width, int height, int quality, int rotation);
     public static native boolean start(long h, int width, int height, int fps);
     public static native void stop(long h);
     public static native int waitNews(long h, int ms);

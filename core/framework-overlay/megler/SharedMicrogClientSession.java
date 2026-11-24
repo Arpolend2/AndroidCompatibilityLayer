@@ -27,20 +27,33 @@ public final class SharedMicrogClientSession implements AutoCloseable {
      */
     public static SharedMicrogClientSession open(InputStream input, OutputStream output,
                                                  Closeable shutdownTransport) {
-        return open(input, output, shutdownTransport, null);
+        return open(input, output, shutdownTransport, null, Broadcasts::sendFromSharedWorker);
     }
 
     static SharedMicrogClientSession open(InputStream input, OutputStream output,
                                           Closeable shutdownTransport, Executor callbacks) {
+        return open(input, output, shutdownTransport, callbacks, Broadcasts::sendFromSharedWorker);
+    }
+
+    static SharedMicrogClientSession open(InputStream input, OutputStream output,
+                                          Closeable shutdownTransport, Executor callbacks,
+                                          SharedMicrogClientRouter.BroadcastDispatcher broadcastDispatcher) {
+        return open(input, output, shutdownTransport, callbacks, broadcastDispatcher, null);
+    }
+
+    static SharedMicrogClientSession open(InputStream input, OutputStream output,
+                                          Closeable shutdownTransport, Executor callbacks,
+                                          SharedMicrogClientRouter.BroadcastDispatcher broadcastDispatcher,
+                                          BinderBridge.MarkerTransport markerTransport) {
         BinderBridge bridge = null;
         SharedMicrogClientRouter router = null;
         SharedMicrogAccounts.Channel accounts = null;
         try {
             if (shutdownTransport == null)
                 throw new IllegalArgumentException("A transport shutdown operation is required.");
-            bridge = new BinderBridge(input, output, null, shutdownTransport);
-            router = callbacks == null ? new SharedMicrogClientRouter(bridge.remoteRoot()) :
-                new SharedMicrogClientRouter(bridge.remoteRoot(), callbacks);
+            bridge = new BinderBridge(input, output, null, shutdownTransport, -1, 0, markerTransport);
+            router = callbacks == null ? new SharedMicrogClientRouter(bridge.remoteRoot(), broadcastDispatcher) :
+                new SharedMicrogClientRouter(bridge.remoteRoot(), callbacks, broadcastDispatcher);
             accounts = SharedMicrogAccounts.install(bridge.remoteRoot());
             SharedMicrogClientSession session = new SharedMicrogClientSession(bridge, router, accounts);
             Services.installSharedMicrogClientRouter(router);

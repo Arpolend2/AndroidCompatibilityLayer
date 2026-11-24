@@ -67,9 +67,18 @@ public final class Broadcasts {
     public static Intent register(Context context, BroadcastReceiver r, IntentFilter f) { return register(context, r, f, null); }
     /** A receiver that hears on the thread of `handler` (the main thread when it is null). */
     public static Intent register(Context context, BroadcastReceiver r, IntentFilter f, Handler handler) {
+        return register(context, r, f, handler, null, 0);
+    }
+    private static final class ReceiverAccess {
+        final String permission;
+        final int flags;
+        ReceiverAccess(String permission, int flags) { this.permission = permission; this.flags = flags; }
+    }
+    public static Intent register(Context context, BroadcastReceiver r, IntentFilter f, Handler handler,
+                                  String permission, int flags) {
         final Handler on = handler != null ? handler : new Handler(Looper.getMainLooper());
         /* With no receiver there is nothing to keep: the call only asks for the sticky intent. (A null in the list was a NullPointerException waiting for the first broadcast its filter matched.) */
-        if (r != null) synchronized (sReceivers) { sReceivers.add(new Object[] { r, f, context, on }); }
+        if (r != null) synchronized (sReceivers) { sReceivers.add(new Object[] { r, f, context, on, new ReceiverAccess(permission, flags) }); }
         /* A receiver of the Bluetooth radio's broadcasts: the framework's thread that hears the radio runs from now on (megler.Bluetooth). */
         for (int k = 0; f != null && k < f.countActions(); k++) if (f.getAction(k) != null && f.getAction(k).startsWith("android.bluetooth.")) { Bluetooth.ensure(); break; }
         Intent first = null;
@@ -143,6 +152,13 @@ public final class Broadcasts {
         // The old way to have a saved file shown in the gallery (ACTION_MEDIA_SCANNER_SCAN_FILE, which Android's media
         // scanner hears): the media provider indexes it (megler.MediaProvider). The app's own receivers hear it too.
         MediaProvider.broadcast(i);
+        if (SharedMicrogIdentity.isWorker()) {
+            Object[] workerSender = sharedSender(from, options);
+            int uid = workerSender == null ? -1 : (Integer) workerSender[0];
+            String packageName = workerSender == null ? null : (String) workerSender[1];
+            SharedMicrogConnections.sendBroadcastToClients(i, permission, also, holdsAlso, uid, packageName);
+        }
+        if (routeSharedMicrog(i, permission, also, options)) return;
         // A broadcast for microG's package goes to microG's receivers (megler.MicroG), as Android sends it to that app.
         if (MicroG.send(from, i)) return;
         // And one of the implicit broadcasts Google's system configuration lets through (CHECKIN_COMPLETE) to its receivers too.
@@ -181,8 +197,8 @@ public final class Broadcasts {
     }
 
     /**
-     * An ordered broadcast, as Context.sendOrderedBroadcast sends it: to the receivers one after another, the registered ones
-     * of the higher priority first, each on its thread and given the result the one before left (getResultCode,
+     * An ordered broadcast, as Context.sendOrderedBroadcast sends it: to the receivers one after another, higher priority
+     * first, each on its thread and given the result the one before left (getResultCode,
      * getResultData, getResultExtras), which it may change or end there (abortBroadcast); one that goes asynchronous
      * (goAsync) holds the next back until its PendingResult's finish(). Then `resultReceiver`, if any, on the thread of
      * `scheduler` (the main thread when it is null), with the result as it ended -- whatever the receivers did, as Android
@@ -194,6 +210,26 @@ public final class Broadcasts {
     }
     /** The same with the sender's options (BroadcastOptions.toBundle, or null): who sent it is told where they share it. */
     public static void sendOrdered(Context from, Intent i, String permission, Bundle options, BroadcastReceiver resultReceiver, Handler scheduler, int code, String data, Bundle extras) {
+        if (SharedMicrogIdentity.isWorker() && SharedMicrogConnections.hasClientTarget(i)) {
+            if (i.getComponent() == null || permission != null || options != null)
+                throw new UnsupportedOperationException("Shared microG client ordered broadcasts require an explicit target without filters or options.");
+            Intent snapshot = new Intent(i);
+            SharedMicrogConnections.sendOrderedBroadcastToClient(snapshot, code, data, extras,
+                (resultCode, resultData, resultExtras) ->
+                    deliverSharedOrderedResult(from, snapshot, resultReceiver, scheduler, resultCode, resultData, resultExtras));
+            return;
+        }
+        if (!SharedMicrogIdentity.isWorker() && SharedMicrogClientRouter.targetsSharedMicrog(i) &&
+                Services.hasSharedMicrogClientRouter(i)) {
+            if (permission != null || options != null)
+                throw new UnsupportedOperationException("Shared microG ordered broadcasts do not support permission filters or options.");
+            Intent snapshot = new Intent(i);
+            Services.sendSharedMicrogOrderedBroadcast(snapshot, code, data, extras,
+                (resultCode, resultData, resultExtras) ->
+                    deliverSharedOrderedResult(from, snapshot, resultReceiver, scheduler, resultCode, resultData, resultExtras));
+            return;
+        }
+        rejectSharedOrdered(i);
         final Context ctx = AppRunner.application() != null ? AppRunner.application() : from;
         ArrayList<Object[]> targets;
         if (MicroG.send(from, i)) targets = new ArrayList<>();
@@ -202,6 +238,94 @@ public final class Broadcasts {
             targets = targets(from, i, permission, null, false);
         }
         next(targets, 0, i, code, data, extras, resultReceiver, scheduler, ctx, sharedSender(from, options));
+    }
+
+    private static void deliverSharedOrderedResult(Context from, Intent intent, BroadcastReceiver receiver, Handler scheduler,
+                                                   int code, String data, Bundle extras) {
+        if (receiver == null) return;
+        Handler handler = scheduler != null ? scheduler : new Handler(Looper.getMainLooper());
+        if (!handler.post(() -> {
+            BroadcastReceiver.PendingResult result = receiver.meglerBegin(false, code, data, extras, null);
+            try { receiver.onReceive(from, intent); } finally { receiver.meglerEnd(result); }
+        })) throw new IllegalStateException("Shared microG ordered broadcast result queue is unavailable.");
+    }
+
+    public static boolean hasSharedOrderedTarget(Intent intent) {
+        return SharedMicrogIdentity.isWorker() ? SharedMicrogConnections.hasClientTarget(intent) :
+            SharedMicrogClientRouter.targetsSharedMicrog(intent) && Services.hasSharedMicrogClientRouter(intent);
+    }
+
+    public static void rejectSharedOrdered(Intent i) {
+        if (SharedMicrogIdentity.isWorker() && SharedMicrogConnections.hasClientTarget(i))
+            throw new UnsupportedOperationException("Shared microG does not support ordered broadcasts to client processes.");
+        if (SharedMicrogClientRouter.targetsSharedMicrog(i) && Services.hasSharedMicrogClientRouter(i))
+            throw new UnsupportedOperationException("Shared microG does not support ordered broadcasts to the worker.");
+    }
+
+    private static boolean routeSharedMicrog(Intent intent, String permission, String also, Bundle options) {
+        if (!SharedMicrogClientRouter.targetsSharedMicrog(intent) ||
+            !Services.hasSharedMicrogClientRouter(intent)) return false;
+        if (permission != null || also != null || options != null)
+            throw new UnsupportedOperationException("Shared microG broadcasts do not support permission filters or options.");
+        return Services.sendSharedMicrogBroadcast(intent);
+    }
+
+    static void sendFromSharedClient(Intent intent) {
+        if (!SharedMicrogIdentity.isWorker() || !SharedMicrogClientRouter.canRoute(intent))
+            throw new SecurityException("Invalid shared microG client broadcast.");
+        if (SharedMicrogProtectedBroadcasts.contains(intent.getAction()))
+            throw new SecurityException("Client cannot send protected broadcasts to shared microG.");
+        Context context = AppRunner.application();
+        if (context == null) throw new IllegalStateException("Shared microG worker Application is unavailable.");
+        ArrayList<Object[]> targets = targets(context, intent, null, null, false, true);
+        Handler main = new Handler(Looper.getMainLooper());
+        for (Object[] target : targets) (target[3] != null ? (Handler) target[3] : main).post(() -> {
+            BroadcastReceiver receiver = (BroadcastReceiver) target[0];
+            BroadcastReceiver.PendingResult result = receiver.meglerBegin(false, 0, null, null, null);
+            try { receiver.onReceive((Context) target[2], Processes.forLoader(intent, receiver.getClass().getClassLoader())); }
+            finally { receiver.meglerEnd(result); }
+        });
+    }
+
+    static void sendOrderedFromSharedClient(Intent intent, int code, String data, Bundle extras,
+                                            SharedMicrogServiceRouter.OrderedCompletion completion) {
+        if (!SharedMicrogIdentity.isWorker() || !SharedMicrogClientRouter.canRouteOrdered(intent))
+            throw new SecurityException("Invalid shared microG client ordered broadcast.");
+        if (SharedMicrogProtectedBroadcasts.contains(intent.getAction()))
+            throw new SecurityException("Client cannot send protected broadcasts to shared microG.");
+        Context context = AppRunner.application();
+        if (context == null) throw new IllegalStateException("Shared microG worker Application is unavailable.");
+        ArrayList<Object[]> matches;
+        if (intent.getComponent() == null) {
+            synchronized (sReceivers) {
+                matches = targets(context, intent, null, null, false, true, true, true);
+            }
+        } else {
+            matches = targets(context, intent, null, null, false, true);
+        }
+        BroadcastReceiver last = new BroadcastReceiver() {
+            @Override public void onReceive(Context ignored, Intent received) {
+                completion.finish(getResultCode(), getResultData(), getResultExtras(false));
+            }
+        };
+        next(matches, 0, intent, code, data, extras, last, null, context, null);
+    }
+
+    static void sendOrderedFromSharedWorker(Intent intent, int code, String data, Bundle extras,
+                                            SharedMicrogServiceRouter.OrderedCompletion completion) {
+        if (!SharedMicrogIdentity.isClient() || !SharedMicrogClientRouter.canTransfer(intent) ||
+                intent.getComponent() == null || !Native.packageName().equals(intent.getComponent().getPackageName()) ||
+                intent.getPackage() != null && !Native.packageName().equals(intent.getPackage()))
+            throw new SecurityException("Invalid shared microG worker ordered broadcast.");
+        Context context = AppRunner.application();
+        if (context == null) throw new IllegalStateException("Shared microG client Application is unavailable.");
+        ArrayList<Object[]> matches = targets(context, intent, null, null, false, true);
+        BroadcastReceiver last = new BroadcastReceiver() {
+            @Override public void onReceive(Context ignored, Intent received) {
+                completion.finish(getResultCode(), getResultData(), getResultExtras(false));
+            }
+        };
+        next(matches, 0, intent, code, data, extras, last, null, context, null);
     }
 
     /** The ordered broadcast's receiver number `at` given the result, or, past the last (or ended), its result receiver. */
@@ -231,14 +355,43 @@ public final class Broadcasts {
         });
     }
 
-    /** The receivers a broadcast reaches, each as {receiver, filter or null, context, handler or null}: registered ones first, by their priority. */
+    /** The receivers a broadcast reaches, ordered by matching filter priority. */
     private static ArrayList<Object[]> targets(Context from, Intent i, String permission, String also, boolean holdsAlso) {
+        return targets(from, i, permission, also, holdsAlso, false);
+    }
+    private static ArrayList<Object[]> targets(Context from, Intent i, String permission, String also, boolean holdsAlso, boolean exportedOnly) {
+        return targets(from, i, permission, also, holdsAlso, exportedOnly, !exportedOnly);
+    }
+    private static ArrayList<Object[]> targets(Context from, Intent i, String permission, String also, boolean holdsAlso,
+                                               boolean exportedOnly, boolean includeRegistered) {
+        return targets(from, i, permission, also, holdsAlso, exportedOnly, includeRegistered, false);
+    }
+    private static ArrayList<Object[]> targets(Context from, Intent i, String permission, String also, boolean holdsAlso,
+                                               boolean exportedOnly, boolean includeRegistered, boolean actionOnly) {
         final Context ctx = AppRunner.application() != null ? AppRunner.application() : from;
         ArrayList<Object[]> targets = new ArrayList<>();
         /* Receivers registered at run time hear implicit intents only: one that names a component is for that component. */
-        if (i.getComponent() == null)
-            synchronized (sReceivers) { for (Object[] e : sReceivers) if (e[1] != null && ((IntentFilter) e[1]).hasAction(i.getAction()) && allowed((Context) e[2], permission, also, holdsAlso)) targets.add(e); }
+        if (includeRegistered && i.getComponent() == null)
+            synchronized (sReceivers) {
+                for (Object[] e : sReceivers) {
+                    IntentFilter filter = (IntentFilter) e[1];
+                    if (filter == null || !filter.hasAction(i.getAction()) || !allowed((Context) e[2], permission, also, holdsAlso)) continue;
+                    if (actionOnly) {
+                        ReceiverAccess access = (ReceiverAccess) e[4];
+                        if ((access.flags & Context.RECEIVER_NOT_EXPORTED) != 0 ||
+                                access.permission != null && !access.permission.isEmpty()) continue;
+                        if ((access.flags & Context.RECEIVER_EXPORTED) == 0)
+                            throw new UnsupportedOperationException("Shared microG dynamic receiver export status is unknown.");
+                        if (filter.countDataSchemes() != 0 || filter.countDataTypes() != 0) continue;
+                        if (filter.meglerHasComplexDataConstraints())
+                            throw new UnsupportedOperationException("Shared microG dynamic receiver data constraints are unsupported.");
+                    }
+                    targets.add(e);
+                }
+            }
         for (Manifest.Component c : Manifest.match(Manifest.receivers, i)) {
+            if (exportedOnly && (!c.exported || (c.permission != null && !c.permission.isEmpty()))) continue;
+            if (actionOnly && !hasActionOnlyFilter(c, i)) continue;
             if (!enabled(ctx, c) || !allowed(ctx, permission, also, holdsAlso)) continue;
             // A receiver assigned to another Android process needs that process's
             // Application. Running it in the main process gives it the wrong one
@@ -253,12 +406,38 @@ public final class Broadcasts {
                 android.util.Log.i("Megler", "receiver " + c.name + " belongs to process " + c.process + "; not dispatched in the main process");
                 continue;
             }
-            try { targets.add(new Object[] { AppRunner.componentFactory().instantiateReceiver(AppRunner.classLoader(), c.name, i), null, ctx, null }); } catch (Throwable t) { android.util.Log.w("Megler", "receiver " + c.name + ": " + t); }
+            try { targets.add(new Object[] { AppRunner.componentFactory().instantiateReceiver(AppRunner.classLoader(), c.name, i), null, ctx, null, manifestPriority(c, i) }); } catch (Throwable t) { android.util.Log.w("Megler", "receiver " + c.name + ": " + t); }
         }
-        // (A stable sort: the registered ones by their filters' priority, higher first, ahead of the manifest's.)
-        java.util.Collections.sort(targets, (a, b) -> Integer.compare(b[1] != null ? ((IntentFilter) b[1]).getPriority() : Integer.MIN_VALUE,
-                                                                      a[1] != null ? ((IntentFilter) a[1]).getPriority() : Integer.MIN_VALUE));
+        sortTargets(targets);
         return targets;
+    }
+    static int manifestPriority(Manifest.Component component, Intent intent) {
+        if (intent.getComponent() != null) return 0;
+        int priority = Integer.MIN_VALUE;
+        boolean matched = false;
+        for (Manifest.Filter filter : component.filters)
+            if (Manifest.matches(filter, intent) &&
+                    (intent.getData() != null || intent.getType() != null || filter.mimeTypes.isEmpty())) {
+                priority = Math.max(priority, filter.priority);
+                matched = true;
+            }
+        return matched ? priority : 0;
+    }
+    private static boolean hasActionOnlyFilter(Manifest.Component component, Intent intent) {
+        boolean found = false;
+        for (Manifest.Filter filter : component.filters)
+            if (filter.schemes.isEmpty() && filter.mimeTypes.isEmpty() && Manifest.matches(filter, intent)) {
+                if (filter.unsupportedDataConstraints)
+                    throw new UnsupportedOperationException("Shared microG manifest receiver data constraints are unsupported.");
+                found = true;
+            }
+        return found;
+    }
+    static void sortTargets(ArrayList<Object[]> targets) {
+        java.util.Collections.sort(targets, (a, b) -> Integer.compare(targetPriority(b), targetPriority(a)));
+    }
+    private static int targetPriority(Object[] target) {
+        return target[1] != null ? ((IntentFilter) target[1]).getPriority() : (Integer) target[4];
     }
     private static boolean allowed(Context c, String permission, String also, boolean holdsAlso) {
         return (permission == null || Phone.holds(c, permission)) && (also == null || Phone.holds(c, also) == holdsAlso);
@@ -268,5 +447,31 @@ public final class Broadcasts {
         int state = PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
         try { state = ctx.getPackageManager().getComponentEnabledSetting(new ComponentName(ctx.getPackageName(), c.name)); } catch (Throwable t) { }
         return state == PackageManager.COMPONENT_ENABLED_STATE_ENABLED || state == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT && c.enabled;
+    }
+
+    static void sendFromSharedWorker(Intent intent, String permission, String also, boolean holdsAlso,
+                                     int uid, String packageName) {
+        if (!SharedMicrogIdentity.isClient() || !SharedMicrogClientRouter.canTransfer(intent) ||
+                permission != null && permission.length() > 4096 ||
+                also != null && also.length() > 4096 ||
+                (uid == -1 && packageName != null) ||
+                (uid != -1 && (uid <= 0 || !"com.google.android.gms".equals(packageName))))
+            throw new SecurityException("Invalid shared microG worker broadcast.");
+        String ownPackage = Native.packageName();
+        if (intent.getPackage() != null && !ownPackage.equals(intent.getPackage())) return;
+        if (intent.getComponent() != null && !ownPackage.equals(intent.getComponent().getPackageName())) return;
+        Context context = AppRunner.application();
+        if (context == null) throw new IllegalStateException("Shared microG client Application is unavailable.");
+        ArrayList<Object[]> targets = targets(context, intent, permission, also, holdsAlso, true, true);
+        Handler main = new Handler(Looper.getMainLooper());
+        final Object[] sender = uid == -1 ? null : new Object[] { uid, packageName };
+        for (Object[] target : targets) (target[3] != null ? (Handler) target[3] : main).post(() -> {
+            if (gone(target)) return;
+            BroadcastReceiver receiver = (BroadcastReceiver) target[0];
+            BroadcastReceiver.PendingResult result = receiver.meglerBegin(false, 0, null, null, null);
+            if (sender != null) result.meglerSentFrom((Integer) sender[0], (String) sender[1]);
+            try { receiver.onReceive((Context) target[2], Processes.forLoader(intent, receiver.getClass().getClassLoader())); }
+            finally { receiver.meglerEnd(result); }
+        });
     }
 }

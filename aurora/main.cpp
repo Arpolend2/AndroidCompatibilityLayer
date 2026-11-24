@@ -28,6 +28,7 @@
 #include <QtQml>
 #include <QJsonParseError>
 
+#include <clocale>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -74,6 +75,7 @@
 #endif
 #include "shared_runtime.h"
 #include "shared_microg_apk_metadata.h"
+#include "shared_microg_module.h"
 #include "rpm_standalone.h"
 #include "rpm_signers.h"
 #include "rpm_test_keys.h"
@@ -96,7 +98,7 @@ static void loadTranslations(QCoreApplication *app, QTranslator *translator)
 }
 
 static bool prepareSharedMicrogWorker(QString *program, QStringList *arguments,
-                                      QString *identityDirectory, QString *error)
+                                      QString *identityDirectory, QByteArray *apkDigest, QString *error)
 {
     if (error) error->clear();
     const QString appData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
@@ -114,7 +116,7 @@ static bool prepareSharedMicrogWorker(QString *program, QStringList *arguments,
         if (error) *error = QStringLiteral("The selected microG APK is unavailable.");
         return false;
     }
-    const QByteArray apkBytes = QFile::encodeName(apk);
+    const QByteArray apkBytes = QFile::encodeName(apkInfo.absoluteFilePath());
     mg_apk_info info = {};
     if (!mg_apk_read_info(apkBytes.constData(), &info)) {
         const QString detail = QString::fromUtf8(info.error);
@@ -130,6 +132,9 @@ static bool prepareSharedMicrogWorker(QString *program, QStringList *arguments,
         if (error) *error = QStringLiteral("The worker requires a standalone com.google.android.gms microG APK.");
         return false;
     }
+    if (!SharedMicrogModule::publish(apkInfo.absoluteFilePath(),
+            Aurora::Application::organizationFilesDir(false).path(), error, apkDigest))
+        return false;
 
     const QString servicesDirectory = QDir(appData).filePath(QStringLiteral("services"));
     const QString dataDirectory = QDir(servicesDirectory).filePath(QStringLiteral("shared-microg-worker"));
@@ -150,7 +155,7 @@ static bool prepareSharedMicrogWorker(QString *program, QStringList *arguments,
     }
     *program = executableInfo.absoluteFilePath();
     *arguments = QStringList()
-        << QStringLiteral("--apk=") + apkInfo.absoluteFilePath()
+        << QStringLiteral("--apk=") + QString::fromLocal8Bit(apkBytes)
         << QStringLiteral("--data-dir=") + QDir(dataDirectory).absolutePath()
         << QStringLiteral("--android-root=") + QFileInfo(androidRoot).absoluteFilePath()
         << QStringLiteral("--apps-dir=") + QDir(appsDirectory).absolutePath();
@@ -724,6 +729,8 @@ int runApplication(int argc, char *argv[], bool reportWebViewAvailable)
         qWarning().noquote() << "In-app log capture unavailable:" << logError;
     if (!child && !diagnosticLog.available()) DiagnosticLog::installChildQtMessageHandler();
     app.reset(Aurora::Application::application(argc, argv));
+    // Qt applies the user's locale; guest printf (e.g. Skia's SkSL "%f") must keep '.' as on Android.
+    std::setlocale(LC_NUMERIC, "C");
     QTranslator translator;
     loadTranslations(app.data(), &translator);
     if (!child && diagnosticLog.available()) diagnosticLog.startNotifications();
@@ -1035,6 +1042,7 @@ int runApplication(int argc, char *argv[], bool reportWebViewAvailable)
         }
         if (standalone) {
             preview.setSharedMicrog(standalonePathsValue.sharedMicrog);
+            preview.setSharedMicrogModulePath(SharedMicrogModule::path(sharedLogRoot));
             preview.setStandaloneSettings(standalonePathsValue.locale, standalonePathsValue.theme,
                                           standalonePathsValue.location);
             preview.setDeniedPermissions(standalonePathsValue.deniedPermissions);
@@ -1172,6 +1180,7 @@ int runApplication(int argc, char *argv[], bool reportWebViewAvailable)
         if (probe) return;
         probe.reset(new Probe(Aurora::Application::organizationPathTo(SharedRuntime::location()).toLocalFile(),
                               nullptr, &diagnosticLog));
+        probe->setSharedMicrogModuleRoot(sharedLogRoot);
         probe->setReportWebViewAvailable(reportWebViewAvailable);
         QObject::connect(probe.data(), &Probe::runtimeSettingsChanged, probe.data(), [&]() {
             if (activeLifecycle) {
@@ -1236,6 +1245,7 @@ int runApplication(int argc, char *argv[], bool reportWebViewAvailable)
     QString configuredWorkerProgram;
     QStringList configuredWorkerArguments;
     QString configuredIdentityDirectory;
+    QByteArray configuredWorkerApkDigest;
     bool sharedMicrogConfigured = false;
     RuntimeManager::Task microgWatchdog(QStringLiteral("MicrogWatchdog"));
     MicrogWatchdogSchedule watchdogSchedule(
@@ -1274,26 +1284,30 @@ int runApplication(int argc, char *argv[], bool reportWebViewAvailable)
                 configuredWorkerProgram.clear();
                 configuredWorkerArguments.clear();
                 configuredIdentityDirectory.clear();
+                configuredWorkerApkDigest.clear();
             }
             return;
         }
 
         QString program, identityDirectory, error;
         QStringList arguments;
-        if (!prepareSharedMicrogWorker(&program, &arguments, &identityDirectory, &error)) {
+        QByteArray apkDigest;
+        if (!prepareSharedMicrogWorker(&program, &arguments, &identityDirectory, &apkDigest, &error)) {
             if (sharedMicrogConfigured) {
                 lifecycle.disableSharedMicrogWorker();
                 sharedMicrogConfigured = false;
                 configuredWorkerProgram.clear();
                 configuredWorkerArguments.clear();
                 configuredIdentityDirectory.clear();
+                configuredWorkerApkDigest.clear();
             }
             qWarning().noquote() << "Shared microG backend unavailable:" << error;
             return;
         }
         if (sharedMicrogConfigured && configuredWorkerProgram == program &&
             configuredWorkerArguments == arguments &&
-            configuredIdentityDirectory == identityDirectory) return;
+            configuredIdentityDirectory == identityDirectory &&
+            configuredWorkerApkDigest == apkDigest) return;
         if (sharedMicrogConfigured) {
             lifecycle.disableSharedMicrogWorker();
             sharedMicrogConfigured = false;
@@ -1308,6 +1322,7 @@ int runApplication(int argc, char *argv[], bool reportWebViewAvailable)
         configuredWorkerProgram = program;
         configuredWorkerArguments = arguments;
         configuredIdentityDirectory = identityDirectory;
+        configuredWorkerApkDigest = apkDigest;
         sharedMicrogConfigured = true;
         lifecycle.enableSharedMicrogBackground();
     };

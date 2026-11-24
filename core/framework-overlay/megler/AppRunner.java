@@ -309,9 +309,14 @@ public final class AppRunner {
      * `referrer` the package that started it where that is not the app (Activity.getReferrer).
      */
     static Activity launch(String cls, Intent intent, Activity caller, int request, Manifest.Component info, Bundle state, String referrer) throws Exception {
+        return launch(cls, intent, caller, request, info, state, referrer, caller, 0, 0);
+    }
+    private static Activity launch(String cls, Intent intent, Activity caller, int request, Manifest.Component info,
+                                   Bundle state, String referrer, Activity source, long channel, long generation) throws Exception {
         android.util.Log.d("Megler", "launch " + cls);
         Activity prev = top();
         Activity a = make(cls, intent, caller, request, info);
+        SharedMicrogWorker.activityCreated(a, source, channel, generation);
         if (referrer != null) a.meglerSetReferrer(referrer);
         final boolean prevResumed = prev != null && prev.isResumedMegler();
         if (prevResumed) prev.meglerPause();
@@ -387,6 +392,7 @@ public final class AppRunner {
         Activity n;
         try { n = make(cls, a.getIntent(), a.meglerCaller(), a.meglerRequestCode(), info); }
         catch (Exception e) { sStack.remove(idx); exitWhenLast(); throw new RuntimeException(e); }
+        SharedMicrogWorker.activityReplaced(a, n);
         n.meglerSetReferrer(a.meglerReferrer());
         n.meglerSetRetained(retained);
         sStack.set(idx, n);
@@ -495,6 +501,26 @@ public final class AppRunner {
         AppResults.requested(cls);
         startActivity(from, i, -1, null);
     }
+
+    static void startSharedMicrogActivity(Intent i, long channel, long generation) {
+        final Manifest.Component component = Manifest.resolve(i);
+        if (component == null) throw new IllegalArgumentException("Shared microG activity not found");
+        final Intent intent = new Intent(i);
+        if (intent.getComponent() == null) intent.setComponent(new ComponentName(Native.packageName(), component.name));
+        final String cls = "activity-alias".equals(component.kind) && component.parentActivity != null ? component.parentActivity : component.name;
+        if (!sHandler.post(() -> {
+            if (!SharedMicrogWorker.activateOnMain(channel, generation)) return;
+            try { launch(cls, intent, null, -1, component, null, null, null, channel, generation); }
+            catch (Throwable t) {
+                android.util.Log.e("Megler", "starting shared microG activity failed", t);
+                SharedMicrogWorker.dismissUi(channel, generation);
+            }
+        })) throw new IllegalStateException("Shared microG activity could not be scheduled");
+    }
+
+    static boolean postSharedMicrog(Runnable action) {
+        return sHandler != null && sHandler.post(action);
+    }
     /** Context.startActivity: an activity of the app's own, or something the host can open (a web page, mail, the store). */
     public static void startActivity(Context from, Intent i, int request, Bundle opts) {
         if (request < 0 && StorePhoenix.request(i)) return;
@@ -542,6 +568,7 @@ public final class AppRunner {
         final Manifest.Component hosted = MicroG.activity(i);
         if (hosted != null) {
             final Activity caller = from instanceof Activity ? (Activity) from : top();
+            final Activity source = ViewRoot.activityOf(from);
             // Its extras in GmsCore's class scope, as a Parcel between two processes makes them (megler.Processes.forLoader):
             // Spotify's SignInHubActivity (play-services-auth, the app's classes) handed GmsCore's sign-in its own
             // SignInConfiguration, which GmsCore cast to its class of that name: ClassCastException, and the sign-in never came.
@@ -550,7 +577,7 @@ public final class AppRunner {
             final String cls = "activity-alias".equals(hosted.kind) && hosted.parentActivity != null ? hosted.parentActivity : hosted.name;
             android.util.Log.d("Megler", "startActivity " + i + " -> Google Play services' " + cls + ", here");
             sHandler.post(() -> {
-                try { launch(cls, intent, caller, request, hosted); }
+                try { launch(cls, intent, caller, request, hosted, null, null, source, 0, 0); }
                 catch (Throwable t) { android.util.Log.e("Megler", "starting " + cls + " failed", t); }
             });
             return;
@@ -571,9 +598,14 @@ public final class AppRunner {
         android.util.Log.d("Megler", "startActivity " + i + (c != null ? " -> " + c.name : " (not an activity of this app)"));
         if (c != null) {
             final Activity caller = from instanceof Activity ? (Activity) from : top();
+            final Activity source = ViewRoot.activityOf(from);
             final Intent intent = new Intent(i);
             if (intent.getComponent() == null) intent.setComponent(new ComponentName(Native.packageName(), c.name));
             sHandler.post(() -> {
+                if (!SharedMicrogWorker.permitsActivityStart(source)) {
+                    android.util.Log.w("Megler", "Ignoring activity start from an old shared microG session");
+                    return;
+                }
                 try {
                     if ((intent.getFlags() & Intent.FLAG_ACTIVITY_CLEAR_TOP) != 0) {
                         // the activity itself, as Android compares realActivity: one started through an <activity-alias> is its target's
@@ -605,7 +637,7 @@ public final class AppRunner {
                         if (t != null && !t.isFinishing() && startedAs(t).equals(intent.getComponent().getClassName())) { t.meglerNewIntent(intent); return; }
                     }
                     // an <activity-alias> starts the activity it names; the intent keeps the alias as its component, as on Android
-                    launch("activity-alias".equals(c.kind) && c.parentActivity != null ? c.parentActivity : c.name, intent, caller, request, c);
+                    launch("activity-alias".equals(c.kind) && c.parentActivity != null ? c.parentActivity : c.name, intent, caller, request, c, null, null, source, 0, 0);
                 } catch (Throwable t) {
                     android.util.Log.e("Megler", "starting " + c.name + " failed", t);
                     if (t instanceof RuntimeException) throw (RuntimeException) t;
@@ -639,10 +671,15 @@ public final class AppRunner {
         final String screen = SystemScreens.screenFor(i);
         if (screen != null) {
             final Activity caller = from instanceof Activity ? (Activity) from : top();
+            final Activity source = ViewRoot.activityOf(from);
             final Intent intent = new Intent(i);
             android.util.Log.d("Megler", "startActivity " + i + " -> Megler's " + screen);
             sHandler.post(() -> {
-                try { launch(screen, intent, caller, request, SystemScreens.component(screen)); }
+                if (!SharedMicrogWorker.permitsActivityStart(source)) {
+                    android.util.Log.w("Megler", "Ignoring system screen from an old shared microG session");
+                    return;
+                }
+                try { launch(screen, intent, caller, request, SystemScreens.component(screen), null, null, source, 0, 0); }
                 catch (Throwable t) { android.util.Log.e("Megler", "starting " + screen + " failed", t); }
             });
             return;
@@ -669,6 +706,20 @@ public final class AppRunner {
     }
     /** Activity.finish: the one below comes back (with the result when it asked for one). */
     public static void finish(Activity a) { sHandler.post(() -> finishNow(a, true)); }
+    static void finishSharedMicrogActivities(long channel, long generation) {
+        ArrayList<Activity> activities = new ArrayList<>(sStack);
+        for (int i = activities.size() - 1; i >= 0; i--) {
+            Activity activity = activities.get(i);
+            if (SharedMicrogWorker.frameOwnedBy(activity, channel, generation)) {
+                activity.meglerMarkFinished();
+                finishNow(activity, false);
+            }
+        }
+        for (Ending ending : new ArrayList<>(sEnding))
+            if (SharedMicrogWorker.frameOwnedBy(ending.activity, channel, generation)) ending.run();
+        ViewRoot.removeSharedMicrogWindows(channel, generation);
+    }
+
     private static void finishNow(Activity a, boolean resumeBelow) {
         android.util.Log.d("Megler", "finish " + a.getClass().getName());
         int idx = sStack.indexOf(a);
@@ -730,20 +781,23 @@ public final class AppRunner {
      * was cancelled before DataStore ran its edit on the main thread, nothing was saved, and the app's sign-in said "No
      * responseUri present" (package 576).
      */
-    private static final ArrayList<Runnable> sEnding = new ArrayList<>();
+    private static final ArrayList<Ending> sEnding = new ArrayList<>();
+    private static final class Ending implements Runnable {
+        final Activity activity;
+        private boolean done;
+        Ending(Activity activity) { this.activity = activity; }
+        @Override public void run() {
+            if (done) return;
+            done = true;
+            sEnding.remove(this);
+            sHandler.removeCallbacks(this);
+            activity.meglerStop();
+            activity.meglerDestroy();
+            exitWhenLast();
+        }
+    }
     private static void endWhenShown(final Activity a) {
-        final Runnable end = new Runnable() {
-            private boolean mDone;
-            @Override public void run() {
-                if (mDone) return;
-                mDone = true;
-                sEnding.remove(this);
-                sHandler.removeCallbacks(this);
-                a.meglerStop();
-                a.meglerDestroy();
-                exitWhenLast();
-            }
-        };
+        final Ending end = new Ending(a);
         sEnding.add(end);
         android.view.Choreographer.getMainThreadInstance().postCallback(android.view.Choreographer.CALLBACK_COMMIT,
             () -> Looper.myQueue().addIdleHandler(() -> { end.run(); return false; }), null);
@@ -802,6 +856,39 @@ public final class AppRunner {
     }
 
     // ---- input from Megler
+    static void resetSharedMicrogInput() {
+        sMoves = null;
+        down = 0;
+        InputMethods.resetShared();
+    }
+
+    static void deliverSharedMicrogInput(int type, String[] fields) {
+        movesDispatched();
+        if (type == 12) {
+            touch(Integer.parseInt(fields[3]), Integer.parseInt(fields[4]),
+                Integer.parseInt(fields[5]), Integer.parseInt(fields[6]), SystemClock.uptimeMillis());
+        } else if (type == 13) {
+            back(0);
+        } else if (type == 14) {
+            InputMethods.deliverShared("t" + fields[3]);
+        } else if (type == 15) {
+            int key = Integer.parseInt(fields[3]);
+            if (key == 1) InputMethods.deliverShared("d");
+            else if (key == 2) InputMethods.sharedEnter();
+            else {
+                int[] codes = { 0, 0, 0, 112, 21, 22, 19, 20, 122, 123 };
+                int code = codes[key];
+                long t = SystemClock.uptimeMillis();
+                KeyEvent downEvent = new KeyEvent(t, t, KeyEvent.ACTION_DOWN, code, 0);
+                KeyEvent upEvent = new KeyEvent(t, t, KeyEvent.ACTION_UP, code, 0);
+                if (!InputMethods.key(downEvent)) ViewRootDispatch.key(downEvent);
+                if (!InputMethods.key(upEvent)) ViewRootDispatch.key(upEvent);
+            }
+        } else if (type == 16) {
+            InputMethods.deliverShared("h");
+        }
+    }
+
     /** events: [n, then n x (phase, id, xbits, ybits), optional n x (timeLow, timeHigh)] -- phase 0 down, 1 move, 2 up, 3 cancel; 4 key (id = code, x = down); 5 back; 6 host pause (id 1) / resume (0); 7 text waiting; 8 insets changed; 9 web view events waiting; 10 the phone's messages and calls; 11 the surface resized or turned (megler.Screen); 12 the phone's picker or camera answered request `id` (megler.Pickers) */
     private static void deliver(int[] ev) {
         int n = ev[0];
@@ -1000,6 +1087,12 @@ public final class AppRunner {
         } else if (phase == 1) {
             if (idx < 0) return;
             xs[idx] = x; ys[idx] = y;
+            if (SharedMicrogWorker.isActive()) {
+                MotionEvent move = MotionEvent.meglerObtain(downTime, now, MotionEvent.ACTION_MOVE, down,
+                    java.util.Arrays.copyOf(ids, down), java.util.Arrays.copyOf(xs, down), java.util.Arrays.copyOf(ys, down));
+                ViewRoot.dispatchTouch(move);
+                return;
+            }
             moveBatched(now);
             return;
         } else {

@@ -60,6 +60,11 @@ void *mg_fd_host_file_map(int fd, u64 offset, size_t len, void **base, size_t *m
 void *mg_fd_shm_map(int fd, u64 offset, size_t len, bool code, bool *writable, void **base, size_t *mapped);
 /* A descriptor on a host file (MG_O_* flags), for handing the guest a file that has no guest path -- the APK itself. */
 int mg_fd_open_host(const char *host_path, int host_flags);
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+/* Duplicate regular files between guest and host descriptor tables; the caller retains its descriptor. */
+int mg_fd_dup_native_regular(int fd);
+int mg_fd_import_native_regular(int fd);
+#endif
 int mg_fd_eventfd(unsigned initial, int flags);
 /*
  * Shared memory as a descriptor (ASharedMemory_create, memfd_create): `size` zeroed bytes of a section of the host's, read
@@ -126,6 +131,7 @@ int mg_fd_wait_locked(u64 timeout_ns);
 
 /* Where a prefix of Android's file system is on the host. */
 void mg_fs_mount(const char *guest_prefix, const char *host_dir);
+void mg_fs_mount_read_only(const char *guest_prefix, const char *host_dir);
 /*
  * One file of the host's own under a guest path of its own: a file that is there whether or not Megler is, which nobody
  * here writes, renames or removes -- a font of Windows's. It is not opened for writing (EROFS), and a private read-only

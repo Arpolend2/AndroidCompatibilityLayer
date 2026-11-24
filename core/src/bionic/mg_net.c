@@ -557,19 +557,40 @@ static int sock_register(gsock *s, int flags)
 }
 
 #if !defined(_WIN32) && !defined(MG_CORE_ELF)
-int mg_net_import_unix_stream(int host_fd)
+static int import_unix_connected(int host_fd, int type)
 {
     int err = 0;
     mg_sock *host;
     gsock *s;
     net_start();
-    host = mg_sock_dup_unix_stream(host_fd, &err);
+    host = type == G_SOCK_STREAM ? mg_sock_dup_unix_stream(host_fd, &err) :
+           mg_sock_dup_unix_seqpacket(host_fd, &err);
     if (!host) return fail(gerr(err));
-    s = sock_new(G_AF_UNIX, G_SOCK_STREAM, 0);
+    s = sock_new(G_AF_UNIX, type, 0);
     s->host = host;
     s->state = S_CONNECTED;
     return sock_register(s, G_SOCK_CLOEXEC);
 }
+
+int mg_net_import_unix_stream(int host_fd) { return import_unix_connected(host_fd, G_SOCK_STREAM); }
+int mg_net_import_unix_seqpacket(int host_fd) { return import_unix_connected(host_fd, G_SOCK_SEQPACKET); }
+
+static int dup_native_unix(int fd, bool stream_only)
+{
+    void *held = NULL;
+    int native = -1, error = GE_OPNOTSUPP;
+    gsock *s = hold(fd, &held, NULL);
+    if (!s) return -1;
+    if (s->family == G_AF_UNIX && s->host)
+        native = stream_only ? mg_sock_dup_native_unix_stream(s->host, &error) :
+                 mg_sock_dup_native_unix_socket(s->host, &error);
+    mg_fd_let_go(held);
+    if (native < 0) mg_set_errno(error);
+    return native;
+}
+
+int mg_net_dup_native_unix_stream(int fd) { return dup_native_unix(fd, true); }
+int mg_net_dup_native_unix_socket(int fd) { return dup_native_unix(fd, false); }
 #endif
 
 /* ------------------------------------------------- addresses, Android's way */
@@ -1265,7 +1286,7 @@ static i32 sendmsg_held(gsock *s, const g_msghdr *m, int flags, bool nonblock)
     u8 *all;
     i32 r;
     if (!m || (m->iovlen && !m->iov)) return fail(GE_FAULT);
-    if (m->controllen) mg_note_once("network: sendmsg was given ancillary data (descriptors or credentials); it is not sent");
+    if (m->controllen) return fail(m->control ? GE_OPNOTSUPP : GE_FAULT);
     if (m->iovlen == 1) return send_any(s, m->iov[0].base, (u32)m->iov[0].len, flags, m->name, m->namelen, nonblock);
     /* Several pieces are one message (and one write): gathered first. */
     total = iov_total(m);

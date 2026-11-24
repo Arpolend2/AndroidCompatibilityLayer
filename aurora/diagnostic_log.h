@@ -25,6 +25,7 @@ public:
     QString text() const;
     bool available() const;
     Q_INVOKABLE QString standaloneDiagnosticFileError() const;
+    Q_INVOKABLE QString overlayText() const;
 
 signals:
     void changed();

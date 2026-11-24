@@ -123,12 +123,16 @@ public abstract class Context {
     public void startActivities(Intent[] intents) { for (Intent i : intents) startActivity(i); }
     public void startActivities(Intent[] intents, Bundle options) { startActivities(intents); }
     public void sendBroadcast(Intent i, String perm) { sendBroadcast(i); }
-    public void sendOrderedBroadcast(Intent i, String perm) { sendBroadcast(i); }
+    public void sendOrderedBroadcast(Intent i, String perm) {
+        if (megler.Broadcasts.hasSharedOrderedTarget(i))
+            megler.Broadcasts.sendOrdered(this, i, perm, null, null, 0, null, null);
+        else { megler.Broadcasts.rejectSharedOrdered(i); sendBroadcast(i); }
+    }
     public void sendStickyBroadcast(Intent i) { sendBroadcast(i); }
-    public Intent registerReceiver(BroadcastReceiver r, IntentFilter f, int flags) { return registerReceiver(r, f); }
+    public Intent registerReceiver(BroadcastReceiver r, IntentFilter f, int flags) { return megler.Broadcasts.register(this, r, f, null, null, flags); }
     /* With a Handler, the receiver hears on its thread (megler.Broadcasts). */
-    public Intent registerReceiver(BroadcastReceiver r, IntentFilter f, String perm, Handler h) { return megler.Broadcasts.register(this, r, f, h); }
-    public Intent registerReceiver(BroadcastReceiver r, IntentFilter f, String perm, Handler h, int flags) { return megler.Broadcasts.register(this, r, f, h); }
+    public Intent registerReceiver(BroadcastReceiver r, IntentFilter f, String perm, Handler h) { return megler.Broadcasts.register(this, r, f, h, perm, 0); }
+    public Intent registerReceiver(BroadcastReceiver r, IntentFilter f, String perm, Handler h, int flags) { return megler.Broadcasts.register(this, r, f, h, perm, flags); }
     public ComponentName startForegroundService(Intent service) { return startService(service); }
     public boolean bindService(Intent service, int flags, java.util.concurrent.Executor e, ServiceConnection c) { return bindService(service, c, flags); }
     public int checkCallingOrSelfPermission(String p) { return checkPermission(p, android.os.Process.myPid(), android.os.Process.myUid()); }
@@ -492,18 +496,18 @@ public abstract class Context {
     public void sendBroadcastMultiplePermissions(android.content.Intent p0, java.lang.String[] p1, java.lang.String[] p2, java.lang.String[] p3) {}
     public void sendBroadcastMultiplePermissions(android.content.Intent p0, java.lang.String[] p1, java.lang.String[] p2, java.lang.String[] p3, android.app.BroadcastOptions p4) {}
     public void sendBroadcastWithMultiplePermissions(android.content.Intent p0, java.lang.String[] p1) {}
-    public void sendOrderedBroadcast(android.content.Intent p0, int p1, java.lang.String p2, java.lang.String p3, android.content.BroadcastReceiver p4, android.os.Handler p5, java.lang.String p6, android.os.Bundle p7, android.os.Bundle p8) {}
-    public void sendOrderedBroadcast(android.content.Intent p0, java.lang.String p1, int p2, android.content.BroadcastReceiver p3, android.os.Handler p4, int p5, java.lang.String p6, android.os.Bundle p7) {}
-    public void sendOrderedBroadcast(android.content.Intent p0, java.lang.String p1, android.content.BroadcastReceiver p2, android.os.Handler p3, int p4, java.lang.String p5, android.os.Bundle p6) {}
-    public void sendOrderedBroadcast(android.content.Intent p0, java.lang.String p1, android.os.Bundle p2) {}
-    public void sendOrderedBroadcast(android.content.Intent p0, java.lang.String p1, android.os.Bundle p2, android.content.BroadcastReceiver p3, android.os.Handler p4, int p5, java.lang.String p6, android.os.Bundle p7) {}
-    public void sendOrderedBroadcast(android.content.Intent p0, java.lang.String p1, java.lang.String p2, android.content.BroadcastReceiver p3, android.os.Handler p4, int p5, java.lang.String p6, android.os.Bundle p7) {}
-    public void sendOrderedBroadcastAsUser(android.content.Intent p0, android.os.UserHandle p1, java.lang.String p2, int p3, android.content.BroadcastReceiver p4, android.os.Handler p5, int p6, java.lang.String p7, android.os.Bundle p8) {}
-    public void sendOrderedBroadcastAsUser(android.content.Intent p0, android.os.UserHandle p1, java.lang.String p2, int p3, android.os.Bundle p4, android.content.BroadcastReceiver p5, android.os.Handler p6, int p7, java.lang.String p8, android.os.Bundle p9) {}
-    public void sendOrderedBroadcastAsUser(android.content.Intent p0, android.os.UserHandle p1, java.lang.String p2, android.content.BroadcastReceiver p3, android.os.Handler p4, int p5, java.lang.String p6, android.os.Bundle p7) {}
-    public void sendOrderedBroadcastAsUserMultiplePermissions(android.content.Intent p0, android.os.UserHandle p1, java.lang.String[] p2, int p3, android.os.Bundle p4, android.content.BroadcastReceiver p5, android.os.Handler p6, int p7, java.lang.String p8, android.os.Bundle p9) {}
-    public void sendOrderedBroadcastMultiplePermissions(android.content.Intent p0, java.lang.String[] p1, java.lang.String p2, android.content.BroadcastReceiver p3, android.os.Handler p4, int p5, java.lang.String p6, android.os.Bundle p7, android.os.Bundle p8) {}
-    public void sendOrderedBroadcastMultiplePermissions(android.content.Intent p0, java.lang.String[] p1, java.lang.String[] p2, java.lang.String p3, android.content.BroadcastReceiver p4, android.os.Handler p5, int p6, java.lang.String p7, android.os.Bundle p8, android.os.Bundle p9) {}
+    public void sendOrderedBroadcast(android.content.Intent p0, int p1, java.lang.String p2, java.lang.String p3, android.content.BroadcastReceiver p4, android.os.Handler p5, java.lang.String p6, android.os.Bundle p7, android.os.Bundle p8) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcast(android.content.Intent p0, java.lang.String p1, int p2, android.content.BroadcastReceiver p3, android.os.Handler p4, int p5, java.lang.String p6, android.os.Bundle p7) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcast(android.content.Intent p0, java.lang.String p1, android.content.BroadcastReceiver p2, android.os.Handler p3, int p4, java.lang.String p5, android.os.Bundle p6) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcast(android.content.Intent p0, java.lang.String p1, android.os.Bundle p2) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcast(android.content.Intent p0, java.lang.String p1, android.os.Bundle p2, android.content.BroadcastReceiver p3, android.os.Handler p4, int p5, java.lang.String p6, android.os.Bundle p7) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcast(android.content.Intent p0, java.lang.String p1, java.lang.String p2, android.content.BroadcastReceiver p3, android.os.Handler p4, int p5, java.lang.String p6, android.os.Bundle p7) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcastAsUser(android.content.Intent p0, android.os.UserHandle p1, java.lang.String p2, int p3, android.content.BroadcastReceiver p4, android.os.Handler p5, int p6, java.lang.String p7, android.os.Bundle p8) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcastAsUser(android.content.Intent p0, android.os.UserHandle p1, java.lang.String p2, int p3, android.os.Bundle p4, android.content.BroadcastReceiver p5, android.os.Handler p6, int p7, java.lang.String p8, android.os.Bundle p9) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcastAsUser(android.content.Intent p0, android.os.UserHandle p1, java.lang.String p2, android.content.BroadcastReceiver p3, android.os.Handler p4, int p5, java.lang.String p6, android.os.Bundle p7) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcastAsUserMultiplePermissions(android.content.Intent p0, android.os.UserHandle p1, java.lang.String[] p2, int p3, android.os.Bundle p4, android.content.BroadcastReceiver p5, android.os.Handler p6, int p7, java.lang.String p8, android.os.Bundle p9) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcastMultiplePermissions(android.content.Intent p0, java.lang.String[] p1, java.lang.String p2, android.content.BroadcastReceiver p3, android.os.Handler p4, int p5, java.lang.String p6, android.os.Bundle p7, android.os.Bundle p8) { megler.Broadcasts.rejectSharedOrdered(p0); }
+    public void sendOrderedBroadcastMultiplePermissions(android.content.Intent p0, java.lang.String[] p1, java.lang.String[] p2, java.lang.String p3, android.content.BroadcastReceiver p4, android.os.Handler p5, int p6, java.lang.String p7, android.os.Bundle p8, android.os.Bundle p9) { megler.Broadcasts.rejectSharedOrdered(p0); }
     public void sendStickyBroadcast(android.content.Intent p0, android.os.Bundle p1) {}
     public void sendStickyBroadcastAsUser(android.content.Intent p0, android.os.UserHandle p1) {}
     public void sendStickyBroadcastAsUser(android.content.Intent p0, android.os.UserHandle p1, android.os.Bundle p2) {}

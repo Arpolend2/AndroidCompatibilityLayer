@@ -3,13 +3,17 @@
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDebug>
+#include <QElapsedTimer>
 #include <QMutexLocker>
+#include <QThread>
 #include <QVariant>
 
 #include <cstring>
 
 namespace {
 const int TimeoutMs = 5000;
+const int OwnerRecoveryTimeoutMs = 500;
+const int OwnerRecoveryPollMs = 20;
 const int MaxNotifications = 256;
 const int OnlyAlertOnce = 8;
 const int Ongoing = 2 | 32 | 64;
@@ -24,22 +28,64 @@ QDBusMessage call(const QDBusMessage &message)
     return QDBusConnection::sessionBus().call(message, QDBus::Block, TimeoutMs);
 }
 
-QString notificationOwner()
+QString notificationOwner(QString *errorName = nullptr, QString *errorMessage = nullptr)
 {
     QDBusMessage query = QDBusMessage::createMethodCall(
         QStringLiteral("org.freedesktop.DBus"), QStringLiteral("/org/freedesktop/DBus"),
         QStringLiteral("org.freedesktop.DBus"), QStringLiteral("GetNameOwner"));
     query << QStringLiteral("org.freedesktop.Notifications");
     const QDBusMessage reply = call(query);
-    if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().size() != 1)
+    if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().size() != 1) {
+        if (reply.type() == QDBusMessage::ErrorMessage) {
+            if (errorName) *errorName = reply.errorName();
+            if (errorMessage) *errorMessage = reply.errorMessage();
+        } else {
+            if (errorName) errorName->clear();
+            if (errorMessage) errorMessage->clear();
+        }
         return QString();
+    }
+    if (errorName) errorName->clear();
+    if (errorMessage) errorMessage->clear();
     return reply.arguments().first().toString();
+}
+
+QString replacementNotificationOwner(const QString &previousOwner)
+{
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < OwnerRecoveryTimeoutMs) {
+        const QString owner = notificationOwner();
+        if (!owner.isEmpty() && owner != previousOwner) return owner;
+        QThread::msleep(OwnerRecoveryPollMs);
+    }
+    return QString();
 }
 
 QDBusMessage method(const QString &owner, const QString &name)
 {
     return QDBusMessage::createMethodCall(owner, QStringLiteral("/org/freedesktop/Notifications"),
                                           QStringLiteral("org.freedesktop.Notifications"), name);
+}
+
+bool ownerDisappeared(const QDBusMessage &reply)
+{
+    if (reply.type() != QDBusMessage::ErrorMessage) return false;
+    return reply.errorName() == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown") ||
+           reply.errorName() == QLatin1String("org.freedesktop.DBus.Error.NameHasNoOwner");
+}
+
+bool accessDenied(const QDBusMessage &reply)
+{
+    return reply.type() == QDBusMessage::ErrorMessage &&
+           reply.errorName() == QLatin1String("org.freedesktop.DBus.Error.AccessDenied");
+}
+
+QString singleLine(QString text)
+{
+    text.replace(QLatin1Char('\r'), QLatin1Char(' '));
+    text.replace(QLatin1Char('\n'), QLatin1Char(' '));
+    return text.left(512);
 }
 }
 
@@ -106,9 +152,22 @@ bool NotificationHost::process(int operation, const char *package, const char *t
         return false;
     }
     m_package = app;
-    const QString owner = notificationOwner();
+    QString ownerError;
+    QString ownerMessage;
+    QString owner = notificationOwner(&ownerError, &ownerMessage);
     if (owner.isEmpty()) {
-        qWarning("System notification service is unavailable.");
+        if (!ownerError.isEmpty()) {
+            const QByteArray name = ownerError.toUtf8();
+            const QByteArray message = singleLine(ownerMessage).toUtf8();
+            if (ownerError == QLatin1String("org.freedesktop.DBus.Error.AccessDenied"))
+                qWarning("System notification permission denied (D-Bus %s: %s).",
+                         name.constData(), message.constData());
+            else
+                qWarning("System notification service is unavailable (D-Bus %s: %s).",
+                         name.constData(), message.constData());
+        } else {
+            qWarning("System notification service is unavailable.");
+        }
         return false;
     }
     if (owner != m_owner) {
@@ -136,24 +195,71 @@ bool NotificationHost::process(int operation, const char *package, const char *t
                                (current != m_ids.end() && (hasProgress || (flags & OnlyAlertOnce)));
         if (importance >= MEGLER_NOTIFICATION_IMPORTANCE_MIN &&
             importance <= MEGLER_NOTIFICATION_IMPORTANCE_MAX)
-            hints.insert(QStringLiteral("urgency"), QVariant::fromValue<uchar>(quiet ? 0 : 1));
+            // Aurora Lipstick returns ID 0 for the spec's byte-typed urgency; it accepts int32.
+            hints.insert(QStringLiteral("urgency"), quiet ? 0 : 1);
         if (noPreview) {
             hints.insert(QStringLiteral("x-nemo-preview-summary"), QString());
             hints.insert(QStringLiteral("x-nemo-preview-body"), QString());
         }
         if (silent || quiet || (current != m_ids.end() && (hasProgress || (flags & OnlyAlertOnce))))
             hints.insert(QStringLiteral("suppress-sound"), true);
-        QDBusMessage message = method(owner, QStringLiteral("Notify"));
-        message << app << (current == m_ids.end() ? uint(0) : current.value()) << QString()
-                << QString::fromUtf8(title ? title : "") << QString::fromUtf8(body ? body : "")
-                << QStringList() << hints << int(hasProgress || (flags & Ongoing) ? 0 : -1);
-        const QDBusMessage reply = call(message);
+        const auto makeMessage = [&](const QString &destination, uint replaces) {
+            QDBusMessage message = method(destination, QStringLiteral("Notify"));
+            message << app << replaces << QString()
+                    << QString::fromUtf8(title ? title : "") << QString::fromUtf8(body ? body : "")
+                    << QStringList() << hints << int(hasProgress || (flags & Ongoing) ? 0 : -1);
+            return message;
+        };
+        const bool updating = current != m_ids.end();
+        const uint replaces = updating ? current.value() : 0;
+        bool isUpdate = updating;
+        QDBusMessage reply = call(makeMessage(owner, replaces));
+        if (ownerDisappeared(reply)) {
+            const QString retryOwner = replacementNotificationOwner(owner);
+            if (!retryOwner.isEmpty()) {
+                owner = retryOwner;
+                m_owner = retryOwner;
+                m_ids.clear();
+                isUpdate = false;
+                reply = call(makeMessage(owner, 0));
+            }
+        }
+        bool validId = false;
+        const uint notificationId = reply.type() == QDBusMessage::ReplyMessage &&
+                                    reply.arguments().size() == 1
+            ? reply.arguments().first().toUInt(&validId) : 0;
         if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().size() != 1 ||
-            !reply.arguments().first().toUInt()) {
-            qWarning("System notification publication failed.");
+            !validId || !notificationId) {
+            const char *action = isUpdate ? "update" : "post";
+            if (reply.type() == QDBusMessage::ErrorMessage) {
+                const QByteArray name = reply.errorName().toUtf8();
+                const QByteArray message = singleLine(reply.errorMessage()).toUtf8();
+                if (ownerDisappeared(reply))
+                    qWarning("System notification service is unavailable (D-Bus %s: %s).",
+                             name.constData(), message.constData());
+                else if (accessDenied(reply))
+                    qWarning("System notification permission denied (D-Bus %s: %s).",
+                             name.constData(), message.constData());
+                else
+                    qWarning("System notification %s failed (D-Bus %s: %s).",
+                             action, name.constData(), message.constData());
+            } else if (reply.type() != QDBusMessage::ReplyMessage) {
+                qWarning("System notification %s failed: unexpected D-Bus reply type %d.",
+                         action, int(reply.type()));
+            } else if (reply.arguments().size() != 1) {
+                qWarning("System notification %s failed: D-Bus reply had %d arguments; expected 1.",
+                         action, reply.arguments().size());
+            } else if (!validId) {
+                const char *type = reply.arguments().first().typeName();
+                qWarning("System notification %s failed: D-Bus notification ID had type %s.",
+                         action, type ? type : "unknown");
+            } else {
+                qWarning("System notification %s failed: D-Bus returned notification ID 0.", action);
+            }
             return false;
         }
-        m_ids.insert(key, reply.arguments().first().toUInt());
+        m_ids.insert(key, notificationId);
+        if (!replaces) qInfo("ACL notification: posted");
         return true;
     }
 
@@ -165,8 +271,24 @@ bool NotificationHost::process(int operation, const char *package, const char *t
         const QDBusMessage reply = call(message);
         if (reply.type() == QDBusMessage::ReplyMessage) {
             it = m_ids.erase(it);
+            qInfo("ACL notification: removed");
         } else {
-            qWarning("System notification cancellation failed.");
+            if (reply.type() == QDBusMessage::ErrorMessage) {
+                const QByteArray name = reply.errorName().toUtf8();
+                const QByteArray message = singleLine(reply.errorMessage()).toUtf8();
+                if (ownerDisappeared(reply))
+                    qWarning("System notification service is unavailable (D-Bus %s: %s).",
+                             name.constData(), message.constData());
+                else if (accessDenied(reply))
+                    qWarning("System notification permission denied (D-Bus %s: %s).",
+                             name.constData(), message.constData());
+                else
+                    qWarning("System notification cancellation failed (D-Bus %s: %s).",
+                             name.constData(), message.constData());
+            } else {
+                qWarning("System notification cancellation failed: unexpected D-Bus reply type %d.",
+                         int(reply.type()));
+            }
             success = false;
             ++it;
         }

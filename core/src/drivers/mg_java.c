@@ -448,7 +448,8 @@ N(Native_readApkResourceTable)
      * time, by every app: Google Play services' 84 MB were read and cut at every app's start (0.7 s on the phone), for the
      * same 9 MB each time. The APK is in the services' shared folder, which all of Megler's packages can write to.
      */
-    if (e->usize >= (1u << 20) && n) {
+    if (e->usize >= (1u << 20) && n &&
+        (!J.config->gms_apk_path || strcmp(J.apk_path[apk], J.config->gms_apk_path))) {
         size_t have = 0;
         u8 *bytes;
         kept = mg_sprintf("%s.%08x%s.arsc", J.apk_path[apk], (unsigned)e->crc, joined);
@@ -2415,7 +2416,7 @@ static void mount_apk(void)
     if (name > path) dir[name - path - 1] = 0;
     mg_fs_mount(guest_dir, dir);
     if (J.config->gms_apk_path && strcmp(J.package, "com.google.android.gms") && strcmp(J.package, gms_package())) {
-        mg_fs_mount("/system/priv-app/GmsCore/GmsCore.apk", J.config->gms_apk_path);
+        mg_fs_mount_host_file("/system/priv-app/GmsCore/GmsCore.apk", J.config->gms_apk_path);
         if (J.config->gms_splits_dir) mount_gms_splits();
     }
     if (J.config->gsf_apk_path && strcmp(J.package, "com.google.android.gsf"))
@@ -2757,6 +2758,7 @@ static MG_HOSTCB void main_thread(void *arg)
         mg_java_camera_set_host(&J.config->camera);
         mg_dvm_register(mg_java_camera_natives());
         mg_dvm_register(mg_java_shared_microg_client_natives());
+        mg_dvm_register(mg_java_shared_microg_fd_natives());
         mg_dvm_register(mg_java_surface_texture_natives());
         mg_java_location_set_host(&J.config->location);
         mg_dvm_register(mg_java_location_natives());

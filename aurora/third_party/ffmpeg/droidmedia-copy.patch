@@ -1,0 +1,704 @@
+--- a/libavcodec/droidmediadec.c
++++ b/libavcodec/droidmediadec.c
+@@ -7,13 +7,29 @@
+  * modify it under the terms of the GNU Lesser General Public
+  * License as published by the Free Software Foundation; either
+  * version 2.1 of the License, or (at your option) any later version.
++ *
++ * Modified on 2026-11-24: validate copy-back, wait for drain, and stop safely.
+  */
+ 
+ #include "config_components.h"
+ 
++#include <errno.h>
+ #include <limits.h>
+ #include <pthread.h>
++#include <stdatomic.h>
+ #include <string.h>
++#include <time.h>
++
++#ifndef ACL_DROID_STOP_TIMEOUT_MS
++#define ACL_DROID_STOP_TIMEOUT_MS 2000
++#endif
++
++static atomic_int droidmedia_disabled;
++
++static int droidmedia_enabled(void)
++{
++    return !atomic_load(&droidmedia_disabled);
++}
+ 
+ #include "libavutil/avassert.h"
+ #include "libavutil/common.h"
+@@ -50,13 +66,21 @@
+     pthread_cond_t cond;
+     AVFrame **frames;
+     int nb_frames;
++    int64_t queued_bytes;
+     int refs;
+     int closing;
++    int stopped;
++    int zero_copy;
++    int data_callbacks;
++    int input_inflight;
++    int queue_calls;
+     int draining;
+     int eos;
+     int error;
+ } DroidMediaDecState;
+ 
++static void close_state(DroidMediaDecState *s);
++
+ typedef struct DroidMediaDecContext {
+     AVClass *avclass;
+     DroidMediaDecState *state;
+@@ -73,7 +97,8 @@
+ static void state_stop_and_free(DroidMediaDecState *s)
+ {
+     if (s->codec) {
+-        s->api->stop(s->codec);
++        if (!s->stopped)
++            s->api->stop(s->codec);
+         s->api->destroy(s->codec);
+     }
+     av_buffer_unref(&s->hw_frames_ctx);
+@@ -103,20 +128,127 @@
+         state_stop_and_free(s);
+ }
+ 
++typedef struct DroidMediaInputRef {
++    DroidMediaDecState *state;
++    AVPacket *packet;
++} DroidMediaInputRef;
++
+ static void input_buffer_unref(void *data)
+ {
+-    AVPacket *pkt = data;
+-    av_packet_free(&pkt);
++    DroidMediaInputRef *ref = data;
++    DroidMediaDecState *s = ref->state;
++
++    av_packet_free(&ref->packet);
++    av_free(ref);
++    pthread_mutex_lock(&s->lock);
++    av_assert0(s->input_inflight > 0);
++    s->input_inflight--;
++    pthread_cond_broadcast(&s->cond);
++    pthread_mutex_unlock(&s->lock);
++    state_unref(s);
++}
++
++static int queue_input(DroidMediaDecState *s, AVPacket *packet, int64_t pts,
++                       int timeout_ms)
++{
++    DroidMediaCodecData data = { 0 };
++    DroidMediaBufferCallbacks cb = { 0 };
++    DroidMediaInputRef *ref;
++    struct timespec deadline;
++    int ret = 0;
++
++    if (pts > INT64_MAX / 1000 || pts < INT64_MIN / 1000)
++        return AVERROR(EINVAL);
++    ref = av_mallocz(sizeof(*ref));
++    if (!ref)
++        return AVERROR(ENOMEM);
++    ref->packet = av_packet_clone(packet);
++    if (!ref->packet) {
++        av_free(ref);
++        return AVERROR(ENOMEM);
++    }
++    ref->state = s;
++    if (clock_gettime(CLOCK_MONOTONIC, &deadline)) {
++        ret = AVERROR(errno);
++        goto fail;
++    }
++    deadline.tv_sec += timeout_ms / 1000;
++    deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
++    if (deadline.tv_nsec >= 1000000000L) {
++        deadline.tv_sec++;
++        deadline.tv_nsec -= 1000000000L;
++    }
++    pthread_mutex_lock(&s->lock);
++    s->refs++;
++    while (s->input_inflight >= 5 && !s->error && !s->closing) {
++        ret = pthread_cond_timedwait(&s->cond, &s->lock, &deadline);
++        if (ret)
++            break;
++    }
++    if (ret && !s->error && !s->closing) {
++        s->error = AVERROR(ret);
++        av_log(NULL, AV_LOG_ERROR, ret == ETIMEDOUT ?
++               "ACL codec: droidmedia queue timeout\n" :
++               "ACL codec: droidmedia queue wait failed\n");
++    }
++    if (s->error || s->closing) {
++        ret = s->closing ? AVERROR_EOF : AVERROR_EXTERNAL;
++        pthread_mutex_unlock(&s->lock);
++        state_unref(s);
++        goto fail;
++    }
++    s->input_inflight++;
++    s->queue_calls++;
++    s->refs++;
++    pthread_mutex_unlock(&s->lock);
++
++    data.data.data = ref->packet->data;
++    data.data.size = ref->packet->size;
++    data.ts = pts;
++    data.sync = !!(ref->packet->flags & AV_PKT_FLAG_KEY);
++    cb.data = ref;
++    cb.unref = input_buffer_unref;
++    s->api->queue(s->codec, &data, &cb);
++
++    pthread_mutex_lock(&s->lock);
++    s->queue_calls--;
++    pthread_cond_broadcast(&s->cond);
++    ret = s->closing ? AVERROR_EOF : (s->error ? AVERROR_EXTERNAL : 0);
++    pthread_mutex_unlock(&s->lock);
++    state_unref(s);
++    return ret;
++
++fail:
++    av_packet_free(&ref->packet);
++    av_free(ref);
++    return ret;
++}
++
++static int64_t frame_buffer_bytes(const AVFrame *frame)
++{
++    int64_t bytes = 0;
++    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
++        if (frame->buf[i]) {
++            if (frame->buf[i]->size > 256 * 1024 * 1024 - bytes)
++                return AVERROR(ENOBUFS);
++            bytes += frame->buf[i]->size;
++        }
++    }
++    return bytes;
+ }
+ 
+ static int queue_push(DroidMediaDecState *s, AVFrame *frame)
+ {
+     AVFrame **frames;
+     int ret = 0;
++    int64_t bytes = s->zero_copy ? 0 : frame_buffer_bytes(frame);
+ 
+     pthread_mutex_lock(&s->lock);
+     if (s->closing) {
+         ret = AVERROR_EOF;
++    } else if (bytes < 0 || s->nb_frames >= 64 ||
++               s->queued_bytes + bytes > 256 * 1024 * 1024) {
++        ret = AVERROR(ENOBUFS);
+     } else {
+         frames = av_realloc_array(s->frames, s->nb_frames + 1,
+                                   sizeof(*s->frames));
+@@ -125,9 +257,14 @@
+         } else {
+             s->frames = frames;
+             s->frames[s->nb_frames++] = frame;
++            s->queued_bytes += bytes;
+             pthread_cond_signal(&s->cond);
+         }
+     }
++    if (ret < 0 && ret != AVERROR_EOF) {
++        s->error = ret;
++        pthread_cond_signal(&s->cond);
++    }
+     pthread_mutex_unlock(&s->lock);
+     return ret;
+ }
+@@ -140,12 +277,14 @@
+     pthread_mutex_lock(&s->lock);
+     if (s->nb_frames) {
+         queued = s->frames[0];
++        if (!s->zero_copy)
++            s->queued_bytes -= frame_buffer_bytes(queued);
+         s->nb_frames--;
+         memmove(s->frames, s->frames + 1,
+                 s->nb_frames * sizeof(*s->frames));
+     } else if (s->error) {
+         ret = AVERROR_EXTERNAL;
+-    } else if (s->eos) {
++    } else if (s->eos && !s->data_callbacks) {
+         ret = AVERROR_EOF;
+     } else {
+         ret = AVERROR(EAGAIN);
+@@ -159,6 +298,35 @@
+     return ret;
+ }
+ 
++static int wait_for_drain(DroidMediaDecState *s, AVFrame *frame, int timeout_ms)
++{
++    struct timespec deadline;
++    int ret = 0;
++
++    if (clock_gettime(CLOCK_MONOTONIC, &deadline))
++        return AVERROR(errno);
++    deadline.tv_sec += timeout_ms / 1000;
++    deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
++    if (deadline.tv_nsec >= 1000000000L) {
++        deadline.tv_sec++;
++        deadline.tv_nsec -= 1000000000L;
++    }
++    pthread_mutex_lock(&s->lock);
++    while (!s->nb_frames && !s->error && (!s->eos || s->data_callbacks) && !s->closing) {
++        ret = pthread_cond_timedwait(&s->cond, &s->lock, &deadline);
++        if (ret)
++            break;
++    }
++    if (ret && !s->nb_frames && !s->error && (!s->eos || s->data_callbacks) && !s->closing) {
++        s->error = AVERROR(ret);
++        av_log(NULL, AV_LOG_ERROR, ret == ETIMEDOUT ?
++               "ACL codec: droidmedia drain timeout\n" :
++               "ACL codec: droidmedia drain wait failed\n");
++    }
++    pthread_mutex_unlock(&s->lock);
++    return queue_pop(s, frame);
++}
++
+ static void set_frame_pts(DroidMediaDecState *s, AVFrame *frame, int64_t ns)
+ {
+     AVRational tb = s->pkt_timebase;
+@@ -185,20 +353,32 @@
+ {
+     DroidMediaCodecMetaData md = { 0 };
+     DroidMediaRect crop = { 0 };
+-    const uint8_t *src = decoded->data.data;
+-    int width, height, stride, slice_height;
+-    int64_t required_size;
++    const uint8_t *src;
++    int width, height, stride, slice_height, chroma_stride;
++    int chroma_width, chroma_height, chroma_slice_height;
++    int64_t luma_size, chroma_size, required_size;
+     int ret;
+ 
+     s->api->get_output_info(s->codec, &md, &crop);
+-    width  = crop.right > crop.left ? crop.right - crop.left : md.width;
+-    height = crop.bottom > crop.top ? crop.bottom - crop.top : md.height;
+-    if (width <= 0 || height <= 0)
++    if (!decoded || !decoded->data.data || decoded->data.size <= 0 ||
++        md.width <= 0 || md.height <= 0 || md.width > 8192 || md.height > 8192)
+         return AVERROR_INVALIDDATA;
++    src = decoded->data.data;
++    if (!crop.left && !crop.top && !crop.right && !crop.bottom) {
++        crop.right = md.width;
++        crop.bottom = md.height;
++    }
++    if (crop.left < 0 || crop.top < 0 || (crop.left & 1) || (crop.top & 1) ||
++        crop.right <= crop.left || crop.bottom <= crop.top ||
++        crop.right > md.width || crop.bottom > md.height)
++        return AVERROR_INVALIDDATA;
++    width = crop.right - crop.left;
++    height = crop.bottom - crop.top;
+ 
+     stride = md.stride > 0 ? md.stride : md.width;
+     slice_height = md.slice_height > 0 ? md.slice_height : md.height;
+-    if (stride < width || slice_height < height)
++    if (stride < md.width || stride > 16384 || (stride & 1) ||
++        slice_height < md.height || slice_height > 8192)
+         return AVERROR_INVALIDDATA;
+ 
+     if (md.hal_format != DM_COLOR_YUV420_PLANAR &&
+@@ -211,7 +391,18 @@
+         return AVERROR_INVALIDDATA;
+     }
+ 
+-    required_size = (int64_t)stride * slice_height * 3 / 2;
++    if (md.hal_format == DM_COLOR_YV12 && (stride & 15))
++        return AVERROR_INVALIDDATA;
++    chroma_stride = md.hal_format == DM_COLOR_YV12
++                        ? FFALIGN(stride / 2, 16) : stride / 2;
++    chroma_width = (width + 1) / 2;
++    chroma_height = (height + 1) / 2;
++    chroma_slice_height = (slice_height + 1) / 2;
++    luma_size = (int64_t)stride * slice_height;
++    chroma_size = (int64_t)chroma_stride * chroma_slice_height;
++    required_size = luma_size + (md.hal_format == DM_COLOR_YUV420_SEMIPLANAR
++                                 ? (int64_t)stride * chroma_slice_height
++                                 : 2 * chroma_size);
+     if (decoded->data.size < required_size)
+         return AVERROR_INVALIDDATA;
+ 
+@@ -228,10 +419,10 @@
+     if (md.hal_format == DM_COLOR_YUV420_SEMIPLANAR) {
+         const uint8_t *uv = decoded->data.data;
+         int x, y;
+-        uv += (int64_t)stride * slice_height + crop.top / 2 * stride +
++        uv += luma_size + crop.top / 2 * stride +
+               crop.left / 2 * 2;
+-        for (y = 0; y < height / 2; y++) {
+-            for (x = 0; x < width / 2; x++) {
++        for (y = 0; y < chroma_height; y++) {
++            for (x = 0; x < chroma_width; x++) {
+                 frame->data[1][y * frame->linesize[1] + x] = uv[2 * x];
+                 frame->data[2][y * frame->linesize[2] + x] = uv[2 * x + 1];
+             }
+@@ -239,21 +430,20 @@
+         }
+     } else {
+         const uint8_t *base = decoded->data.data;
+-        const uint8_t *u = base + (int64_t)stride * slice_height;
+-        const uint8_t *v = u + (int64_t)(stride / 2) * (slice_height / 2);
+-        int chroma_stride = stride / 2;
++        const uint8_t *u = base + luma_size;
++        const uint8_t *v = u + chroma_size;
+         u += crop.top / 2 * chroma_stride + crop.left / 2;
+         v += crop.top / 2 * chroma_stride + crop.left / 2;
+         if (md.hal_format == DM_COLOR_YV12) {
+             copy_plane(frame->data[1], frame->linesize[1], v, chroma_stride,
+-                       width / 2, height / 2);
++                       chroma_width, chroma_height);
+             copy_plane(frame->data[2], frame->linesize[2], u, chroma_stride,
+-                       width / 2, height / 2);
++                       chroma_width, chroma_height);
+         } else {
+             copy_plane(frame->data[1], frame->linesize[1], u, chroma_stride,
+-                       width / 2, height / 2);
++                       chroma_width, chroma_height);
+             copy_plane(frame->data[2], frame->linesize[2], v, chroma_stride,
+-                       width / 2, height / 2);
++                       chroma_width, chroma_height);
+         }
+     }
+ 
+@@ -264,20 +454,36 @@
+ static void data_available(void *opaque, DroidMediaCodecData *decoded)
+ {
+     DroidMediaDecState *s = opaque;
+-    AVFrame *frame = av_frame_alloc();
++    AVFrame *frame;
+     int ret;
+ 
+-    if (!frame)
++    pthread_mutex_lock(&s->lock);
++    if (s->closing) {
++        pthread_mutex_unlock(&s->lock);
+         return;
+-    ret = copy_software_frame(s, decoded, frame);
+-    if (ret < 0 || queue_push(s, frame) < 0) {
+-        av_frame_free(&frame);
+-        if (ret < 0) {
+-            pthread_mutex_lock(&s->lock);
++    }
++    s->data_callbacks++;
++    pthread_mutex_unlock(&s->lock);
++
++    frame = av_frame_alloc();
++    if (!frame) {
++        pthread_mutex_lock(&s->lock);
++        s->error = AVERROR(ENOMEM);
++    } else {
++        ret = copy_software_frame(s, decoded, frame);
++        if (ret == AVERROR_INVALIDDATA)
++            av_log(NULL, AV_LOG_ERROR, "ACL codec: droidmedia output frame rejected\n");
++        if (ret >= 0)
++            ret = queue_push(s, frame);
++        if (ret < 0)
++            av_frame_free(&frame);
++        pthread_mutex_lock(&s->lock);
++        if (ret < 0 && ret != AVERROR_EOF)
+             s->error = ret;
+-            pthread_mutex_unlock(&s->lock);
+-        }
+     }
++    s->data_callbacks--;
++    pthread_cond_broadcast(&s->cond);
++    pthread_mutex_unlock(&s->lock);
+ }
+ 
+ static void hardware_frame_free(void *opaque, uint8_t *data)
+@@ -400,6 +606,7 @@
+ {
+     DroidMediaDecState *s = opaque;
+ 
++    av_log(NULL, AV_LOG_ERROR, "ACL codec: droidmedia asynchronous error\n");
+     pthread_mutex_lock(&s->lock);
+     s->error = err ? err : AVERROR_EXTERNAL;
+     pthread_cond_signal(&s->cond);
+@@ -427,16 +634,39 @@
+     DroidMediaCodecDecoderMetaData md = { 0 };
+     DroidMediaCodecCallbacks callbacks = { 0 };
+     DroidMediaDecState *s = NULL;
++    pthread_condattr_t condattr;
+     int ret = AVERROR_EXTERNAL;
+ 
++    if (!droidmedia_enabled()) {
++        av_log(avctx, AV_LOG_ERROR, "droidmedia disabled after a stop failure\n");
++        return AVERROR_EXTERNAL;
++    }
+     s = av_mallocz(sizeof(*s));
+     if (!s)
+         return AVERROR(ENOMEM);
+ 
+     s->pkt_timebase = avctx->pkt_timebase;
++    s->zero_copy = ctx->zero_copy;
+     s->refs = 1;
+-    pthread_mutex_init(&s->lock, NULL);
+-    pthread_cond_init(&s->cond, NULL);
++    ret = pthread_mutex_init(&s->lock, NULL);
++    if (ret) {
++        av_free(s);
++        return AVERROR(ret);
++    }
++    ret = pthread_condattr_init(&condattr);
++    if (!ret) {
++        ret = pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC);
++        if (!ret)
++            ret = pthread_cond_init(&s->cond, &condattr);
++        pthread_condattr_destroy(&condattr);
++    }
++    if (ret) {
++        pthread_mutex_destroy(&s->lock);
++        av_free(s);
++        return AVERROR(ret);
++    }
++    ret = AVERROR_EXTERNAL;
+     s->api = ff_droidmedia_get_api();
+     if (!s->api) {
++        av_log(avctx, AV_LOG_ERROR, "ACL codec: droidmedia library or ABI unavailable\n");
+         ret = AVERROR(ENOSYS);
+@@ -446,6 +676,9 @@
+     md.parent.type = codec_mime(avctx->codec_id);
+     md.parent.width = avctx->width > 0 ? avctx->width : 1280;
+     md.parent.height = avctx->height > 0 ? avctx->height : 720;
++    md.parent.fps = -1;
++    md.parent.channels = -1;
++    md.parent.sample_rate = -1;
+-    if (avctx->framerate.num > 0 && avctx->framerate.den > 0)
++    if (avctx->framerate.den > 0 && avctx->framerate.num >= avctx->framerate.den)
+         md.parent.fps = avctx->framerate.num / avctx->framerate.den;
+     md.parent.flags = DROID_MEDIA_CODEC_HW_ONLY;
+@@ -464,6 +697,7 @@
+     }
+ 
+     if (!s->api->is_supported(&md.parent, false)) {
++        av_log(avctx, AV_LOG_ERROR, "ACL codec: droidmedia capability check rejected\n");
+         ret = AVERROR(ENOSYS);
+         goto fail;
+     }
+@@ -489,8 +723,10 @@
+     }
+ 
+     s->codec = s->api->create_decoder(&md);
+-    if (!s->codec)
++    if (!s->codec) {
++        av_log(avctx, AV_LOG_ERROR, "ACL codec: droidmedia create or configure failed\n");
+         goto fail;
++    }
+     s->buffer_queue = s->api->get_buffer_queue(s->codec);
+ 
+     callbacks.signal_eos = signal_eos;
+@@ -514,8 +750,10 @@
+         goto fail;
+     }
+ 
+-    if (!s->api->start(s->codec))
++    if (!s->api->start(s->codec)) {
++        av_log(avctx, AV_LOG_ERROR, "ACL codec: droidmedia start failed\n");
+         goto fail;
++    }
+ 
+     ctx->state = s;
+     av_log(avctx, AV_LOG_INFO, "droidmedia started: %s, %s\n",
+@@ -522,6 +760,10 @@
+ 
+ fail:
+     if (s) {
++        if (s->codec && !s->zero_copy) {
++            close_state(s);
++            return ret;
++        }
+         av_buffer_unref(&s->hw_frames_ctx);
+         if (s->codec) {
+             s->api->stop(s->codec);
+@@ -561,6 +803,7 @@
+     count = s->nb_frames;
+     s->frames = NULL;
+     s->nb_frames = 0;
++    s->queued_bytes = 0;
+     pthread_mutex_unlock(&s->lock);
+ 
+     for (i = 0; i < count; i++)
+@@ -568,6 +811,111 @@
+     av_free(frames);
+ }
+ 
++typedef struct DroidMediaStopJob {
++    DroidMediaDecState *state;
++    pthread_mutex_t lock;
++    pthread_cond_t cond;
++    int done, abandoned;
++} DroidMediaStopJob;
++
++static void free_stop_job(DroidMediaStopJob *job)
++{
++    pthread_cond_destroy(&job->cond);
++    pthread_mutex_destroy(&job->lock);
++    av_free(job);
++}
++
++static void *stop_thread(void *opaque)
++{
++    DroidMediaStopJob *job = opaque;
++    DroidMediaDecState *s = job->state;
++    int abandoned;
++
++    pthread_mutex_lock(&s->lock);
++    while (s->queue_calls || s->data_callbacks)
++        pthread_cond_wait(&s->cond, &s->lock);
++    pthread_mutex_unlock(&s->lock);
++    s->api->stop(s->codec);
++    s->stopped = 1;
++
++    pthread_mutex_lock(&job->lock);
++    job->done = 1;
++    abandoned = job->abandoned;
++    pthread_cond_signal(&job->cond);
++    pthread_mutex_unlock(&job->lock);
++    if (abandoned)
++        free_stop_job(job);
++    return NULL;
++}
++
++static int stop_copy_decoder(DroidMediaDecState *s)
++{
++    DroidMediaStopJob *job = av_mallocz(sizeof(*job));
++    pthread_condattr_t attr;
++    pthread_t thread;
++    struct timespec deadline;
++    int ret;
++
++    if (!job)
++        goto failed;
++    job->state = s;
++    ret = pthread_mutex_init(&job->lock, NULL);
++    if (ret) {
++        av_free(job);
++        goto failed;
++    }
++    ret = pthread_condattr_init(&attr);
++    if (!ret) {
++        ret = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
++        if (!ret)
++            ret = pthread_cond_init(&job->cond, &attr);
++        pthread_condattr_destroy(&attr);
++    }
++    if (ret) {
++        pthread_mutex_destroy(&job->lock);
++        av_free(job);
++        goto failed;
++    }
++    if (clock_gettime(CLOCK_MONOTONIC, &deadline)) {
++        free_stop_job(job);
++        goto failed;
++    }
++    deadline.tv_sec += ACL_DROID_STOP_TIMEOUT_MS / 1000;
++    deadline.tv_nsec += (ACL_DROID_STOP_TIMEOUT_MS % 1000) * 1000000L;
++    if (deadline.tv_nsec >= 1000000000L) {
++        deadline.tv_sec++;
++        deadline.tv_nsec -= 1000000000L;
++    }
++    ret = pthread_create(&thread, NULL, stop_thread, job);
++    if (ret) {
++        free_stop_job(job);
++        goto failed;
++    }
++    pthread_mutex_lock(&job->lock);
++    while (!job->done) {
++        ret = pthread_cond_timedwait(&job->cond, &job->lock, &deadline);
++        if (ret)
++            break;
++    }
++    if (!job->done) {
++        job->abandoned = 1;
++        atomic_store(&droidmedia_disabled, 1);
++        pthread_mutex_unlock(&job->lock);
++        pthread_detach(thread);
++        av_log(NULL, AV_LOG_ERROR, "droidmedia stop timed out; disabling hardware decoder for this process\n");
++        return AVERROR_EXTERNAL;
++    }
++    pthread_mutex_unlock(&job->lock);
++    pthread_join(thread, NULL);
++    free_stop_job(job);
++    return 0;
++
++failed:
++    atomic_store(&droidmedia_disabled, 1);
++    av_log(NULL, AV_LOG_ERROR, "cannot start bounded droidmedia stop; disabling hardware decoder for this process\n");
++    return AVERROR_EXTERNAL;
++}
++
+ static void close_state(DroidMediaDecState *s)
+ {
+     DroidMediaCodecCallbacks callbacks = { 0 };
+@@ -578,8 +926,22 @@
+ 
+     pthread_mutex_lock(&s->lock);
+     s->closing = 1;
++    pthread_cond_broadcast(&s->cond);
+     pthread_mutex_unlock(&s->lock);
+ 
++    if (!s->zero_copy) {
++        /* On timeout the state remains alive for any callbacks and the stop thread. */
++        if (stop_copy_decoder(s) < 0)
++            return;
++        clear_queued_frames(s);
++        state_unref(s);
++        return;
++    }
++
++    pthread_mutex_lock(&s->lock);
++    while (s->queue_calls)
++        pthread_cond_wait(&s->cond, &s->lock);
++    pthread_mutex_unlock(&s->lock);
+     if (s->buffer_queue)
+         s->api->buffer_queue_set_callbacks(s->buffer_queue, NULL, NULL);
+     s->api->set_callbacks(s->codec, &callbacks, NULL);
+@@ -615,9 +977,6 @@
+ {
+     DroidMediaDecContext *ctx = avctx->priv_data;
+     DroidMediaDecState *s = ctx->state;
+-    DroidMediaCodecData data = { 0 };
+-    DroidMediaBufferCallbacks cb = { 0 };
+-    AVPacket *queued;
+     int64_t pts;
+     int ret;
+ 
+@@ -637,31 +996,23 @@
+                     s->draining = 1;
+                     continue;
+                 }
+-                return queue_pop(s, frame);
++                return wait_for_drain(s, frame, 10000);
+             }
+             if (ret < 0)
+                 return ret;
+         }
+ 
+-        queued = av_packet_clone(&ctx->buffered_pkt);
+-        if (!queued)
+-            return AVERROR(ENOMEM);
+-
+-        pts = queued->pts != AV_NOPTS_VALUE ? queued->pts : queued->dts;
++        pts = ctx->buffered_pkt.pts != AV_NOPTS_VALUE ?
++              ctx->buffered_pkt.pts : ctx->buffered_pkt.dts;
+         if (pts == AV_NOPTS_VALUE)
+             pts = 0;
+         if (avctx->pkt_timebase.num && avctx->pkt_timebase.den)
+             pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
+ 
+-        data.data.data = queued->data;
+-        data.data.size = queued->size;
+-        data.ts = pts;
+-        data.sync = !!(queued->flags & AV_PKT_FLAG_KEY);
+-        cb.data = queued;
+-        cb.unref = input_buffer_unref;
+-
+-        s->api->queue(s->codec, &data, &cb);
++        ret = queue_input(s, &ctx->buffered_pkt, pts, 5000);
+         av_packet_unref(&ctx->buffered_pkt);
++        if (ret < 0)
++            return ret;
+     }
+ }
+ 

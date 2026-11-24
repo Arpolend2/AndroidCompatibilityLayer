@@ -9,6 +9,9 @@
 #include <QTimer>
 
 #include <sys/types.h>
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+#include "embedded_gpu_transport.h"
+#endif
 
 class QSocketNotifier;
 
@@ -34,6 +37,20 @@ public:
     void releaseRetention();
     void closeChannel(quint64 channelId);
     void stop();
+    bool gpuTransportAvailable() const
+    {
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+        return m_gpuTransport.connected();
+#else
+        return false;
+#endif
+    }
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    typedef std::function<bool(AuroraDmaBufFrame &&, const std::function<void(quint64, bool)> &)> GpuFrameHandler;
+    void setGpuFrameHandler(const GpuFrameHandler &handler) { m_gpuFrameHandler = handler; }
+    quint64 authenticationGeneration(quint64 channel) const
+    { return channel == m_authUiChannel ? m_authUiGeneration : 0; }
+#endif
 
 signals:
     void workerDied();
@@ -59,18 +76,21 @@ private:
     };
 
     bool start(QString *error);
+    bool startAttempt(bool gpu, QString *error);
     bool sendMessage(MessageType type, quint64 channelId, quint32 uid, quint32 pid,
                      const QByteArray &package, int fd, QString *error);
     bool waitForReply(MessageType expected, quint64 channelId, QString *error,
-                      bool *rejected = nullptr, bool *disconnected = nullptr);
+                      bool *rejected = nullptr, bool *disconnected = nullptr,
+                      bool reportDeath = true);
     bool receiveMessage(Message *message, QString *error, bool *wouldBlock = nullptr);
-    bool receiveFrame(QImage *frame, quint64 *channelId, QString *error, bool *wouldBlock);
+    bool receiveFrame(QImage *frame, quint64 *channelId, quint64 *generation,
+                      QString *error, bool *wouldBlock);
     void handleWorkerEvent(const Message &message);
     bool checkChild(bool reportDeath);
     void readUnsolicited();
     void readFrames();
     void handleDisconnected(quint64 channelId);
-    void failWorker();
+    void failWorker(bool notify = true);
     void reapChild();
     void closeControlSocket();
     void closeFrameSocket();
@@ -94,14 +114,23 @@ private:
     QTimer m_reaper;
     quint64 m_frameSequence = 0;
     quint64 m_frameChannel = 0;
+    quint64 m_frameGeneration = 0;
     QByteArray m_frameBuffer;
     int m_frameWidth = 0;
     int m_frameHeight = 0;
     int m_frameStride = 0;
     quint32 m_frameOffset = 0;
     quint64 m_authUiChannel = 0;
+    quint64 m_authUiGeneration = 0;
+    quint64 m_lastUiGeneration = 0;
     quint64 m_lastFrameChannel = 0;
+    quint64 m_lastFrameGeneration = 0;
     QImage m_lastFrame;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    EmbeddedGpuTransport m_gpuTransport;
+    GpuFrameHandler m_gpuFrameHandler;
+    quint64 m_lastGpuFrameId = 0;
+#endif
 };
 
 #endif

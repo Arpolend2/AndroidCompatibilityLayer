@@ -12,6 +12,10 @@ import java.util.*;
 
 /** Optional GmsCore APK service host. Services execute in the client's process. */
 public final class MicroG {
+    private static void requireLocalHosting() {
+        if (SharedMicrogIdentity.isClient())
+            throw new IllegalStateException("Local microG components are forbidden in a shared client");
+    }
     public static final String APK = "/system/priv-app/GmsCore/GmsCore.apk";
     /** The folder of the services every app shares (core/src/run/mg_run.c). */
     public static final String SHARED = "/data/megler-services";
@@ -104,6 +108,7 @@ public final class MicroG {
      * GmsCore's sign-in finds its next screen so (PRE_ADD_ACCOUNT).
      */
     public static Manifest.Component activity(Intent i) {
+        if (SharedMicrogIdentity.isClient()) return null;
         // (What tells an intent is none of GmsCore's first: every activity an app starts is asked of here.)
         if (i == null || PhoneApps.isLauncherIntent(i)) return null;
         String pkg = i.getComponent() != null ? i.getComponent().getPackageName() : i.getPackage();
@@ -131,6 +136,7 @@ public final class MicroG {
     public static boolean hosts(Manifest.Component c) { MicroG g = loaded(); return g != null && c != null && g.activities.contains(c); }
     /** An activity of GmsCore's, made in its class scope, its Application made first as for anything of GmsCore's that runs here. */
     public static Activity newActivity(String cls) throws Exception {
+        requireLocalHosting();
         MicroG g = get();
         g.application();
         return (Activity) g.loader().loadClass(cls).newInstance();
@@ -280,6 +286,7 @@ public final class MicroG {
                                      (other != null && authority.startsWith(other)));
     }
     public static ContentProvider provider(String authority) {
+        if (SharedMicrogIdentity.isClient()) return null;
         // (Every authority but the app's own and Android's few asks here: ContentResolver.)
         if (!mayBeGmsAuthority(authority)) return null;
         MicroG g = get();
@@ -584,6 +591,7 @@ public final class MicroG {
      * exported or not (microG's GoogleLoginService is not).
      */
     public static boolean bindAsSystem(Intent intent, ServiceConnection conn) {
+        requireLocalHosting();
         MicroG g = get();
         return g != null && g.find(intent, true) != null && bind(g.context, intent, conn);
     }
@@ -595,6 +603,7 @@ public final class MicroG {
      * is read for an intent of another package.
      */
     public static IBinder bindAsSystemNow(Intent intent, long timeoutMs) {
+        if (SharedMicrogIdentity.isClient()) return null;
         if (!mayBeGms(intent)) return null;
         final MicroG g = get();
         final Entry e = g == null ? null : g.find(intent, true);
@@ -635,6 +644,7 @@ public final class MicroG {
      * GeocodeProviderService).
      */
     public static boolean geocoderPresent(String action) {
+        if (SharedMicrogIdentity.isClient()) return false;
         if (!installed()) return false;
         MicroG g = loaded();
         if (g != null) return g.find(new Intent(action), true) != null;
@@ -690,6 +700,7 @@ public final class MicroG {
     }
     /* (running is changed on the main thread and read by stop and stopSelf on any thread: they lock it.) */
     private Running create(Entry e) throws Exception {
+        requireLocalHosting();
         Running r;
         synchronized (running) { r = running.get(e.info.name); }
         if (r != null) return r;
@@ -732,6 +743,7 @@ public final class MicroG {
      * is that one.
      */
     private synchronized Application attached() throws Exception {
+        requireLocalHosting();
         if (attached != null) return attached;
         if (attaching != null) return attaching;
         Application a = info.applicationInfo.className == null ? new Application() :
@@ -816,6 +828,7 @@ public final class MicroG {
         if (intent == null) return false;
         String pkg = intent.getComponent() == null ? intent.getPackage() : intent.getComponent().getPackageName();
         if (!GooglePackages.GMS.equals(pkg)) return false;
+        requireLocalHosting();
         MicroG g = get();
         if (g == null) return false;
         g.deliver(intent, from != null && GooglePackages.GMS.equals(from.getPackageName()));
@@ -826,6 +839,7 @@ public final class MicroG {
      * system sends it to Google Play services: exported or not, whatever names the intent.
      */
     public static boolean sendAsSystem(Intent intent) {
+        if (SharedMicrogIdentity.isClient()) return false;
         MicroG g = get();
         if (g == null || intent == null) return false;
         g.deliver(new Intent(intent).setPackage(GooglePackages.GMS), true);
@@ -844,10 +858,12 @@ public final class MicroG {
     /** One of those broadcasts, naming no package nor component, to microG's receivers too: from microG, to all that take it; from the app, to the exported ones. */
     public static void sendImplicit(Context from, Intent intent) {
         if (intent == null || intent.getComponent() != null || intent.getPackage() != null || !IMPLICIT.contains(intent.getAction())) return;
+        if (SharedMicrogIdentity.isClient()) return;
         MicroG g = get();
         if (g != null) g.deliver(intent, from != null && GooglePackages.GMS.equals(from.getPackageName()));
     }
     private void deliver(Intent intent, boolean internal) {
+        requireLocalHosting();
         for (Receiver r : receivers) {
             if (!r.info.enabled || (!internal && !r.info.exported)) continue;
             boolean takes = false;
@@ -907,6 +923,7 @@ public final class MicroG {
 
     public static boolean bind(Context from, Intent intent, ServiceConnection conn) {
         if (!mayBeGms(intent)) return false;
+        requireLocalHosting();
         // (The app's own binding of Google Play services' location API settles Google Location Accuracy: megler.LocationAccuracy.)
         LocationAccuracy.bound(from, intent.getAction());
         MicroG g = get(); Entry e = g == null ? null : g.find(intent, GooglePackages.GMS.equals(from.getPackageName()));
@@ -1048,6 +1065,7 @@ public final class MicroG {
     }
     public static ComponentName start(Context from, Intent intent) {
         if (!mayBeGms(intent)) return null;
+        requireLocalHosting();
         MicroG g = get(); Entry e = g == null ? null : g.find(intent, GooglePackages.GMS.equals(from.getPackageName()));
         if (e == null) return null;
         countStart(intent, e.info.name);
@@ -1218,7 +1236,14 @@ public final class MicroG {
         @Override public ComponentName startForegroundService(Intent i) { return Services.start(this, i); }
         @Override public void sendBroadcast(Intent i) { Broadcasts.send(this, i); }
         @Override public void sendBroadcast(Intent i, String permission) { Broadcasts.send(this, i); }
-        @Override public void sendOrderedBroadcast(Intent i, String permission) { Broadcasts.send(this, i); }
+        @Override public void sendOrderedBroadcast(Intent i, String permission) {
+            if (Broadcasts.hasSharedOrderedTarget(i)) {
+                Broadcasts.sendOrdered(this, i, permission, null, null, 0, null, null);
+                return;
+            }
+            Broadcasts.rejectSharedOrdered(i);
+            Broadcasts.send(this, i);
+        }
         // Google Play services holds its permissions as a phone's system app does, whatever the app it is in holds: its own
         // checks (the location it uses for itself, the accounts, the text messages its SMS Retriever hears) are its own. The
         // app's context answers for the app (megler.Permissions); this one, a wrapper of it, would have answered for the app too.

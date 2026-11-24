@@ -19,6 +19,7 @@
  */
 #include "mg_java.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,11 +31,26 @@
 
 /* The shell's cameras: set when the app starts, before any of its code runs. */
 static megler_camera_host g_host;
+static megler_camera_capture_host g_capture_host;
 
 void mg_java_camera_set_host(const megler_camera_host *host)
 {
     if (host) g_host = *host;
     else memset(&g_host, 0, sizeof(g_host));
+}
+
+void mg_java_camera_set_capture_host(const megler_camera_capture_host *host)
+{
+    if (host) g_capture_host = *host;
+    else memset(&g_capture_host, 0, sizeof(g_capture_host));
+}
+
+bool megler_set_camera_capture_host(const megler_camera_capture_host *host)
+{
+    if (megler_running()) return false;
+    if (host && (!host->picture_sizes || !host->capture)) return false;
+    mg_java_camera_set_capture_host(host);
+    return true;
 }
 
 static bool host_usable(void) { return g_host.count && g_host.info && g_host.open && g_host.start && g_host.stop && g_host.close; }
@@ -181,6 +197,100 @@ mg_jcamera *mg_jcamera_open(int index, int *error)
 }
 
 const megler_camera_caps *mg_jcamera_caps(mg_jcamera *c) { return c ? &c->caps : NULL; }
+
+int mg_jcamera_picture_sizes(mg_jcamera *c, megler_camera_picture_size *sizes, int max)
+{
+    int count, i, out = 0;
+    megler_camera_picture_size reported[MEGLER_CAMERA_MAX_SIZES];
+    if (!c || !sizes || max <= 0 || !g_capture_host.picture_sizes || !c->cam) return 0;
+    if (max > MEGLER_CAMERA_MAX_SIZES) max = MEGLER_CAMERA_MAX_SIZES;
+    mg_lock_acquire(&c->host_lock);
+    count = c->cam ? g_capture_host.picture_sizes(g_capture_host.user, c->cam, reported, max) : 0;
+    mg_lock_release(&c->host_lock);
+    if (count < 0) count = 0;
+    if (count > max) count = max;
+    for (i = 0; i < count; i++) {
+        int j;
+        const megler_camera_picture_size size = reported[i];
+        if (size.width <= 0 || size.height <= 0 || size.width > 16384 || size.height > 16384 ||
+            (uint64_t)size.width * (uint64_t)size.height > 100000000U)
+            continue;
+        for (j = 0; j < out; j++)
+            if (sizes[j].width == size.width && sizes[j].height == size.height) break;
+        if (j == out) sizes[out++] = size;
+    }
+    return out;
+}
+
+typedef struct jpeg_buffer {
+    u8 *data;
+    size_t size, capacity;
+} jpeg_buffer;
+
+static bool append_jpeg(void *context, const uint8_t *bytes, size_t size)
+{
+    jpeg_buffer *buffer = (jpeg_buffer *)context;
+    size_t needed, capacity;
+    u8 *grown;
+    if (!buffer || (!bytes && size) || !size || size > MEGLER_CAMERA_MAX_JPEG_BYTES - buffer->size) return false;
+    needed = buffer->size + size;
+    if (needed > buffer->capacity) {
+        capacity = buffer->capacity ? buffer->capacity : 65536;
+        while (capacity < needed) {
+            if (capacity > MEGLER_CAMERA_MAX_JPEG_BYTES / 2) {
+                capacity = MEGLER_CAMERA_MAX_JPEG_BYTES;
+                break;
+            }
+            capacity *= 2;
+        }
+        grown = (u8 *)realloc(buffer->data, capacity);
+        if (!grown) return false;
+        buffer->data = grown;
+        buffer->capacity = capacity;
+    }
+    memcpy(buffer->data + buffer->size, bytes, size);
+    buffer->size = needed;
+    return true;
+}
+
+bool mg_jcamera_capture(mg_jcamera *c, int width, int height, int quality, int rotation, u8 **jpeg, size_t *jpeg_size)
+{
+    megler_camera_picture_size sizes[MEGLER_CAMERA_MAX_SIZES];
+    jpeg_buffer buffer = {0};
+    int count = 0, i;
+    bool supported = false, captured = false;
+    if (jpeg) *jpeg = NULL;
+    if (jpeg_size) *jpeg_size = 0;
+    if (!c || !jpeg || !jpeg_size || !c->cam || !c->streaming || !g_capture_host.picture_sizes || !g_capture_host.capture ||
+        width <= 0 || height <= 0 || quality < 1 || quality > 100 ||
+        (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270))
+        return false;
+    mg_lock_acquire(&c->host_lock);
+    if (c->cam) {
+        count = g_capture_host.picture_sizes(g_capture_host.user, c->cam, sizes, MEGLER_CAMERA_MAX_SIZES);
+        if (count < 0) count = 0;
+        if (count > MEGLER_CAMERA_MAX_SIZES) count = MEGLER_CAMERA_MAX_SIZES;
+        for (i = 0; i < count; i++)
+            if (sizes[i].width == width && sizes[i].height == height) supported = true;
+        if (supported)
+            captured = g_capture_host.capture(g_capture_host.user, c->cam, width, height, quality, rotation, append_jpeg, &buffer);
+    }
+    mg_lock_release(&c->host_lock);
+    if (!supported) {
+        mg_warn("camera: still size %dx%d is not supported by camera %d", width, height, c->index);
+        free(buffer.data);
+        return false;
+    } else if (!captured || buffer.size < 4 || buffer.data[0] != 0xff || buffer.data[1] != 0xd8 ||
+               buffer.data[buffer.size - 2] != 0xff || buffer.data[buffer.size - 1] != 0xd9) {
+        mg_warn("camera: still capture failed or returned an invalid JPEG for camera %d", c->index);
+        free(buffer.data);
+        return false;
+    }
+    *jpeg = buffer.data;
+    *jpeg_size = buffer.size;
+    mg_info("camera: still capture succeeded for camera %d at %dx%d (%zu bytes)", c->index, width, height, buffer.size);
+    return true;
+}
 
 /* A picture from the shell, on its thread: NV12 into the spare buffer as NV21, which then becomes the latest. */
 static MEGLER_CB void on_frame(void *core, const megler_camera_frame *f)
@@ -525,6 +635,7 @@ void mg_java_camera_close_all(void)
             close_camera(c, true);
         }
     }
+    mg_java_camera_set_capture_host(NULL);
 }
 
 /* ------------------------------------------------------------ natives */
@@ -580,6 +691,41 @@ N(Camera_caps)
     c->ret.l = a;
 }
 
+N(Camera_pictureSizes)
+{
+    megler_camera_picture_size sizes[MEGLER_CAMERA_MAX_SIZES];
+    mg_jcamera *camera = CAMERA;
+    int count = mg_jcamera_picture_sizes(camera, sizes, MEGLER_CAMERA_MAX_SIZES), i;
+    mg_jobj *a = mg_dvm_new_array("[I", count * 2);
+    c->ret.l = NULL;
+    if (!a) return;
+    for (i = 0; i < count; i++) {
+        ((i32 *)a->u.arr.data)[2 * i] = sizes[i].width;
+        ((i32 *)a->u.arr.data)[2 * i + 1] = sizes[i].height;
+    }
+    c->ret.l = a;
+}
+
+N(Camera_capture)
+{
+    u8 *jpeg = NULL;
+    size_t size = 0;
+    mg_jobj *a;
+    c->ret.l = NULL;
+    if (!mg_jcamera_capture(CAMERA, c->args[1].i, c->args[2].i, c->args[3].i, c->args[4].i, &jpeg, &size)) return;
+    if (size > INT_MAX) {
+        free(jpeg);
+        mg_warn("camera: still JPEG exceeds the Java array limit");
+        return;
+    }
+    a = mg_dvm_new_array("[B", (int)size);
+    if (a) {
+        memcpy(a->u.arr.data, jpeg, size);
+        c->ret.l = a;
+    }
+    free(jpeg);
+}
+
 N(Camera_start) { c->ret.i = mg_jcamera_start(CAMERA, c->args[1].i, c->args[2].i, c->args[3].i) ? 1 : 0; }
 N(Camera_stop) { mg_jcamera_stop(CAMERA); }
 N(Camera_waitNews) { c->ret.i = mg_jcamera_wait(CAMERA, c->args[1].i); }
@@ -624,6 +770,8 @@ static const mg_jhle k_camera[] = {
     { "megler/CameraNative", "features", NULL, Camera_features },
     { "megler/CameraNative", "open", NULL, Camera_open },
     { "megler/CameraNative", "caps", NULL, Camera_caps },
+    { "megler/CameraNative", "pictureSizes", NULL, Camera_pictureSizes },
+    { "megler/CameraNative", "capture", NULL, Camera_capture },
     { "megler/CameraNative", "start", NULL, Camera_start },
     { "megler/CameraNative", "stop", NULL, Camera_stop },
     { "megler/CameraNative", "waitNews", NULL, Camera_waitNews },

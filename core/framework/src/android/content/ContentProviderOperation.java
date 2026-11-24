@@ -147,9 +147,25 @@ public class ContentProviderOperation implements Parcelable {
         Bundle b = new Bundle();
         for (Map.Entry<String, Object> e : mExtras.entrySet()) {
             Object o = e.getValue();
-            b.putObject(e.getKey(), o instanceof BackReference ? ((BackReference) o).resolve(backRefs, numBackRefs) : o);
+            putBundleValue(b, e.getKey(),
+                o instanceof BackReference ? ((BackReference) o).resolve(backRefs, numBackRefs) : o);
         }
         return b;
+    }
+    private static void putBundleValue(Bundle bundle, String key, Object value) {
+        if (value == null || value instanceof String) bundle.putString(key, (String) value);
+        else if (value instanceof Boolean) bundle.putBoolean(key, (Boolean) value);
+        else if (value instanceof Byte) bundle.putByte(key, (Byte) value);
+        else if (value instanceof Short) bundle.putShort(key, (Short) value);
+        else if (value instanceof Integer) bundle.putInt(key, (Integer) value);
+        else if (value instanceof Long) bundle.putLong(key, (Long) value);
+        else if (value instanceof Float) bundle.putFloat(key, (Float) value);
+        else if (value instanceof Double) bundle.putDouble(key, (Double) value);
+        else if (value instanceof byte[]) bundle.putByteArray(key, (byte[]) value);
+        else if (value instanceof android.os.IBinder) bundle.putBinder(key, (android.os.IBinder) value);
+        else if (value instanceof Parcelable) bundle.putParcelable(key, (Parcelable) value);
+        else if (value instanceof java.io.Serializable) bundle.putSerializable(key, (java.io.Serializable) value);
+        else throw new IllegalArgumentException("Unsupported provider operation extra type");
     }
     public String[] resolveSelectionArgsBackReferences(ContentProviderResult[] backRefs, int numBackRefs) {
         if (mSelectionArgs == null) return null;
@@ -185,11 +201,167 @@ public class ContentProviderOperation implements Parcelable {
         return s.append(')').toString();
     }
 
-    // In this one process a Parcel carries objects as they are: the operation itself goes through it.
+    private static final int VALUE_NULL = 0, VALUE_STRING = 1, VALUE_BOOLEAN = 2,
+        VALUE_BYTE = 3, VALUE_SHORT = 4, VALUE_INTEGER = 5, VALUE_LONG = 6,
+        VALUE_FLOAT = 7, VALUE_DOUBLE = 8, VALUE_BLOB = 9, VALUE_BACK_REFERENCE = 10;
+
+    public ContentProviderOperation(Parcel parcel) {
+        this(readBuilder(parcel));
+    }
+
+    private static Builder readBuilder(Parcel parcel) {
+        int type = parcel.readInt();
+        if (type < TYPE_INSERT || type > TYPE_CALL)
+            throw new IllegalArgumentException("Invalid provider operation type");
+        String uriText = readBoundedString(parcel, 8192);
+        if (uriText == null) throw new IllegalArgumentException("Provider operation URI is required");
+        Builder builder = new Builder(type, Uri.parse(uriText));
+        builder.mMethod = readBoundedString(parcel, 4096);
+        builder.mArg = readBoundedString(parcel, 4096);
+        builder.mSelection = readBoundedString(parcel, 8192);
+        int hasExpectedCount = readBoolean(parcel);
+        if (hasExpectedCount != 0) builder.mExpectedCount = parcel.readInt();
+        builder.mYieldAllowed = readBoolean(parcel) != 0;
+        builder.mExceptionAllowed = readBoolean(parcel) != 0;
+        builder.mValues = readOperationMap(parcel);
+        builder.mExtras = readOperationMap(parcel);
+        int selectionCount = parcel.readInt();
+        if (selectionCount < -1 || selectionCount > 128)
+            throw new IllegalArgumentException("Provider selection arguments exceed limit");
+        if (selectionCount >= 0) {
+            builder.mSelectionArgs = new TreeMap<>();
+            for (int i = 0; i < selectionCount; i++) {
+                int index = parcel.readInt();
+                if (index < 0 || index >= 128 || builder.mSelectionArgs.containsKey(index))
+                    throw new IllegalArgumentException("Invalid provider selection argument index");
+                builder.mSelectionArgs.put(index, readOperationValue(parcel));
+            }
+        }
+        return builder;
+    }
+
+    private static void writeOperationMap(Parcel parcel, Map<String, Object> values) {
+        if (values == null) { parcel.writeInt(-1); return; }
+        if (values.size() > 128) throw new IllegalArgumentException("Provider operation values exceed limit");
+        parcel.writeInt(values.size());
+        for (Map.Entry<String, Object> entry : values.entrySet()) {
+            String key = entry.getKey();
+            if (key == null || key.isEmpty() || key.length() > 1024)
+                throw new IllegalArgumentException("Invalid provider operation key");
+            parcel.writeString(key);
+            writeOperationValue(parcel, entry.getValue());
+        }
+    }
+
+    private static Map<String, Object> readOperationMap(Parcel parcel) {
+        int count = parcel.readInt();
+        if (count < -1 || count > 128) throw new IllegalArgumentException("Provider operation values exceed limit");
+        if (count < 0) return null;
+        Map<String, Object> values = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < count; i++) {
+            String key = parcel.readString();
+            if (key == null || key.isEmpty() || key.length() > 1024 || values.containsKey(key))
+                throw new IllegalArgumentException("Invalid provider operation key");
+            values.put(key, readOperationValue(parcel));
+        }
+        return values;
+    }
+
+    private static void writeOperationValue(Parcel parcel, Object value) {
+        if (value == null) parcel.writeInt(VALUE_NULL);
+        else if (value instanceof String) {
+            parcel.writeInt(VALUE_STRING); parcel.writeString(bounded((String) value, 65536));
+        } else if (value instanceof Boolean) { parcel.writeInt(VALUE_BOOLEAN); parcel.writeInt((Boolean) value ? 1 : 0); }
+        else if (value instanceof Byte) { parcel.writeInt(VALUE_BYTE); parcel.writeInt((Byte) value); }
+        else if (value instanceof Short) { parcel.writeInt(VALUE_SHORT); parcel.writeInt((Short) value); }
+        else if (value instanceof Integer) { parcel.writeInt(VALUE_INTEGER); parcel.writeInt((Integer) value); }
+        else if (value instanceof Long) { parcel.writeInt(VALUE_LONG); parcel.writeLong((Long) value); }
+        else if (value instanceof Float) { parcel.writeInt(VALUE_FLOAT); parcel.writeFloat((Float) value); }
+        else if (value instanceof Double) { parcel.writeInt(VALUE_DOUBLE); parcel.writeDouble((Double) value); }
+        else if (value instanceof byte[]) {
+            byte[] bytes = (byte[]) value;
+            if (bytes.length > 262144) throw new IllegalArgumentException("Provider operation blob exceeds limit");
+            parcel.writeInt(VALUE_BLOB); parcel.writeByteArray(bytes);
+        } else if (value instanceof BackReference) {
+            BackReference reference = (BackReference) value;
+            parcel.writeInt(VALUE_BACK_REFERENCE);
+            parcel.writeInt(reference.mFromIndex);
+            parcel.writeString(reference.mFromKey);
+        } else throw new IllegalArgumentException("Unsupported provider operation value type");
+    }
+
+    private static Object readOperationValue(Parcel parcel) {
+        switch (parcel.readInt()) {
+            case VALUE_NULL: return null;
+            case VALUE_STRING: return readBoundedString(parcel, 65536);
+            case VALUE_BOOLEAN: {
+                int value = readBoolean(parcel);
+                return value != 0;
+            }
+            case VALUE_BYTE: return (byte) parcel.readInt();
+            case VALUE_SHORT: return (short) parcel.readInt();
+            case VALUE_INTEGER: return parcel.readInt();
+            case VALUE_LONG: return parcel.readLong();
+            case VALUE_FLOAT: return parcel.readFloat();
+            case VALUE_DOUBLE: return parcel.readDouble();
+            case VALUE_BLOB: {
+                byte[] value = parcel.createByteArray();
+                if (value == null || value.length > 262144)
+                    throw new IllegalArgumentException("Invalid provider operation blob");
+                return value;
+            }
+            case VALUE_BACK_REFERENCE: {
+                int index = parcel.readInt();
+                if (index < 0 || index >= 128) throw new IllegalArgumentException("Invalid provider back reference");
+                return new BackReference(index, readBoundedString(parcel, 1024));
+            }
+            default: throw new IllegalArgumentException("Unsupported provider operation value type");
+        }
+    }
+
+    private static int readBoolean(Parcel parcel) {
+        int value = parcel.readInt();
+        if (value != 0 && value != 1) throw new IllegalArgumentException("Invalid provider operation boolean");
+        return value;
+    }
+
+    private static String bounded(String value, int maxLength) {
+        if (value.length() > maxLength) throw new IllegalArgumentException("Provider operation string exceeds limit");
+        return value;
+    }
+
+    private static String readBoundedString(Parcel parcel, int maxLength) {
+        String value = parcel.readString();
+        return value == null ? null : bounded(value, maxLength);
+    }
+
     public int describeContents() { return 0; }
-    public void writeToParcel(Parcel p, int flags) { p.writeValue(this); }
+    public void writeToParcel(Parcel p, int flags) {
+        p.writeInt(mType);
+        p.writeString(mUri == null ? null : bounded(mUri.toString(), 8192));
+        p.writeString(mMethod == null ? null : bounded(mMethod, 4096));
+        p.writeString(mArg == null ? null : bounded(mArg, 4096));
+        p.writeString(mSelection == null ? null : bounded(mSelection, 8192));
+        p.writeInt(mExpectedCount == null ? 0 : 1);
+        if (mExpectedCount != null) p.writeInt(mExpectedCount);
+        p.writeInt(mYieldAllowed ? 1 : 0);
+        p.writeInt(mExceptionAllowed ? 1 : 0);
+        writeOperationMap(p, mValues);
+        writeOperationMap(p, mExtras);
+        if (mSelectionArgs == null) p.writeInt(-1);
+        else {
+            if (mSelectionArgs.size() > 128) throw new IllegalArgumentException("Provider selection arguments exceed limit");
+            p.writeInt(mSelectionArgs.size());
+            for (Map.Entry<Integer, Object> entry : mSelectionArgs.entrySet()) {
+                if (entry.getKey() < 0 || entry.getKey() >= 128)
+                    throw new IllegalArgumentException("Invalid provider selection argument index");
+                p.writeInt(entry.getKey());
+                writeOperationValue(p, entry.getValue());
+            }
+        }
+    }
     public static final Parcelable.Creator<ContentProviderOperation> CREATOR = new Parcelable.Creator<ContentProviderOperation>() {
-        public ContentProviderOperation createFromParcel(Parcel p) { return (ContentProviderOperation) p.readValue(null); }
+        public ContentProviderOperation createFromParcel(Parcel p) { return new ContentProviderOperation(p); }
         public ContentProviderOperation[] newArray(int n) { return new ContentProviderOperation[n]; }
     };
 

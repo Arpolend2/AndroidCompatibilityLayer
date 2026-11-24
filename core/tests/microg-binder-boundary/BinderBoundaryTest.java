@@ -76,7 +76,7 @@ public class BinderBoundaryTest {
         Parcel unsupported = Parcel.obtain();
         try {
             unsupported.writeStrongBinder(resolved);
-            unsupported.writeList(new ArrayList<String>(Arrays.asList("item")));
+            unsupported.writeList(new ArrayList<Object>(Arrays.asList("item", 1)));
             rejected = false;
             final int[] exported = {0};
             try { unsupported.meglerMarshallBinders(b -> { exported[0]++; return 1; }); }

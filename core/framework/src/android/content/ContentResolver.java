@@ -26,6 +26,10 @@ public class ContentResolver {
     }
     private static ContentProvider provider(Uri u) { if (u == null || !SCHEME_CONTENT.equals(u.getScheme())) return null; return byAuthority(u.getAuthority()); }
     private static ContentProvider byAuthority(String a) {
+        if (a != null && a.startsWith("com.google.")) {
+            ContentProvider shared = megler.Services.sharedMicrogProvider(a);
+            if (shared != null || megler.Services.sharedMicrogRequired()) return shared;
+        }
         ContentProvider p; synchronized (sProviders) { p = sProviders.get(a); }
         if (p != null) return p;
         if ("settings".equals(a)) return megler.SettingsProvider.INSTANCE;
@@ -94,7 +98,15 @@ public class ContentResolver {
         @Override public int update(Uri u, ContentValues v, String sel, String[] args) { return 0; }
     };
     public final Bundle call(Uri u, String method, String arg, Bundle extras) { ContentProvider p = provider(u); return p == null ? null : p.call(method, arg, extras); }
-    public final Bundle call(String authority, String method, String arg, Bundle extras) { ContentProvider p; synchronized (sProviders) { p = sProviders.get(authority); } return p == null ? null : p.call(method, arg, extras); }
+    public final Bundle call(String authority, String method, String arg, Bundle extras) {
+        ContentProvider p;
+        if (authority != null && authority.startsWith("com.google.")) {
+            p = byAuthority(authority);
+        } else {
+            synchronized (sProviders) { p = sProviders.get(authority); }
+        }
+        return p == null ? null : p.call(method, arg, extras);
+    }
     public final java.io.InputStream openInputStream(Uri u) throws java.io.FileNotFoundException {
         if (u == null) throw new java.io.FileNotFoundException("null uri");
         String s = u.getScheme();
@@ -121,6 +133,8 @@ public class ContentResolver {
     public final java.io.OutputStream openOutputStream(Uri u, String mode) throws java.io.FileNotFoundException {
         String s = u.getScheme();
         if (SCHEME_FILE.equals(s) || s == null) return new java.io.FileOutputStream(u.getPath(), mode.contains("a"));
+        if (megler.Services.isSharedMicrogAuthority(u))
+            return megler.Services.openSharedMicrogOutputStream(u, mode);
         ContentProvider p = provider(u);
         if (p != null) {
             // (Closing the stream closes the descriptor, as Android's AssetFileDescriptor.createOutputStream does: a provider
@@ -148,18 +162,46 @@ public class ContentResolver {
         if (p != null) return p.openTypedAssetFile(u, mime, o);
         return openAssetFileDescriptor(u, "r");
     }
-    public final void registerContentObserver(Uri u, boolean descendants, ContentObserver o) { synchronized (sObservers) { sObservers.add(new Object[] { u, descendants, o }); } }
-    public final void unregisterContentObserver(ContentObserver o) { synchronized (sObservers) { for (int i = sObservers.size() - 1; i >= 0; i--) if (sObservers.get(i)[2] == o) sObservers.remove(i); } }
+    public final void registerContentObserver(Uri u, boolean descendants, ContentObserver o) {
+        if (megler.Services.registerSharedMicrogObserver(u, descendants, o)) return;
+        meglerRegisterLocalObserver(u, descendants, o);
+    }
+    public final void meglerRegisterLocalObserver(Uri u, boolean descendants, ContentObserver o) {
+        synchronized (sObservers) { sObservers.add(new Object[] { u, descendants, o }); }
+    }
+    public final void unregisterContentObserver(ContentObserver o) {
+        megler.Services.unregisterSharedMicrogObserver(o);
+        meglerUnregisterLocalObserver(o);
+    }
+    public final void meglerUnregisterLocalObserver(ContentObserver o) {
+        synchronized (sObservers) { for (int i = sObservers.size() - 1; i >= 0; i--) if (sObservers.get(i)[2] == o) sObservers.remove(i); }
+    }
     public void notifyChange(Uri u, ContentObserver observer) { notifyChange(u, observer, true); }
     public void notifyChange(Uri u, ContentObserver observer, boolean sync) {
+        if (megler.Services.isSharedMicrogAuthority(u)) {
+            megler.Services.notifySharedMicrogChange(u, observer);
+            return;
+        }
+        meglerNotifyLocalChange(u, observer);
+    }
+    public void meglerNotifyLocalChange(Uri u, ContentObserver observer) {
+        ArrayList<ContentObserver> excluded = new ArrayList<>();
+        if (observer != null) excluded.add(observer);
+        meglerNotifyLocalChangeExcluding(u, excluded);
+    }
+    public void meglerNotifyLocalChangeExcluding(Uri u, java.util.List<ContentObserver> excluded) {
         ArrayList<Object[]> list; synchronized (sObservers) { list = new ArrayList<>(sObservers); }
         String us = u.toString();
         for (Object[] e : list) {
             String os = e[0].toString();
-            if (e[2] != observer && (us.equals(os) || ((Boolean) e[1] && us.startsWith(os)))) ((ContentObserver) e[2]).dispatchChange(false, u);
+            if (!excluded.contains(e[2]) && (us.equals(os) || ((Boolean) e[1] && us.startsWith(os)))) ((ContentObserver) e[2]).dispatchChange(false, u);
         }
     }
-    public void notifyChange(Uri u, ContentObserver observer, int flags) { notifyChange(u, observer, true); }
+    public void notifyChange(Uri u, ContentObserver observer, int flags) {
+        if (flags != 0 && megler.Services.isSharedMicrogAuthority(u))
+            throw new UnsupportedOperationException("Shared microG notification flags are unsupported.");
+        notifyChange(u, observer, true);
+    }
     public void takePersistableUriPermission(Uri u, int flags) {}
     public void releasePersistableUriPermission(Uri u, int flags) {}
     public java.util.List<UriPermission> getPersistedUriPermissions() { return new ArrayList<>(); }
@@ -325,8 +367,12 @@ public class ContentResolver {
     public android.graphics.drawable.Drawable getTypeDrawable(java.lang.String p0) { return null; }
     public android.content.ContentResolver.MimeTypeInfo getTypeInfo(java.lang.String p0) { return null; }
     public int getUserId() { return 0; }
-    public void notifyChange(android.net.Uri p0, android.database.ContentObserver p1, int p2, int p3) {}
-    public void notifyChange(android.net.Uri p0, android.database.ContentObserver p1, boolean p2, int p3) {}
+    public void notifyChange(android.net.Uri p0, android.database.ContentObserver p1, int p2, int p3) {
+        if (megler.Services.isSharedMicrogAuthority(p0)) throw new UnsupportedOperationException("Shared microG user-scoped notifications are unsupported.");
+    }
+    public void notifyChange(android.net.Uri p0, android.database.ContentObserver p1, boolean p2, int p3) {
+        if (megler.Services.isSharedMicrogAuthority(p0)) throw new UnsupportedOperationException("Shared microG user-scoped notifications are unsupported.");
+    }
     public void notifyChange(java.lang.Iterable p0, android.database.ContentObserver p1, int p2) {}
     public void notifyChange(java.util.Collection p0, android.database.ContentObserver p1, int p2) {}
     public void notifyChange(android.net.Uri[] p0, android.database.ContentObserver p1, int p2, int p3) {}
@@ -337,8 +383,12 @@ public class ContentResolver {
     public android.content.res.AssetFileDescriptor openTypedAssetFileDescriptor(android.net.Uri p0, java.lang.String p1, android.os.Bundle p2, android.os.CancellationSignal p3) { return null; }
     public void putCache(android.net.Uri p0, android.os.Bundle p1) {}
     public boolean refresh(android.net.Uri p0, android.os.Bundle p1, android.os.CancellationSignal p2) { return false; }
-    public void registerContentObserver(android.net.Uri p0, boolean p1, android.database.ContentObserver p2, int p3) {}
-    public void registerContentObserverAsUser(android.net.Uri p0, boolean p1, android.database.ContentObserver p2, android.os.UserHandle p3) {}
+    public void registerContentObserver(android.net.Uri p0, boolean p1, android.database.ContentObserver p2, int p3) {
+        if (megler.Services.isSharedMicrogAuthority(p0)) throw new UnsupportedOperationException("Shared microG user-scoped observers are unsupported.");
+    }
+    public void registerContentObserverAsUser(android.net.Uri p0, boolean p1, android.database.ContentObserver p2, android.os.UserHandle p3) {
+        if (megler.Services.isSharedMicrogAuthority(p0)) throw new UnsupportedOperationException("Shared microG user-scoped observers are unsupported.");
+    }
     public int resolveUserId(android.net.Uri p0) { return 0; }
     public void takePersistableUriPermission(java.lang.String p0, android.net.Uri p1, int p2) {}
     public int update(android.net.Uri p0, android.content.ContentValues p1, android.os.Bundle p2) { return 0; }

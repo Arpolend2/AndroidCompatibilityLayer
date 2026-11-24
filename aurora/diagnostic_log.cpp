@@ -297,6 +297,11 @@ QString DiagnosticLog::standaloneDiagnosticFileError() const
     return ErrorLog::standaloneDiagnosticFileError();
 }
 
+QString DiagnosticLog::overlayText() const
+{
+    return ErrorLog::overlayText();
+}
+
 DiagnosticLog::~DiagnosticLog()
 {
     if (!available()) return;

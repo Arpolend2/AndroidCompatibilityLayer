@@ -1,8 +1,8 @@
 Name:       ru.androidcompatibilitylayer.appmanager
 Summary:    AndroidCompatibilityLayer for Aurora OS
-Version:    0.3.5
-Release:    9
-License:    GPL-3.0-only
+Version:    0.3.6
+Release:    8
+License:    GPL-3.0-only AND LGPL-2.1-or-later
 URL:        https://github.com/Arpolend2/AndroidCompatibilityLayer
 Source0:    %{name}-%{version}.tar.bz2
 
@@ -14,6 +14,8 @@ Requires:       qt5-plugin-imageformat-jpeg
 Requires:       nemo-qml-plugin-notifications-qt5
 Requires:       ru.auroraos.webview
 BuildRequires:  cmake
+BuildRequires:  make
+BuildRequires:  patch
 BuildRequires:  qt5-qttools-linguist
 BuildRequires:  python3
 BuildRequires:  pkgconfig(auroraapp)

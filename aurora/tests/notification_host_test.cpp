@@ -2,16 +2,18 @@
 
 #include <QCoreApplication>
 #include <QDBusConnection>
+#include <QDBusContext>
 #include <QDBusMessage>
 #include <QEventLoop>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QThread>
 #include <QTimer>
 
 #include <cstdio>
 
-class NotificationService : public QObject
+class NotificationService : public QObject, protected QDBusContext
 {
     Q_OBJECT
     Q_CLASSINFO("D-Bus Interface", "org.freedesktop.Notifications")
@@ -19,6 +21,18 @@ public slots:
     uint Notify(const QString &app, uint replaces, const QString &, const QString &title,
                 const QString &body, const QStringList &, const QVariantMap &hints, int timeout)
     {
+        if (m_replaceOnNotify) {
+            m_replaceOnNotify = false;
+            QDBusConnection bus = QDBusConnection::sessionBus();
+            if (!bus.unregisterService(QStringLiteral("org.freedesktop.Notifications"))) {
+                sendErrorReply(QStringLiteral("org.freedesktop.DBus.Error.Failed"),
+                               QStringLiteral("test service could not release its name"));
+                return 0;
+            }
+            sendErrorReply(QStringLiteral("org.freedesktop.DBus.Error.ServiceUnknown"),
+                           QStringLiteral("test service owner changed during Notify"));
+            return 0;
+        }
         QJsonObject record;
         record.insert(QStringLiteral("app"), app);
         record.insert(QStringLiteral("replaces"), int(replaces));
@@ -32,7 +46,7 @@ public slots:
         record.insert(QStringLiteral("originPackage"), hints.value(QStringLiteral("x-nemo-origin-package")).toString());
         record.insert(QStringLiteral("hasUrgency"), hints.contains(QStringLiteral("urgency")));
         record.insert(QStringLiteral("urgency"), hints.value(QStringLiteral("urgency")).toInt());
-        record.insert(QStringLiteral("urgencyIsByte"), hints.value(QStringLiteral("urgency")).userType() == QMetaType::UChar);
+        record.insert(QStringLiteral("urgencyIsInt"), hints.value(QStringLiteral("urgency")).userType() == QMetaType::Int);
         record.insert(QStringLiteral("hasProgress"), hints.contains(QStringLiteral("x-nemo-progress")));
         record.insert(QStringLiteral("progress"), hints.value(QStringLiteral("x-nemo-progress")).toDouble());
         record.insert(QStringLiteral("timeout"), timeout);
@@ -57,11 +71,15 @@ signals:
 
 private:
     uint m_next = 40;
+    bool m_replaceOnNotify = false;
+
+public:
+    explicit NotificationService(bool replaceOnNotify = false) : m_replaceOnNotify(replaceOnNotify) {}
 };
 
-static bool startService(QProcess &process)
+static bool startService(QProcess &process, const QString &mode = QStringLiteral("--service"))
 {
-    process.start(QCoreApplication::applicationFilePath(), {QStringLiteral("--service")});
+    process.start(QCoreApplication::applicationFilePath(), {mode});
     return process.waitForStarted() && process.waitForReadyRead(5000) &&
            process.readLine().trimmed() == "ready";
 }
@@ -90,6 +108,28 @@ int main(int argc, char **argv)
                                 QDBusConnection::ExportAllSlots | QDBusConnection::ExportAllSignals)) return 1;
         std::puts("ready");
         std::fflush(stdout);
+        return app.exec();
+    }
+    if (argc == 2 && QByteArray(argv[1]) == "--service-switch") {
+        NotificationService service(true);
+        QDBusConnection bus = QDBusConnection::sessionBus();
+        if (!bus.registerService(QStringLiteral("org.freedesktop.Notifications")) ||
+            !bus.registerObject(QStringLiteral("/org/freedesktop/Notifications"), &service,
+                                QDBusConnection::ExportAllSlots | QDBusConnection::ExportAllSignals)) return 1;
+        std::puts("ready");
+        std::fflush(stdout);
+        return app.exec();
+    }
+    if (argc == 2 && QByteArray(argv[1]) == "--service-wait") {
+        NotificationService service;
+        QDBusConnection bus = QDBusConnection::sessionBus();
+        if (!bus.registerObject(QStringLiteral("/org/freedesktop/Notifications"), &service,
+                                QDBusConnection::ExportAllSlots | QDBusConnection::ExportAllSignals)) return 1;
+        std::puts("waiting");
+        std::fflush(stdout);
+        QThread::msleep(250);
+        while (!bus.registerService(QStringLiteral("org.freedesktop.Notifications")))
+            QThread::msleep(5);
         return app.exec();
     }
     QProcess service;
@@ -184,7 +224,7 @@ int main(int argc, char **argv)
                  policy.value("previewBody").toString().isEmpty() &&
                  policy.value("suppressSound").toBool() &&
                  policy.value("originPackage").toString() == QLatin1String(pkg) &&
-                 policy.value("hasUrgency").toBool() && policy.value("urgencyIsByte").toBool() &&
+                 policy.value("hasUrgency").toBool() && policy.value("urgencyIsInt").toBool() &&
                  policy.value("urgency").toInt(-1) == 0 &&
                  policy.value("timeout").toInt(-1) == 0 && !policy.value("hasProgress").toBool(),
                  "initial ongoing minimum importance is quiet without progress")) return 1;
@@ -221,6 +261,23 @@ int main(int argc, char **argv)
                  "completion clears ongoing timeout")) return 1;
     service.terminate();
     if (!require(service.waitForFinished(5000), "final service stop")) return 1;
+    if (!require(startService(service, QStringLiteral("--service-switch")), "switch service start")) return 1;
+    QProcess replacement;
+    replacement.start(QCoreApplication::applicationFilePath(), {QStringLiteral("--service-wait")});
+    if (!require(replacement.waitForStarted(), "replacement service start")) return 1;
+    if (!require(replacement.waitForReadyRead(5000) &&
+                 replacement.readLine().trimmed() == "waiting", "replacement service wait")) return 1;
+    if (!require(send(MEGLER_NOTIFICATION_POST, pkg, nullptr, 30, "Owner handover", "Recovered"),
+                 "post retries after notification owner handover")) return 1;
+    QJsonObject recovered = record(replacement);
+    if (!require(recovered.value("title").toString() == QLatin1String("Owner handover") &&
+                 recovered.value("body").toString() == QLatin1String("Recovered") &&
+                 recovered.value("replaces").toInt(-1) == 0,
+                 "notification retried with new owner")) return 1;
+    replacement.terminate();
+    if (!require(replacement.waitForFinished(5000), "replacement service stop")) return 1;
+    service.terminate();
+    if (!require(service.waitForFinished(5000), "switch service stop")) return 1;
     return 0;
 }
 

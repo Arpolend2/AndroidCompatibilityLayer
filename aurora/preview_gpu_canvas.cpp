@@ -1,4 +1,5 @@
 #include "preview_gpu_canvas.h"
+#include "egl_frame_transport.h"
 #include "preview_gpu_metrics.h"
 #include "preview_gpu_pixels.h"
 #include "store_worker_teardown.h"
@@ -27,6 +28,14 @@
 #include <QThread>
 #include <QTransform>
 #include <QVector>
+#include <EGL/egl.h>
+
+#ifdef ACL_HAVE_WAYLAND_EGL
+#include <QGuiApplication>
+#include <qpa/qplatformnativeinterface.h>
+#include <wayland-client.h>
+#include <wayland-egl.h>
+#endif
 
 #include <atomic>
 #include <climits>
@@ -47,6 +56,15 @@ struct PreviewGpuOffscreenContexts {
 };
 
 namespace {
+
+#ifdef ACL_HAVE_WAYLAND_EGL
+struct InvisibleEglWindow {
+    EGLDisplay display;
+    EGLSurface surface;
+    wl_surface *waylandSurface;
+    wl_egl_window *window;
+};
+#endif
 
 std::atomic<quint64> nextContextId{1};
 constexpr quint64 multipleContexts = ~quint64(0);
@@ -74,6 +92,7 @@ struct ThreadFramebuffer {
 struct ThreadContext {
     PreviewGpuCanvasHost *owner = nullptr;
     QOpenGLContext *context = nullptr;
+    EGLContext eglContext = EGL_NO_CONTEXT;
     quint64 contextId = 0;
     QHash<quint64, ThreadFramebuffer> framebuffers;
     GLuint filterProgram = 0;
@@ -94,7 +113,9 @@ struct ThreadContext {
 
     void clear()
     {
-        QOpenGLFunctions *gl = context && QOpenGLContext::currentContext() == context
+        const bool current = context && QOpenGLContext::currentContext() == context &&
+                             eglGetCurrentContext() == eglContext;
+        QOpenGLFunctions *gl = current
             ? context->functions() : nullptr;
         if (offscreenContexts) {
             QMutexLocker lock(&offscreenContexts->mutex);
@@ -120,10 +141,11 @@ struct ThreadContext {
         fenceSync = nullptr;
         clientWaitSync = nullptr;
         deleteSync = nullptr;
-        if (context && QOpenGLContext::currentContext() == context)
+        if (current)
             context->doneCurrent();
         delete context;
         context = nullptr;
+        eglContext = EGL_NO_CONTEXT;
         owner = nullptr;
         if (offscreenContexts) {
             {
@@ -145,27 +167,63 @@ thread_local ThreadContext threadContext;
 
 class ScopedOffscreenCurrent {
 public:
-    explicit ScopedOffscreenCurrent(PreviewGpuCanvasHost *) { ++depth; }
+    explicit ScopedOffscreenCurrent(PreviewGpuCanvasHost *)
+    {
+        if (depth++ == 0) {
+            previousDisplay = eglGetCurrentDisplay();
+            previousDraw = eglGetCurrentSurface(EGL_DRAW);
+            previousRead = eglGetCurrentSurface(EGL_READ);
+            previousContext = eglGetCurrentContext();
+            restorePrevious = previousContext != EGL_NO_CONTEXT &&
+                (!threadContext.context || previousContext != threadContext.eglContext);
+        }
+    }
+
     ~ScopedOffscreenCurrent()
     {
-        if (--depth == 0 && threadContext.owner && threadContext.offscreenContexts) {
+        if (--depth != 0)
+            return;
+        if (threadContext.owner) {
             if (!mg_java_gfx_retains_thread_context()) {
                 threadContext.owner->releaseThreadContext();
-                return;
+            } else {
+                if (threadContext.context &&
+                    QOpenGLContext::currentContext() == threadContext.context &&
+                    eglGetCurrentContext() == threadContext.eglContext)
+                    threadContext.context->doneCurrent();
+                if (threadContext.offscreenContexts) {
+                    QMutexLocker lock(&threadContext.offscreenContexts->mutex);
+                    threadContext.offscreenContexts->owners[threadContext.tid].state = "unbound";
+                }
+                threadContext.wasBound = false;
             }
-            if (threadContext.context && QOpenGLContext::currentContext() == threadContext.context)
-                threadContext.context->doneCurrent();
-            QMutexLocker lock(&threadContext.offscreenContexts->mutex);
-            threadContext.offscreenContexts->owners[threadContext.tid].state = "unbound";
-            threadContext.wasBound = false;
         }
+        if (restorePrevious &&
+            !eglMakeCurrent(previousDisplay, previousDraw, previousRead, previousContext))
+            qWarning("GPU Canvas could not restore the guest EGL context after a Canvas callback (EGL error 0x%x)",
+                     static_cast<unsigned int>(eglGetError()));
+        previousDisplay = EGL_NO_DISPLAY;
+        previousDraw = EGL_NO_SURFACE;
+        previousRead = EGL_NO_SURFACE;
+        previousContext = EGL_NO_CONTEXT;
+        restorePrevious = false;
     }
 
 private:
     static thread_local unsigned depth;
+    static thread_local EGLDisplay previousDisplay;
+    static thread_local EGLSurface previousDraw;
+    static thread_local EGLSurface previousRead;
+    static thread_local EGLContext previousContext;
+    static thread_local bool restorePrevious;
 };
 
 thread_local unsigned ScopedOffscreenCurrent::depth = 0;
+thread_local EGLDisplay ScopedOffscreenCurrent::previousDisplay = EGL_NO_DISPLAY;
+thread_local EGLSurface ScopedOffscreenCurrent::previousDraw = EGL_NO_SURFACE;
+thread_local EGLSurface ScopedOffscreenCurrent::previousRead = EGL_NO_SURFACE;
+thread_local EGLContext ScopedOffscreenCurrent::previousContext = EGL_NO_CONTEXT;
+thread_local bool ScopedOffscreenCurrent::restorePrevious = false;
 
 void clearGlErrors(QOpenGLFunctions *gl)
 {
@@ -603,6 +661,11 @@ struct PreviewGpuCanvasHost::Shader {
     void *cpuShader = nullptr;
 };
 
+struct PreviewGpuCanvasHost::EglTexture {
+    AuroraEglFrame frame = {};
+    ~EglTexture() { aurora_egl_frame_release(&frame); }
+};
+
 PreviewGpuCanvasHost::PreviewGpuCanvasHost()
     : m_cpu(mg_gfx_standin())
     , m_surface(nullptr)
@@ -678,6 +741,8 @@ bool PreviewGpuCanvasHost::prepareTexturePresentation(QOpenGLContext *shareConte
     m_presentUser = presentUser;
     if (offscreenWorker)
         m_offscreenContexts = std::make_shared<PreviewGpuOffscreenContexts>();
+    if (!enableNativeEglTextures())
+        qWarning("WebView GPU: native EGL texture capture unavailable; software fallback");
     return true;
 }
 
@@ -693,6 +758,109 @@ bool PreviewGpuCanvasHost::prepareCpuPresentation(QOpenGLContext *shareContext, 
     m_presentUser = presentUser;
     m_offscreenContexts = std::make_shared<PreviewGpuOffscreenContexts>();
     return true;
+}
+
+bool PreviewGpuCanvasHost::prepareRemotePresentationWithCpuFallback(
+    QOpenGLContext *shareContext, Present presentCallback, Release releaseCallback,
+    PresentPixels fallback, void *presentUser)
+{
+    if (!fallback || !prepareRemotePresentation(shareContext, presentCallback, releaseCallback, presentUser))
+        return false;
+    if (m_presentPixels && m_presentPixels != fallback) return false;
+    m_presentPixels = fallback;
+    return true;
+}
+
+bool PreviewGpuCanvasHost::enableNativeEglTextures()
+{
+    if (m_nativeEglTextures)
+        return true;
+    QOpenGLContext *previous = QOpenGLContext::currentContext();
+    QSurface *previousSurface = previous ? previous->surface() : nullptr;
+    if (!m_surface || !m_shareContext)
+        return false;
+    // The share context belongs to the Qt render thread; probe with a same-group context owned by this thread.
+    QOpenGLContext probe;
+    probe.setFormat(m_shareContext->format());
+    probe.setShareContext(m_shareContext.data());
+    if (!probe.create() || probe.shareGroup() != m_shareContext->shareGroup() || !probe.makeCurrent(m_surface))
+        return false;
+    const EGLDisplay display = eglGetCurrentDisplay();
+#ifdef ACL_HAVE_WAYLAND_EGL
+    if (QGuiApplication::platformName().startsWith(QLatin1String("wayland"))) {
+        QPlatformNativeInterface *native = QGuiApplication::platformNativeInterface();
+        if (native)
+            m_waylandCompositor = native->nativeResourceForIntegration(QByteArrayLiteral("compositor"));
+    }
+#endif
+    m_nativeEglDisplay = display;
+    const QByteArray extensions = display == EGL_NO_DISPLAY ? QByteArray() :
+        QByteArray(eglQueryString(display, EGL_EXTENSIONS));
+    const auto has = [&extensions](const char *name) {
+        return (QByteArray(" ") + extensions + " ").contains(QByteArray(" ") + name + " ");
+    };
+    bool ready = has("EGL_KHR_image_base") && has("EGL_KHR_gl_texture_2D_image") &&
+        has("EGL_KHR_fence_sync") && has("EGL_KHR_wait_sync") &&
+        probe.hasExtension(QByteArrayLiteral("GL_OES_EGL_image"));
+    if (ready) {
+        EGLint configAttrs[] = {
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE
+        };
+        const EGLint surfaceAttrs[] = { EGL_WIDTH, 8, EGL_HEIGHT, 8, EGL_NONE };
+        EGLConfig config = nullptr;
+        EGLint count = 0;
+        ready = eglChooseConfig(display, configAttrs, &config, 1, &count) && count == 1;
+        bool hostSurface = false;
+        if (!ready && m_waylandCompositor) {
+            configAttrs[1] = EGL_WINDOW_BIT;
+            count = 0;
+            ready = eglChooseConfig(display, configAttrs, &config, 1, &count) && count == 1;
+            hostSurface = ready;
+        }
+        if (ready) {
+            void *token = nullptr;
+            EGLSurface surface = hostSurface
+                ? static_cast<EGLSurface>(eglSurfaceNew(this, display, config, 8, 8, &token))
+                : eglCreatePbufferSurface(display, config, surfaceAttrs);
+            const EGLint contextAttrs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+            EGLContext producer = eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttrs);
+            const EGLContext original = eglGetCurrentContext();
+            const EGLSurface draw = eglGetCurrentSurface(EGL_DRAW);
+            const EGLSurface read = eglGetCurrentSurface(EGL_READ);
+            AuroraEglFrame frame = {};
+            char failure[256] = {};
+            ready = surface != EGL_NO_SURFACE && producer != EGL_NO_CONTEXT &&
+                    eglMakeCurrent(display, surface, surface, producer);
+            if (ready)
+                ready = aurora_egl_frame_capture(display, surface, 8, 8, 0,
+                                                  &frame, failure, sizeof(failure)) == AURORA_EGL_FRAME_READY;
+            const bool restored = eglMakeCurrent(display, draw, read, original);
+            ready = ready && restored;
+            if (ready) {
+                const GLuint imported = aurora_egl_frame_import(&frame);
+                ready = imported != 0;
+                if (imported) probe.functions()->glDeleteTextures(1, &imported);
+            }
+            aurora_egl_frame_release(&frame);
+            if (token) eglSurfaceFree(this, token);
+            else if (surface != EGL_NO_SURFACE && !eglDestroySurface(display, surface)) ready = false;
+            if (producer != EGL_NO_CONTEXT && !eglDestroyContext(display, producer)) ready = false;
+            if (!ready && failure[0]) qWarning("GPU Canvas EGL probe: %s", failure);
+        }
+        if (!ready)
+            qWarning("GPU Canvas EGL display cannot capture and import a WebView surface");
+    }
+    probe.doneCurrent();
+    if (previous && previousSurface && !previous->makeCurrent(previousSurface)) {
+        qWarning("GPU Canvas could not restore the previous context after the EGL capability probe");
+        m_nativeEglDisplay = nullptr;
+        m_nativeEglTextures = false;
+        return false;
+    }
+    m_nativeEglTextures = ready;
+    m_nativeEglDisplay = ready ? display : nullptr;
+    return ready;
 }
 
 bool PreviewGpuCanvasHost::prepareContext(QOpenGLContext *shareContext)
@@ -766,6 +934,77 @@ void PreviewGpuCanvasHost::install(megler_gfx_host *host)
     host->shader_free = shaderFree;
     host->present = present;
     if (m_offscreenContexts) host->release_thread = releaseThread;
+    if (m_nativeEglTextures) {
+        host->texture_egl_frame = textureEglFrame;
+        host->draw_texture = drawTexture;
+        if (m_waylandCompositor) {
+            host->egl_surface_configs = eglSurfaceConfigs;
+            host->egl_surface_new = eglSurfaceNew;
+            host->egl_surface_free = eglSurfaceFree;
+        }
+    }
+}
+
+int MEGLER_CB PreviewGpuCanvasHost::eglSurfaceConfigs(void *user, void *display, int version,
+                                                       void **configs, int capacity)
+{
+    auto *self = static_cast<PreviewGpuCanvasHost *>(user);
+    if (!self || !self->m_waylandCompositor || display != self->m_nativeEglDisplay ||
+        !configs || capacity <= 0 || (version != 2 && version != 3))
+        return 0;
+    const EGLint attrs[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, version == 3 ? 0x40 : EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE
+    };
+    EGLint count = 0;
+    return eglChooseConfig(static_cast<EGLDisplay>(display), attrs, configs, capacity, &count)
+        ? qMin(count, capacity) : 0;
+}
+
+void *MEGLER_CB PreviewGpuCanvasHost::eglSurfaceNew(void *user, void *display, void *config,
+                                                    int width, int height, void **token)
+{
+    if (token) *token = nullptr;
+#ifdef ACL_HAVE_WAYLAND_EGL
+    auto *self = static_cast<PreviewGpuCanvasHost *>(user);
+    if (!self || !token || !self->m_waylandCompositor || display != self->m_nativeEglDisplay ||
+        !config || width <= 0 || height <= 0)
+        return nullptr;
+    auto *native = new InvisibleEglWindow{static_cast<EGLDisplay>(display), EGL_NO_SURFACE, nullptr, nullptr};
+    native->waylandSurface = wl_compositor_create_surface(static_cast<wl_compositor *>(self->m_waylandCompositor));
+    if (native->waylandSurface)
+        native->window = wl_egl_window_create(native->waylandSurface, width, height);
+    if (native->window)
+        native->surface = eglCreateWindowSurface(native->display, static_cast<EGLConfig>(config),
+                                                 reinterpret_cast<EGLNativeWindowType>(native->window), nullptr);
+    if (native->surface == EGL_NO_SURFACE) {
+        if (native->window) wl_egl_window_destroy(native->window);
+        if (native->waylandSurface) wl_surface_destroy(native->waylandSurface);
+        delete native;
+        return nullptr;
+    }
+    *token = native;
+    return native->surface;
+#else
+    Q_UNUSED(user) Q_UNUSED(display) Q_UNUSED(config) Q_UNUSED(width) Q_UNUSED(height)
+    return nullptr;
+#endif
+}
+
+void MEGLER_CB PreviewGpuCanvasHost::eglSurfaceFree(void *user, void *token)
+{
+    Q_UNUSED(user)
+#ifdef ACL_HAVE_WAYLAND_EGL
+    auto *native = static_cast<InvisibleEglWindow *>(token);
+    if (!native) return;
+    if (!eglDestroySurface(native->display, native->surface))
+        qWarning("GPU Canvas could not destroy its invisible EGL window surface");
+    wl_egl_window_destroy(native->window);
+    wl_surface_destroy(native->waylandSurface);
+    delete native;
+#else
+    Q_UNUSED(token)
+#endif
 }
 
 void MEGLER_CB PreviewGpuCanvasHost::releaseThread(void *user)
@@ -789,7 +1028,9 @@ void PreviewGpuCanvasHost::releaseThreadContext()
 {
     if (threadContext.owner != this)
         return;
-    if (threadContext.context && QOpenGLContext::currentContext() != threadContext.context &&
+    if (threadContext.context &&
+        (QOpenGLContext::currentContext() != threadContext.context ||
+         eglGetCurrentContext() != threadContext.eglContext) &&
         !ensureCurrent("release-thread"))
         qWarning("GPU Canvas could not make its context current during thread cleanup");
     threadContext.clear();
@@ -825,9 +1066,16 @@ bool PreviewGpuCanvasHost::ensureCurrent(const char *origin)
             m_offscreenContexts->owners.insert(threadContext.tid, {QByteArray(name), origin, "unbound"});
         }
     }
-    if (QOpenGLContext::currentContext() != threadContext.context
-        && !threadContext.context->makeCurrent(m_surface))
-        return false;
+    if (QOpenGLContext::currentContext() != threadContext.context ||
+        eglGetCurrentContext() != threadContext.eglContext) {
+        if (QOpenGLContext::currentContext() == threadContext.context)
+            threadContext.context->doneCurrent();
+        if (!threadContext.context->makeCurrent(m_surface))
+            return false;
+        threadContext.eglContext = eglGetCurrentContext();
+        if (threadContext.eglContext == EGL_NO_CONTEXT)
+            return false;
+    }
     if (threadContext.offscreenContexts && !threadContext.wasBound) {
         QMutexLocker lock(&threadContext.offscreenContexts->mutex);
         threadContext.offscreenContexts->owners[threadContext.tid].state = "was-bound";
@@ -1042,12 +1290,38 @@ bool PreviewGpuCanvasHost::upload(Canvas *canvas)
     }
     QOpenGLFunctions *gl = threadContext.context->functions();
     GLint previous = 0;
+    GLint unpackAlignment = 4;
+    GLint unpackBuffer = 0;
+    GLint unpackRowLength = 0;
+    GLint unpackSkipPixels = 0;
+    GLint unpackSkipRows = 0;
+    const bool gles3 = threadContext.context->isOpenGLES() &&
+                       threadContext.context->format().majorVersion() >= 3;
     clearGlErrors(gl);
     gl->glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+    gl->glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpackAlignment);
+    if (gles3) {
+        gl->glGetIntegerv(0x88EF, &unpackBuffer); // GL_PIXEL_UNPACK_BUFFER_BINDING
+        gl->glGetIntegerv(0x0CF2, &unpackRowLength); // GL_UNPACK_ROW_LENGTH
+        gl->glGetIntegerv(0x0CF3, &unpackSkipRows); // GL_UNPACK_SKIP_ROWS
+        gl->glGetIntegerv(0x0CF4, &unpackSkipPixels); // GL_UNPACK_SKIP_PIXELS
+        gl->glBindBuffer(0x88EC, 0); // GL_PIXEL_UNPACK_BUFFER
+        gl->glPixelStorei(0x0CF2, 0);
+        gl->glPixelStorei(0x0CF3, 0);
+        gl->glPixelStorei(0x0CF4, 0);
+    }
+    gl->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     gl->glBindTexture(GL_TEXTURE_2D, canvas->texture);
     gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, canvas->width, canvas->height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.constData());
     const GLenum error = gl->glGetError();
     gl->glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous));
+    gl->glPixelStorei(GL_UNPACK_ALIGNMENT, unpackAlignment);
+    if (gles3) {
+        gl->glPixelStorei(0x0CF2, unpackRowLength);
+        gl->glPixelStorei(0x0CF3, unpackSkipRows);
+        gl->glPixelStorei(0x0CF4, unpackSkipPixels);
+        gl->glBindBuffer(0x88EC, static_cast<GLuint>(unpackBuffer));
+    }
     if (error != GL_NO_ERROR)
         qWarning("GPU Canvas upload failed (OpenGL error 0x%x)", static_cast<unsigned int>(error));
     else {
@@ -2863,6 +3137,18 @@ bool MEGLER_CB PreviewGpuCanvasHost::present(void *user, void *handle, int, int,
             self->m_metrics->finishPresent(false, sample, sample.sampled ? static_cast<quint64>(timer.nsecsElapsed() / 1000) : 0, 0);
         return false;
     }
+    if (self->m_present && self->m_presentPixels) {
+        QOpenGLFunctions *gl = threadContext.context->functions();
+        clearGlErrors(gl);
+        gl->glFinish();
+        if (gl->glGetError() == GL_NO_ERROR &&
+            self->m_present(self->m_presentUser, canvas->texture, canvas->width, canvas->height)) {
+            if (sample.enabled)
+                self->m_metrics->finishPresent(true, sample,
+                    sample.sampled ? static_cast<quint64>(timer.nsecsElapsed() / 1000) : 0, 0);
+            return true;
+        }
+    }
     if (self->m_presentPixels) {
         const bool read = self->readback(canvas, PreviewGpuReadbackReason::Present);
         const quint64 producerUs = sample.sampled ? static_cast<quint64>(timer.nsecsElapsed() / 1000) : 0;
@@ -2892,6 +3178,145 @@ bool MEGLER_CB PreviewGpuCanvasHost::present(void *user, void *handle, int, int,
         self->m_metrics->finishPresent(result, sample, producerUs, qtWaitUs);
     }
     return result;
+}
+
+int MEGLER_CB PreviewGpuCanvasHost::textureEglFrame(void *user, int id, void *display,
+                                                    void *surface, int width, int height)
+{
+    auto *self = static_cast<PreviewGpuCanvasHost *>(user);
+    if (!self || id <= 0 || !self->m_nativeEglTextures)
+        return 0;
+    if (!display && !surface) {
+        QMutexLocker lock(&self->m_mutex);
+        self->m_eglTextures.remove(id);
+        return 1;
+    }
+    if (!display || !surface || width <= 0 || height <= 0 || width > 8192 || height > 8192)
+        return 0;
+    auto texture = std::make_shared<EglTexture>();
+    char failure[256] = {};
+    const AuroraEglFrameResult result = aurora_egl_frame_capture(
+        static_cast<EGLDisplay>(display), static_cast<EGLSurface>(surface),
+        width, height, 0, &texture->frame, failure, sizeof(failure));
+    if (result != AURORA_EGL_FRAME_READY) {
+        qWarning("GPU Canvas could not capture a native EGL texture: %s", failure);
+        return result == AURORA_EGL_FRAME_CONTEXT_LOST ? -1 : 0;
+    }
+    QMutexLocker lock(&self->m_mutex);
+    self->m_eglTextures.insert(id, std::move(texture));
+    return 1;
+}
+
+void MEGLER_CB PreviewGpuCanvasHost::drawTexture(void *user, void *handle, int id,
+                                                  float left, float top, float right, float bottom, int alpha)
+{
+    auto *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
+    Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
+    if (!canvas || right <= left || bottom <= top || alpha <= 0)
+        return;
+    std::shared_ptr<EglTexture> image;
+    {
+        QMutexLocker lock(&self->m_mutex);
+        image = self->m_eglTextures.value(id);
+    }
+    if (!image)
+        return;
+    Bitmap::ScopedLocks bitmapLock(canvas->bitmap, nullptr);
+    if (!self->ensureCurrent("draw-egl-texture") ||
+        (canvas->gpuBacked && !self->ensureBitmapCurrent(canvas))) {
+        qWarning("GPU Canvas could not make the EGL texture consumer current");
+        return;
+    }
+    QOpenGLFunctions *gl = threadContext.context->functions();
+    const GLuint texture = aurora_egl_frame_import(&image->frame);
+    if (!texture) {
+        qWarning("GPU Canvas could not import a native EGL texture");
+        return;
+    }
+    Canvas source;
+    {
+        QMutexLocker lock(&self->m_mutex);
+        source.id = self->m_nextCanvasId++;
+    }
+    source.texture = texture;
+    source.width = image->frame.width;
+    source.height = image->frame.height;
+    source.states.append(Canvas::State());
+    const bool framebufferReady = self->ensureFramebuffer(&source, "egl-texture-source");
+    const Canvas::State &state = canvas->states.last();
+    const auto integral = [](qreal n) {
+        return n >= -16777216 && n <= 16777216 && n == std::floor(n);
+    };
+    const QRectF bounds(left + state.matrix.dx(), top + state.matrix.dy(), right - left, bottom - top);
+    megler_gfx_paint paint = {};
+    paint.color = qRgba(255, 255, 255, qBound(0, alpha, 255));
+    paint.blend = MEGLER_GFX_BLEND_SRC_OVER;
+    paint.filter_mode = MEGLER_GFX_BLEND_DST;
+    paint.flags = MEGLER_GFX_FILTER_BITMAP;
+    bool drawn = false;
+    if (framebufferReady && canvas->gpuBacked && state.copyClipValid &&
+        state.matrix.type() <= QTransform::TxTranslate &&
+        integral(bounds.left()) && integral(bounds.top()) &&
+        integral(bounds.right()) && integral(bounds.bottom())) {
+        drawn = self->drawFiltered(canvas, &paint, bounds, {}, &source,
+                                   QRect(0, 0, source.width, source.height));
+    }
+    if (!drawn && framebufferReady) {
+        const qint64 bytes = qint64(source.width) * source.height * 4;
+        if (bytes <= INT_MAX) {
+            QByteArray rgba(int(bytes), '\0');
+            QByteArray bgra(int(bytes), '\0');
+            GLint previous = 0, pack = 4;
+            GLint packBuffer = 0, rowLength = 0, skipPixels = 0, skipRows = 0;
+            const bool gles3 = threadContext.context->isOpenGLES() &&
+                               threadContext.context->format().majorVersion() >= 3;
+            gl->glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous);
+            gl->glGetIntegerv(GL_PACK_ALIGNMENT, &pack);
+            if (gles3) {
+                gl->glGetIntegerv(0x88ED, &packBuffer); // GL_PIXEL_PACK_BUFFER_BINDING
+                gl->glGetIntegerv(0x0D02, &rowLength); // GL_PACK_ROW_LENGTH
+                gl->glGetIntegerv(0x0D04, &skipPixels); // GL_PACK_SKIP_PIXELS
+                gl->glGetIntegerv(0x0D03, &skipRows); // GL_PACK_SKIP_ROWS
+                gl->glBindBuffer(0x88EB, 0); // GL_PIXEL_PACK_BUFFER
+                gl->glPixelStorei(0x0D02, 0);
+                gl->glPixelStorei(0x0D04, 0);
+                gl->glPixelStorei(0x0D03, 0);
+            }
+            gl->glBindFramebuffer(GL_FRAMEBUFFER, threadContext.framebuffers.value(source.id).id);
+            gl->glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            clearGlErrors(gl);
+            gl->glReadPixels(0, 0, source.width, source.height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+            const GLenum error = gl->glGetError();
+            gl->glPixelStorei(GL_PACK_ALIGNMENT, pack);
+            if (gles3) {
+                gl->glPixelStorei(0x0D02, rowLength);
+                gl->glPixelStorei(0x0D04, skipPixels);
+                gl->glPixelStorei(0x0D03, skipRows);
+                gl->glBindBuffer(0x88EB, GLuint(packBuffer));
+            }
+            gl->glBindFramebuffer(GL_FRAMEBUFFER, GLuint(previous));
+            if (error == GL_NO_ERROR &&
+                (canvas->gpuBacked ? self->readback(canvas, PreviewGpuReadbackReason::Self)
+                                   : self->ensureCpuMirrorCurrent(canvas->bitmap))) {
+                copyReadbackRgbaToBgra(reinterpret_cast<const uint8_t *>(rgba.constData()),
+                                       reinterpret_cast<uint8_t *>(bgra.data()),
+                                       source.width, source.height, source.width * 4);
+                const megler_gfx_image pixels = { bgra.constData(), source.width, source.height,
+                                                  source.width * 4, 0, 0 };
+                const float src[] = { 0, 0, float(source.width), float(source.height) };
+                const float dst[] = { left, top, right, bottom };
+                paint.filter_mode = -1;
+                self->m_cpu->draw_bitmap(self->m_cpu->user, canvas->cpuCanvas, &pixels, src, dst, &paint);
+                self->markCpuWrite(canvas->bitmap);
+                drawn = !canvas->gpuBacked || self->upload(canvas);
+            }
+        }
+    }
+    self->removeFramebuffer(&source);
+    gl->glDeleteTextures(1, &texture);
+    if (!drawn)
+        qWarning("GPU Canvas could not draw a native EGL texture");
 }
 
 bool PreviewGpuCanvasHost::drawTextPath(void *handle, const float *path, int count, int fill,

@@ -8,11 +8,13 @@
 
 #include <cerrno>
 #include <cstring>
+#include <memory>
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -22,7 +24,7 @@ namespace {
 const int HeaderSize = 28;
 const int MaxPackageBytes = 255;
 const int MaxInputBytes = 4096;
-const int FrameHeaderSize = 48;
+const int FrameHeaderSize = 56;
 const int MaxFrameChunkBytes = 60 * 1024;
 const int MaxFrameBytes = 16 * 1024 * 1024;
 const int StartupTimeoutMs = 15000;
@@ -64,6 +66,19 @@ void setError(QString *error, const QString &message)
 {
     if (error) *error = message;
 }
+
+bool hasWaylandSocket()
+{
+    QByteArray display = qgetenv("WAYLAND_DISPLAY");
+    if (display.isEmpty()) display = "wayland-0";
+    if (!display.startsWith('/')) {
+        const QByteArray runtime = qgetenv("XDG_RUNTIME_DIR");
+        if (runtime.isEmpty()) return false;
+        display = runtime + '/' + display;
+    }
+    struct stat status;
+    return ::stat(display.constData(), &status) == 0 && S_ISSOCK(status.st_mode);
+}
 }
 
 SharedMicrogSupervisor::SharedMicrogSupervisor(QObject *parent)
@@ -71,6 +86,33 @@ SharedMicrogSupervisor::SharedMicrogSupervisor(QObject *parent)
 {
     m_reaper.setInterval(250);
     connect(&m_reaper, &QTimer::timeout, this, &SharedMicrogSupervisor::reapChild);
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    m_gpuTransport.setFrameHandler([this](AuroraDmaBufFrame &&frame) {
+        const quint64 id = frame.id;
+        // UI_STARTED is sent before drawing, but its socket may be dispatched after GPU.
+        readUnsolicited();
+        if (frame.probeOnly || !frame.channel || frame.channel != m_authUiChannel ||
+            frame.generation != m_authUiGeneration || id <= m_lastGpuFrameId || !m_gpuFrameHandler) {
+            m_gpuTransport.sendReply(id, false);
+            return;
+        }
+        m_lastGpuFrameId = id;
+        const int replyFd = m_gpuTransport.duplicatePeer();
+        if (replyFd < 0) {
+            m_gpuTransport.sendReply(id, false);
+            return;
+        }
+        const std::shared_ptr<int> replySocket(new int(replyFd), [](int *fd) {
+            ::close(*fd);
+            delete fd;
+        });
+        if (!m_gpuFrameHandler(std::move(frame), [replySocket](quint64 frameId, bool accepted) {
+                if (!EmbeddedGpuTransport::sendReplyPacket(*replySocket, frameId, accepted))
+                    qWarning("Shared microG GPU frame acknowledgement failed.");
+            }))
+            m_gpuTransport.sendReply(id, false);
+    });
+#endif
 }
 
 SharedMicrogSupervisor::~SharedMicrogSupervisor()
@@ -101,6 +143,17 @@ bool SharedMicrogSupervisor::configure(const QString &program, const QStringList
 bool SharedMicrogSupervisor::start(QString *error)
 {
     if (m_pid > 0 && m_ready && checkChild(true)) return true;
+    if (hasWaylandSocket()) {
+        QString gpuError;
+        if (startAttempt(true, &gpuError)) return true;
+        qWarning("Shared microG: native EGL worker unavailable (%s); retrying with software graphics",
+                 qPrintable(gpuError));
+    }
+    return startAttempt(false, error);
+}
+
+bool SharedMicrogSupervisor::startAttempt(bool gpu, QString *error)
+{
     if (!isConfigured()) {
         setError(error, QStringLiteral("The shared microG worker is not configured."));
         return false;
@@ -118,18 +171,34 @@ bool SharedMicrogSupervisor::start(QString *error)
         setError(error, QString::fromLocal8Bit(std::strerror(socketError)));
         return false;
     }
-    const int parentFd = ::fcntl(controlSockets[0], F_DUPFD_CLOEXEC, 5);
-    const int childFd = ::fcntl(controlSockets[1], F_DUPFD_CLOEXEC, 5);
-    const int parentFrameFd = ::fcntl(frameSockets[0], F_DUPFD_CLOEXEC, 5);
-    const int childFrameFd = ::fcntl(frameSockets[1], F_DUPFD_CLOEXEC, 5);
+    int gpuSockets[2] = {-1, -1};
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    if (gpu && ::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, gpuSockets) != 0) {
+        const int socketError = errno;
+        for (int fd : controlSockets) ::close(fd);
+        for (int fd : frameSockets) ::close(fd);
+        setError(error, QString::fromLocal8Bit(std::strerror(socketError)));
+        return false;
+    }
+#endif
+    const int parentFd = ::fcntl(controlSockets[0], F_DUPFD_CLOEXEC, 7);
+    const int childFd = ::fcntl(controlSockets[1], F_DUPFD_CLOEXEC, 7);
+    const int parentFrameFd = ::fcntl(frameSockets[0], F_DUPFD_CLOEXEC, 7);
+    const int childFrameFd = ::fcntl(frameSockets[1], F_DUPFD_CLOEXEC, 7);
+    const int parentGpuFd = gpuSockets[0] >= 0 ? ::fcntl(gpuSockets[0], F_DUPFD_CLOEXEC, 7) : -1;
+    const int childGpuFd = gpuSockets[1] >= 0 ? ::fcntl(gpuSockets[1], F_DUPFD_CLOEXEC, 7) : -1;
     const int duplicateError = errno;
     for (int fd : controlSockets) ::close(fd);
     for (int fd : frameSockets) ::close(fd);
-    if (parentFd < 0 || childFd < 0 || parentFrameFd < 0 || childFrameFd < 0) {
+    for (int fd : gpuSockets) if (fd >= 0) ::close(fd);
+    if (parentFd < 0 || childFd < 0 || parentFrameFd < 0 || childFrameFd < 0 ||
+        (gpuSockets[0] >= 0 && (parentGpuFd < 0 || childGpuFd < 0))) {
         if (parentFd >= 0) ::close(parentFd);
         if (childFd >= 0) ::close(childFd);
         if (parentFrameFd >= 0) ::close(parentFrameFd);
         if (childFrameFd >= 0) ::close(childFrameFd);
+        if (parentGpuFd >= 0) ::close(parentGpuFd);
+        if (childGpuFd >= 0) ::close(childGpuFd);
         setError(error, QString::fromLocal8Bit(std::strerror(duplicateError)));
         return false;
     }
@@ -139,10 +208,13 @@ bool SharedMicrogSupervisor::start(QString *error)
     const bool actionsInitialized = status == 0;
     if (status == 0) status = ::posix_spawn_file_actions_adddup2(&actions, childFd, 3);
     if (status == 0) status = ::posix_spawn_file_actions_adddup2(&actions, childFrameFd, 4);
+    if (status == 0 && childGpuFd >= 0) status = ::posix_spawn_file_actions_adddup2(&actions, childGpuFd, 5);
     if (status == 0) status = ::posix_spawn_file_actions_addclose(&actions, parentFd);
     if (status == 0) status = ::posix_spawn_file_actions_addclose(&actions, childFd);
     if (status == 0) status = ::posix_spawn_file_actions_addclose(&actions, parentFrameFd);
     if (status == 0) status = ::posix_spawn_file_actions_addclose(&actions, childFrameFd);
+    if (status == 0 && parentGpuFd >= 0) status = ::posix_spawn_file_actions_addclose(&actions, parentGpuFd);
+    if (status == 0 && childGpuFd >= 0) status = ::posix_spawn_file_actions_addclose(&actions, childGpuFd);
 
     QList<QByteArray> encodedArguments;
     encodedArguments << m_program.toLocal8Bit()
@@ -151,6 +223,7 @@ bool SharedMicrogSupervisor::start(QString *error)
                      << QByteArrayLiteral("--control-fd=3")
                      << QByteArrayLiteral("--frame-fd=4")
                      << QByteArrayLiteral("--protocol-version=1");
+    if (gpu) encodedArguments << QByteArrayLiteral("--gpu-canvas");
     for (const QString &argument : m_arguments)
         encodedArguments << argument.toLocal8Bit();
     QVector<char *> argv;
@@ -165,9 +238,11 @@ bool SharedMicrogSupervisor::start(QString *error)
     if (actionsInitialized) ::posix_spawn_file_actions_destroy(&actions);
     ::close(childFd);
     ::close(childFrameFd);
+    if (childGpuFd >= 0) ::close(childGpuFd);
     if (status != 0) {
         ::close(parentFd);
         ::close(parentFrameFd);
+        if (parentGpuFd >= 0) ::close(parentGpuFd);
         m_pid = -1;
         setError(error, QString::fromLocal8Bit(std::strerror(status)));
         return false;
@@ -175,16 +250,23 @@ bool SharedMicrogSupervisor::start(QString *error)
 
     m_controlFd = parentFd;
     m_frameFd = parentFrameFd;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    if (parentGpuFd >= 0 && !m_gpuTransport.adoptInheritedSocket(parentGpuFd, true, error)) {
+        failWorker(!gpu);
+        return false;
+    }
+    m_lastGpuFrameId = 0;
+#endif
     const int flags = ::fcntl(m_controlFd, F_GETFL);
     const int frameFlags = ::fcntl(m_frameFd, F_GETFL);
     if (flags < 0 || ::fcntl(m_controlFd, F_SETFL, flags | O_NONBLOCK) != 0 ||
         frameFlags < 0 || ::fcntl(m_frameFd, F_SETFL, frameFlags | O_NONBLOCK) != 0) {
         setError(error, QStringLiteral("Cannot configure the shared microG worker sockets."));
-        failWorker();
+        failWorker(!gpu);
         return false;
     }
-    if (!waitForReply(Ready, 0, error)) {
-        failWorker();
+    if (!waitForReply(Ready, 0, error, nullptr, nullptr, !gpu)) {
+        failWorker(!gpu);
         return false;
     }
     m_ready = true;
@@ -228,7 +310,8 @@ bool SharedMicrogSupervisor::sendMessage(MessageType type, quint64 channelId, qu
                  (!open && !input && (uid != 0 || pid != 0)))) ||
         (input && ((!m_channels.contains(channelId) &&
                     !(type == UiResize && m_openingChannels.contains(channelId))) ||
-                   !channelId || fd >= 0))) {
+                   !channelId || fd >= 0 || channelId != m_authUiChannel ||
+                   !m_authUiGeneration))) {
         setError(error, QStringLiteral("Invalid shared microG control message."));
         return false;
     }
@@ -263,15 +346,17 @@ bool SharedMicrogSupervisor::sendMessage(MessageType type, quint64 channelId, qu
         setError(error, QStringLiteral("Invalid shared microG UI size."));
         return false;
     }
-    QByteArray payload(HeaderSize + package.size(), '\0');
+    const int prefixSize = input ? 8 : 0;
+    QByteArray payload(HeaderSize + prefixSize + package.size(), '\0');
     std::memcpy(payload.data(), "MGR1", 4);
     write32(payload.data() + 4, static_cast<quint32>(type));
     write64(payload.data() + 8, channelId);
     write32(payload.data() + 16, uid);
     write32(payload.data() + 20, pid);
-    write32(payload.data() + 24, static_cast<quint32>(package.size()));
+    write32(payload.data() + 24, static_cast<quint32>(prefixSize + package.size()));
+    if (input) write64(payload.data() + HeaderSize, m_authUiGeneration);
     if (!package.isEmpty())
-        std::memcpy(payload.data() + HeaderSize, package.constData(), static_cast<size_t>(package.size()));
+        std::memcpy(payload.data() + HeaderSize + prefixSize, package.constData(), static_cast<size_t>(package.size()));
 
     struct iovec vector;
     vector.iov_base = payload.data();
@@ -398,14 +483,15 @@ bool SharedMicrogSupervisor::receiveMessage(Message *message, QString *error, bo
     message->packageLength = read32(payload + 24);
     const bool simple = message->type == Ready || message->type == Ack ||
                         message->type == Nack || message->type == Disconnected ||
-                        message->type == UiStarted || message->type == UiFinished ||
                         message->type == KeyboardHide;
+    const bool ui = (message->type == UiStarted || message->type == UiFinished) &&
+                    (message->uid || message->pid) && !message->packageLength;
     const bool frameDiagnostic = message->type == FrameDelivered ||
                                  message->type == FrameSuppressed ||
                                  message->type == FrameSendFailed;
     const bool keyboard = message->type == KeyboardShow &&
                           message->uid <= 7 && message->pid <= 255 && message->packageLength <= 6;
-    if ((!simple && !keyboard && !frameDiagnostic) ||
+    if ((!simple && !ui && !keyboard && !frameDiagnostic) ||
         (simple && (message->uid || message->pid || message->packageLength)) ||
         (frameDiagnostic && (!message->channelId ||
                              (message->type == FrameDelivered &&
@@ -426,7 +512,7 @@ bool SharedMicrogSupervisor::receiveMessage(Message *message, QString *error, bo
     return true;
 }
 
-bool SharedMicrogSupervisor::receiveFrame(QImage *frame, quint64 *channelId,
+bool SharedMicrogSupervisor::receiveFrame(QImage *frame, quint64 *channelId, quint64 *generation,
                                           QString *error, bool *wouldBlock)
 {
     if (wouldBlock) *wouldBlock = false;
@@ -439,7 +525,7 @@ bool SharedMicrogSupervisor::receiveFrame(QImage *frame, quint64 *channelId,
     }
     if (count < FrameHeaderSize || count > packet.size() ||
         std::memcmp(packet.constData(), "MGUI", 4) != 0 ||
-        read32(packet.constData() + 4) != 1) {
+        read32(packet.constData() + 4) != 2) {
         setError(error, QStringLiteral("Invalid shared microG UI frame packet."));
         return false;
     }
@@ -451,7 +537,8 @@ bool SharedMicrogSupervisor::receiveFrame(QImage *frame, quint64 *channelId,
     const quint32 total = read32(packet.constData() + 36);
     const quint32 offset = read32(packet.constData() + 40);
     const quint32 chunk = read32(packet.constData() + 44);
-    if (!channel || !sequence || width == 0 || width > 2048 || height == 0 || height > 2048 ||
+    const quint64 frameGeneration = read64(packet.constData() + 48);
+    if (!channel || !sequence || !frameGeneration || width == 0 || width > 2048 || height == 0 || height > 2048 ||
         stride < width * 4 || stride > width * 4 + 4096 ||
         total != stride * height || total > MaxFrameBytes ||
         chunk == 0 || chunk > MaxFrameChunkBytes ||
@@ -467,13 +554,14 @@ bool SharedMicrogSupervisor::receiveFrame(QImage *frame, quint64 *channelId,
         }
         m_frameSequence = sequence;
         m_frameChannel = channel;
+        m_frameGeneration = frameGeneration;
         m_frameWidth = static_cast<int>(width);
         m_frameHeight = static_cast<int>(height);
         m_frameStride = static_cast<int>(stride);
         m_frameOffset = 0;
         m_frameBuffer.resize(static_cast<int>(total));
     }
-    if (sequence != m_frameSequence || channel != m_frameChannel ||
+    if (sequence != m_frameSequence || channel != m_frameChannel || frameGeneration != m_frameGeneration ||
         width != static_cast<quint32>(m_frameWidth) ||
         height != static_cast<quint32>(m_frameHeight) ||
         stride != static_cast<quint32>(m_frameStride) || offset != m_frameOffset) {
@@ -499,6 +587,7 @@ bool SharedMicrogSupervisor::receiveFrame(QImage *frame, quint64 *channelId,
     m_frameOffset = 0;
     *frame = decoded;
     *channelId = channel;
+    *generation = frameGeneration;
     if (sequence == 1 || sequence % 300 == 0)
         qInfo("Shared microG UI frame assembled: %dx%d, stride=%d, sequence=%llu",
               width, height, stride, static_cast<unsigned long long>(sequence));
@@ -528,25 +617,34 @@ void SharedMicrogSupervisor::handleWorkerEvent(const Message &message)
     }
     if (message.type == UiStarted || message.type == UiFinished) {
         const bool active = message.type == UiStarted;
+        const quint64 generation = (quint64(message.uid) << 32) | message.pid;
+        if (!active && m_closedChannelIds.contains(message.channelId) &&
+            generation <= m_lastUiGeneration &&
+            (m_authUiChannel != message.channelId || m_authUiGeneration != generation))
+            return;
         if (!m_channels.contains(message.channelId) && !m_openingChannels.contains(message.channelId)) {
             failWorker();
             return;
         }
-        if (active && m_authUiChannel && m_authUiChannel != message.channelId) {
+        if ((active && (m_authUiChannel || generation <= m_lastUiGeneration)) ||
+            (!active && (m_authUiChannel != message.channelId || m_authUiGeneration != generation))) {
             failWorker();
             return;
         }
-        if (active) m_authUiChannel = message.channelId;
-        else if (m_authUiChannel == message.channelId) m_authUiChannel = 0;
-        if (!active && m_frameChannel == message.channelId) {
-            m_frameChannel = 0;
-            m_frameBuffer.clear();
+        if (active) {
+            m_authUiChannel = message.channelId;
+            m_authUiGeneration = m_lastUiGeneration = generation;
+        } else {
+            m_authUiChannel = 0;
+            m_authUiGeneration = 0;
         }
         emit authenticationUiChanged(message.channelId, active);
-        if (active && m_lastFrameChannel == message.channelId && !m_lastFrame.isNull())
+        if (active && m_lastFrameChannel == message.channelId &&
+            m_lastFrameGeneration == generation && !m_lastFrame.isNull())
             emit authenticationFrameChanged(message.channelId, m_lastFrame);
-        if (!active && m_lastFrameChannel == message.channelId) {
+        if (!active && m_lastFrameChannel == message.channelId && m_lastFrameGeneration == generation) {
             m_lastFrameChannel = 0;
+            m_lastFrameGeneration = 0;
             m_lastFrame = QImage();
         }
     } else if (message.type == KeyboardShow) {
@@ -561,7 +659,7 @@ void SharedMicrogSupervisor::handleWorkerEvent(const Message &message)
 }
 
 bool SharedMicrogSupervisor::waitForReply(MessageType expected, quint64 channelId, QString *error,
-                                          bool *rejected, bool *disconnected)
+                                          bool *rejected, bool *disconnected, bool reportDeath)
 {
     if (rejected) *rejected = false;
     if (disconnected) *disconnected = false;
@@ -569,7 +667,7 @@ bool SharedMicrogSupervisor::waitForReply(MessageType expected, quint64 channelI
     elapsed.start();
     const int timeout = expected == Ready ? StartupTimeoutMs : RequestTimeoutMs;
     while (elapsed.elapsed() < timeout) {
-        if (!checkChild(true)) {
+        if (!checkChild(reportDeath)) {
             setError(error, QStringLiteral("The shared microG worker exited."));
             return false;
         }
@@ -816,7 +914,7 @@ bool SharedMicrogSupervisor::checkChild(bool reportDeath)
     return false;
 }
 
-void SharedMicrogSupervisor::failWorker()
+void SharedMicrogSupervisor::failWorker(bool notify)
 {
     const bool wasActive = m_pid > 0 || m_ready || !m_channels.isEmpty() ||
                            !m_openingChannels.isEmpty();
@@ -846,7 +944,7 @@ void SharedMicrogSupervisor::failWorker()
     }
     closeControlSocket();
     closeFrameSocket();
-    if (wasActive && !m_stopping) emit workerDied();
+    if (wasActive && !m_stopping && notify) emit workerDied();
 }
 
 void SharedMicrogSupervisor::reapChild()
@@ -862,13 +960,21 @@ void SharedMicrogSupervisor::closeControlSocket()
 
 void SharedMicrogSupervisor::closeFrameSocket()
 {
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    m_gpuTransport.close();
+#endif
     if (m_frameFd >= 0) ::close(m_frameFd);
     m_frameFd = -1;
     m_frameBuffer.clear();
     m_frameOffset = 0;
+    m_frameSequence = 0;
     m_frameChannel = 0;
+    m_frameGeneration = 0;
     m_authUiChannel = 0;
+    m_authUiGeneration = 0;
+    m_lastUiGeneration = 0;
     m_lastFrameChannel = 0;
+    m_lastFrameGeneration = 0;
     m_lastFrame = QImage();
 }
 
@@ -904,10 +1010,10 @@ void SharedMicrogSupervisor::readFrames()
     const int maxPacketsPerDispatch = 16;
     for (int packets = 0; m_frameFd >= 0 && packets < maxPacketsPerDispatch; ++packets) {
         QImage frame;
-        quint64 channel = 0;
+        quint64 channel = 0, generation = 0;
         QString error;
         bool wouldBlock = false;
-        if (!receiveFrame(&frame, &channel, &error, &wouldBlock)) {
+        if (!receiveFrame(&frame, &channel, &generation, &error, &wouldBlock)) {
             if (wouldBlock) return;
             qWarning("Shared microG UI frame rejected: %s", qPrintable(error));
             failWorker();
@@ -915,13 +1021,20 @@ void SharedMicrogSupervisor::readFrames()
         }
         if (frame.isNull()) continue;
         if (!m_channels.contains(channel) && !m_openingChannels.contains(channel)) {
+            if (m_closedChannelIds.contains(channel)) continue;
             qWarning("Shared microG UI frame has no active client channel.");
             failWorker();
             return;
         }
+        if (generation < m_lastUiGeneration ||
+            (generation == m_lastUiGeneration &&
+             (m_authUiChannel != channel || m_authUiGeneration != generation)))
+            continue;
         m_lastFrameChannel = channel;
+        m_lastFrameGeneration = generation;
         m_lastFrame = frame;
-        emit authenticationFrameChanged(channel, frame);
+        if (m_authUiChannel == channel && m_authUiGeneration == generation)
+            emit authenticationFrameChanged(channel, frame);
     }
 }
 
@@ -934,12 +1047,15 @@ void SharedMicrogSupervisor::handleDisconnected(quint64 channelId)
         failWorker();
         return;
     }
+    m_closedChannelIds.insert(channelId);
     if (m_authUiChannel == channelId) {
         m_authUiChannel = 0;
-        m_frameBuffer.clear();
-        m_frameOffset = 0;
-        m_lastFrameChannel = 0;
-        m_lastFrame = QImage();
+        m_authUiGeneration = 0;
+        if (m_lastFrameChannel == channelId && m_lastFrameGeneration <= m_lastUiGeneration) {
+            m_lastFrameChannel = 0;
+            m_lastFrameGeneration = 0;
+            m_lastFrame = QImage();
+        }
         emit authenticationUiChanged(channelId, false);
     }
     m_channels.remove(channelId);

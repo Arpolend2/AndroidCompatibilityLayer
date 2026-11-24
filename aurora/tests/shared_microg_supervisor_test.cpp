@@ -6,17 +6,20 @@
 #include <QFile>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QSocketNotifier>
 
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 namespace {
 enum { Ready = 1, Open = 2, Close = 3, Stop = 4, Ack = 5, Nack = 6, Disconnected = 7 };
-enum { HeaderSize = 28, FrameHeaderSize = 48, FrameChunk = 60 * 1024 };
+enum { HeaderSize = 28, FrameHeaderSize = 56, FrameChunk = 60 * 1024 };
 
 bool sawFrameDelivered = false;
 bool sawFrameSuppressed = false;
@@ -63,9 +66,12 @@ quint64 read64(const char *buffer)
 
 bool sendReply(int fd, quint32 type, quint64 channelId)
 {
+    static quint64 generation = 0;
     char packet[HeaderSize] = { 'M', 'G', 'R', '1' };
     write32(packet + 4, type);
     write64(packet + 8, channelId);
+    if (type == 8) ++generation;
+    if (type == 8 || type == 9) write64(packet + 16, generation);
     return ::send(fd, packet, sizeof(packet), MSG_NOSIGNAL) == sizeof(packet);
 }
 
@@ -100,7 +106,7 @@ bool sendFrame(int fd, quint64 channelId, quint64 sequence, bool nonzero)
         quint32 chunk = total - offset;
         if (chunk > FrameChunk) chunk = FrameChunk;
         std::memcpy(packet, "MGUI", 4);
-        write32(packet + 4, 1);
+        write32(packet + 4, 2);
         write64(packet + 8, channelId);
         write64(packet + 16, sequence);
         write32(packet + 24, width);
@@ -109,6 +115,7 @@ bool sendFrame(int fd, quint64 channelId, quint64 sequence, bool nonzero)
         write32(packet + 36, total);
         write32(packet + 40, offset);
         write32(packet + 44, chunk);
+        write64(packet + 48, 1);
         unsigned char *pixels = reinterpret_cast<unsigned char *>(packet + FrameHeaderSize);
         for (quint32 i = 0; i < chunk; ++i)
             pixels[i] = nonzero ? static_cast<unsigned char>((offset + i) * 37 + 11) : 0;
@@ -120,11 +127,12 @@ bool sendFrame(int fd, quint64 channelId, quint64 sequence, bool nonzero)
     return true;
 }
 
-bool sendSmallFrame(int fd, quint64 channelId, quint64 sequence = 1)
+bool sendSmallFrame(int fd, quint64 channelId, quint64 sequence = 1,
+                    quint64 generation = 1, unsigned char fill = 1)
 {
     char packet[FrameHeaderSize + 16];
     std::memcpy(packet, "MGUI", 4);
-    write32(packet + 4, 1);
+    write32(packet + 4, 2);
     write64(packet + 8, channelId);
     write64(packet + 16, sequence);
     write32(packet + 24, 2);
@@ -133,15 +141,68 @@ bool sendSmallFrame(int fd, quint64 channelId, quint64 sequence = 1)
     write32(packet + 36, 16);
     write32(packet + 40, 0);
     write32(packet + 44, 16);
+    write64(packet + 48, generation);
     for (int i = 0; i < 16; ++i)
-        packet[FrameHeaderSize + i] = static_cast<char>(i + 1);
+        packet[FrameHeaderSize + i] = static_cast<char>(fill + i);
     return ::send(fd, packet, sizeof(packet), MSG_NOSIGNAL) ==
            static_cast<ssize_t>(sizeof(packet));
 }
 
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+bool sendGpuFixture(quint64 channel, quint64 generation, quint64 id, bool expected)
+{
+    AuroraDmaBufFrame frame;
+    frame.id = id;
+    frame.channel = channel;
+    frame.generation = generation;
+    frame.width = frame.height = 2;
+    frame.fourcc = 0x34325241;
+    frame.planeCount = 1;
+    frame.strides[0] = 8;
+    frame.fds[0] = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (frame.fds[0] < 0 || !EmbeddedGpuTransport::sendFramePacket(5, frame)) return false;
+    struct pollfd ready = {5, POLLIN, 0};
+    bool accepted = false;
+    return ::poll(&ready, 1, 2000) > 0 &&
+        EmbeddedGpuTransport::receiveReplyPacket(5, id, &accepted) && accepted == expected;
+}
+
+int gpuFixtureWorker()
+{
+    if (!sendReply(3, Ready, 0)) return 60;
+    char packet[HeaderSize + 255], ancillary[CMSG_SPACE(sizeof(int))];
+    struct iovec vec = {packet, sizeof(packet)};
+    struct msghdr message = {};
+    message.msg_iov = &vec;
+    message.msg_iovlen = 1;
+    message.msg_control = ancillary;
+    message.msg_controllen = sizeof(ancillary);
+    if (::recvmsg(3, &message, MSG_CMSG_CLOEXEC) < HeaderSize || read32(packet + 4) != Open)
+        return 61;
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+        header->cmsg_len != CMSG_LEN(sizeof(int))) return 62;
+    int client = -1;
+    std::memcpy(&client, CMSG_DATA(header), sizeof(client));
+    const quint64 channel = read64(packet + 8);
+    if (!sendReply(3, 8, channel) || !sendReply(3, Ack, channel) ||
+        !sendGpuFixture(channel, 1, 1, true) ||
+        !sendReply(3, 9, channel) || !sendReply(3, 8, channel)) return 63;
+    char marker = 0;
+    if (::recv(client, &marker, 1, 0) != 1 || marker != '2' ||
+        !sendGpuFixture(channel, 1, 2, false) ||
+        !sendGpuFixture(channel, 2, 3, true) || !sendReply(3, 9, channel)) return 64;
+    if (::recv(client, &marker, 1, 0) != 1 || marker != '3' ||
+        !sendGpuFixture(channel, 2, 4, false) ||
+        ::send(client, "D", 1, MSG_NOSIGNAL) != 1) return 65;
+    ::close(client);
+    return 0;
+}
+#endif
+
 int fakeWorker(bool rejectOpen, bool disconnectOpen, bool disconnectOnClose, bool exitAfterReady,
                bool sendFrames, bool sendFrameBeforeUi, bool sendKeyboard, bool receiveResize,
-               bool sendBurst)
+               bool sendBurst, bool sendStaleFrame)
 {
     struct Channel {
         quint64 id;
@@ -207,7 +268,14 @@ int fakeWorker(bool rejectOpen, bool disconnectOpen, bool disconnectOnClose, boo
                 if (!sendReply(3, 8, channelId)) return 36;
             }
             if ((sendKeyboard || receiveResize) && !sendReply(3, 8, channelId)) return 44;
+            if (sendStaleFrame) {
+                if (!sendReply(3, 8, channelId) || !sendReply(3, 9, channelId) ||
+                    !sendReply(3, 8, channelId)) return 51;
+            }
             if (!sendReply(3, Ack, channelId)) return 27;
+            if (sendStaleFrame &&
+                (!sendSmallFrame(4, channelId, 1, 1, 17) ||
+                 !sendSmallFrame(4, channelId, 2, 2, 33))) return 52;
             if (sendKeyboard && !sendKeyboardShow(3, channelId, 5)) return 45;
             if (sendFrames) {
                 if (!sendFrame(4, channelId, 1, true)) return 37;
@@ -234,11 +302,12 @@ int fakeWorker(bool rejectOpen, bool disconnectOpen, bool disconnectOnClose, boo
             if (!sendReply(3, Ack, channelId)) return 30;
             if (disconnectOnClose && !sendReply(3, Disconnected, channelId)) return 35;
         } else if (type == 21 && receiveResize) {
-            if (count != HeaderSize + 8 || receivedCount || packageLength != 8 ||
-                !((uid == 480 && pid == 800 && read32(packet + HeaderSize) == 160 &&
-                   read32(packet + HeaderSize + 4) == 0) ||
-                  (uid == 800 && pid == 480 && read32(packet + HeaderSize) == 160 &&
-                   read32(packet + HeaderSize + 4) == 1)))
+            if (count != HeaderSize + 16 || receivedCount || packageLength != 16 ||
+                read64(packet + HeaderSize) != 1 ||
+                !((uid == 480 && pid == 800 && read32(packet + HeaderSize + 8) == 160 &&
+                   read32(packet + HeaderSize + 12) == 0) ||
+                  (uid == 800 && pid == 480 && read32(packet + HeaderSize + 8) == 160 &&
+                   read32(packet + HeaderSize + 12) == 1)))
                 return 47;
             if (!sendKeyboardShow(3, channelId, 5)) return 48;
         } else if (type == Stop) {
@@ -273,13 +342,78 @@ bool check(bool value, const char *description)
     if (!value) std::fprintf(stderr, "FAIL: %s\n", description);
     return value;
 }
+
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+bool gpuOwnerBoundaryTest()
+{
+    QTemporaryDir directory;
+    if (!directory.isValid()) return false;
+    const QByteArray path = QFile::encodeName(directory.path() + QStringLiteral("/wayland"));
+    sockaddr_un address = {};
+    address.sun_family = AF_UNIX;
+    if (path.size() >= int(sizeof(address.sun_path))) return false;
+    std::memcpy(address.sun_path, path.constData(), size_t(path.size()) + 1);
+    int wayland = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (wayland < 0 || ::bind(wayland, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+        ::listen(wayland, 1) != 0) {
+        if (wayland >= 0) ::close(wayland);
+        return false;
+    }
+    const QByteArray oldDisplay = qgetenv("WAYLAND_DISPLAY");
+    qputenv("WAYLAND_DISPLAY", path);
+    SharedMicrogSupervisor supervisor;
+    int client = -1, starts = 0, finishes = 0, accepted = 0;
+    bool markerFailure = false;
+    QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationUiChanged,
+        [&](quint64, bool active) {
+            if (active && ++starts == 2) {
+                if (::send(client, "2", 1, MSG_NOSIGNAL) != 1) markerFailure = true;
+            } else if (!active && ++finishes == 2) {
+                if (::send(client, "3", 1, MSG_NOSIGNAL) != 1) markerFailure = true;
+            }
+        });
+    supervisor.setGpuFrameHandler([&](AuroraDmaBufFrame &&frame,
+                                      const std::function<void(quint64, bool)> &completion) {
+        if (frame.channel != 77 || frame.generation != quint64(accepted + 1)) return false;
+        ++accepted;
+        completion(frame.id, true);
+        return true;
+    });
+    QString error;
+    bool ok = supervisor.configure(QCoreApplication::applicationFilePath(),
+                                  QStringList() << QStringLiteral("--fake-worker-gpu-owner"), &error) &&
+              openTestChannel(&supervisor, 77, &client, &error);
+    if (ok) {
+        QEventLoop loop;
+        QSocketNotifier marker(client, QSocketNotifier::Read);
+        bool done = false;
+        QObject::connect(&marker, &QSocketNotifier::activated, &loop, [&](int) {
+            char byte = 0;
+            done = ::recv(client, &byte, 1, 0) == 1 && byte == 'D';
+            loop.quit();
+        });
+        QTimer::singleShot(5000, &loop, &QEventLoop::quit);
+        loop.exec();
+        ok = done && !markerFailure && starts == 2 && finishes == 2 && accepted == 2;
+        ::close(client);
+    }
+    supervisor.stop();
+    if (oldDisplay.isEmpty()) qunsetenv("WAYLAND_DISPLAY");
+    else qputenv("WAYLAND_DISPLAY", oldDisplay);
+    ::close(wayland);
+    return ok;
+}
+#endif
 }
 
 int main(int argc, char **argv)
 {
     bool workerMode = false, rejectOpen = false, disconnectOpen = false, disconnectOnClose = false;
-    bool sendFrames = false, sendFrameBeforeUi = false, sendKeyboard = false, receiveResize = false, sendBurst = false;
-    bool exitAfterReady = false;
+    bool sendFrames = false, sendFrameBeforeUi = false, sendKeyboard = false, receiveResize = false, sendBurst = false, sendStaleFrame = false;
+    bool exitAfterReady = false, gpu = false, failGpu = false;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    bool gpuOwnerFixture = false;
+#endif
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shared-microg-worker") == 0) workerMode = true;
         else if (std::strcmp(argv[i], "--fake-worker-reject") == 0) rejectOpen = true;
@@ -291,12 +425,31 @@ int main(int argc, char **argv)
         else if (std::strcmp(argv[i], "--fake-worker-keyboard") == 0) sendKeyboard = true;
         else if (std::strcmp(argv[i], "--fake-worker-resize") == 0) receiveResize = true;
         else if (std::strcmp(argv[i], "--fake-worker-burst") == 0) sendBurst = true;
+        else if (std::strcmp(argv[i], "--fake-worker-stale-frame") == 0) sendStaleFrame = true;
+        else if (std::strcmp(argv[i], "--gpu-canvas") == 0) gpu = true;
+        else if (std::strcmp(argv[i], "--fake-worker-gpu-fails") == 0) failGpu = true;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+        else if (std::strcmp(argv[i], "--fake-worker-gpu-owner") == 0) gpuOwnerFixture = true;
+#endif
     }
-    if (workerMode) return fakeWorker(rejectOpen, disconnectOpen, disconnectOnClose, exitAfterReady,
-                                      sendFrames, sendFrameBeforeUi, sendKeyboard, receiveResize, sendBurst);
+    if (workerMode && gpu && failGpu) {
+        QFile marker(QString::fromLocal8Bit(qgetenv("MEGLER_TEST_GPU_MARKER")));
+        if (!marker.open(QIODevice::WriteOnly)) return 3;
+        return 2;
+    }
+    if (workerMode) {
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+        if (gpuOwnerFixture) return gpu ? gpuFixtureWorker() : 66;
+#endif
+        return fakeWorker(rejectOpen, disconnectOpen, disconnectOnClose, exitAfterReady,
+                                      sendFrames, sendFrameBeforeUi, sendKeyboard, receiveResize, sendBurst, sendStaleFrame);
+    }
 
     QCoreApplication app(argc, argv);
     qInstallMessageHandler(captureDiagnostics);
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    if (!check(gpuOwnerBoundaryTest(), "GPU frames cannot cross sign-in generations")) return 1;
+#endif
     const QString realWorker = QString::fromLocal8Bit(qgetenv("MEGLER_SHARED_MICROG_TEST_WORKER"));
     if (!realWorker.isEmpty()) {
         const QString apk = QString::fromLocal8Bit(qgetenv("MEGLER_SHARED_MICROG_TEST_APK"));
@@ -344,6 +497,46 @@ int main(int argc, char **argv)
     QString error;
     bool ok = true;
     int clientFd = -1;
+    {
+        QTemporaryDir temporary;
+        const QByteArray oldDisplay = qgetenv("WAYLAND_DISPLAY");
+        const bool hadDisplay = std::getenv("WAYLAND_DISPLAY") != nullptr;
+        const QByteArray socketPath = QFile::encodeName(temporary.path() + QStringLiteral("/wayland-test"));
+        const QByteArray markerPath = QFile::encodeName(temporary.path() + QStringLiteral("/gpu-attempt"));
+        int listener = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_un address = {};
+        address.sun_family = AF_UNIX;
+        ok &= check(temporary.isValid() && listener >= 0 &&
+                    socketPath.size() < static_cast<int>(sizeof(address.sun_path)),
+                    "create fake Wayland socket");
+        if (listener >= 0 && socketPath.size() < static_cast<int>(sizeof(address.sun_path))) {
+            std::memcpy(address.sun_path, socketPath.constData(), static_cast<size_t>(socketPath.size()) + 1);
+            ok &= check(::bind(listener, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) == 0,
+                        "bind fake Wayland socket");
+            qputenv("WAYLAND_DISPLAY", socketPath);
+            qputenv("MEGLER_TEST_GPU_MARKER", markerPath);
+            SharedMicrogSupervisor supervisor;
+            int deaths = 0;
+            QObject::connect(&supervisor, &SharedMicrogSupervisor::workerDied, [&] { ++deaths; });
+            ok &= check(supervisor.configure(program, QStringList() << QStringLiteral("--fake-worker-gpu-fails"), &error),
+                        "configure GPU startup failure fixture");
+            ok &= check(supervisor.startRetained(&error), "retry worker with software after GPU startup failure");
+            ok &= check(QFile::exists(QString::fromLocal8Bit(markerPath)), "GPU startup was attempted");
+            ok &= check(deaths == 0, "failed GPU attempt does not report worker death");
+            ok &= check(openTestChannel(&supervisor, 19, &clientFd, &error),
+                        "fallback worker accepts a client");
+            if (clientFd >= 0) {
+                supervisor.closeChannel(19);
+                ::close(clientFd);
+                clientFd = -1;
+            }
+            supervisor.releaseRetention();
+        }
+        if (listener >= 0) ::close(listener);
+        if (hadDisplay) qputenv("WAYLAND_DISPLAY", oldDisplay);
+        else qunsetenv("WAYLAND_DISPLAY");
+        qunsetenv("MEGLER_TEST_GPU_MARKER");
+    }
     {
         SharedMicrogSupervisor supervisor;
         ok &= check(supervisor.configure(program, QStringList(), &error), "configure retained worker");
@@ -512,6 +705,31 @@ int main(int argc, char **argv)
         ok &= check(frameCount == 1 && readyChannel == 20,
                     "saved frame is emitted after UI activation without another frame");
         ok &= check(nonzeroBytes > 0, "saved frame carries nonzero pixels");
+    }
+    {
+        SharedMicrogSupervisor supervisor;
+        ok &= check(supervisor.configure(program, QStringList() << QStringLiteral("--fake-worker-stale-frame"),
+                                         &error), "configure stale frame fixture");
+        int frameClientFd = -1, activeCount = 0, staleFrames = 0, currentFrames = 0, deaths = 0;
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::workerDied, [&] { ++deaths; });
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationUiChanged,
+                         [&](quint64, bool active) { if (active) ++activeCount; });
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationFrameChanged,
+                         [&](quint64, const QImage &frame) {
+            if (frame.constBits()[0] == 17) ++staleFrames;
+            if (frame.constBits()[0] == 33) ++currentFrames;
+        });
+        ok &= check(openTestChannel(&supervisor, 21, &frameClientFd, &error),
+                    "open stale frame fixture channel");
+        if (frameClientFd >= 0) {
+            QEventLoop loop;
+            QTimer::singleShot(300, &loop, SLOT(quit()));
+            loop.exec();
+            supervisor.closeChannel(21);
+            ::close(frameClientFd);
+        }
+        ok &= check(activeCount == 2 && !staleFrames && currentFrames == 1 && !deaths,
+                    "late frames from the previous UI generation are not delivered");
     }
     {
         SharedMicrogSupervisor supervisor;

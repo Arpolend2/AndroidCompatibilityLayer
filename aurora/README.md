@@ -13,6 +13,19 @@ The manager and standalone app interface use Russian when the device language
 is Russian and otherwise use English. Android apps choose their own language;
 the Android language setting is independent of the manager interface.
 
+At Android runtime startup, the bundled certificate authorities are combined
+with Aurora's extracted server-auth TLS bundle. The p11-kit blacklist and the
+bundled store's known distrust list are excluded. System certificates with an
+`nss-server-distrust-after` restriction are imported only if they were already
+in the bundled Android store: the Android store cannot express that restriction.
+Certificates installed through Aurora's system trust configuration are included
+after the system regenerates its TLS bundle; a separate per-user NSS database
+is not treated as an Android user CA store. A private read-only snapshot is
+published atomically, and new processes see changes on their next start.
+If the bundle is absent, the built-in certificates remain available; errors
+reading an existing bundle or system policy are reported instead of silently
+ignoring them. The diagnostic overlay reports CA startup status.
+
 Android notifications from a running app are sent to the system notification
 service when its notification permission and channel allow them. Channel
 importance `MIN` and `LOW` maps to low urgency without sound or a preview;
@@ -326,6 +339,16 @@ are validated as bounded ordinary files, but their contents and claimed
 application identity are not cryptographically authenticated. The manager
 refreshes these snapshots in the Log view. Built-in preview/Store logging
 retains its existing D-Bus transport.
+
+The Log view shows the combined report in export order. Search filters its
+lines case-insensitively without changing the saved report. The Android window
+shows up to six short, redacted diagnostic messages while capture is active;
+it currently sees only events recorded in the window's own process. It does
+not expose raw log lines, Intent contents, or tokens in the overlay.
+The feature-tagged rules and their fixed display text are in `overlayRules`
+in `aurora/error_log.cpp`: add an entry when a feature needs testing and
+remove its entries after the feature is confirmed. Keep the display text
+free of private data, and update the focused overlay tests for rule changes.
 
 The detailed report identifies an unconfigured or unavailable snapshot directory
 and an empty directory; an empty directory can also mean that snapshots were

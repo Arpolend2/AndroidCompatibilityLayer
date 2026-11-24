@@ -44,6 +44,19 @@ enum { FLAG_CONFIG = 2, FLAG_EOS = 4 };
 
 /* The shell's decoders: set when the app starts, before any of its code runs. */
 static megler_codec_host g_host;
+static bool (MEGLER_CB *g_checked_drain)(void *user, void *decoder);
+
+void mg_java_media_set_checked_drain(bool (MEGLER_CB *drain)(void *user, void *decoder))
+{
+    g_checked_drain = drain;
+}
+
+static bool drain_decoder(void *decoder)
+{
+    if (g_checked_drain) return g_checked_drain(g_host.user, decoder);
+    if (g_host.drain) g_host.drain(g_host.user, decoder);
+    return true;
+}
 
 void mg_java_media_set_host(const megler_codec_host *host)
 {
@@ -130,6 +143,7 @@ struct mg_mcodec {
     i32 learnt;
     i64 gone;
     bool any_gone;
+    bool decode_failed;
     blob unit;                         /* the unit being put together for the decoder */
     int nal_length_size;               /* MP4 length prefix, from avcC/hvcC; 4 without a record */
     i64 pushed, pictures, blocks, failed;
@@ -401,9 +415,14 @@ static bool video_open(mg_mcodec *c)
 
 static void push(mg_mcodec *c, const u8 *d, size_t n, i64 time_us)
 {
-    if (!c->dec || !g_host.push) return;
+    if (!c->dec || !g_host.push) {
+        c->decode_failed = true;
+        mg_warn("media codec: no %s decoder is available for a sample", kind_name(c->kind));
+        return;
+    }
     c->pushed++;
     if (!g_host.push(g_host.user, c->dec, d, n, time_us)) {
+        c->decode_failed = true;
         if (++c->failed <= 3) mg_warn("media codec: the shell's %s decoder failed on a sample of %u bytes at %lld ms", kind_name(c->kind), (unsigned)n,
                                       (long long)(time_us / 1000));
     }
@@ -418,7 +437,11 @@ static void video_decode(mg_mcodec *c, const u8 *d, size_t n, i64 time_us, i32 f
     if (n && !((flags & FLAG_CONFIG) && each_record_nal(c, d, n, take_nal, &w))) each_nal(c, d, n, take_nal, &w);
     /* Parameter sets the app sends as such go in front of the next unit, whatever came before. */
     if ((flags & FLAG_CONFIG) && w.params) c->fresh = true;
-    if (w.slices && !(flags & FLAG_CONFIG) && video_open(c)) {
+    if (w.slices && !(flags & FLAG_CONFIG)) {
+        if (!video_open(c)) {
+            c->decode_failed = true;
+            return;
+        }
         if (c->fresh && (w.params & params_needed(c)) != params_needed(c) && c->sps.n) {
             /* The parameter sets in front, the unit after them: a fresh decoder sees them before its first slice. */
             blob whole;
@@ -431,10 +454,15 @@ static void video_decode(mg_mcodec *c, const u8 *d, size_t n, i64 time_us, i32 f
             push(c, c->unit.d, c->unit.n, time_us);
         }
         c->fresh = false;
+        if (c->decode_failed) return;
         pull_pictures(c, false);
     }
     if ((flags & FLAG_EOS) && c->dec) {
-        if (g_host.drain) g_host.drain(g_host.user, c->dec);
+        if (!drain_decoder(c->dec)) {
+            c->decode_failed = true;
+            mg_warn("media codec: %s decoder drain failed", kind_name(c->kind));
+            return;
+        }
         pull_pictures(c, true);
     }
 }
@@ -552,7 +580,7 @@ static void audio_decode(mg_mcodec *c, const u8 *d, size_t n, i64 time_us, i32 f
             if (n >= 2 && (!c->dec || !c->asc_given || c->asc.n != n || memcmp(c->asc.d, d, n))) {
                 blob_set(&c->asc, d, n);
                 c->asc_given = true;
-                audio_open(c, c->asked_rate, c->asked_channels);
+                if (!audio_open(c, c->asked_rate, c->asked_channels)) c->decode_failed = true;
             }
         } else if (adts_header(d, n, &header, &frame)) {
             /* ADTS: each frame without its header; the first header says what the stream is when the app did not. */
@@ -563,10 +591,10 @@ static void audio_decode(mg_mcodec *c, const u8 *d, size_t n, i64 time_us, i32 f
                 asc[1] = (u8)((sfi & 1) << 7 | chan << 3);
                 if (!c->dec || c->asc.n != 2 || memcmp(c->asc.d, asc, 2)) {
                     blob_set(&c->asc, asc, 2);
-                    audio_open(c, 0, 0);
+                    if (!audio_open(c, 0, 0)) c->decode_failed = true;
                 }
             }
-            while (adts_header(d, n, &header, &frame)) {
+            while (!c->decode_failed && adts_header(d, n, &header, &frame)) {
                 push(c, d + header, frame - header, time_us);
                 if (c->rate > 0) time_us += (i64)1024 * 1000000 / c->rate;
                 d += frame;
@@ -582,7 +610,10 @@ static void audio_decode(mg_mcodec *c, const u8 *d, size_t n, i64 time_us, i32 f
         else if (!c->dec) audio_open(c, c->asked_rate, c->asked_channels);
         push(c, d, n, time_us);
     }
-    if ((flags & FLAG_EOS) && c->dec && g_host.drain) g_host.drain(g_host.user, c->dec);
+    if (!c->decode_failed && (flags & FLAG_EOS) && c->dec && !drain_decoder(c->dec)) {
+        c->decode_failed = true;
+        mg_warn("media codec: %s decoder drain failed", kind_name(c->kind));
+    }
 }
 
 /* ------------------------------------------------------------ the codec */
@@ -634,13 +665,18 @@ bool mg_mcodec_configure(mg_mcodec *c, i32 width, i32 height, i32 rate, i32 chan
     return ok;
 }
 
-void mg_mcodec_decode(mg_mcodec *c, const u8 *data, size_t size, i64 time_us, i32 flags)
+bool mg_mcodec_decode(mg_mcodec *c, const u8 *data, size_t size, i64 time_us, i32 flags)
 {
-    if (!c) return;
+    bool ok;
+    if (!c) return false;
     mg_lock_acquire(&c->lock);
-    if (is_video(c)) video_decode(c, data, data ? size : 0, time_us, flags);
-    else audio_decode(c, data, data ? size : 0, time_us, flags);
+    if (!c->decode_failed) {
+        if (is_video(c)) video_decode(c, data, data ? size : 0, time_us, flags);
+        else audio_decode(c, data, data ? size : 0, time_us, flags);
+    }
+    ok = !c->decode_failed;
     mg_lock_release(&c->lock);
+    return ok;
 }
 
 mg_mframe *mg_mcodec_next_frame(mg_mcodec *c, i64 info[3])
@@ -743,6 +779,7 @@ void mg_mcodec_flush(mg_mcodec *c)
     drop_frames(c);
     c->fresh = true;
     c->any_gone = false;
+    c->decode_failed = false;
     mg_lock_release(&c->lock);
 }
 
@@ -884,8 +921,7 @@ N(Media_decode)
     size_t n = 0;
     const u8 *d = array_bytes(c->args[1].l, &n);
     if (c->args[2].i >= 0 && (size_t)c->args[2].i < n) n = (size_t)c->args[2].i;
-    mg_mcodec_decode(CODEC, d, d ? n : 0, c->args[3].j, c->args[4].i);
-    c->ret.i = 0;
+    c->ret.i = mg_mcodec_decode(CODEC, d, d ? n : 0, c->args[3].j, c->args[4].i) ? 0 : -1;
 }
 
 static i64 *long_array(mg_jobj *a) { return a && a->u.arr.len >= 3 ? (i64 *)a->u.arr.data : NULL; }

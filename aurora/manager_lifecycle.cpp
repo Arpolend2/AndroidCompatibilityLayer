@@ -3,6 +3,9 @@
 #include "preview_keyboard.h"
 #include "preview_orientation.h"
 #include "preview_viewport.h"
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+#include "preview_gpu.h"
+#endif
 
 #include <QCoreApplication>
 #include <QDir>
@@ -69,6 +72,26 @@ ManagerLifecycle::ManagerLifecycle(const std::function<bool()> &showGui, QObject
     : QObject(parent), m_showGui(showGui), m_provider(QDBusConnection::sessionBus(), nullptr,
                                                     [this]() { noteRequest(); })
 {
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    m_authGpuState = std::make_shared<PreviewGpuState>();
+    m_authGpuState->setDmaBufOwner(0, 0);
+    m_pendingAuthGpuTimer.setSingleShot(true);
+    connect(&m_pendingAuthGpuTimer, &QTimer::timeout, this, [this]() {
+        qWarning("Shared microG GPU frame timed out waiting for the authentication surface.");
+        rejectPendingAuthenticationGpuFrame();
+    });
+    m_worker.setGpuFrameHandler([this](AuroraDmaBufFrame &&frame,
+                                       const std::function<void(quint64, bool)> &completion) {
+        if (m_pendingAuthGpuFrame || m_authUiChannel != frame.channel ||
+            m_worker.authenticationGeneration(frame.channel) != frame.generation)
+            return false;
+        m_pendingAuthGpuFrame.reset(new AuroraDmaBufFrame(std::move(frame)));
+        m_pendingAuthGpuCompletion = completion;
+        m_pendingAuthGpuTimer.start(800);
+        submitPendingAuthenticationGpuFrame();
+        return true;
+    });
+#endif
     m_idle.setSingleShot(true);
     m_idle.setInterval(idleMilliseconds);
     connect(&m_idle, &QTimer::timeout, QCoreApplication::instance(), &QCoreApplication::quit);
@@ -127,11 +150,16 @@ ManagerLifecycle::ManagerLifecycle(const std::function<bool()> &showGui, QObject
                 return;
             }
             m_authUiChannel = channelId;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+            m_authGpuState->setDmaBufOwner(channelId, m_worker.authenticationGeneration(channelId));
+            m_authGpuFrameSize = QSize();
+#endif
             m_authFrame = QImage();
             m_pendingAuthFrame = QImage();
             m_authViewport = QSize();
             m_authDensity = 0;
             m_authFrameCurrent = false;
+            m_authFramePath = NoFramePath;
             m_authViewportPending = false;
             m_authAwaitingViewportFrame = false;
             emit authenticationFrameChanged();
@@ -169,6 +197,18 @@ void ManagerLifecycle::acceptAuthenticationFrame(quint64 channelId, const QImage
         return;
     }
     if (!m_authViewport.isEmpty() && frame.size() != m_authViewport) return;
+    if (m_authFramePath != CpuFramePath) {
+        qInfo("Shared microG frame received: cpu");
+        qInfo("Shared microG frame fallback: %s", m_worker.gpuTransportAvailable()
+              ? "GPU frame unavailable" : "GPU transport unavailable");
+        m_authFramePath = CpuFramePath;
+    }
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    ++m_authFrameRevision;
+    m_authGpuFrameSize = QSize();
+    m_authGpuState->clear();
+    if (m_authSurface) QMetaObject::invokeMethod(m_authSurface, "requestGpuFrame", Qt::QueuedConnection);
+#endif
     const bool firstFrame = m_authFrame.isNull() && !frame.isNull();
     m_authFrame = frame;
     m_authFrameCurrent = !frame.isNull();
@@ -191,6 +231,9 @@ void ManagerLifecycle::acceptAuthenticationFrame(quint64 channelId, const QImage
 
 ManagerLifecycle::~ManagerLifecycle()
 {
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    rejectPendingAuthenticationGpuFrame();
+#endif
     if (m_authKeyboard) m_authKeyboard->stop();
     m_provider.revokeAllChannels();
     m_worker.stop();
@@ -200,11 +243,19 @@ void ManagerLifecycle::closeAuthenticationUi(quint64 channelId)
 {
     if (!channelId || m_authUiChannel != channelId) return;
     m_authUiChannel = 0;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    ++m_authFrameRevision;
+    rejectPendingAuthenticationGpuFrame();
+    m_authGpuState->setDmaBufOwner(0, 0);
+    m_authGpuFrameSize = QSize();
+    if (m_authSurface) QMetaObject::invokeMethod(m_authSurface, "requestGpuFrame", Qt::QueuedConnection);
+#endif
     m_authFrame = QImage();
     m_pendingAuthFrame = QImage();
     m_authViewport = QSize();
     m_authDensity = 0;
     m_authFrameCurrent = false;
+    m_authFramePath = NoFramePath;
     m_authViewportPending = false;
     m_authAwaitingViewportFrame = false;
     if (m_authKeyboard) m_authKeyboard->hideKeyboard();
@@ -214,6 +265,80 @@ void ManagerLifecycle::closeAuthenticationUi(quint64 channelId)
     emit authenticationFrameChanged();
     emit authenticationUiChanged();
 }
+
+QSize ManagerLifecycle::authenticationFrameSize() const
+{
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    if (!m_authGpuFrameSize.isEmpty()) return m_authGpuFrameSize;
+#endif
+    return m_authFrame.size();
+}
+
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+void ManagerLifecycle::rejectPendingAuthenticationGpuFrame()
+{
+    m_pendingAuthGpuTimer.stop();
+    if (!m_pendingAuthGpuFrame) return;
+    const quint64 id = m_pendingAuthGpuFrame->id;
+    m_pendingAuthGpuFrame.reset();
+    const std::function<void(quint64, bool)> completion = m_pendingAuthGpuCompletion;
+    m_pendingAuthGpuCompletion = {};
+    completion(id, false);
+}
+
+void ManagerLifecycle::submitPendingAuthenticationGpuFrame()
+{
+    if (!m_pendingAuthGpuFrame) return;
+    const AuroraDmaBufFrame &pending = *m_pendingAuthGpuFrame;
+    if (m_authUiChannel != pending.channel ||
+        m_worker.authenticationGeneration(pending.channel) != pending.generation) {
+        rejectPendingAuthenticationGpuFrame();
+        return;
+    }
+    if (!m_authSurface || m_authViewportPending) return;
+    if (!m_authViewport.isEmpty() && QSize(pending.width, pending.height) != m_authViewport) {
+        rejectPendingAuthenticationGpuFrame();
+        return;
+    }
+    const quint64 id = pending.id, channel = pending.channel, generation = pending.generation;
+    const quint64 revision = ++m_authFrameRevision;
+    const int width = pending.width, height = pending.height;
+    std::unique_ptr<AuroraDmaBufFrame> frame = std::move(m_pendingAuthGpuFrame);
+    const std::function<void(quint64, bool)> completion = m_pendingAuthGpuCompletion;
+    m_pendingAuthGpuCompletion = {};
+    m_pendingAuthGpuTimer.stop();
+    QPointer<ManagerLifecycle> self(this);
+    if (!m_authGpuState->submitDmaBuf(std::move(*frame), m_authSurface,
+        [self, completion, channel, generation, revision, width, height](quint64 frameId, bool accepted) {
+            if (accepted && (!self || !QMetaObject::invokeMethod(self, "authenticationGpuAccepted",
+                Qt::QueuedConnection, Q_ARG(quint64, channel), Q_ARG(quint64, generation),
+                Q_ARG(quint64, revision), Q_ARG(int, width), Q_ARG(int, height))))
+                accepted = false;
+            completion(frameId, accepted);
+        }))
+        completion(id, false);
+}
+
+void ManagerLifecycle::authenticationGpuAccepted(quint64 channel, quint64 generation, quint64 revision,
+                                                 int width, int height)
+{
+    const QSize size(width, height);
+    if (m_authUiChannel != channel || m_worker.authenticationGeneration(channel) != generation ||
+        m_authFrameRevision != revision ||
+        m_authViewportPending || (!m_authViewport.isEmpty() && m_authViewport != size))
+        return;
+    m_authFrame = QImage();
+    m_authGpuFrameSize = size;
+    if (m_authFramePath != GpuFramePath) {
+        qInfo("Shared microG frame received: gpu");
+        m_authFramePath = GpuFramePath;
+    }
+    m_authFrameCurrent = true;
+    m_authAwaitingViewportFrame = false;
+    if (m_authKeyboard && m_authSurface) m_authKeyboard->setSurface(m_authSurface, size);
+    emit authenticationFrameChanged();
+}
+#endif
 
 void ManagerLifecycle::setAuthenticationKeyboard(PreviewKeyboard *keyboard)
 {
@@ -259,9 +384,12 @@ void ManagerLifecycle::setAuthenticationSurface(QObject *surface, int pixelWidth
     QQuickItem *item = qobject_cast<QQuickItem *>(surface);
     m_authSurface = item;
     if (m_authKeyboard)
-        m_authKeyboard->setSurface(item, m_authFrame.isNull()
+        m_authKeyboard->setSurface(item, authenticationFrameSize().isEmpty()
                                    ? QSize(qMax(0, pixelWidth), qMax(0, pixelHeight))
-                                   : m_authFrame.size());
+                                   : authenticationFrameSize());
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    submitPendingAuthenticationGpuFrame();
+#endif
 }
 
 void ManagerLifecycle::setAuthenticationViewport(const QSize &pixels, int density, int rotation)
@@ -269,19 +397,21 @@ void ManagerLifecycle::setAuthenticationViewport(const QSize &pixels, int densit
     if (!m_authUiChannel || pixels.isEmpty()) return;
     if (m_authViewport == pixels && m_authDensity == density && m_authRotation == rotation) {
         m_authViewportPending = false;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+        submitPendingAuthenticationGpuFrame();
+#endif
         const QImage pending = m_pendingAuthFrame;
         m_pendingAuthFrame = QImage();
         if (!m_authAwaitingViewportFrame && !pending.isNull() && pending.size() == pixels) {
             acceptAuthenticationFrame(m_authUiChannel, pending);
             return;
         }
-        m_authFrameCurrent = !m_authAwaitingViewportFrame && !m_authFrame.isNull() &&
-                             m_authFrame.size() == pixels;
+        m_authFrameCurrent = !m_authAwaitingViewportFrame && authenticationFrameSize() == pixels;
         return;
     }
     const bool reuseInitial = !m_authDensity && !m_pendingAuthFrame.isNull() &&
                               m_pendingAuthFrame.size() == pixels;
-    const bool mustWait = m_authFrame.isNull() || m_authFrame.size() != pixels ||
+    const bool mustWait = authenticationFrameSize().isEmpty() || authenticationFrameSize() != pixels ||
                           (m_authDensity && (m_authDensity != density || m_authRotation != rotation));
     if (mustWait) {
         m_authFrameCurrent = false;
@@ -296,6 +426,9 @@ void ManagerLifecycle::setAuthenticationViewport(const QSize &pixels, int densit
     m_authDensity = density;
     m_authRotation = rotation;
     m_authViewportPending = false;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    submitPendingAuthenticationGpuFrame();
+#endif
     const QImage pending = m_pendingAuthFrame;
     m_pendingAuthFrame = QImage();
     if (reuseInitial) acceptAuthenticationFrame(m_authUiChannel, pending);
@@ -304,6 +437,9 @@ void ManagerLifecycle::setAuthenticationViewport(const QSize &pixels, int densit
 void ManagerLifecycle::invalidateAuthenticationViewport()
 {
     if (!m_authUiChannel) return;
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    ++m_authFrameRevision;
+#endif
     m_authViewportPending = true;
     m_authFrameCurrent = false;
 }
@@ -704,8 +840,17 @@ void SharedMicrogAuthSurface::setHost(QObject *host)
     ManagerLifecycle *lifecycle = qobject_cast<ManagerLifecycle *>(host);
     if (m_host == lifecycle) return;
     if (m_host) disconnect(m_host, nullptr, this, nullptr);
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    delete m_gpuItem;
+    m_gpuItem = nullptr;
+#endif
     m_host = lifecycle;
     if (m_host) {
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+        m_gpuItem = new PreviewGpuItem(m_host->authenticationGpuState(), this);
+        m_gpuItem->setSize(QSizeF(width(), height()));
+        m_gpuItem->setZ(1);
+#endif
         connect(m_host, &ManagerLifecycle::authenticationFrameChanged, this,
                 [this]() { update(); });
         connect(m_host, &ManagerLifecycle::authenticationUiChanged, this,
@@ -726,8 +871,18 @@ void SharedMicrogAuthSurface::setPageOrientation(int orientation)
 void SharedMicrogAuthSurface::geometryChanged(const QRectF &geometry, const QRectF &oldGeometry)
 {
     QQuickPaintedItem::geometryChanged(geometry, oldGeometry);
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+    if (m_gpuItem) m_gpuItem->setSize(geometry.size());
+#endif
     if (geometry.size() != oldGeometry.size()) scheduleViewport();
 }
+
+#if defined(MG_EXPERIMENTAL_GPU_COMPOSITION) && defined(MG_EXPERIMENTAL_GPU_CANVAS)
+void SharedMicrogAuthSurface::requestGpuFrame()
+{
+    if (m_gpuItem) m_gpuItem->update();
+}
+#endif
 
 void SharedMicrogAuthSurface::scheduleViewport()
 {
@@ -760,13 +915,13 @@ void SharedMicrogAuthSurface::paint(QPainter *painter)
     if (!m_host) return;
     const QImage frame = m_host->authenticationFrame();
     if (frame.isNull()) return;
-    painter->drawImage(imageTarget(frame), frame);
+    painter->drawImage(imageTarget(frame.size()), frame);
 }
 
-QRectF SharedMicrogAuthSurface::imageTarget(const QImage &frame) const
+QRectF SharedMicrogAuthSurface::imageTarget(const QSize &frame) const
 {
-    if (frame.isNull() || width() <= 0 || height() <= 0) return QRectF();
-    const QSizeF scaled = QSizeF(frame.size()).scaled(QSizeF(width(), height()), Qt::KeepAspectRatio);
+    if (frame.isEmpty() || width() <= 0 || height() <= 0) return QRectF();
+    const QSizeF scaled = QSizeF(frame).scaled(QSizeF(width(), height()), Qt::KeepAspectRatio);
     return QRectF((width() - scaled.width()) / 2, (height() - scaled.height()) / 2,
                   scaled.width(), scaled.height());
 }
@@ -774,8 +929,8 @@ QRectF SharedMicrogAuthSurface::imageTarget(const QImage &frame) const
 bool SharedMicrogAuthSurface::sendTouch(int phase, const QPointF &point)
 {
     if (!m_host) return false;
-    const QImage frame = m_host->authenticationFrame();
-    if (frame.isNull()) return false;
+    const QSize frame = m_host->authenticationFrameSize();
+    if (frame.isEmpty()) return false;
     const QRectF target = imageTarget(frame);
     if (target.isEmpty() || (phase == 0 && !target.contains(point))) return false;
     const int x = qBound(0, qRound((point.x() - target.left()) * frame.width() / target.width()),

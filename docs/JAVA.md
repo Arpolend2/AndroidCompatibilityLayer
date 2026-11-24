@@ -1146,8 +1146,8 @@ broadcast: the framework says Wi-Fi throughout.
 
 **Ordered broadcasts.** `sendOrderedBroadcast` with a result receiver (each of
 its overloads, and `sendOrderedBroadcastAsUser`, from a context or a wrapper)
-goes to the receivers one after another, the registered ones of the higher
-priority first, each on its thread with the result the one before left
+goes to the receivers one after another, with matching manifest and registered
+receivers ordered by filter priority, each on its thread with the result the one before left
 (`getResultCode`, `getResultData`, `getResultExtras`), which it may change or
 end (`abortBroadcast`); one that goes asynchronous (`goAsync`) holds the next
 back until its `PendingResult.finish()`. Then the result receiver, on its

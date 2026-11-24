@@ -86,7 +86,13 @@ public abstract class ContentProvider implements ComponentCallbacks2 {
      * package, and microG's account provider, called by Classroom's GoogleAuthUtil, said "UID [10100] is not related to
      * packageName [com.google.android.gms] (seems to be com.google.android.apps.classroom)" for every list of accounts.
      */
-    public final String getCallingPackage() { return megler.Native.packageName(); }
+    public final String getCallingPackage() {
+        if (megler.SharedMicrogIdentity.isWorker()) {
+            String packageName = megler.SharedMicrogIdentity.packageForUid(android.os.Binder.getCallingUid());
+            if (packageName != null) return packageName;
+        }
+        return megler.Native.packageName();
+    }
     public final String getCallingPackageUnchecked() { return getCallingPackage(); }
     public final String getReadPermission() { return mReadPermission; }
     public final String getWritePermission() { return mWritePermission; }

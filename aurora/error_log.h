@@ -17,6 +17,9 @@ bool setDetailedPaused(bool paused);
 bool setDetailedEnabled(bool enabled, QString *error);
 bool clearCurrentLog(QString *error);
 bool detailedReport(QString *text, QString *error);
+// Newest-first window of manager log lines containing query (case-insensitive).
+bool recentLines(const QString &query, int maxLines, QString *text, bool *more, QString *error);
+QString overlayText();
 bool saveDetailedReport(QString *path, QString *error, bool *partial = nullptr,
                         QString *cleanupWarning = nullptr);
 bool clearSavedLogs(int &removed, bool includeExports = true);

@@ -86,6 +86,8 @@ u32 mg_gl_standin_pixel(int x, int y);
  * false when it is held by the other side.
  */
 bool mg_gl_standin_keyed(void *share_handle, bool acquire);
+/* Native EGL surfaces do not have ANGLE's keyed mutex. */
+void mg_gl_standin_native_surfaces(bool enabled);
 /* The display the last EGL image was asked for on. Displays: 0xD15, and 0xD16 for the native display -3 (EGL_D3D11_ONLY_DISPLAY_ANGLE). */
 void *mg_gl_standin_image_display(void);
 /* The features of ANGLE's the app's display was asked to be made without, by name, separated by spaces ("" for none). */

@@ -2,6 +2,7 @@
 #include "google_services_runtime.h"
 #include "shared_microg_apk_metadata.h"
 #include "../core/src/drivers/mg_java.h"
+#include "../core/src/ndk/mg_media.h"
 
 #include <QCoreApplication>
 #include <QAtomicInt>
@@ -301,25 +302,35 @@ void PreviewPlayer::start()
     }
     GoogleServicesRuntime googleServices(QString::fromUtf8(m_rootUtf8));
     QString googleError;
+    bool sharedMicrogReady = false;
     if (m_sharedMicrogEnabled) {
+        // Google services are optional: without a reachable shared microG the app still starts.
         mg_apk_info info = {};
         if (!mg_apk_read_info(m_apkUtf8.constData(), &info)) {
-            setStatus(tr("Could not inspect the shared microG client APK."));
-            ErrorLog::record(QStringLiteral("Android"), m_status, true);
-            return;
-        }
-        const QString package = QString::fromUtf8(info.package);
-        mg_apk_info_free(&info);
-        m_sharedMicrog.reset(new SharedMicrogClientChannel);
-        const QByteArray metadata = readSharedMicrogApkMetadata(
-            QString::fromUtf8(m_apkUtf8), package, &googleError);
-        if (metadata.isEmpty() ||
-            !m_sharedMicrog->openClientWithMetadata(package, metadata, &googleError)) {
-            setStatus(tr("Shared microG: %1").arg(googleError));
-            ErrorLog::record(QStringLiteral("Android"), m_status, true);
-            return;
+            googleError = QStringLiteral("Could not inspect the shared microG client APK.");
+        } else {
+            const QString package = QString::fromUtf8(info.package);
+            mg_apk_info_free(&info);
+            m_sharedMicrog.reset(new SharedMicrogClientChannel);
+            const QByteArray metadata = readSharedMicrogApkMetadata(
+                QString::fromUtf8(m_apkUtf8), package, &googleError);
+            sharedMicrogReady = !metadata.isEmpty() &&
+                                m_sharedMicrog->openClientWithMetadata(package, metadata, &googleError);
         }
         if (m_closing) return;
+        if (sharedMicrogReady) {
+            qInfo("Shared microG client channel ready.");
+            if (googleServices.applySharedModule(run, QString::fromUtf8(m_sharedMicrogApkUtf8), &googleError))
+                qInfo("Shared microG module APK ready.");
+            else
+                qWarning("Shared microG module APK unavailable: %s", qPrintable(googleError));
+        } else {
+            m_sharedMicrog.reset();
+            qWarning("Shared microG client channel open failed.");
+            ErrorLog::record(QStringLiteral("Android"),
+                             tr("Google services are unavailable, starting without them: %1").arg(googleError),
+                             true);
+        }
     } else if (!googleServices.apply(run, &googleError)) {
         qWarning().noquote() << "Google services:" << googleError;
         setStatus(tr("Google services: %1").arg(googleError));
@@ -394,7 +405,15 @@ void PreviewPlayer::start()
         gpuCanvasReady = m_gpuCanvas.prepare(m_gpuState->qtContext(), presentGpuCanvas, releaseGpuCanvas, this);
     }
     if (gpuCanvasReady) {
+        const bool webviewGpuReady = m_gpuCanvas.enableNativeEglTextures() &&
+            (!remoteGpuCanvasReady || mg_egl_set_native_display(m_gpuCanvas.nativeEglDisplay()));
         run.gfx = previewGraphics(&m_gpuCanvas);
+        if (webviewGpuReady) {
+            qInfo("WebView GPU: native EGL texture capture ready");
+        } else {
+            run.gfx.texture_egl_frame = nullptr;
+            qWarning("WebView GPU: native EGL texture capture unavailable; software fallback");
+        }
         if (remoteGpuCanvasReady)
             qInfo("Embedded GPU DMA-BUF producer is ready; waiting for the first live frame");
         else
@@ -406,11 +425,22 @@ void PreviewPlayer::start()
     if (m_audio) run.audio = m_audio->callbacks();
 #ifdef ACL_WITH_FFMPEG7_MEDIA
     run.codec = auroraMediaCodecCallbacks();
+    mg_java_media_set_checked_drain(auroraMediaCodecDrainChecked);
+    mg_media_set_demux_host(auroraDemuxCallbacks());
 #else
     run.codec = auroraMp3CodecCallbacks();
+    mg_java_media_set_checked_drain(nullptr);
 #endif
+    mg_java_media_set_host(&run.codec);
     run.media = auroraMp3MediaCallbacks();
-    if (!m_deniedPermissions.contains(QStringLiteral("camera"))) run.camera = auroraCameraHost();
+    const bool cameraAllowed = !m_deniedPermissions.contains(QStringLiteral("camera"));
+    if (cameraAllowed) run.camera = auroraCameraHost();
+    megler_camera_capture_host captureHost = cameraAllowed ? auroraCameraCaptureHost() : megler_camera_capture_host{};
+    if (!megler_set_camera_capture_host(cameraAllowed ? &captureHost : nullptr)) {
+        setStatus(tr("Could not configure camera still capture."));
+        ErrorLog::record(QStringLiteral("Android"), m_status, true);
+        return;
+    }
     run.sensors = auroraSensorHost();
     if (!m_deniedPermissions.contains(QStringLiteral("nearby_devices"))) run.bluetooth = auroraBluetoothHost();
     if (ordinaryStorage || cameraDestination) run.storage = m_storage.host();
@@ -462,17 +492,20 @@ void PreviewPlayer::start()
 #endif
     run.on_exit = appExited;
     run.user = this;
-    if (m_sharedMicrogEnabled) {
+    if (sharedMicrogReady) {
         QString error;
         const int fd = m_sharedMicrog->takeStream(&error);
         const QByteArray package = m_sharedMicrog->package().toUtf8();
         if (fd < 0 || !mg_java_set_shared_microg_client(fd, m_sharedMicrog->uid(),
                                                       m_sharedMicrog->pid(), package.constData())) {
             if (fd >= 0) ::close(fd);
-            setStatus(tr("Could not hand the shared microG channel to Android: %1").arg(
-                error.isEmpty() ? QStringLiteral("Invalid client bootstrap.") : error));
-            ErrorLog::record(QStringLiteral("Android"), m_status, true);
-            return;
+            run.gms_apk_path = nullptr;
+            m_sharedMicrogApkUtf8.clear();
+            m_sharedMicrog.reset();
+            ErrorLog::record(QStringLiteral("Android"),
+                             tr("Google services are unavailable, starting without them: %1").arg(
+                                 error.isEmpty() ? QStringLiteral("Invalid client bootstrap.") : error),
+                             true);
         }
     }
     if (!megler_run(&run)) {

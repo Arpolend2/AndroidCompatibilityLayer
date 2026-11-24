@@ -30,8 +30,16 @@ public class ParcelFileDescriptor implements Parcelable, Closeable {
     private final FileDescriptor mFd;
     private final Closeable mOwner;
     private final File mFile;
-    ParcelFileDescriptor(FileDescriptor fd, Closeable owner, File f) { mFd = fd; mOwner = owner; mFile = f; }
-    public ParcelFileDescriptor(ParcelFileDescriptor o) { this(o.mFd, o.mOwner, o.mFile); }
+    private FileDescriptor mCommFd;
+    private Integer mStatus;
+    private String mStatusMessage;
+    private boolean mClosed;
+    private ParcelFileDescriptor mWrapped;
+    ParcelFileDescriptor(FileDescriptor fd, Closeable owner, File f) { this(fd, owner, f, null); }
+    private ParcelFileDescriptor(FileDescriptor fd, Closeable owner, File f, FileDescriptor comm) {
+        mFd = fd; mOwner = owner; mFile = f; mCommFd = comm;
+    }
+    public ParcelFileDescriptor(ParcelFileDescriptor o) { this(o.mFd, o.mOwner, o.mFile, o.mCommFd); mWrapped = o; }
     public static int parseMode(String m) {
         int r;
         if ("r".equals(m)) r = MODE_READ_ONLY;
@@ -52,7 +60,19 @@ public class ParcelFileDescriptor implements Parcelable, Closeable {
         } catch (FileNotFoundException e) { throw e; } catch (IOException e) { throw new FileNotFoundException(e.toString()); }
     }
     /** Megler: a FileDescriptor object for a descriptor number. */
-    private static FileDescriptor meglerOf(int fd) { FileDescriptor f = new FileDescriptor(); try { java.lang.reflect.Field d = FileDescriptor.class.getDeclaredField("descriptor"); d.setAccessible(true); d.setInt(f, fd); } catch (Exception e) {} return f; }
+    private static java.lang.reflect.Field meglerDescriptorField() throws ReflectiveOperationException {
+        java.lang.reflect.Field field;
+        try { field = FileDescriptor.class.getDeclaredField("descriptor"); }
+        catch (NoSuchFieldException e) { field = FileDescriptor.class.getDeclaredField("fd"); }
+        field.setAccessible(true);
+        return field;
+    }
+    private static FileDescriptor meglerOf(int fd) {
+        FileDescriptor f = new FileDescriptor();
+        try { meglerDescriptorField().setInt(f, fd); }
+        catch (ReflectiveOperationException e) { throw new IllegalStateException("File descriptor access is unavailable", e); }
+        return f;
+    }
     /** Megler: libcore's android.system.Os.dup or close, by reflection (the stubs the framework is compiled against have no Os). */
     private static Object meglerOs(String name, FileDescriptor fd) throws IOException {
         try {
@@ -76,6 +96,10 @@ public class ParcelFileDescriptor implements Parcelable, Closeable {
     public static ParcelFileDescriptor fromFd(int fd) throws IOException { return meglerDup(meglerOf(fd), null); }
     public static ParcelFileDescriptor adoptFd(int fd) { FileDescriptor f = meglerOf(fd); return new ParcelFileDescriptor(f, meglerCloser(f), null); }
     public static ParcelFileDescriptor[] createPipe() throws IOException {
+        if (megler.SharedMicrogFdTransport.available()) {
+            int[] fds = megler.SharedMicrogFdTransport.createPipe();
+            return new ParcelFileDescriptor[] { adoptFd(fds[0]), adoptFd(fds[1]) };
+        }
         try {
             FileDescriptor[] fds = (FileDescriptor[]) Class.forName("android.system.Os").getMethod("pipe").invoke(null);
             return new ParcelFileDescriptor[] {
@@ -88,35 +112,161 @@ public class ParcelFileDescriptor implements Parcelable, Closeable {
             throw new IOException(e);
         }
     }
-    public static ParcelFileDescriptor[] createReliablePipe() throws IOException { throw new IOException("reliable pipes are not supported"); }
-    public ParcelFileDescriptor dup() throws IOException { return meglerDup(mFd, mFile); }
-    public FileDescriptor getFileDescriptor() { return mFd; }
-    public int getFd() { try { java.lang.reflect.Field d = FileDescriptor.class.getDeclaredField("descriptor"); d.setAccessible(true); return d.getInt(mFd); } catch (Exception e) { return -1; } }
+    public static ParcelFileDescriptor[] createReliablePipe() throws IOException { return withStatusChannel(createPipe()); }
+    public ParcelFileDescriptor dup() throws IOException { return mWrapped != null ? mWrapped.dup() : meglerDup(mFd, mFile); }
+    public FileDescriptor getFileDescriptor() { return mWrapped != null ? mWrapped.getFileDescriptor() : mFd; }
+    public int getFd() {
+        if (mWrapped != null) return mWrapped.getFd();
+        try { return meglerDescriptorField().getInt(mFd); }
+        catch (ReflectiveOperationException e) { throw new IllegalStateException("File descriptor access is unavailable", e); }
+    }
     /* Detached: the number is the caller's, and closing this no longer closes it. */
     private boolean mDetached;
-    public int detachFd() { mDetached = true; return getFd(); }
+    public synchronized int detachFd() {
+        if (mWrapped != null) return mWrapped.detachFd();
+        if (mClosed || mDetached) throw new IllegalStateException("Already closed");
+        int fd = getFd();
+        try { sendStatus(2, null); }
+        catch (IOException e) { System.err.println("ParcelFileDescriptor status delivery failed"); }
+        mDetached = true;
+        mClosed = true;
+        return fd;
+    }
     public long getStatSize() { return mFile != null ? mFile.length() : -1; }
     /** Megler: the file this was opened from (open), or null: what ResourcesProvider.loadFromApk opens the APK by. */
     public File meglerFile() { return mFile; }
-    public void close() throws IOException { if (mOwner != null && !mDetached) mOwner.close(); }
-    public void closeWithError(String msg) throws IOException { close(); }
-    public void checkError() throws IOException {}
+    private static ParcelFileDescriptor[] withStatusChannel(ParcelFileDescriptor[] pair) throws IOException {
+        ParcelFileDescriptor[] comm = null;
+        try {
+            comm = createSocketPair(5);
+            for (ParcelFileDescriptor end : comm) {
+                Class.forName("android.system.Os").getMethod("fcntlInt", FileDescriptor.class, int.class, int.class)
+                    .invoke(null, end.mFd, 4, 04000);
+            }
+            return new ParcelFileDescriptor[] {
+                new ParcelFileDescriptor(pair[0].mFd, pair[0].mOwner, pair[0].mFile, comm[0].mFd),
+                new ParcelFileDescriptor(pair[1].mFd, pair[1].mOwner, pair[1].mFile, comm[1].mFd)
+            };
+        } catch (ReflectiveOperationException | IOException e) {
+            for (ParcelFileDescriptor end : pair) try { end.close(); } catch (IOException closeError) { e.addSuppressed(closeError); }
+            if (comm != null) for (ParcelFileDescriptor end : comm) try { end.close(); } catch (IOException closeError) { e.addSuppressed(closeError); }
+            throw new IOException("Could not create descriptor status channel", e);
+        }
+    }
+    private synchronized void readStatus() throws IOException {
+        if (mCommFd == null || mStatus != null) return;
+        byte[] bytes = new byte[1024];
+        try {
+            int n = (Integer) Class.forName("android.system.Os")
+                .getMethod("read", FileDescriptor.class, byte[].class, int.class, int.class)
+                .invoke(null, mCommFd, bytes, 0, bytes.length);
+            if (n == 0) { mStatus = -2; return; }
+            if (n < 4) throw new IOException("Invalid descriptor status");
+            mStatus = ((bytes[0] & 255) << 24) | ((bytes[1] & 255) << 16) | ((bytes[2] & 255) << 8) | (bytes[3] & 255);
+            if (mStatus == 1) mStatusMessage = new String(bytes, 4, n - 4, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            try {
+                if (cause.getClass().getField("errno").getInt(cause) == 11) return;
+            } catch (ReflectiveOperationException ignored) {}
+            throw new IOException("Could not read descriptor status", cause);
+        } catch (ReflectiveOperationException e) {
+            throw new IOException("Descriptor status channel is unavailable", e);
+        }
+    }
+    private synchronized void sendStatus(int status, String message) throws IOException {
+        if (mCommFd == null) return;
+        FileDescriptor comm = mCommFd;
+        IOException failure = null;
+        try {
+            if (status != -1) {
+                readStatus();
+                if (mStatus == null) {
+                    byte[] text = message == null ? new byte[0] : message.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    byte[] bytes = new byte[4 + Math.min(text.length, 1020)];
+                    bytes[0] = (byte)(status >>> 24); bytes[1] = (byte)(status >>> 16);
+                    bytes[2] = (byte)(status >>> 8); bytes[3] = (byte)status;
+                    System.arraycopy(text, 0, bytes, 4, bytes.length - 4);
+                    int written = (Integer) Class.forName("android.system.Os")
+                        .getMethod("write", FileDescriptor.class, byte[].class, int.class, int.class)
+                        .invoke(null, comm, bytes, 0, bytes.length);
+                    if (written != bytes.length) throw new IOException("Incomplete descriptor status");
+                }
+            }
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            failure = new IOException("Could not send descriptor status", e.getCause());
+        } catch (ReflectiveOperationException e) {
+            failure = new IOException("Descriptor status channel is unavailable", e);
+        } catch (IOException e) {
+            failure = e;
+        } finally {
+            mCommFd = null;
+            try { meglerOs("close", comm); }
+            catch (IOException e) {
+                if (failure == null) failure = e;
+                else failure.addSuppressed(e);
+            }
+        }
+        if (failure != null) throw failure;
+    }
+    private synchronized void closeWithStatus(int status, String message) throws IOException {
+        if (mWrapped != null) { mWrapped.closeWithStatus(status, message); return; }
+        if (mClosed) return;
+        mClosed = true;
+        IOException failure = null;
+        try { sendStatus(status, message); } catch (IOException e) { failure = e; }
+        try { if (mOwner != null && !mDetached) mOwner.close(); }
+        catch (IOException e) {
+            if (failure == null) failure = e;
+            else failure.addSuppressed(e);
+        }
+        if (failure != null) throw failure;
+    }
+    public void close() throws IOException { closeWithStatus(0, null); }
+    /** Complete a successful Binder return without sending a close status. */
+    public void meglerCloseAfterTransfer() throws IOException { closeWithStatus(-1, null); }
+    public void closeWithError(String msg) throws IOException {
+        if (msg == null) throw new IllegalArgumentException("Error message is required");
+        closeWithStatus(1, msg);
+    }
+    public synchronized void checkError() throws IOException {
+        if (mWrapped != null) { mWrapped.checkError(); return; }
+        readStatus();
+        if (mStatus == null || mStatus == 0) return;
+        if (mStatus == 2) throw new FileDescriptorDetachedException();
+        if (mStatus == 1) throw new IOException(mStatusMessage);
+        throw new IOException("Remote descriptor closed unexpectedly");
+    }
     public int describeContents() { return CONTENTS_FILE_DESCRIPTOR; }
-    /** As Android's: no channel for errors (0), then the descriptor -- here a duplicate, which the one read owns. */
     @Override
-    public void writeToParcel(Parcel out, int flags) {
-        out.writeInt(0);
-        FileDescriptor copy;
-        try { copy = (FileDescriptor) meglerOs("dup", mFd); } catch (IOException e) { copy = null; }
-        out.writeRawFileDescriptor(copy);
-        if ((flags & PARCELABLE_WRITE_RETURN_VALUE) != 0) { try { close(); } catch (IOException e) {} }
+    public synchronized void writeToParcel(Parcel out, int flags) {
+        if (mWrapped != null) { mWrapped.writeToParcel(out, flags); return; }
+        try {
+            out.writeInt(mCommFd == null ? 0 : 1);
+            out.writeRawFileDescriptor(mFd);
+            if (mCommFd != null) out.writeRawFileDescriptor(mCommFd);
+            if ((flags & PARCELABLE_WRITE_RETURN_VALUE) != 0 && !out.meglerDeferFdReturn(this))
+                closeWithStatus(-1, null);
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not parcel file descriptor", e);
+        }
     }
     public static final Parcelable.Creator<ParcelFileDescriptor> CREATOR = new Parcelable.Creator<ParcelFileDescriptor>() {
         @Override
         public ParcelFileDescriptor createFromParcel(Parcel in) {
-            if (in.readInt() != 0) in.readRawFileDescriptor();
-            FileDescriptor fd = in.readRawFileDescriptor();
-            return fd == null ? null : new ParcelFileDescriptor(fd, meglerCloser(fd), null);
+            boolean hasComm = in.readInt() != 0;
+            FileDescriptor fd = null, comm = null;
+            try {
+                fd = in.readRawFileDescriptor();
+                comm = hasComm ? in.readRawFileDescriptor() : null;
+                if (fd == null || (hasComm && comm == null))
+                    throw new IllegalArgumentException("Invalid parcelled file descriptor");
+                return new ParcelFileDescriptor(fd, meglerCloser(fd), null, comm);
+            } catch (RuntimeException | Error failure) {
+                if (fd != null) try { meglerOs("close", fd); } catch (IOException e) { failure.addSuppressed(e); }
+                if (comm != null) try { meglerOs("close", comm); } catch (IOException e) { failure.addSuppressed(e); }
+                throw failure;
+            }
         }
         @Override
         public ParcelFileDescriptor[] newArray(int size) { return new ParcelFileDescriptor[size]; }
@@ -125,6 +275,17 @@ public class ParcelFileDescriptor implements Parcelable, Closeable {
         private final ParcelFileDescriptor mPfd;
         public AutoCloseInputStream(ParcelFileDescriptor p) { super(p.getFileDescriptor()); mPfd = p; }
         @Override public void close() throws IOException { try { super.close(); } finally { mPfd.close(); } }
+        @Override public int read() throws IOException {
+            int result = super.read();
+            if (result < 0 && mPfd.canDetectErrors()) mPfd.checkError();
+            return result;
+        }
+        @Override public int read(byte[] b, int off, int len) throws IOException {
+            int result = super.read(b, off, len);
+            if (result < 0 && mPfd.canDetectErrors()) mPfd.checkError();
+            return result;
+        }
+        @Override public int read(byte[] b) throws IOException { return read(b, 0, b.length); }
     }
     public static class AutoCloseOutputStream extends FileOutputStream {
         private final ParcelFileDescriptor mPfd;
@@ -132,10 +293,30 @@ public class ParcelFileDescriptor implements Parcelable, Closeable {
         @Override public void close() throws IOException { try { super.close(); } finally { mPfd.close(); } }
     }
     // ---- generated by tools/compat/fillmembers.py: the platform's members this class does not write (signatures only)
-    public static android.os.ParcelFileDescriptor[] createReliableSocketPair() { return null; }
-    public static android.os.ParcelFileDescriptor[] createReliableSocketPair(int p0) { return null; }
-    public static android.os.ParcelFileDescriptor[] createSocketPair() { return null; }
-    public static android.os.ParcelFileDescriptor[] createSocketPair(int p0) { return null; }
+    public static ParcelFileDescriptor[] createReliableSocketPair() throws IOException { return createReliableSocketPair(1); }
+    public static ParcelFileDescriptor[] createReliableSocketPair(int type) throws IOException {
+        return withStatusChannel(createSocketPair(type));
+    }
+    public static ParcelFileDescriptor[] createSocketPair() throws IOException { return createSocketPair(1); }
+    public static ParcelFileDescriptor[] createSocketPair(int type) throws IOException {
+        if (megler.SharedMicrogFdTransport.available()) {
+            int[] fds = megler.SharedMicrogFdTransport.createSocketPair(type);
+            return new ParcelFileDescriptor[] { adoptFd(fds[0]), adoptFd(fds[1]) };
+        }
+        try {
+            FileDescriptor first = new FileDescriptor(), second = new FileDescriptor();
+            Class.forName("android.system.Os").getMethod("socketpair", int.class, int.class, int.class,
+                FileDescriptor.class, FileDescriptor.class).invoke(null, 1, type, 0, first, second);
+            return new ParcelFileDescriptor[] {
+                new ParcelFileDescriptor(first, meglerCloser(first), null),
+                new ParcelFileDescriptor(second, meglerCloser(second), null)
+            };
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            throw new IOException(e.getCause());
+        } catch (ReflectiveOperationException e) {
+            throw new IOException(e);
+        }
+    }
     public static android.os.ParcelFileDescriptor fromData(byte[] p0, java.lang.String p1) { return null; }
     public static android.os.ParcelFileDescriptor fromDatagramSocket(java.net.DatagramSocket p0) { return null; }
     public static android.os.ParcelFileDescriptor fromFd(java.io.FileDescriptor p0, android.os.Handler p1, android.os.ParcelFileDescriptor.OnCloseListener p2) { return null; }
@@ -143,9 +324,19 @@ public class ParcelFileDescriptor implements Parcelable, Closeable {
     public static java.io.File getFile(java.io.FileDescriptor p0) { return null; }
     public static android.os.ParcelFileDescriptor open(java.io.File p0, int p1, android.os.Handler p2, android.os.ParcelFileDescriptor.OnCloseListener p3) { return null; }
     public static android.os.ParcelFileDescriptor wrap(android.os.ParcelFileDescriptor p0, android.os.Handler p1, android.os.ParcelFileDescriptor.OnCloseListener p2) { return null; }
-    public boolean canDetectErrors() { return false; }
+    public synchronized boolean canDetectErrors() { return mWrapped != null ? mWrapped.canDetectErrors() : mCommFd != null; }
     public void releaseResources() {}
-    public long seekTo(long p0) { return 0L; }
+    public long seekTo(long pos) throws IOException {
+        if (mWrapped != null) return mWrapped.seekTo(pos);
+        try {
+            return (Long) Class.forName("android.system.Os")
+                .getMethod("lseek", FileDescriptor.class, long.class, int.class).invoke(null, mFd, pos, 0);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            throw new IOException("Could not seek descriptor", e.getCause());
+        } catch (ReflectiveOperationException e) {
+            throw new IOException("Descriptor seeking is unavailable", e);
+        }
+    }
     // ---- end of generated members
     // ---- generated by tools/compat/genstubs.py: the platform's nested classes this class does not write
     public static class FileDescriptorDetachedException extends java.io.IOException {

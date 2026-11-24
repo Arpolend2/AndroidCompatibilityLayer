@@ -26,7 +26,7 @@ enum { READY = 1, OPEN = 2, CLOSE = 3, STOP = 4, ACK = 5, NACK = 6, DISCONNECTED
        FRAME_DELIVERED = 18, FRAME_SUPPRESSED = 19, FRAME_SEND_FAILED = 20,
        UI_RESIZE = 21 };
 enum { HEADER_SIZE = 28, MAX_PACKAGE = 255, MAX_CONTROL_INPUT = 4096,
-       FRAME_HEADER_SIZE = 48, FRAME_CHUNK = 60 * 1024, MAX_FRAME_BYTES = 16 * 1024 * 1024,
+       FRAME_HEADER_SIZE = 56, FRAME_CHUNK = 60 * 1024, MAX_FRAME_BYTES = 16 * 1024 * 1024,
        FRAME_SEND_TIMEOUT_MS = 1000 };
 static int control_fd = -1;
 static int frame_fd = -1;
@@ -37,6 +37,8 @@ static pthread_mutex_t exit_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t exit_cond = PTHREAD_COND_INITIALIZER;
 static int exited, exit_status;
 static uint64_t active_ui_channel, ui_generation, frame_sequence;
+static uint64_t pending_ui_channel, pending_ui_generation;
+static uint64_t frame_owner_channel, frame_owner_generation;
 /* Guarded by frame_lock; one best-effort diagnostic of each kind per UI. */
 static uint64_t diagnostic_generation;
 static unsigned frame_diagnostics;
@@ -130,17 +132,16 @@ static int package_valid(const unsigned char *name, size_t size)
 
 static void worker_receive(mg_jcall *call)
 {
-    unsigned char packet[HEADER_SIZE + MAX_CONTROL_INPUT];
+    unsigned char packet[HEADER_SIZE + 8 + MAX_CONTROL_INPUT];
     union { struct cmsghdr align; unsigned char bytes[CMSG_SPACE(sizeof(int) * 8)]; } ancillary;
     struct iovec iov = { packet, sizeof(packet) };
     struct msghdr message;
     struct cmsghdr *cmsg;
     int fds[8], count, invalid, guest_fd = -1;
     uint32_t type, uid, pid, package_size;
-    uint64_t channel;
+    uint64_t channel, generation = 0;
     ssize_t n;
     char text[HEADER_SIZE + MAX_CONTROL_INPUT + 96];
-receive_next:
     count = 0;
     invalid = 0;
     memset(&message, 0, sizeof(message));
@@ -176,6 +177,13 @@ receive_next:
         uid = read32(packet + 16);
         pid = read32(packet + 20);
         package_size = read32(packet + 24);
+        if (type >= TOUCH && type <= KEYBOARD_HEIGHT) {
+            if (package_size < 8 || (size_t)n != HEADER_SIZE + package_size) invalid = 1;
+            else generation = read64(packet + HEADER_SIZE);
+        } else if (type == UI_RESIZE) {
+            if (package_size < 8 || (size_t)n != HEADER_SIZE + package_size) invalid = 1;
+            else generation = read64(packet + HEADER_SIZE);
+        }
         if (type == OPEN) {
             if (!channel || uid < 11000 || uid > 19999 || !pid || pid > INT32_MAX ||
                 package_size > MAX_PACKAGE || (size_t)n != HEADER_SIZE + package_size ||
@@ -184,23 +192,26 @@ receive_next:
             if ((type == CLOSE && !channel) || (type == STOP && channel) ||
                 uid || pid || package_size || n != HEADER_SIZE || count) invalid = 1;
         } else if (type == TOUCH) {
-            if (!channel || uid > 2 || pid > 15 || package_size != 8 ||
-                n != HEADER_SIZE + 8 || count) invalid = 1;
+            if (!channel || !generation || uid > 2 || pid > 15 || package_size != 16 ||
+                n != HEADER_SIZE + 16 || count ||
+                read32(packet + HEADER_SIZE + 8) > 8192 ||
+                read32(packet + HEADER_SIZE + 12) > 8192) invalid = 1;
         } else if (type == BACK || type == KEYBOARD_CLOSED) {
-            if (!channel || uid || pid || package_size || n != HEADER_SIZE || count) invalid = 1;
+            if (!channel || !generation || uid || pid || package_size != 8 ||
+                n != HEADER_SIZE + 8 || count) invalid = 1;
         } else if (type == TEXT_COMMIT) {
-            if (!channel || uid || pid || !package_size || package_size > MAX_CONTROL_INPUT ||
+            if (!channel || !generation || uid || pid || package_size <= 8 || package_size > MAX_CONTROL_INPUT + 8 ||
                 n != HEADER_SIZE + package_size || count ||
-                memchr(packet + HEADER_SIZE, 0, package_size)) invalid = 1;
+                memchr(packet + HEADER_SIZE + 8, 0, package_size - 8)) invalid = 1;
         } else if (type == TEXT_KEY || type == KEYBOARD_HEIGHT) {
-            if (!channel || pid || package_size || n != HEADER_SIZE || count ||
+            if (!channel || !generation || pid || package_size != 8 || n != HEADER_SIZE + 8 || count ||
                 (type == TEXT_KEY && (uid < 1 || uid > 9)) ||
                 (type == KEYBOARD_HEIGHT && uid > 8192)) invalid = 1;
         } else if (type == UI_RESIZE) {
-            if (!channel || !uid || uid > 2048 || !pid || pid > 2048 ||
-                package_size != 8 || n != HEADER_SIZE + 8 || count ||
-                !read32(packet + HEADER_SIZE) || read32(packet + HEADER_SIZE) > 8192 ||
-                read32(packet + HEADER_SIZE + 4) > 3) invalid = 1;
+            if (!channel || !generation || !uid || uid > 2048 || !pid || pid > 2048 ||
+                package_size != 16 || n != HEADER_SIZE + 16 || count ||
+                !read32(packet + HEADER_SIZE + 8) || read32(packet + HEADER_SIZE + 8) > 8192 ||
+                read32(packet + HEADER_SIZE + 12) > 3) invalid = 1;
         } else invalid = 1;
     }
     if (invalid) {
@@ -211,14 +222,6 @@ receive_next:
         call->ret.l = NULL;
         return;
     }
-    if (type == UI_RESIZE) {
-        pthread_mutex_lock(&ui_lock);
-        if (channel == active_ui_channel)
-            megler_set_surface((int)uid, (int)pid, (int)read32(packet + HEADER_SIZE),
-                               (int)read32(packet + HEADER_SIZE + 4));
-        pthread_mutex_unlock(&ui_lock);
-        goto receive_next;
-    }
     if (type == OPEN) {
         guest_fd = mg_net_import_unix_stream(fds[0]);
         close(fds[0]);
@@ -226,17 +229,20 @@ receive_next:
         snprintf(text, sizeof(text), "%u %016llx %u %u %d %.*s", type,
                  (unsigned long long)channel, uid, pid, guest_fd, (int)package_size,
                  (const char *)(packet + HEADER_SIZE));
-    } else if (type == TOUCH) {
-        snprintf(text, sizeof(text), "%u %016llx %u %u %u %u", type,
-                 (unsigned long long)channel, uid, pid,
-                 read32(packet + HEADER_SIZE), read32(packet + HEADER_SIZE + 4));
+    } else if (type == TOUCH || type == UI_RESIZE) {
+        snprintf(text, sizeof(text), "%u %016llx %016llx %u %u %u %u", type,
+                 (unsigned long long)channel, (unsigned long long)generation, uid, pid,
+                 read32(packet + HEADER_SIZE + 8), read32(packet + HEADER_SIZE + 12));
     } else if (type == TEXT_COMMIT) {
-        snprintf(text, sizeof(text), "%u %016llx %.*s", type,
-                 (unsigned long long)channel, (int)package_size,
-                 (const char *)(packet + HEADER_SIZE));
+        snprintf(text, sizeof(text), "%u %016llx %016llx %.*s", type,
+                 (unsigned long long)channel, (unsigned long long)generation,
+                 (int)package_size - 8, (const char *)(packet + HEADER_SIZE + 8));
     } else if (type == TEXT_KEY || type == KEYBOARD_HEIGHT) {
-        snprintf(text, sizeof(text), "%u %016llx %u", type,
-                 (unsigned long long)channel, uid);
+        snprintf(text, sizeof(text), "%u %016llx %016llx %u", type,
+                 (unsigned long long)channel, (unsigned long long)generation, uid);
+    } else if (type == BACK || type == KEYBOARD_CLOSED) {
+        snprintf(text, sizeof(text), "%u %016llx %016llx", type,
+                 (unsigned long long)channel, (unsigned long long)generation);
     } else {
         snprintf(text, sizeof(text), "%u %016llx", type, (unsigned long long)channel);
     }
@@ -255,86 +261,138 @@ static void worker_send(mg_jcall *call)
     call->ret.i = send_packet((unsigned)type, channel);
 }
 
-static void worker_event(mg_jcall *call)
+static uint64_t start_ui(uint64_t channel)
 {
-    const int type = call->args[0].i;
-    const uint64_t channel = (uint64_t)call->args[1].j;
-    const uint32_t first = (uint32_t)call->args[2].i;
-    const uint32_t second = (uint32_t)call->args[3].i;
-    const uint32_t third = (uint32_t)call->args[4].i;
-    int allowed = 0, sent = 0;
+    uint64_t generation = 0;
     pthread_mutex_lock(&ui_lock);
-    if (type == UI_STARTED && channel && !active_ui_channel) {
-        active_ui_channel = channel;
-        ++ui_generation;
-        allowed = 1;
-    } else if (type == UI_FINISHED && channel && active_ui_channel == channel) {
-        active_ui_channel = 0;
-        allowed = 1;
-    } else if (type == KEYBOARD_SHOW && channel && active_ui_channel == channel &&
-               first <= MEGLER_KEYBOARD_DATETIME && second <= 255 && third <= MEGLER_ENTER_PREVIOUS) {
-        allowed = 1;
-    } else if (type == KEYBOARD_HIDE && channel && active_ui_channel == channel) {
-        allowed = 1;
+    if (channel && !active_ui_channel && !pending_ui_channel && ui_generation != UINT64_MAX) {
+        generation = ++ui_generation;
+        pending_ui_channel = channel;
+        pending_ui_generation = generation;
     }
-    if (allowed)
-        sent = send_packet_fields((unsigned)type, channel, first, second, third);
-    if (type == UI_STARTED && allowed && !sent) active_ui_channel = 0;
     pthread_mutex_unlock(&ui_lock);
-    call->ret.i = sent;
+    return generation;
 }
 
-static int ui_channel_matches(uint64_t channel)
+static int activate_ui(uint64_t channel, uint64_t generation)
+{
+    int sent = 0;
+    pthread_mutex_lock(&ui_lock);
+    if (channel && generation && !active_ui_channel &&
+        pending_ui_channel == channel && pending_ui_generation == generation) {
+        pending_ui_channel = pending_ui_generation = 0;
+        active_ui_channel = channel;
+        frame_owner_channel = frame_owner_generation = 0;
+        sent = send_packet_fields(UI_STARTED, channel, (uint32_t)(generation >> 32),
+                                  (uint32_t)generation, 0);
+        if (!sent) active_ui_channel = 0;
+    }
+    pthread_mutex_unlock(&ui_lock);
+    return sent;
+}
+
+static int finish_ui(uint64_t channel, uint64_t generation)
+{
+    int sent = 0;
+    pthread_mutex_lock(&ui_lock);
+    if (channel && generation && pending_ui_channel == channel && pending_ui_generation == generation) {
+        pending_ui_channel = pending_ui_generation = 0;
+        sent = 1;
+    } else if (channel && generation && active_ui_channel == channel && generation == ui_generation) {
+        active_ui_channel = 0;
+        frame_owner_channel = frame_owner_generation = 0;
+        sent = send_packet_fields(UI_FINISHED, channel, (uint32_t)(ui_generation >> 32),
+                                  (uint32_t)ui_generation, 0);
+    }
+    pthread_mutex_unlock(&ui_lock);
+    return sent;
+}
+
+static void worker_start_ui(mg_jcall *call)
+{
+    call->ret.j = (int64_t)start_ui((uint64_t)call->args[0].j);
+}
+
+static void worker_activate_ui(mg_jcall *call)
+{
+    call->ret.i = activate_ui((uint64_t)call->args[0].j, (uint64_t)call->args[1].j);
+}
+
+static void worker_cancel_pending_ui(mg_jcall *call)
+{
+    const uint64_t channel = (uint64_t)call->args[0].j;
+    const uint64_t generation = (uint64_t)call->args[1].j;
+    pthread_mutex_lock(&ui_lock);
+    call->ret.i = channel && generation && pending_ui_channel == channel &&
+                  pending_ui_generation == generation;
+    if (call->ret.i) pending_ui_channel = pending_ui_generation = 0;
+    pthread_mutex_unlock(&ui_lock);
+}
+
+static void worker_finish_ui(mg_jcall *call)
+{
+    call->ret.i = finish_ui((uint64_t)call->args[0].j, (uint64_t)call->args[1].j);
+}
+
+static void worker_current_ui_channel(mg_jcall *call)
+{
+    pthread_mutex_lock(&ui_lock);
+    call->ret.j = (int64_t)active_ui_channel;
+    pthread_mutex_unlock(&ui_lock);
+}
+
+static void worker_current_ui_generation(mg_jcall *call)
+{
+    const uint64_t channel = (uint64_t)call->args[0].j;
+    pthread_mutex_lock(&ui_lock);
+    call->ret.j = channel && channel == active_ui_channel ? (int64_t)ui_generation : 0;
+    pthread_mutex_unlock(&ui_lock);
+}
+
+static void worker_authorize_frame(mg_jcall *call)
+{
+    const uint64_t channel = (uint64_t)call->args[0].j;
+    const uint64_t generation = (uint64_t)call->args[1].j;
+    pthread_mutex_lock(&ui_lock);
+    if (!channel && !generation) {
+        frame_owner_channel = frame_owner_generation = 0;
+        call->ret.i = 1;
+    } else if (channel && generation && channel == active_ui_channel && generation == ui_generation) {
+        frame_owner_channel = channel;
+        frame_owner_generation = generation;
+        call->ret.i = 1;
+    } else {
+        frame_owner_channel = frame_owner_generation = 0;
+        call->ret.i = 0;
+    }
+    pthread_mutex_unlock(&ui_lock);
+}
+
+static int ui_matches(uint64_t channel, uint64_t generation)
 {
     int matches;
     pthread_mutex_lock(&ui_lock);
-    matches = channel && active_ui_channel == channel;
+    matches = channel && generation && active_ui_channel == channel && ui_generation == generation;
     pthread_mutex_unlock(&ui_lock);
     return matches;
 }
 
-static void worker_touch(mg_jcall *call)
-{
-    const uint64_t channel = (uint64_t)call->args[0].j;
-    const int phase = call->args[1].i, pointer = call->args[2].i;
-    const int x = call->args[3].i, y = call->args[4].i;
-    if (ui_channel_matches(channel) && phase >= 0 && phase <= 2 && pointer >= 0 && pointer <= 15 &&
-        x >= 0 && x <= 8192 && y >= 0 && y <= 8192)
-        megler_touch(phase, pointer, (float)x, (float)y);
-}
-
-static void worker_back(mg_jcall *call)
-{
-    if (!ui_channel_matches((uint64_t)call->args[0].j)) return;
-    megler_key(4, true);
-    megler_key(4, false);
-}
-
-static void worker_text(mg_jcall *call)
-{
-    const char *text = call->args[1].l ? mg_dvm_string_utf8(call->args[1].l) : NULL;
-    if (text && strlen(text) <= MAX_CONTROL_INPUT && ui_channel_matches((uint64_t)call->args[0].j))
-        megler_text_commit(text);
-}
-
-static void worker_text_key(mg_jcall *call)
-{
-    const int key = call->args[1].i;
-    if (ui_channel_matches((uint64_t)call->args[0].j) && key >= MEGLER_TEXT_BACKSPACE &&
-        key <= MEGLER_TEXT_END)
-        megler_text_key(key);
-}
-
-static void worker_keyboard_closed(mg_jcall *call)
-{
-    if (ui_channel_matches((uint64_t)call->args[0].j)) megler_keyboard_closed();
-}
-
 static void worker_keyboard_height(mg_jcall *call)
 {
-    const int height = call->args[1].i;
-    if (ui_channel_matches((uint64_t)call->args[0].j) && height >= 0 && height <= 8192)
+    const int height = call->args[2].i;
+    if (ui_matches((uint64_t)call->args[0].j, (uint64_t)call->args[1].j) &&
+        height >= 0 && height <= 8192)
         megler_keyboard_height(height);
+}
+
+static void worker_resize(mg_jcall *call)
+{
+    const int width = call->args[2].i, height = call->args[3].i;
+    const int density = call->args[4].i, rotation = call->args[5].i;
+    if (ui_matches((uint64_t)call->args[0].j, (uint64_t)call->args[1].j) &&
+        width > 0 && width <= 2048 && height > 0 && height <= 2048 &&
+        density > 0 && density <= 8192 && rotation >= 0 && rotation <= 3)
+        megler_set_surface(width, height, density, rotation);
 }
 
 static void MEGLER_CB worker_keyboard_show(void *user, int kind, int flags, int enter)
@@ -359,24 +417,24 @@ static void MEGLER_CB worker_keyboard_hide(void *user)
     if (channel) send_packet_fields(KEYBOARD_HIDE, channel, 0, 0, 0);
 }
 
-static void MEGLER_CB worker_present_pixels(void *user, const void *pixels, int width, int height, int stride)
+static int worker_send_pixels(const void *pixels, int width, int height, int stride)
 {
     unsigned char packet[FRAME_HEADER_SIZE + FRAME_CHUNK];
     const unsigned char *source = (const unsigned char *)pixels;
     uint64_t channel, generation, sequence;
     uint32_t total, offset = 0;
     struct timespec deadline;
-    (void)user;
     if (!pixels || frame_fd < 0 || width <= 0 || width > 2048 || height <= 0 || height > 2048 ||
         stride < width * 4 || stride > width * 4 + 4096 ||
         (uint64_t)stride * (uint64_t)height > MAX_FRAME_BYTES)
-        return;
+        return 0;
     pthread_mutex_lock(&frame_lock);
     pthread_mutex_lock(&ui_lock);
-    channel = active_ui_channel;
-    generation = ui_generation;
+    channel = frame_owner_channel;
+    generation = frame_owner_generation;
+    if (channel != active_ui_channel || generation != ui_generation) channel = 0;
     pthread_mutex_unlock(&ui_lock);
-    if (!channel) { pthread_mutex_unlock(&frame_lock); return; }
+    if (!channel) { pthread_mutex_unlock(&frame_lock); return 1; }
     if (diagnostic_generation != generation) {
         diagnostic_generation = generation;
         frame_diagnostics = 0;
@@ -385,7 +443,7 @@ static void MEGLER_CB worker_present_pixels(void *user, const void *pixels, int 
     if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
         fprintf(stderr, "shared microG: cannot start UI frame send deadline: %s\n", strerror(errno));
         pthread_mutex_unlock(&frame_lock);
-        return;
+        return 0;
     }
     if (!frame_sequence) {
         uint32_t i;
@@ -396,7 +454,7 @@ static void MEGLER_CB worker_present_pixels(void *user, const void *pixels, int 
         if (!nonzero) {
             send_frame_diagnostic(FRAME_SUPPRESSED, channel, (uint32_t)width, (uint32_t)height);
             pthread_mutex_unlock(&frame_lock);
-            return;
+            return 1;
         }
     }
     deadline.tv_nsec += FRAME_SEND_TIMEOUT_MS * 1000000L;
@@ -411,7 +469,7 @@ static void MEGLER_CB worker_present_pixels(void *user, const void *pixels, int 
         int send_error = 0;
         if (chunk > FRAME_CHUNK) chunk = FRAME_CHUNK;
         memcpy(packet, "MGUI", 4);
-        write32(packet + 4, 1);
+        write32(packet + 4, 2);
         write64(packet + 8, channel);
         write64(packet + 16, sequence);
         write32(packet + 24, (uint32_t)width);
@@ -420,6 +478,7 @@ static void MEGLER_CB worker_present_pixels(void *user, const void *pixels, int 
         write32(packet + 36, total);
         write32(packet + 40, offset);
         write32(packet + 44, chunk);
+        write64(packet + 48, generation);
         memcpy(packet + FRAME_HEADER_SIZE, source + offset, chunk);
         int polledWritable = 0;
         for (;;) {
@@ -495,24 +554,53 @@ static void MEGLER_CB worker_present_pixels(void *user, const void *pixels, int 
         }
     }
     pthread_mutex_unlock(&frame_lock);
+    return offset == total;
+}
+
+static void MEGLER_CB worker_present_pixels(void *user, const void *pixels, int width, int height, int stride)
+{
+    (void)user;
+    (void)worker_send_pixels(pixels, width, height, stride);
+}
+
+bool MEGLER_CB shared_microg_gpu_present_pixels(void *user, const void *pixels, int width, int height, int stride)
+{
+    (void)user;
+    return worker_send_pixels(pixels, width, height, stride) != 0;
+}
+
+bool shared_microg_gpu_frame_owner(uint64_t *channel, uint64_t *generation)
+{
+    bool valid;
+    if (!channel || !generation) return false;
+    pthread_mutex_lock(&ui_lock);
+    valid = frame_owner_channel != 0 && frame_owner_channel == active_ui_channel &&
+            frame_owner_generation != 0 && frame_owner_generation == ui_generation;
+    *channel = valid ? frame_owner_channel : 0;
+    *generation = valid ? frame_owner_generation : 0;
+    pthread_mutex_unlock(&ui_lock);
+    return valid;
 }
 
 static void configure_worker_graphics(megler_run_config *run, const megler_gfx_host *graphics)
 {
     run->gfx = *graphics;
     run->window.present_pixels = worker_present_pixels;
+    run->block_unowned_egl_layers = true;
 }
 
 static const mg_jhle worker_natives[] = {
     { "megler/SharedMicrogWorker", "receive", "()Ljava/lang/String;", worker_receive },
     { "megler/SharedMicrogWorker", "send", "(IJ)Z", worker_send },
-    { "megler/SharedMicrogWorker", "event", "(IJIII)Z", worker_event },
-    { "megler/SharedMicrogWorker", "touch", "(JIIII)V", worker_touch },
-    { "megler/SharedMicrogWorker", "back", "(J)V", worker_back },
-    { "megler/SharedMicrogWorker", "text", "(JLjava/lang/String;)V", worker_text },
-    { "megler/SharedMicrogWorker", "textKey", "(JI)V", worker_text_key },
-    { "megler/SharedMicrogWorker", "keyboardClosed", "(J)V", worker_keyboard_closed },
-    { "megler/SharedMicrogWorker", "keyboardHeight", "(JI)V", worker_keyboard_height },
+    { "megler/SharedMicrogWorker", "startUi", "(J)J", worker_start_ui },
+    { "megler/SharedMicrogWorker", "activateUi", "(JJ)Z", worker_activate_ui },
+    { "megler/SharedMicrogWorker", "cancelPendingUi", "(JJ)Z", worker_cancel_pending_ui },
+    { "megler/SharedMicrogWorker", "finishUi", "(JJ)Z", worker_finish_ui },
+    { "megler/SharedMicrogWorker", "currentUiChannel", "()J", worker_current_ui_channel },
+    { "megler/SharedMicrogWorker", "currentUiGeneration", "(J)J", worker_current_ui_generation },
+    { "megler/SharedMicrogWorker", "authorizeFrame", "(JJ)Z", worker_authorize_frame },
+    { "megler/SharedMicrogWorker", "keyboardHeight", "(JJI)V", worker_keyboard_height },
+    { "megler/SharedMicrogWorker", "resize", "(JJIIII)V", worker_resize },
     { NULL, NULL, NULL, NULL }
 };
 
@@ -544,7 +632,7 @@ static int absolute_path(const char *path, int directory)
 int shared_microg_worker_main(int argc, char **argv, const megler_gfx_host *graphics)
 {
     const char *apk = NULL, *data = NULL, *root = NULL, *apps = NULL;
-    int headless = 0, version = 0, mode = 0, i, type, frame_type;
+    int headless = 0, version = 0, mode = 0, gpu = 0, i, type, frame_type;
     socklen_t type_size = sizeof(type), frame_type_size = sizeof(frame_type);
     struct sockaddr_storage local, peer, frame_local, frame_peer;
     socklen_t local_size = sizeof(local), peer_size = sizeof(peer);
@@ -555,6 +643,7 @@ int shared_microg_worker_main(int argc, char **argv, const megler_gfx_host *grap
     for (i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "--shared-microg-worker") && !mode) mode = 1;
+        else if (!strcmp(arg, "--gpu-canvas") && !gpu) gpu = 1;
         else if (!strcmp(arg, "--headless") && !headless) headless = 1;
         else if (!strcmp(arg, "--control-fd=3") && control_fd < 0) control_fd = 3;
         else if (!strcmp(arg, "--frame-fd=4") && frame_fd < 0) frame_fd = 4;

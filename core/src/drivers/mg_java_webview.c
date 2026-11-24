@@ -363,7 +363,8 @@ typedef struct wv_functor {
     aw_callbacks cb;
     bool released;                     /* release_functor: its last callbacks are the render thread's to make */
     bool drawn;                        /* draw_gl has run: on_context_destroyed is owed at the end */
-    EGLSurface surface;                /* its pbuffer, pw x ph */
+    EGLSurface surface;                /* its offscreen surface, pw x ph */
+    void *host_surface;
     int pw, ph;
     mg_java_gl_share share;
     u32 draws;
@@ -413,12 +414,13 @@ static struct {
     i32 state;                         /* 0 not tried, 1 found, 2 none */
     EGLConfig config;
     int version;
-} WP = { MG_LOCK_INIT, 0, NULL, 0 };
+    bool host_surface;
+} WP = { MG_LOCK_INIT, 0, NULL, 0, false };
 
 static bool wv_pick(void)
 {
     enum {
-        EGL_NONE = 0x3038, EGL_SURFACE_TYPE = 0x3033, EGL_PBUFFER_BIT = 1, EGL_RENDERABLE_TYPE = 0x3040, EGL_OPENGL_ES2_BIT = 4,
+        EGL_NONE = 0x3038, EGL_SURFACE_TYPE = 0x3033, EGL_PBUFFER_BIT = 1, EGL_WINDOW_BIT = 4, EGL_RENDERABLE_TYPE = 0x3040, EGL_OPENGL_ES2_BIT = 4,
         EGL_OPENGL_ES3_BIT = 0x40, EGL_RED_SIZE = 0x3024, EGL_GREEN_SIZE = 0x3023, EGL_BLUE_SIZE = 0x3022, EGL_ALPHA_SIZE = 0x3021,
         EGL_WIDTH = 0x3057, EGL_HEIGHT = 0x3056, EGL_CONFIG_ID = 0x3028, EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE = 0x3200
     };
@@ -434,7 +436,7 @@ static bool wv_pick(void)
     EGLDisplay display;
     EGLConfig configs[32];
     EGLint n, id = 0;
-    int version, i, tried = 0;
+    int version, i, mode, tried = 0;
     if (WP.state) return WP.state == 1;
     mg_lock_acquire(&WP.lock);
     if (!WP.state) {
@@ -445,28 +447,40 @@ static bool wv_pick(void)
         config_attrib = (u32(*)(EGLDisplay, EGLConfig, EGLint, EGLint *))mg_egl_host("eglGetConfigAttrib");
         /* Chromium's display: what its own eglGetDisplay is given (ndk/mg_egl.c). */
         display = mg_egl_display_for_library("libwebviewchromium.so");
-        for (version = 3; version >= 2 && !WP.config && choose && create_pbuffer && destroy_surface && query_pointer && display; version--) {
-            want[3] = version == 3 ? EGL_OPENGL_ES3_BIT : EGL_OPENGL_ES2_BIT;
-            n = 0;
-            if (!choose(display, want, configs, (EGLint)MG_COUNT(configs), &n)) n = 0;
-            for (i = 0; i < n && !WP.config; i++) {
-                EGLSurface pb = create_pbuffer(display, configs[i], probe);
-                void *handle = NULL;
-                tried++;
-                if (!pb) continue;
-                if (!query_pointer(display, pb, EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE, &handle)) handle = NULL;
-                destroy_surface(display, pb);
-                if (!handle) continue;
-                WP.config = configs[i];
-                WP.version = version;
+        for (mode = 0; mode < 2 && !WP.config && choose && create_pbuffer && destroy_surface &&
+             (query_pointer || mg_java_gl_native_texture_frames()) && display; mode++) {
+            if (mode && !mg_java_gl_native_surfaces()) break;
+            want[1] = mode ? EGL_WINDOW_BIT : EGL_PBUFFER_BIT;
+            for (version = 3; version >= 2 && !WP.config; version--) {
+                want[3] = version == 3 ? EGL_OPENGL_ES3_BIT : EGL_OPENGL_ES2_BIT;
+                n = 0;
+                if (mode)
+                    n = mg_java_gl_native_surface_configs(display, version, configs, (int)MG_COUNT(configs));
+                else if (!choose(display, want, configs, (EGLint)MG_COUNT(configs), &n)) n = 0;
+                if (n < 0 || n > (EGLint)MG_COUNT(configs)) n = 0;
+                for (i = 0; i < n && !WP.config; i++) {
+                    void *token = NULL, *handle = NULL;
+                    EGLSurface pb = mode ? mg_java_gl_native_surface_new(display, configs[i], 64, 64, &token)
+                                         : create_pbuffer(display, configs[i], probe);
+                    tried++;
+                    if (!pb) continue;
+                    if (mg_java_gl_native_texture_frames()) handle = pb;
+                    else if (!query_pointer(display, pb, EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE, &handle)) handle = NULL;
+                    if (mode) mg_java_gl_native_surface_free(token);
+                    else destroy_surface(display, pb);
+                    if (!handle) continue;
+                    WP.config = configs[i];
+                    WP.version = version;
+                    WP.host_surface = mode != 0;
+                }
             }
         }
         if (WP.config && config_attrib) config_attrib(display, WP.config, EGL_CONFIG_ID, &id);
         if (WP.config)
-            mg_info("webview: the render thread's pbuffers are of EGL configuration %d (OpenGL ES %d), whose texture the display shares (%d tried)",
-                    (int)id, WP.version, tried);
+            mg_info("webview: the render thread uses EGL configuration %d (OpenGL ES %d, %s; %d tried)",
+                    (int)id, WP.version, WP.host_surface ? "host surface" : "pbuffer", tried);
         else
-            mg_warn("webview: no EGL configuration's pbuffer has a texture the display shares (%d tried): pages are drawn in software", tried);
+            mg_warn("webview: no usable EGL surface configuration (%d tried): pages are drawn in software", tried);
         mg_atomic_xchg(&WP.state, WP.config ? 1 : 2);
     }
     mg_lock_release(&WP.lock);
@@ -612,8 +626,10 @@ static void wv_surface_free(wv_functor *f)
 {
     if (!f->surface) return;
     W.make_current(W.display, NULL, NULL, NULL);
-    W.destroy_surface(W.display, f->surface);
+    if (f->host_surface) mg_java_gl_native_surface_free(f->host_surface);
+    else W.destroy_surface(W.display, f->surface);
     f->surface = NULL;
+    f->host_surface = NULL;
     f->pw = f->ph = 0;
     memset(&f->share, 0, sizeof(f->share));
 }
@@ -697,9 +713,10 @@ static i64 wv_draw(wv_functor *f, int l, int t, int w, int h)
         wv_surface_free(f);
         attribs[1] = pw;
         attribs[3] = ph;
-        f->surface = W.create_pbuffer(W.display, W.config, attribs);
+        f->surface = WP.host_surface ? mg_java_gl_native_surface_new(W.display, W.config, pw, ph, &f->host_surface)
+                                    : W.create_pbuffer(W.display, W.config, attribs);
         if (!f->surface) {
-            mg_warn("webview: no %dx%d pbuffer for draw functor %d (EGL error 0x%x)", pw, ph, (int)f->id, (unsigned)W.get_error());
+            mg_warn("webview: no %dx%d EGL surface for draw functor %d (EGL error 0x%x)", pw, ph, (int)f->id, (unsigned)W.get_error());
             return 0;
         }
         f->pw = pw;
@@ -897,6 +914,7 @@ void mg_java_webview_forget_egl(void)
     WP.state = 0;
     WP.config = NULL;
     WP.version = 0;
+    WP.host_surface = false;
     mg_lock_release(&WP.lock);
     mg_lock_release(&g_wv_serial);
 }

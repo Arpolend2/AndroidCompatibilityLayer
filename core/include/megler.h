@@ -619,6 +619,12 @@ typedef struct megler_camera_size {
     int min_fps, max_fps;
 } megler_camera_size;
 
+#define MEGLER_CAMERA_MAX_JPEG_BYTES (64U * 1024U * 1024U)
+
+typedef struct megler_camera_picture_size {
+    int width, height;
+} megler_camera_picture_size;
+
 typedef struct megler_camera_caps {
     int size_count;
     megler_camera_size sizes[MEGLER_CAMERA_MAX_SIZES];
@@ -649,6 +655,19 @@ typedef struct megler_camera_host {
     void (MEGLER_CB *torch)(void *user, void *camera, bool on);
     void (MEGLER_CB *close)(void *user, void *camera);
 } megler_camera_host;
+
+typedef bool (MEGLER_CB *megler_camera_jpeg_write_fn)(void *context, const uint8_t *bytes, size_t size);
+
+/*
+ * Optional still-image support, separate from megler_run_config so its ABI stays unchanged. Picture sizes must be reported
+ * from the active camera backend; capture writes one JPEG in bounded chunks and must not retain writer or context.
+ */
+typedef struct megler_camera_capture_host {
+    void *user;
+    int (MEGLER_CB *picture_sizes)(void *user, void *camera, megler_camera_picture_size *sizes, int max);
+    bool (MEGLER_CB *capture)(void *user, void *camera, int width, int height, int quality, int rotation,
+                              megler_camera_jpeg_write_fn write, void *context);
+} megler_camera_capture_host;
 
 /*
  * The phone's own folders in an app's storage.
@@ -1446,6 +1465,20 @@ typedef struct megler_gfx_host {
     /* The canonical memory was changed by the CPU and must replace any cached
        GPU image before it is used again. */
     void (MEGLER_CB *bitmap_changed)(void *user, uint32_t id);
+    /* Optional native EGL equivalent of texture_frame. The producer's GLES
+       context and pbuffer are current when called; the host must retain its
+       own picture before returning. A null display and surface release the id.
+       Return 1 on success, 0 to fall back, or -1 if the producer context
+       could not be restored. Requires draw_texture. */
+    int (MEGLER_CB *texture_egl_frame)(void *user, int id, void *display,
+                                       void *surface, int width, int height);
+    /* Optional offscreen EGL window for displays without pbuffer configurations.
+       The returned surface and token belong to the host until egl_surface_free. */
+    int (MEGLER_CB *egl_surface_configs)(void *user, void *display, int version,
+                                        void **configs, int capacity);
+    void *(MEGLER_CB *egl_surface_new)(void *user, void *display, void *config,
+                                      int width, int height, void **token);
+    void (MEGLER_CB *egl_surface_free)(void *user, void *token);
 } megler_gfx_host;
 
 /*
@@ -2186,6 +2219,8 @@ typedef struct megler_run_config {
     int (MEGLER_CB *present_egl_layer)(void *user, int layer, void *display, void *surface, int width, int height);
     void (MEGLER_CB *place_egl_layer)(void *user, int layer, int x, int y, int width, int height, int flags);
     megler_notification_host notifications;
+    /* A shared worker cannot safely present legacy EGL layers without an owner per layer. */
+    bool block_unowned_egl_layers;
 } megler_run_config;
 
 /*
@@ -2218,6 +2253,8 @@ MEGLER_API bool megler_running(void);
  * No files are moved and the storage host's permissions are unchanged.
  */
 MEGLER_API bool megler_set_camera_storage_alias(const char *package, bool enabled);
+/* Set optional still-image callbacks for the next app; NULL disables them. False while an app runs or the host is invalid. */
+MEGLER_API bool megler_set_camera_capture_host(const megler_camera_capture_host *host);
 MEGLER_API const char *megler_last_error(void);
 /*
  * Where another thread of the process stands, in one line: its pc and lr, and the ways back into a module or into Android

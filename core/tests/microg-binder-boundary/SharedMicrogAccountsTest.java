@@ -29,6 +29,8 @@ public final class SharedMicrogAccountsTest {
     private static void child() throws Exception {
         AtomicBoolean screenLaunched = new AtomicBoolean();
         AtomicBoolean screenDismissed = new AtomicBoolean();
+        AtomicBoolean screenBusy = new AtomicBoolean();
+        CountDownLatch firstScreenReady = new CountDownLatch(1);
         SharedMicrogAccounts.Engine engine = new SharedMicrogAccounts.Engine() {
             @Override public Account[] accounts() {
                 return new Account[] { new Account("fixture.account", SharedMicrogAccounts.GOOGLE) };
@@ -43,10 +45,19 @@ public final class SharedMicrogAccountsTest {
                 Bundle answer = new Bundle();
                 if (operation == SharedMicrogAccounts.OP_FEATURES) {
                     answer.putBoolean(AccountManager.KEY_BOOLEAN_RESULT, true);
-                } else if ("screen".equals(mode)) {
+                } else if ("screen".equals(mode) || "screen-hold".equals(mode) || "screen-busy".equals(mode)) {
+                    if ("screen-busy".equals(mode)) {
+                        try { check(firstScreenReady.await(10, TimeUnit.SECONDS), "first screen did not start"); }
+                        catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new RuntimeException(e); }
+                    }
                     answer.putParcelable(AccountManager.KEY_INTENT,
                         new Intent().setClassName("com.google.android.gms", "fixture.Login"));
                     response.onResult(answer);
+                    if ("screen-hold".equals(mode)) {
+                        firstScreenReady.countDown();
+                        return () -> { };
+                    }
+                    if ("screen-busy".equals(mode)) return () -> { };
                     Thread completion = new Thread(() -> {
                         try { Thread.sleep(100); }
                         catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
@@ -75,16 +86,20 @@ public final class SharedMicrogAccountsTest {
         };
         SharedMicrogAccounts.Server server = new SharedMicrogAccounts.Server(engine,
             new SharedMicrogAccounts.Foreground() {
-                @Override public boolean launch(long channelId, Intent intent) {
+                @Override public long launch(long channelId, Intent intent) {
                     if (channelId != 1 || intent.getComponent() == null ||
                             !"com.google.android.gms".equals(intent.getComponent().getPackageName()) ||
                             !"fixture.Login".equals(intent.getComponent().getClassName()))
-                        return false;
+                        return 0;
+                    if (!screenBusy.compareAndSet(false, true)) return 0;
                     screenLaunched.set(true);
-                    return true;
+                    return 17;
                 }
-                @Override public void dismiss(long channelId) {
-                    if (channelId == 1) screenDismissed.set(true);
+                @Override public void dismiss(long channelId, long generation) {
+                    if (channelId == 1 && generation == 17) {
+                        screenDismissed.set(true);
+                        screenBusy.set(false);
+                    }
                 }
             }, 1, "fixture.client", 11001, 50001);
         BinderBridge bridge = new BinderBridge(System.in, System.out, server.binder());
@@ -135,6 +150,19 @@ public final class SharedMicrogAccountsTest {
             client.token(accounts[0], "fixture.scope", options, mismatch);
             mismatch.await();
             check(mismatch.result == null && mismatch.error == AccountManager.ERROR_CODE_INVALID_RESPONSE, "wrong account rejected");
+
+            options.putString("fixture.mode", "screen-hold");
+            Callback firstScreen = new Callback();
+            int firstId = client.add(null, null, options, firstScreen);
+            options.putString("fixture.mode", "screen-busy");
+            Callback busyScreen = new Callback();
+            client.add(null, null, options, busyScreen);
+            busyScreen.await();
+            check(busyScreen.result == null && busyScreen.error == AccountManager.ERROR_CODE_REMOTE_EXCEPTION,
+                "second sign-in is rejected while first is active");
+            client.cancel(firstId);
+            firstScreen.await();
+            check(firstScreen.error == AccountManager.ERROR_CODE_CANCELED, "first sign-in canceled");
 
             options.putString("fixture.mode", "screen");
             Callback screen = new Callback();

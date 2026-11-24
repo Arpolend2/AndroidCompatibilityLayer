@@ -50,7 +50,8 @@ final class SharedMicrogClientStartup {
                 // Linux SHUT_RDWR; guest OsConstants initialization is not implemented.
                 try { Os.shutdown(stream.getFileDescriptor(), 2); }
                 catch (ErrnoException e) { throw new IOException("Shared microG socket shutdown failed", e); }
-            });
+            }, null, Broadcasts::sendFromSharedWorker,
+            SharedMicrogFdTransport.available() ? BinderBridge.descriptorTransport(stream.getFd()) : null);
     }
 
     static void close() throws IOException {

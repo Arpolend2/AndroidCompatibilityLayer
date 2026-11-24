@@ -40,8 +40,9 @@ import java.util.concurrent.TimeUnit;
 /**
  * The old camera API as a code scanner uses it (core/src/drivers/mg_java_camera.c and the overlay's android.hardware.Camera),
  * on the test's stand-in for the shell's cameras (core/tests/mg_camera_standin.c): a camera at the back turned 90 degrees,
- * with focus and a torch, and one at the front turned 270, whose pictures are four quarters of known colours with their
- * number in the first four bytes. The top half of the screen is a SurfaceView for the back camera's preview, the bottom
+ * with focus and a torch, and one at the front turned 270, whose preview pictures are four quarters of known colours with
+ * their number in the first four bytes. The still-image stand-in reports separate full-resolution sizes and a JPEG. The top
+ * half of the screen is a SurfaceView for the back camera's preview, the bottom
  * half a TextureView for the front camera's. A thread of the app's goes through the steps and says how each went; the back
  * camera is opened on a HandlerThread, whose looper its callbacks must come on, the front one on that plain thread, whose
  * callbacks must come on the main looper. While a preview runs for the test to look at, the app waits for a tap.
@@ -407,6 +408,7 @@ public class Main extends Activity {
             tapped = new CountDownLatch(1);
             return seen;
         });
+        step("capture", this::capture);
         step("autofocus", () -> {
             Focus f = new Focus(), cancelled = new Focus();
             back.autoFocus(f);
@@ -509,6 +511,50 @@ public class Main extends Activity {
             return params && got && frames.allRight && frames.allOn("main") && focused && f.success && "main".equals(f.thread) && seen;
         });
         Log.i(T, "done ok=" + ok + " failed=" + failed);
+    }
+
+    private boolean capture() throws Exception {
+        Camera.Parameters params = back.getParameters();
+        params.setPictureSize(4032, 3024);
+        params.setJpegQuality(83);
+        params.setRotation(90);
+        back.setParameters(params);
+        boolean rawRejected = false, postviewRejected = false;
+        try {
+            back.takePicture(null, (data, camera) -> {}, null, null);
+        } catch (RuntimeException e) {
+            rawRejected = e.getMessage() != null && e.getMessage().contains("raw and postview callbacks are unsupported");
+        }
+        try {
+            back.takePicture(null, null, (data, camera) -> {}, null);
+        } catch (RuntimeException e) {
+            postviewRejected = e.getMessage() != null && e.getMessage().contains("raw and postview callbacks are unsupported");
+        }
+        final byte[][] received = { null };
+        final boolean[] shutter = { false };
+        final CountDownLatch done = new CountDownLatch(1);
+        back.takePicture(() -> shutter[0] = true, null, (data, camera) -> {
+            received[0] = data;
+            done.countDown();
+        });
+        boolean delivered = done.await(20, TimeUnit.SECONDS);
+        byte[] data = received[0];
+        int exif = -1;
+        if (data != null) {
+            for (int i = 0; i + 24 < data.length; i++) {
+                if (data[i] == 'E' && data[i + 1] == 'x' && data[i + 2] == 'i' && data[i + 3] == 'f' &&
+                        data[i + 4] == 0 && data[i + 5] == 0) {
+                    exif = i;
+                    break;
+                }
+            }
+        }
+        boolean jpeg = data != null && data.length > 40 && (data[0] & 255) == 0xff && (data[1] & 255) == 0xd8 &&
+                (data[data.length - 2] & 255) == 0xff && (data[data.length - 1] & 255) == 0xd9;
+        boolean orientation = exif >= 0 && (data[exif + 24] & 255) == 6;
+        Log.i(T, "capture delivered=" + delivered + " shutter=" + shutter[0] + " jpeg=" + jpeg +
+                " exifOrientation=" + (exif >= 0 ? (data[exif + 24] & 255) : -1));
+        return rawRejected && postviewRejected && delivered && shutter[0] && jpeg && orientation;
     }
 
     private static boolean near(int got, int want) { return Math.abs(got - want) <= 2; }
@@ -641,7 +687,10 @@ public class Main extends Activity {
         Camera.Parameters p = back.getParameters();
         Log.i(T, "parameters sizes=" + p.get("preview-size-values") + " fps=" + p.get("preview-fps-range-values") + " focus=" + p.get("focus-mode-values")
                 + " flash=" + p.get("flash-mode-values"));
+        Camera.Size defaultPicture = p.getPictureSize();
         boolean offered = hasSize(p.getSupportedPreviewSizes(), 1280, 720) && hasSize(p.getSupportedPreviewSizes(), 640, 480) && hasSize(p.getSupportedPreviewSizes(), 320, 240)
+                && hasSize(p.getSupportedPictureSizes(), 4032, 3024) && hasSize(p.getSupportedPictureSizes(), 1920, 1080)
+                && defaultPicture != null && defaultPicture.width == 4032 && defaultPicture.height == 3024
                 && p.getPreviewFormat() == ImageFormat.NV21 && p.getSupportedPreviewFormats().contains(ImageFormat.NV21) && p.getSupportedPreviewFormats().contains(ImageFormat.YV12)
                 && has(p.getSupportedFocusModes(), "auto", "continuous-picture", "continuous-video", "macro") && has(p.getSupportedFlashModes(), "off", "torch")
                 && "off".equals(p.getFlashMode()) && !p.isZoomSupported() && p.getMaxZoom() == 0 && p.getZoomRatios() == null && p.getMaxExposureCompensation() == 0
@@ -692,8 +741,15 @@ public class Main extends Activity {
         } catch (IllegalArgumentException e) {
             refusals++;
         }
+        r = back.getParameters();
+        r.setPictureSize(640, 480);
+        try {
+            back.setParameters(r);
+        } catch (RuntimeException e) {
+            if ("setParameters failed".equals(e.getMessage())) refusals++;
+        }
         s = back.getParameters().getPreviewSize();
         Log.i(T, "parameters offered=" + offered + " fps=" + fps + " flat=" + flat + " set=" + set + " refusals=" + refusals);
-        return offered && fps && flat && set && refusals == 3 && s.width == 320;
+        return offered && fps && flat && set && refusals == 4 && s.width == 320;
     }
 }

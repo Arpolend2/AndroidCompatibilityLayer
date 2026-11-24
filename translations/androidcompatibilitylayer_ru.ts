@@ -439,7 +439,7 @@
     <message><source>Waiting for the Google sign-in screen...</source><translation>Ожидание экрана входа в Google...</translation></message>
     <message><source>Cancel sign-in</source><translation>Отменить вход</translation></message>
     <message><source>What's new in this build</source><translation>Что нового в этой сборке</translation></message>
-    <message><source>- GPU acceleration for Aurora Store and microG settings, with improved image scaling.&#10;- Notifications from Android apps now appear in Aurora.&#10;- Standalone apps can continue background tasks after their window is closed.</source><translation>- GPU-ускорение интерфейса Aurora Store и настроек microG, улучшенное масштабирование изображений.&#10;- Уведомления Android-приложений теперь отображаются в Авроре.&#10;- Standalone-приложения могут продолжать фоновые задачи после закрытия окна.</translation></message>
+    <message><source>- Improved Google Maps rendering and OpenGL compatibility.&#10;- Improved microG integration, WebView rendering and Google sign-in compatibility.&#10;- Added hardware video decoding through Rockchip MPP and improved media support.&#10;- Improved camera preview and front-camera photo capture on Rockchip devices.&#10;- Android apps can use Aurora's system certificates.&#10;- Added a searchable log feed and diagnostic overlay; improved notifications.</source><translation>- Улучшена отрисовка Google Карт и совместимость с OpenGL.&#10;- Улучшены интеграция microG, отрисовка WebView и совместимость входа Google.&#10;- Добавлено аппаратное декодирование видео через Rockchip MPP, улучшена поддержка медиа.&#10;- Улучшены видоискатель и съёмка на фронтальную камеру устройств Rockchip.&#10;- Android-приложения могут использовать системные сертификаты Авроры.&#10;- Добавлены лента журнала с поиском и диагностический оверлей; улучшены уведомления.</translation></message>
     <message><source>Could not open the link.</source><translation>Не удалось открыть ссылку.</translation></message>
     <message><source>Disable and clear logs</source><translation>Выключить и очистить журнал</translation></message>
     <message><source>Detailed logs may contain passwords, tokens, app data, paths and network addresses. Standalone snapshots are stored in a shared organization folder. Turning logging off clears the current and shared logs, but keeps files exported to Documents. Running apps may briefly recreate snapshots. Review logs before sharing.</source><translation>Подробный журнал может содержать пароли, токены, данные приложений, пути и сетевые адреса. Снимки отдельных приложений хранятся в общей папке организации. Выключение записи очищает текущий и общие журналы, но сохраняет файлы, экспортированные в «Документы». Запущенные приложения могут ненадолго создать снимки снова. Проверяйте журнал перед отправкой.</translation></message>
@@ -730,6 +730,14 @@ Pick an Android app&apos;s APK to add it to the library.</source>
     <message>
         <source>No core messages yet.</source>
         <translation>Сообщений ядра пока нет.</translation>
+    </message>
+    <message>
+        <source>Search log</source>
+        <translation>Поиск в журнале</translation>
+    </message>
+    <message>
+        <source>No matching log lines.</source>
+        <translation>Совпадений в журнале нет.</translation>
     </message>
     <message>
         <source>Resolution</source>

@@ -16,6 +16,8 @@
 struct AuroraDmaBufFrame
 {
     quint64 id = 0;
+    quint64 channel = 0;
+    quint64 generation = 0;
     bool probeOnly = false;
     int width = 0;
     int height = 0;
@@ -44,6 +46,7 @@ public:
 
     bool listen(const QString &path, qint64 expectedPeerPid, QString *error);
     bool connectTo(const QString &path, qint64 expectedPeerPid, QString *error);
+    bool adoptInheritedSocket(int fd, bool receiveFrames, QString *error);
     void setExpectedPeerPid(qint64 pid);
     void close();
     void closePeer();
@@ -51,8 +54,10 @@ public:
     void setFrameHandler(const std::function<void(AuroraDmaBufFrame &&)> &handler);
     bool sendReply(quint64 frameId, bool accepted);
     bool sendFrame(const AuroraDmaBufFrame &frame, QString *error);
-    bool presentTexture(GLuint texture, int width, int height, QString *error);
-    bool presentGbmTexture(GLuint texture, int width, int height, QString *error);
+    bool presentTexture(GLuint texture, int width, int height, QString *error,
+                        quint64 channel = 0, quint64 generation = 0);
+    bool presentGbmTexture(GLuint texture, int width, int height, QString *error,
+                           quint64 channel = 0, quint64 generation = 0);
     static bool canExportDmaBuf(QString *error);
     static QStringList currentGpuCapabilities();
     static QString probeGbmRenderTarget(int width, int height,
@@ -62,6 +67,7 @@ public:
     static bool receiveFramePacket(int socket, AuroraDmaBufFrame *frame);
     static bool sendReplyPacket(int socket, quint64 frameId, bool accepted);
     static bool receiveReplyPacket(int socket, quint64 frameId, bool *accepted);
+    int duplicatePeer() const;
 
 signals:
     void peerConnected();
@@ -74,7 +80,6 @@ private slots:
 
 private:
     bool setPeer(int fd, qint64 expectedPeerPid, QString *error);
-    int duplicatePeer() const;
     void closePeerLocked();
     void fail(const QString &reason);
 

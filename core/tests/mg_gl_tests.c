@@ -1363,6 +1363,69 @@ static void test_experimental_shell(void)
     run->place_egl_layer = NULL;
 }
 
+static void test_shared_worker_unowned_layers(void)
+{
+    static const i32 whole[4] = { 0, 0, 64, 48 };
+    megler_run_config *run = (megler_run_config *)mg_run_config();
+    mg_jobj *view;
+    u8 *views;
+    i64 x, surf, second;
+    say("Shared worker: unowned EGL layers cannot reach either presentation path");
+    memset(&experimental_shell, 0, sizeof(experimental_shell));
+    memset(&W, 0, sizeof(W));
+    run->present_egl_views = experimental_views;
+    run->present_egl_layer = experimental_frame;
+    run->place_egl_layer = experimental_place;
+    run->block_unowned_egl_layers = true;
+    mg_java_gl_start(64, 48, shown);
+    views = views_picture(64, 48, 10, 8, 40, 20, -1);
+    CHECK(!mg_java_gl_views(views, 64, 48, 64 * 4, k_all));
+    view = mg_dvm_new("java/lang/Object", "()V", NULL);
+    x = EGL("createContext", "(IJ)J", 2, I(2), J(0)).j;
+    surf = EGL("createWindowSurface", "(Ljava/lang/Object;II)J", 3, L(view), I(40), I(20)).j;
+    second = EGL("createWindowSurface", "(Ljava/lang/Object;II)J", 3, L(view), I(40), I(20)).j;
+    CHECK(x && surf && second && EGL("makeCurrent", "(JJ)Z", 2, J(surf), J(x)).z);
+    EGL("place", "(Ljava/lang/Object;IIIII)V", 6, L(view), I(10), I(8), I(40), I(20), I(0));
+    draw_frame(0, NULL, 1, 0, 0);
+    CHECK(EGL("swap", "(JJIIII)Z", 6, J(surf), J(x), I(10), I(8), I(40), I(20)).z);
+    CHECK(mg_java_gl_views(views, 64, 48, 64 * 4, k_all));
+    draw_frame(0, NULL, 0, 1, 0);
+    CHECK(EGL("swap", "(JJIIII)Z", 6, J(surf), J(x), I(10), I(8), I(40), I(20)).z);
+    CHECK(mg_java_gl_views(views, 64, 48, 64 * 4, k_all));
+    CHECK(W.pictures == 0 && experimental_shell.frames == 0 &&
+          experimental_shell.pictures == 0 && experimental_shell.places == 0);
+    EGL("makeCurrent", "(JJ)Z", 2, J(0), J(0));
+    EGL("destroySurface", "(J)V", 1, J(surf));
+    CHECK(mg_java_gl_composing());
+    CHECK(mg_java_gl_views(views, 64, 48, 64 * 4, k_all) && W.pictures == 0);
+    EGL("destroySurface", "(J)V", 1, J(second));
+    CHECK(!mg_java_gl_composing());
+    if (!mg_java_gl_views(views, 64, 48, 64 * 4, k_all))
+        shown(views, 64, 48, 64 * 4, whole);
+    CHECK(W.pictures == 1 && window_pixel(5, 5) == 0x808080);
+
+    surf = EGL("createWindowSurface", "(Ljava/lang/Object;II)J", 3, L(view), I(40), I(20)).j;
+    CHECK(surf && EGL("makeCurrent", "(JJ)Z", 2, J(surf), J(x)).z);
+    EGL("place", "(Ljava/lang/Object;IIIII)V", 6, L(view), I(10), I(8), I(40), I(20), I(0));
+    CHECK(mg_java_gl_views(views, 64, 48, 64 * 4, k_all));
+    EGL("forget", "(Ljava/lang/Object;)V", 1, L(view));
+    CHECK(!mg_java_gl_composing());
+    CHECK(EGL("swap", "(JJIIII)Z", 6, J(surf), J(x), I(10), I(8), I(40), I(20)).z);
+    CHECK(W.pictures == 1);
+    if (!mg_java_gl_views(views, 64, 48, 64 * 4, k_all))
+        shown(views, 64, 48, 64 * 4, whole);
+    CHECK(W.pictures == 2);
+    EGL("makeCurrent", "(JJ)Z", 2, J(0), J(0));
+    EGL("destroySurface", "(J)V", 1, J(surf));
+    EGL("destroyContext", "(J)V", 1, J(x));
+    free(views);
+    mg_java_gl_reset();
+    run->block_unowned_egl_layers = false;
+    run->present_egl_views = NULL;
+    run->present_egl_layer = NULL;
+    run->place_egl_layer = NULL;
+}
+
 static void test_two_threads(void)
 {
     mg_jobj *view = mg_dvm_new("java/lang/Object", "()V", NULL);
@@ -1876,7 +1939,86 @@ static MEGLER_CB void fn_draw_texture(void *user, void *canvas, int id, float l,
     (void)user, (void)canvas, (void)id, (void)l, (void)t, (void)r, (void)b, (void)alpha;
 }
 
-static void test_draw_functor(void)
+static MEGLER_CB int fn_egl_texture_frame(void *user, int id, void *display, void *surface, int width, int height)
+{
+    void *(*current)(int) = (void *(*)(int))mg_egl_host("eglGetCurrentSurface");
+    const u8 *rgba;
+    int w, h;
+    (void)user;
+    if (!display && !surface) {
+        FT.let_go = id;
+        return 1;
+    }
+    if (!display || !surface || !current || current(0x3059) != surface || current(0x305A) != surface)
+        return 0;
+    if (!mg_gl_standin_shared(surface, &rgba, &w, &h) || w != width || h != height)
+        return 0;
+    FT.frame_id = id;
+    FT.fw = width;
+    FT.fh = height;
+    rgba += (size_t)(height - 1) * (size_t)width * 4;
+    FT.corner = (u32)rgba[0] << 24 | (u32)rgba[1] << 16 | (u32)rgba[2] << 8 | rgba[3];
+    FT.frames++;
+    return 1;
+}
+
+static void *native_webview_provider(const char *name)
+{
+    if (!strcmp(name, "eglQuerySurfacePointerANGLE")) return NULL;
+    return mg_gl_standin(name);
+}
+
+static int host_surfaces_created, host_surfaces_freed;
+static unsigned MG_GLAPI window_only_choose(void *display, const int *attrs, void **configs, int size, int *count)
+{
+    unsigned (MG_GLAPI *choose)(void *, const int *, void **, int, int *) =
+        (unsigned (MG_GLAPI *)(void *, const int *, void **, int, int *))mg_gl_standin("eglChooseConfig");
+    const int *p;
+    for (p = attrs; p && *p != 0x3038; p += 2)
+        if (*p == 0x3033 && p[1] == 1) {
+            if (count) *count = 0;
+            return 1;
+        }
+    return choose(display, attrs, configs, size, count);
+}
+
+static void *window_webview_provider(const char *name)
+{
+    if (!strcmp(name, "eglChooseConfig")) return (void *)window_only_choose;
+    return native_webview_provider(name);
+}
+
+static int MEGLER_CB fn_host_surface_configs(void *user, void *display, int version, void **configs, int capacity)
+{
+    unsigned (MG_GLAPI *choose)(void *, const int *, void **, int, int *) =
+        (unsigned (MG_GLAPI *)(void *, const int *, void **, int, int *))mg_gl_standin("eglChooseConfig");
+    const int attrs[] = { 0x3033, 4, 0x3040, version == 3 ? 0x40 : 4, 0x3038 };
+    int count = 0;
+    (void)user;
+    return choose(display, attrs, configs, capacity, &count) ? count : 0;
+}
+
+static void *MEGLER_CB fn_host_surface_new(void *user, void *display, void *config, int width, int height, void **token)
+{
+    void *(MG_GLAPI *create)(void *, void *, const int *) =
+        (void *(MG_GLAPI *)(void *, void *, const int *))mg_gl_standin("eglCreatePbufferSurface");
+    int attrs[] = { 0x3057, width, 0x3056, height, 0x3038 };
+    void *surface = create(display, config, attrs);
+    (void)user;
+    *token = surface;
+    if (surface) host_surfaces_created++;
+    return surface;
+}
+
+static void MEGLER_CB fn_host_surface_free(void *user, void *token)
+{
+    unsigned (MG_GLAPI *destroy)(void *, void *) =
+        (unsigned (MG_GLAPI *)(void *, void *))mg_gl_standin("eglDestroySurface");
+    (void)user;
+    if (destroy(mg_egl_display_for_library("libwebviewchromium.so"), token)) host_surfaces_freed++;
+}
+
+static void test_draw_functor(int mode)
 {
     static t_fn_callbacks cb;
     static megler_gfx_host host;
@@ -1887,12 +2029,29 @@ static void test_draw_functor(void)
     i64 drawn;
     i32 id;
     int tries;
-    say("The WebView's draw functor: Chromium's page drawn on the render thread, its picture handed to the shell");
+    const bool native = mode != 0;
+    say("The WebView's draw functor: Chromium's page handed to the %s shell", native ? "native EGL" : "ANGLE");
     memset(&FT, 0, sizeof(FT));
     memset(&host, 0, sizeof(host));
-    host.texture_frame = fn_texture_frame;
+    if (native) {
+        mg_gl_standin_native_surfaces(true);
+        mg_egl_set_provider(mode == 2 ? window_webview_provider : native_webview_provider);
+        host.texture_egl_frame = fn_egl_texture_frame;
+        if (mode == 2) {
+            host_surfaces_created = host_surfaces_freed = 0;
+            host.egl_surface_configs = fn_host_surface_configs;
+            host.egl_surface_new = fn_host_surface_new;
+            host.egl_surface_free = fn_host_surface_free;
+        }
+    } else {
+        host.texture_frame = fn_texture_frame;
+    }
     host.draw_texture = fn_draw_texture;
     mg_java_gl_set_shell(&host);
+    if (mode == 2) {
+        CHECK(mg_java_gl_native_surfaces());
+        CHECK(mg_egl_display_for_library("libwebviewchromium.so") != NULL);
+    }
     CHECK(mg_java_gl_shares_frames());
     CHECK(table && table->version == 4 && table->query_render_mode && table->create_functor_v3 && table->release_functor);
     if (!table || !table->create_functor_v3 || !table->release_functor || !table->query_render_mode) goto end;
@@ -1915,13 +2074,13 @@ static void test_draw_functor(void)
     CHECK(FT.p.transform[0] == 1 && FT.p.transform[5] == 1 && FT.p.transform[10] == 1 && FT.p.transform[15] == 1);
     CHECK(FT.p.transform[12] == -10 && FT.p.transform[13] == -20 && FT.p.transform[1] == 0 && FT.p.transform[4] == 0);
     CHECK(FT.p.transfer[0] == 2.4f && FT.p.to_xyz[0] > 0.43f && FT.p.to_xyz[0] < 0.44f && FT.p.to_xyz[8] > 0.71f);
-    CHECK(FT.frames == 1 && FT.frame_id == 0x40000000 + id && FT.keyed && FT.fw == 128 && FT.fh == 64);
+    CHECK(FT.frames == 1 && FT.frame_id == 0x40000000 + id && (native || FT.keyed) && FT.fw == 128 && FT.fh == 64);
     CHECK_HEX(FT.corner, 0xFF0000FF);
     share = FT.share;
     /* A smaller part: the same surface, cleared before Chromium draws again. */
     drawn = mg_java_webview_draw_functor(id, 0, 0, 90, 40);
     CHECK((u32)drawn == (u32)(0x40000000 + id) && (drawn >> 32 & 0xFFFF) == 128 && (drawn >> 48 & 0xFFFF) == 64);
-    CHECK(FT.syncs == 2 && FT.draws == 2 && FT.in_order && FT.frames == 2 && FT.share == share);
+    CHECK(FT.syncs == 2 && FT.draws == 2 && FT.in_order && FT.frames == 2 && (native || FT.share == share));
     CHECK_HEX(FT.before, 0);
     CHECK(FT.p.clip_right == 90 && FT.p.clip_bottom == 40 && FT.p.transform[12] == 0 && FT.p.transform[13] == 0);
     /* Released: its last callbacks on the render thread, the context's first. */
@@ -1930,11 +2089,15 @@ static void test_draw_functor(void)
     CHECK(FT.gone == 1 && FT.context_gone == 1 && FT.gone_in_order && FT.gone_thread == FT.draw_thread);
     for (tries = 0; tries < 100 && FT.let_go != 0x40000000 + id; tries++) mg_sleep_ns(5000000ull);
     CHECK(FT.let_go == 0x40000000 + id);
+    if (mode == 2)
+        CHECK(host_surfaces_created == 2 && host_surfaces_freed == 2);
     /* Gone, it draws nothing. */
     CHECK(mg_java_webview_draw_functor(id, 0, 0, 90, 40) == 0 && FT.draws == 2);
 end:
+    if (native) mg_gl_standin_native_surfaces(false);
     mg_java_webview_forget_egl();
     mg_java_gl_set_shell(was);
+    if (native) mg_egl_set_provider(mg_gl_standin);
 }
 
 int mg_gl_natives_tests_run(mg_test_sink sink, void *user, int *checks)
@@ -1958,7 +2121,9 @@ int mg_gl_natives_tests_run(mg_test_sink sink, void *user, int *checks)
     test_hardware_buffers();
     test_webview_display();
     mg_egl_webview_own_display(false);
-    test_draw_functor();
+    test_draw_functor(0);
+    test_draw_functor(1);
+    test_draw_functor(2);
     test_fence_syncs();
     test_doomed();
     test_turns();
@@ -1969,6 +2134,9 @@ int mg_gl_natives_tests_run(mg_test_sink sink, void *user, int *checks)
     mg_gl_standin_reset(true, false);
     mg_java_gl_reset();
     test_window();
+    mg_gl_standin_reset(true, false);
+    mg_java_gl_reset();
+    test_shared_worker_unowned_layers();
     mg_gl_standin_reset(true, false);
     mg_java_gl_reset();
     test_experimental_shell();

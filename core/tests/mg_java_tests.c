@@ -37,8 +37,9 @@
  * stand-in that draws (mg_gl_standin.c), for every app here.
  *
  * `camera` is the old android.hardware.Camera as a code scanner uses it, on a stand-in for the shell's cameras
- * (mg_camera_standin.c): the cameras, their parameters, a preview on a SurfaceView with frames in the app's buffers, focus,
- * the torch, preview callbacks, the front camera on a TextureView, and the pictures the previews put in the window. Run a
+ * (mg_camera_standin.c): the cameras, their separate still-image sizes and full-resolution JPEG capture, their parameters,
+ * a preview on a SurfaceView with frames in the app's buffers, focus, the torch, preview callbacks, the front camera on a
+ * TextureView, and the pictures the previews put in the window. Run a
  * second time with every camera refused, as Windows refuses one the user said no to.
  *
  * `splits` is an app in several APKs (core/tests/app/splits): what it is given is a bundle of them, an .apks or an .xapk,
@@ -1666,6 +1667,7 @@ static bool start(const char *apk, const char *android_root)
     cfg.codec = *mg_codec_standin();
     /* (The pickers app has them too: the package manager answers a camera app's intents where the device has a camera.) */
     if (g_camera_app || g_pickers_app) cfg.camera = *mg_camera_standin();
+    if (g_camera_app) CHECK(megler_set_camera_capture_host(mg_camera_standin_capture_host()));
     /* The phone in Moscow, the location on (mg_location_standin.c). */
     cfg.location = *mg_location_standin();
     /* Its Wi-Fi on, four networks in range, connected to the first (mg_wifi_standin.c), its scans counted from each start. */
@@ -4786,7 +4788,7 @@ static bool camera_shown(const int r[4], const int want[4], int seconds)
 static int run_camera(void)
 {
     static const char *const steps[] = { "permission", "features", "info", "open", "busy", "parameters", "orientation", "buffers" };
-    static const char *const after[] = { "preview", "autofocus", "torch", "callback", "one-shot", "stop", "release", "camera2" };
+    static const char *const after[] = { "preview", "capture", "autofocus", "torch", "callback", "one-shot", "stop", "release", "camera2" };
     /* Top left, top right, bottom left, bottom right: the back camera's quarters turned 90 degrees; the front's mirrored, then turned 90. */
     static const int back[4] = { CQ_B, CQ_R, CQ_W, CQ_G }, front[4] = { CQ_W, CQ_G, CQ_B, CQ_R };
     mg_camera_standin_counts k;
@@ -4851,6 +4853,7 @@ static int run_camera(void)
     say("  the stand-in: %d opened, %d closed, %d started, %d stopped, %d pictures, %d focused, %d focusing cancelled", k.opened, k.closed, k.started, k.stopped,
         k.frames, k.focused, k.cancelled);
     CHECK(k.opened == k.closed && k.started == k.stopped && k.frames > 0 && k.focused >= 1 && !k.torch && k.width == 320 && k.height == 240);
+    CHECK(k.captures == 1 && k.picture_width == 4032 && k.picture_height == 3024 && k.picture_quality == 83 && k.picture_rotation == 90);
     CHECK(find_line("camera: camera 0's first picture, 320x240", 0) >= 0 && find_line("camera: camera 1 closed", 0) >= 0);
     CHECK(find_line("FAILED", 0) < 0 && find_line("FATAL EXCEPTION", 0) < 0);
     back_and_end("I/CameraTest: onDestroy", &at);

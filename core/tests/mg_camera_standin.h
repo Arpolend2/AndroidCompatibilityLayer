@@ -3,9 +3,10 @@
  * whose every byte is known, on a thread of its own, as a camera's driver would hand them over.
  *
  * Two cameras, as a phone has them: 0 at the back, turned 90 degrees (a sensor laid along the phone's long side), with
- * focus (once, continuously, close up) and a torch, at 1280 x 720, 640 x 480 and 320 x 240; 1 at the front, turned 270,
- * fixed focus, no light, at 640 x 480 and 320 x 240. Each streams at 15 to 30 frames a second, at the rate it was started
- * with. A camera opens once at a time: a second open is MEGLER_CAMERA_BUSY; and every open is MEGLER_CAMERA_DENIED while
+ * focus (once, continuously, close up) and a torch, preview sizes 1280 x 720, 640 x 480 and 320 x 240, and reported still
+ * sizes 4032 x 3024 and 1920 x 1080; 1 at the front, turned 270, fixed focus, no light, with preview sizes 640 x 480 and
+ * 320 x 240 and still size 1280 x 720. Each streams at 15 to 30 frames a second, at the rate it was started with. A camera
+ * opens once at a time: a second open is MEGLER_CAMERA_BUSY; and every open is MEGLER_CAMERA_DENIED while
  * mg_camera_standin_refuse says so, as Windows answers when the user has said no.
  *
  * A picture is NV12 in four quarters of one colour each, with BT.601's video-range values: the top left red, the top right
@@ -32,6 +33,7 @@ extern "C" {
 #define MG_CAMERA_STANDIN_WHITE 235, 128, 128
 
 const megler_camera_host *mg_camera_standin(void);
+const megler_camera_capture_host *mg_camera_standin_capture_host(void);
 /* Every open refused (MEGLER_CAMERA_DENIED) from now on, or no longer. */
 void mg_camera_standin_refuse(bool refuse);
 
@@ -39,6 +41,7 @@ typedef struct mg_camera_standin_counts {
     int opened, closed, started, stopped, frames, focused, cancelled;
     bool torch;                        /* on, now */
     int width, height, fps;            /* as last started */
+    int captures, picture_width, picture_height, picture_quality, picture_rotation;
 } mg_camera_standin_counts;
 void mg_camera_standin_counts_get(mg_camera_standin_counts *out);
 

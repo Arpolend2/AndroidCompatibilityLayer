@@ -49,7 +49,10 @@ public abstract class JobScheduler {
             return sHandler;
         }
         public int schedule(JobInfo j) {
-            if (j == null || j.getService() == null) return RESULT_FAILURE;
+            if (j == null || j.getService() == null) {
+                android.util.Log.w("ACL", "ACL background: job failed");
+                return RESULT_FAILURE;
+            }
             Run old, run = new Run(j);
             synchronized (sJobs) { old = sJobs.put(j.getId(), run); }
             if (old != null) stop(old, 1 /* STOP_REASON_CANCELLED_BY_APP */);
@@ -58,7 +61,10 @@ public abstract class JobScheduler {
             return RESULT_SUCCESS;
         }
         public int enqueue(JobInfo j, JobWorkItem w) {
-            if (j == null || j.getService() == null) return RESULT_FAILURE;
+            if (j == null || j.getService() == null) {
+                android.util.Log.w("ACL", "ACL background: job failed");
+                return RESULT_FAILURE;
+            }
             Run run;
             synchronized (sJobs) {
                 run = sJobs.get(j.getId());
@@ -106,6 +112,9 @@ public abstract class JobScheduler {
             handler().postDelayed(r, Math.max(0, delay));
         }
         private static boolean current(Run run) { synchronized (sJobs) { return sJobs.get(run.info.getId()) == run; } }
+        private static boolean workManager(Run run) {
+            return "androidx.work.impl.background.systemjob.SystemJobService".equals(run.info.getService().getClassName());
+        }
 
         private static void start(Run run) {
             synchronized (sJobs) { run.planned = null; if (sJobs.get(run.info.getId()) != run || run.running) return; run.running = true; }
@@ -119,6 +128,7 @@ public abstract class JobScheduler {
                 if (s != null && !(s instanceof JobService))
                     engine = JobServiceEngine.of(s.onBind(new android.content.Intent("android.app.job.JobService").setComponent(run.info.getService())));
                 if (!(s instanceof JobService) && engine == null) {
+                    android.util.Log.w("ACL", "ACL background: job failed");
                     android.util.Log.w("Megler", "job " + run.info.getId() + ": " + run.info.getService().getClassName() + " is no job service of the app's");
                     synchronized (sJobs) { run.running = false; if (sJobs.get(run.info.getId()) == run) sJobs.remove(run.info.getId()); }
                     megler.AppRunner.backgroundWorkChanged();
@@ -127,9 +137,11 @@ public abstract class JobScheduler {
                 if (engine == null) run.service = (JobService) s;
                 run.engine = engine;
                 run.params = new JobParameters(run);
+                android.util.Log.i("ACL", workManager(run) ? "ACL background: WorkManager job started" : "ACL background: job started");
                 android.util.Log.i("Megler", "job " + run.info.getId() + " (" + run.info.getService().getShortClassName() + ") runs" + (engine != null ? " through its engine" : ""));
                 if (!(engine != null ? engine.onStartJob(run.params) : run.service.onStartJob(run.params))) finished(run.params, false);
             } catch (Throwable t) {
+                android.util.Log.w("ACL", "ACL background: job failed");
                 android.util.Log.e("Megler", "job " + run.info.getId() + " failed", t);
                 if (run.params != null) finished(run.params, false);
                 else {
@@ -162,6 +174,7 @@ public abstract class JobScheduler {
                     sJobs.remove(run.info.getId());
                 }
             }
+            android.util.Log.i("ACL", workManager(run) ? "ACL background: WorkManager job finished" : "ACL background: job finished");
             if (again >= 0) plan(run, again);
             megler.AppRunner.backgroundWorkChanged();
         }
@@ -179,6 +192,7 @@ public abstract class JobScheduler {
             Runnable planned;
             boolean running;
             synchronized (sJobs) { planned = run.planned; run.planned = null; running = run.running; run.running = false; run.stopReason = reason; }
+            if (running) android.util.Log.i("ACL", workManager(run) ? "ACL background: WorkManager job stopped" : "ACL background: job stopped");
             if (planned != null) handler().removeCallbacks(planned);
             if (running && (run.service != null || run.engine != null) && run.params != null) {
                 final Run r = run;

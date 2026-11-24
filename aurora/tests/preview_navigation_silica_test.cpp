@@ -1,10 +1,13 @@
 #include <QGuiApplication>
+#include <QMouseEvent>
 #include <QQuickView>
 #include <QQuickItem>
 #include <QQmlContext>
 #include <QQmlExpression>
 #include <QQmlError>
 #include <QTimer>
+#include <QTouchDevice>
+#include <QTouchEvent>
 #include <cstdio>
 
 class TestSurface : public QQuickItem {
@@ -13,13 +16,21 @@ class TestSurface : public QQuickItem {
     Q_PROPERTY(qreal edgeZoneWidth MEMBER edgeZoneWidth)
     Q_PROPERTY(int pageOrientation MEMBER pageOrientation)
 public:
-    TestSurface(QQuickItem *parent = nullptr) : QQuickItem(parent) { ++created; }
+    TestSurface(QQuickItem *parent = nullptr) : QQuickItem(parent) {
+        setAcceptedMouseButtons(Qt::LeftButton);
+        ++created;
+    }
     ~TestSurface() { ++destroyed; }
     QObject *player = nullptr;
     qreal edgeZoneWidth = 0;
     int pageOrientation = 0;
     static int created;
     static int destroyed;
+    int presses = 0;
+    int touches = 0;
+protected:
+    void mousePressEvent(QMouseEvent *event) override { ++presses; event->accept(); }
+    void touchEvent(QTouchEvent *event) override { if (event->type() == QEvent::TouchBegin) ++touches; event->accept(); }
 };
 int TestSurface::created = 0;
 int TestSurface::destroyed = 0;
@@ -94,7 +105,9 @@ class TestDiagnostics : public QObject {
     Q_OBJECT
 public:
     QString error = QStringLiteral("test write failure");
+    QString overlay;
     Q_INVOKABLE QString standaloneDiagnosticFileError() const { return error; }
+    Q_INVOKABLE QString overlayText() const { return overlay; }
 };
 
 int main(int argc, char **argv)
@@ -104,15 +117,16 @@ int main(int argc, char **argv)
     const bool orientationTest = argc == 3 && QByteArray(argv[2]) == "--orientation";
     const bool orientationPolicyTest = argc == 3 && QByteArray(argv[2]) == "--orientation-policy";
     const bool frameCaptureTest = argc == 3 && QByteArray(argv[2]) == "--frame-capture";
+    const bool overlayTest = argc == 3 && QByteArray(argv[2]) == "--overlay";
     if (argc != 2 && !(argc == 3 && QByteArray(argv[2]) == "--microg") &&
-        !diagnosticTest && !orientationTest && !orientationPolicyTest && !frameCaptureTest) {
+        !diagnosticTest && !orientationTest && !orientationPolicyTest && !frameCaptureTest && !overlayTest) {
         std::fprintf(stderr, "Expected the absolute path to Preview.qml\n");
         return 1;
     }
 
     qmlRegisterType<TestSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
     TestPlayer player;
-    player.closeOnBackGesture = argc == 3 && !diagnosticTest && !orientationTest && !orientationPolicyTest && !frameCaptureTest;
+    player.closeOnBackGesture = argc == 3 && !diagnosticTest && !orientationTest && !orientationPolicyTest && !frameCaptureTest && !overlayTest;
     TestPicker picker;
     TestDiagnostics diagnostics;
     QQuickView view;
@@ -127,6 +141,94 @@ int main(int argc, char **argv)
         return 1;
     }
     if (view.rootObject()->findChild<QObject *>(QStringLiteral("backGestureHint"))) return 1;
+    if (overlayTest) {
+        QTimer::singleShot(700, [&]() {
+            QObject *overlay = view.rootObject()->findChild<QObject *>(QStringLiteral("diagnosticOverlay"));
+            QObject *text = view.rootObject()->findChild<QObject *>(QStringLiteral("diagnosticOverlayText"));
+            if (!overlay || !text || overlay->property("visible").toBool()) {
+                app.exit(1);
+                return;
+            }
+            diagnostics.overlay = QStringLiteral("droidmedia started");
+            QTimer::singleShot(700, [&, overlay, text]() {
+                if (!overlay->property("visible").toBool() ||
+                    text->property("text").toString() != diagnostics.overlay) {
+                    app.exit(1);
+                    return;
+                }
+                auto *item = qobject_cast<QQuickItem *>(overlay);
+                TestSurface *surface = view.rootObject()->findChild<TestSurface *>();
+                if (!item || !surface || item->height() > view.height() * 0.25) {
+                    app.exit(1);
+                    return;
+                }
+                QTouchDevice device;
+                device.setType(QTouchDevice::TouchScreen);
+                device.setCapabilities(QTouchDevice::Position);
+                const auto sendTouch = [&](const QPointF &position) {
+                    QTouchEvent::TouchPoint touch(0);
+                    touch.setState(Qt::TouchPointPressed);
+                    touch.setPos(position);
+                    touch.setScenePos(position);
+                    touch.setScreenPos(position);
+                    QTouchEvent begin(QEvent::TouchBegin, &device, Qt::NoModifier,
+                                      Qt::TouchPointPressed, QList<QTouchEvent::TouchPoint>() << touch);
+                    QCoreApplication::sendEvent(&view, &begin);
+                    touch.setState(Qt::TouchPointReleased);
+                    QTouchEvent end(QEvent::TouchEnd, &device, Qt::NoModifier,
+                                    Qt::TouchPointReleased, QList<QTouchEvent::TouchPoint>() << touch);
+                    QCoreApplication::sendEvent(&view, &end);
+                };
+                const QPointF point = item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
+                sendTouch(point);
+                if (surface->touches != 1) {
+                    std::fprintf(stderr, "overlay intercepted portrait touch\n");
+                    app.exit(1);
+                    return;
+                }
+                QMouseEvent press(QEvent::MouseButtonPress, point, Qt::LeftButton,
+                                  Qt::LeftButton, Qt::NoModifier);
+                QCoreApplication::sendEvent(&view, &press);
+                QMouseEvent release(QEvent::MouseButtonRelease, point, Qt::LeftButton,
+                                    Qt::NoButton, Qt::NoModifier);
+                QCoreApplication::sendEvent(&view, &release);
+                if (surface->presses != 1) {
+                    std::fprintf(stderr, "overlay intercepted input\n");
+                    app.exit(1);
+                    return;
+                }
+                view.resize(960, 540);
+                QCoreApplication::processEvents();
+                if (item->width() > 960 || item->height() > 540 * 0.25) {
+                    app.exit(1);
+                    return;
+                }
+                const QPointF landscapePoint = item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
+                QMouseEvent landscapePress(QEvent::MouseButtonPress, landscapePoint, Qt::LeftButton,
+                                           Qt::LeftButton, Qt::NoModifier);
+                QCoreApplication::sendEvent(&view, &landscapePress);
+                QMouseEvent landscapeRelease(QEvent::MouseButtonRelease, landscapePoint, Qt::LeftButton,
+                                             Qt::NoButton, Qt::NoModifier);
+                QCoreApplication::sendEvent(&view, &landscapeRelease);
+                if (surface->presses != 2) {
+                    std::fprintf(stderr, "overlay intercepted landscape input\n");
+                    app.exit(1);
+                    return;
+                }
+                sendTouch(landscapePoint);
+                if (surface->touches != 2) {
+                    std::fprintf(stderr, "overlay intercepted landscape touch\n");
+                    app.exit(1);
+                    return;
+                }
+                diagnostics.overlay.clear();
+                QTimer::singleShot(700, [&, overlay]() {
+                    app.exit(overlay->property("visible").toBool() ? 1 : 0);
+                });
+            });
+        });
+        return app.exec();
+    }
     if (frameCaptureTest) {
         QTimer::singleShot(700, [&]() {
             QObject *button = view.rootObject()->findChild<QObject *>(QStringLiteral("captureDiagnosticFrames"));
@@ -205,6 +307,24 @@ int main(int argc, char **argv)
     }
     if (orientationPolicyTest) {
         QTimer::singleShot(500, [&]() {
+            const QByteArray expectedLock = qgetenv("ACL_TEST_EXPECT_ORIENTATION_LOCK");
+            if (!expectedLock.isEmpty() &&
+                view.rootObject()->property("systemOrientationLock").toString() !=
+                    QString::fromLatin1(expectedLock)) {
+                std::fprintf(stderr, "system orientation setting was not read\n");
+                failed = true;
+            }
+            if (expectedLock == "landscape") {
+                player.setOrientationMask(int(Qt::PortraitOrientation));
+                QCoreApplication::processEvents();
+                const int expected = action("Orientation.Landscape").toInt();
+                if (view.rootObject()->property("allowedOrientations").toInt() != expected ||
+                    action("pageStack.currentPage.allowedOrientations").toInt() != expected) {
+                    std::fprintf(stderr, "system orientation setting did not override Android policy\n");
+                    failed = true;
+                }
+            }
+            view.rootObject()->setProperty("systemOrientationLock", QStringLiteral("dynamic"));
             struct PolicyCase {
                 int mask;
                 const char *expression;
@@ -230,6 +350,38 @@ int main(int argc, char **argv)
                     std::fprintf(stderr, "orientation policy mapping failed for mask %d\n", policy.mask);
                     failed = true;
                 }
+            }
+            const struct {
+                const char *lock;
+                const char *expression;
+            } lockedCases[] = {
+                { "portrait", "Orientation.Portrait" },
+                { "landscape", "Orientation.Landscape" },
+                { "portrait-inverted", "Orientation.PortraitInverted" },
+                { "landscape-inverted", "Orientation.LandscapeInverted" }
+            };
+            for (const auto &locked : lockedCases) {
+                view.rootObject()->setProperty("systemOrientationLock", QString::fromLatin1(locked.lock));
+                for (const PolicyCase &policy : cases) {
+                    player.setOrientationMask(policy.mask);
+                    QCoreApplication::processEvents();
+                    const int expected = action(locked.expression).toInt();
+                    if (view.rootObject()->property("allowedOrientations").toInt() != expected ||
+                        action("pageStack.currentPage.allowedOrientations").toInt() != expected) {
+                        std::fprintf(stderr, "system orientation lock %s ignored for mask %d\n",
+                                     locked.lock, policy.mask);
+                        failed = true;
+                    }
+                }
+            }
+            player.setOrientationMask(int(Qt::PortraitOrientation));
+            view.rootObject()->setProperty("systemOrientationLock", QStringLiteral("dynamic"));
+            QCoreApplication::processEvents();
+            const int portrait = action("Orientation.Portrait").toInt();
+            if (view.rootObject()->property("allowedOrientations").toInt() != portrait ||
+                action("pageStack.currentPage.allowedOrientations").toInt() != portrait) {
+                std::fprintf(stderr, "Android policy not restored after unlocking orientation\n");
+                failed = true;
             }
             app.exit(failed ? 1 : 0);
         });

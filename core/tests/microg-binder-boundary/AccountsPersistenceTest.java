@@ -56,8 +56,8 @@ public final class AccountsPersistenceTest {
                 return () -> {};
             }
         }, new SharedMicrogAccounts.Foreground() {
-            @Override public boolean launch(long channel, Intent intent) { return false; }
-            @Override public void dismiss(long channel) {}
+            @Override public long launch(long channel, Intent intent) { return 0; }
+            @Override public void dismiss(long channel, long generation) {}
         }, 1, "fixture.client", 11001, 50001);
         SharedMicrogAccounts.Client client = new SharedMicrogAccounts.Client(server.binder());
         try {
@@ -128,8 +128,8 @@ public final class AccountsPersistenceTest {
             };
             SharedMicrogAccounts.Server server = new SharedMicrogAccounts.Server(engine,
                 new SharedMicrogAccounts.Foreground() {
-                    @Override public boolean launch(long channel, Intent intent) { return false; }
-                    @Override public void dismiss(long channel) {}
+                    @Override public long launch(long channel, Intent intent) { return 0; }
+                    @Override public void dismiss(long channel, long generation) {}
                 }, 1, "fixture.client", 11001, 50001);
             BinderBridge bridge = new BinderBridge(System.in, System.out, server.binder());
             try { bridge.awaitClosed(); }

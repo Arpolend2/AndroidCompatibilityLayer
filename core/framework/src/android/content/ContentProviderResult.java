@@ -24,9 +24,27 @@ public class ContentProviderResult implements Parcelable {
     }
     /** Android's, for another user; there is one here. */
     public ContentProviderResult(ContentProviderResult r, int userId) { this(r.uri, r.count, r.extras, r.exception); }
-    // In this one process a Parcel carries objects as they are: the result itself goes through it.
     public ContentProviderResult(Parcel p) { this(read(p), 0); }
-    private static ContentProviderResult read(Parcel p) { Object o = p.readValue(null); return o instanceof ContentProviderResult ? (ContentProviderResult) o : new ContentProviderResult(); }
+    private static ContentProviderResult read(Parcel p) {
+        String uriText = p.readString();
+        if (uriText != null && uriText.length() > 8192)
+            throw new IllegalArgumentException("Invalid provider result URI");
+        int hasCount = p.readInt();
+        if (hasCount != 0 && hasCount != 1)
+            throw new IllegalArgumentException("Invalid provider result count");
+        Integer count = hasCount == 0 ? null : p.readInt();
+        Bundle extras = p.readBundle(Bundle.class.getClassLoader());
+        if (extras != null && extras.size() > 128)
+            throw new IllegalArgumentException("Invalid provider result extras");
+        String type = p.readString(), message = p.readString();
+        if (type != null && (type.isEmpty() || type.length() > 512) ||
+                message != null && (type == null || message.length() > 4096)) {
+            throw new IllegalArgumentException("Invalid provider result exception");
+        }
+        Throwable exception = type == null ? null : new RuntimeException("Remote provider exception " + type +
+            (message == null ? "" : ": " + message));
+        return new ContentProviderResult(uriText == null ? null : Uri.parse(uriText), count, extras, exception);
+    }
     public ContentProviderResult() { this(null, null, null, null); }
     @Override public String toString() {
         StringBuilder s = new StringBuilder("ContentProviderResult(");
@@ -38,9 +56,23 @@ public class ContentProviderResult implements Parcelable {
         return s.append(')').toString();
     }
     public int describeContents() { return 0; }
-    public void writeToParcel(Parcel p, int flags) { p.writeValue(this); }
+    public void writeToParcel(Parcel p, int flags) {
+        String value = uri == null ? null : uri.toString();
+        if (value != null && value.length() > 8192)
+            throw new IllegalArgumentException("Provider result URI exceeds limit");
+        if (extras != null && extras.size() > 128)
+            throw new IllegalArgumentException("Provider result extras exceed limit");
+        String message = exception == null ? null : exception.getMessage();
+        if (message != null && message.length() > 4096) message = message.substring(0, 4096);
+        p.writeString(value);
+        p.writeInt(count == null ? 0 : 1);
+        if (count != null) p.writeInt(count);
+        p.writeBundle(extras);
+        p.writeString(exception == null ? null : exception.getClass().getName());
+        p.writeString(message);
+    }
     public static final Parcelable.Creator<ContentProviderResult> CREATOR = new Parcelable.Creator<ContentProviderResult>() {
-        public ContentProviderResult createFromParcel(Parcel p) { return (ContentProviderResult) p.readValue(null); }
+        public ContentProviderResult createFromParcel(Parcel p) { return new ContentProviderResult(p); }
         public ContentProviderResult[] newArray(int n) { return new ContentProviderResult[n]; }
     };
 }

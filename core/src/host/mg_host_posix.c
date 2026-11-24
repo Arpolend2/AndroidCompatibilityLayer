@@ -1022,6 +1022,42 @@ void mg_file_close(mg_file *f)
     free(f);
 }
 
+static int dup_regular(int fd, int *flags, int *error)
+{
+    struct stat st;
+    int status, copy;
+    if (fstat(fd, &st) != 0) { *error = errno; return -1; }
+    if (!S_ISREG(st.st_mode)) { *error = EOPNOTSUPP; return -1; }
+    status = fcntl(fd, F_GETFL);
+    if (status < 0) { *error = errno; return -1; }
+    if (status & O_PATH) { *error = EOPNOTSUPP; return -1; }
+    if (flags) *flags = status;
+    copy = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0) *error = errno;
+    return copy;
+}
+
+int mg_file_dup_native_regular(mg_file *f, int *error)
+{
+    if (!f) { *error = EBADF; return -1; }
+    return dup_regular(f->fd, NULL, error);
+}
+
+mg_file *mg_file_from_native_regular(int fd, int *flags, int *error)
+{
+    int status, duplicate = dup_regular(fd, &status, error);
+    mg_file *f;
+    if (duplicate < 0) return NULL;
+    f = (mg_file *)mg_alloc(sizeof(*f));
+    f->fd = duplicate;
+    if (flags) {
+        *flags = (status & O_ACCMODE) == O_RDONLY ? MG_O_READ :
+                 (status & O_ACCMODE) == O_WRONLY ? MG_O_WRITE : MG_O_READ | MG_O_WRITE;
+        if (status & O_APPEND) *flags |= MG_O_APPEND;
+    }
+    return f;
+}
+
 i64 mg_file_read(mg_file *f, void *buf, size_t n, int *err)
 {
     ssize_t r;
@@ -1543,7 +1579,7 @@ mg_sock *mg_sock_open(int family, int type, int protocol, int *err)
     return sock_wrap(fd, family, type);
 }
 
-mg_sock *mg_sock_dup_unix_stream(int fd, int *err)
+static mg_sock *dup_unix_connected(int fd, int expected, int *err)
 {
     struct sockaddr_storage local, peer;
     socklen_t local_len = sizeof(local), peer_len = sizeof(peer), type_len;
@@ -1560,7 +1596,7 @@ mg_sock *mg_sock_dup_unix_stream(int fd, int *err)
     if (getsockopt(copy, SOL_SOCKET, SO_TYPE, &type, &type_len) != 0 ||
         getsockname(copy, (struct sockaddr *)&local, &local_len) != 0 ||
         getpeername(copy, (struct sockaddr *)&peer, &peer_len) != 0 ||
-        type != SOCK_STREAM || local.ss_family != AF_UNIX || peer.ss_family != AF_UNIX) {
+        type != expected || local.ss_family != AF_UNIX || peer.ss_family != AF_UNIX) {
         close(copy);
         *err = MG_NE_INVAL;
         return NULL;
@@ -1581,8 +1617,33 @@ mg_sock *mg_sock_dup_unix_stream(int fd, int *err)
     k = (mg_sock *)mg_alloc(sizeof(*k));
     k->fd = copy;
     k->family = 0;
-    k->type = MG_SOCK_STREAM;
+    k->type = expected == SOCK_STREAM ? MG_SOCK_STREAM : MG_SOCK_SEQPACKET;
     return k;
+}
+
+mg_sock *mg_sock_dup_unix_stream(int fd, int *err) { return dup_unix_connected(fd, SOCK_STREAM, err); }
+mg_sock *mg_sock_dup_unix_seqpacket(int fd, int *err) { return dup_unix_connected(fd, SOCK_SEQPACKET, err); }
+
+int mg_sock_dup_native_unix_socket(mg_sock *sock, int *error)
+{
+    int copy;
+    if (!sock || sock->family != 0 ||
+        (sock->type != MG_SOCK_STREAM && sock->type != MG_SOCK_SEQPACKET)) {
+        *error = EOPNOTSUPP;
+        return -1;
+    }
+    copy = fcntl(sock->fd, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0) *error = errno;
+    return copy;
+}
+
+int mg_sock_dup_native_unix_stream(mg_sock *sock, int *error)
+{
+    if (!sock || sock->family != 0 || sock->type != MG_SOCK_STREAM) {
+        *error = EOPNOTSUPP;
+        return -1;
+    }
+    return mg_sock_dup_native_unix_socket(sock, error);
 }
 
 void mg_sock_close(mg_sock *k)

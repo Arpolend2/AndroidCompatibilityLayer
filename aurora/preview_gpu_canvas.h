@@ -35,6 +35,10 @@ public:
     bool prepare(QOpenGLContext *shareContext, Present present, Release release, void *presentUser);
     bool prepareRemotePresentation(QOpenGLContext *shareContext, Present present, Release release, void *presentUser);
     bool prepareCpuPresentation(QOpenGLContext *shareContext, PresentPixels present, void *presentUser);
+    bool prepareRemotePresentationWithCpuFallback(QOpenGLContext *shareContext, Present present,
+                                                   Release release, PresentPixels fallback, void *presentUser);
+    bool enableNativeEglTextures();
+    void *nativeEglDisplay() const { return m_nativeEglDisplay; }
     void install(megler_gfx_host *host);
     void releaseThreadContext();
     bool drawTextPath(void *canvas, const float *path, int count, int fill, const megler_gfx_paint *paint, void *shader);
@@ -46,6 +50,7 @@ private:
     struct Canvas;
     struct Bitmap;
     struct Shader;
+    struct EglTexture;
     bool prepareTexturePresentation(QOpenGLContext *shareContext, Present present, Release release,
                                     void *presentUser, bool offscreenWorker);
     static void MEGLER_CB releaseThread(void *user);
@@ -84,6 +89,12 @@ private:
     static void MEGLER_CB shaderMatrix(void *user, void *shader, const float *matrix);
     static void MEGLER_CB shaderFree(void *user, void *shader);
     static bool MEGLER_CB present(void *user, void *canvas, int x, int y, int width, int height);
+    static int MEGLER_CB textureEglFrame(void *user, int id, void *display, void *surface, int width, int height);
+    static int MEGLER_CB eglSurfaceConfigs(void *user, void *display, int version, void **configs, int capacity);
+    static void *MEGLER_CB eglSurfaceNew(void *user, void *display, void *config, int width, int height, void **token);
+    static void MEGLER_CB eglSurfaceFree(void *user, void *token);
+    static void MEGLER_CB drawTexture(void *user, void *canvas, int id, float left, float top,
+                                      float right, float bottom, int alpha);
 
     Canvas *findCanvas(void *canvas) const;
     bool ensureCurrent(const char *origin);
@@ -122,6 +133,10 @@ private:
     mutable QMutex m_mutex;
     QHash<void *, Canvas *> m_canvases;
     QHash<uint32_t, Bitmap *> m_bitmaps;
+    QHash<int, std::shared_ptr<EglTexture>> m_eglTextures;
+    bool m_nativeEglTextures = false;
+    void *m_nativeEglDisplay = nullptr;
+    void *m_waylandCompositor = nullptr;
     quint64 m_nextCanvasId;
     std::shared_ptr<PreviewGpuMetrics> m_metrics;
 };

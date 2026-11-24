@@ -20,6 +20,8 @@ public final class Manifest {
     }
     public static final class Filter {
         public final ArrayList<String> actions = new ArrayList<>(), categories = new ArrayList<>(), schemes = new ArrayList<>(), mimeTypes = new ArrayList<>(), hosts = new ArrayList<>();
+        public int priority;
+        public boolean unsupportedDataConstraints;
     }
     public static String packageName, applicationClass, versionName, appComponentFactory, appTaskAffinity;
     public static int versionCode, minSdk = 21, targetSdk = 34, appTheme, appLabel, appIcon, appFlags;
@@ -126,7 +128,7 @@ public final class Manifest {
                     cur.authorities = p.getAttributeValue(NS, "authorities");
                     cur.grantUriPermissions = p.getAttributeBooleanValue(NS, "grantUriPermissions", false);
                     cur.process = p.getAttributeValue(NS, "process");
-                    cur.permission = "service".equals(tag) && p.indexOf(NS, "permission") < 0
+                    cur.permission = ("service".equals(tag) || "receiver".equals(tag)) && p.indexOf(NS, "permission") < 0
                         ? appPermission : p.getAttributeValue(NS, "permission");
                     cur.readPermission = p.getAttributeValue(NS, "readPermission");
                     cur.writePermission = p.getAttributeValue(NS, "writePermission");
@@ -139,6 +141,7 @@ public final class Manifest {
                 }
                 case "intent-filter": if (cur != null) {
                     filter = new Filter(); cur.filters.add(filter);
+                    filter.priority = p.getAttributeIntValue(NS, "priority", 0);
                     if ("service".equals(cur.kind) && !cur.exportedDeclared) cur.exported = true;
                 } break;
                 case "action": if (filter != null) filter.actions.add(p.getAttributeValue(NS, "name")); break;
@@ -147,6 +150,11 @@ public final class Manifest {
                     if (filter != null) {
                         String s = attrOrRef(p, "scheme"), h = attrOrRef(p, "host"), m = attrOrRef(p, "mimeType");
                         if (s != null) filter.schemes.add(s); if (h != null) filter.hosts.add(h); if (m != null) filter.mimeTypes.add(m);
+                        for (int a = 0; a < p.getAttributeCount(); a++) {
+                            String name = p.getAttributeName(a);
+                            if (!"scheme".equals(name) && !"host".equals(name) && !"mimeType".equals(name))
+                                filter.unsupportedDataConstraints = true;
+                        }
                     }
                     break;
                 case "meta-data": {
@@ -328,7 +336,10 @@ public final class Manifest {
                     out.add(cur);
                     break;
                 }
-                case "intent-filter": if (cur != null) { filter = new Filter(); cur.filters.add(filter); } break;
+                case "intent-filter": if (cur != null) {
+                    filter = new Filter(); cur.filters.add(filter);
+                    filter.priority = p.getAttributeIntValue(NS, "priority", 0);
+                } break;
                 case "action": if (filter != null) filter.actions.add(p.getAttributeValue(NS, "name")); break;
                 case "category": if (filter != null) filter.categories.add(p.getAttributeValue(NS, "name")); break;
                 case "data":

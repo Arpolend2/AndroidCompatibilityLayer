@@ -2,6 +2,7 @@
 #include "preview_image.h"
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
 #include "preview_gpu_canvas.h"
+#include "../core/src/ndk/mg_egl.h"
 #endif
 
 #include <QFont>
@@ -353,5 +354,44 @@ megler_gfx_host previewGraphics(PreviewGpuCanvasHost *gpuCanvas)
     if (gpuCanvas)
         gpuCanvas->install(&host);
     return host;
+}
+
+struct SharedMicrogGpuCanvas {
+    QOpenGLContext context;
+    PreviewGpuCanvasHost canvas;
+};
+
+static bool MEGLER_CB releaseSharedMicrogTexture(void *, uint32_t)
+{
+    return true;
+}
+
+SharedMicrogGpuCanvas *createSharedMicrogGpuCanvas(
+    megler_gfx_host *graphics,
+    bool (MEGLER_CB *present)(void *, const void *, int, int, int),
+    bool (MEGLER_CB *presentTexture)(void *, uint32_t, int, int), void *user)
+{
+    if (!graphics || !present)
+        return nullptr;
+    std::unique_ptr<SharedMicrogGpuCanvas> gpu(new SharedMicrogGpuCanvas);
+    QSurfaceFormat format;
+    format.setRenderableType(QSurfaceFormat::OpenGLES);
+    format.setVersion(2, 0);
+    gpu->context.setFormat(format);
+    if (!gpu->context.create() || !gpu->context.isOpenGLES() ||
+        !(presentTexture
+            ? gpu->canvas.prepareRemotePresentationWithCpuFallback(&gpu->context, presentTexture,
+                                                                    releaseSharedMicrogTexture, present, user)
+            : gpu->canvas.prepareCpuPresentation(&gpu->context, present, user)) ||
+        !gpu->canvas.enableNativeEglTextures() ||
+        !mg_egl_set_native_display(gpu->canvas.nativeEglDisplay()))
+        return nullptr;
+    *graphics = previewGraphics(&gpu->canvas);
+    return gpu.release();
+}
+
+void destroySharedMicrogGpuCanvas(SharedMicrogGpuCanvas *canvas)
+{
+    delete canvas;
 }
 #endif

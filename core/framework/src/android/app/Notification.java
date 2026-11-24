@@ -260,7 +260,20 @@ public class Notification implements android.os.Parcelable {
         public Builder setOnlyAlertOnce(boolean o) { return setFlag(FLAG_ONLY_ALERT_ONCE, o); } public Builder setAutoCancel(boolean a) { return this; } public Builder setLocalOnly(boolean l) { return this; } public Builder setDefaults(int d) { n.defaults = d; return this; }
         public Builder setPriority(int p) { n.priority = p; return this; } public Builder setCategory(String c) { n.category = c; return this; } public Builder addPerson(String p) { return this; } public Builder addPerson(Person p) { return this; }
         public Builder setGroup(String g) { return this; } public Builder setGroupSummary(boolean s) { return this; } public Builder setSortKey(String k) { return this; } public Builder addExtras(Bundle b) { n.extras.putAll(b); return this; }
-        public Builder setExtras(Bundle b) { n.extras = b; return this; } public Bundle getExtras() { return n.extras; } public Builder addAction(int i, CharSequence t, PendingIntent p) { return this; } public Builder addAction(Action a) { return this; }
+        /* AndroidX NotificationCompat sets its own extras after the title, text and progress; Android keeps those apart from them. */
+        public Builder setExtras(Bundle b) {
+            Bundle kept = n.extras;
+            n.extras = b != null ? b : new Bundle();
+            if (kept == null || kept == n.extras) return this;
+            for (String k : new String[] { EXTRA_TITLE, EXTRA_TEXT })
+                if (kept.containsKey(k) && !n.extras.containsKey(k)) n.extras.putCharSequence(k, kept.getCharSequence(k));
+            for (String k : new String[] { EXTRA_PROGRESS_MAX, EXTRA_PROGRESS })
+                if (kept.containsKey(k) && !n.extras.containsKey(k)) n.extras.putInt(k, kept.getInt(k));
+            if (kept.containsKey(EXTRA_PROGRESS_INDETERMINATE) && !n.extras.containsKey(EXTRA_PROGRESS_INDETERMINATE))
+                n.extras.putBoolean(EXTRA_PROGRESS_INDETERMINATE, kept.getBoolean(EXTRA_PROGRESS_INDETERMINATE));
+            return this;
+        }
+        public Bundle getExtras() { return n.extras; } public Builder addAction(int i, CharSequence t, PendingIntent p) { return this; } public Builder addAction(Action a) { return this; }
         public Builder setActions(Action... a) { return this; } public Builder setStyle(Style s) { return this; } public Builder setVisibility(int v) { return this; } public Builder setPublicVersion(Notification p) { return this; }
         public Builder extend(Extender e) { return e != null ? e.extend(this) : this; } public Builder setColor(int c) { return this; } public Builder setChannelId(String c) { n.channelId = c; return this; } public Builder setTimeoutAfter(long t) { return this; }
         public Builder setShortcutId(String s) { return this; } public Builder setLocusId(android.content.LocusId l) { return this; } public Builder setBadgeIconType(int t) { return this; } public Builder setGroupAlertBehavior(int b) { return this; }

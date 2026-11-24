@@ -1774,6 +1774,43 @@ static void test_threads(void)
     CHECK_INT(seen.count, 0);
 }
 
+static void test_read_only_cacerts(const char *data)
+{
+    char *dir = mg_sprintf("%s/cacerts-test", data);
+    char *file = mg_sprintf("%s/abcd1234.0", dir);
+    say("the Android certificate store is read-only");
+    CHECK(mg_path_mkdirs(dir));
+    CHECK(mg_file_write_all(file, "certificate", 11));
+    mg_fs_mount_read_only("/system/etc/security/cacerts", dir);
+    CHECK(!strcmp(get("/system/etc/security/cacerts/abcd1234.0"), "certificate"));
+    CHECK_INT(open_errno("/system/etc/security/cacerts/abcd1234.0", T_WRONLY | T_TRUNC), GE_ROFS);
+    CHECK_INT(open_errno("/system/etc/security/cacerts/new", T_RDONLY | T_CREAT), GE_ROFS);
+    CHECK(C.unlink("/system/etc/security/cacerts/abcd1234.0") == -1 && last_errno() == GE_ROFS);
+    CHECK(C.rename("/system/etc/security/cacerts/abcd1234.0", "/system/etc/security/cacerts/new") == -1 &&
+          last_errno() == GE_ROFS);
+    CHECK(C.mkdir("/system/etc/security/cacerts/newdir", 0700) == -1 && last_errno() == GE_ROFS);
+    CHECK(!strcmp(get("/system/etc/security/cacerts/abcd1234.0"), "certificate"));
+    mg_path_remove(file, NULL);
+    mg_path_rmdir(dir, NULL);
+    free(file);
+    free(dir);
+}
+
+static void test_read_only_module_apk(const char *data)
+{
+    char *file = mg_sprintf("%s/module-apk-test", data);
+    const char *guest = "/system/priv-app/GmsCore/GmsCore.apk";
+    say("a mounted module APK can only be read");
+    CHECK(mg_file_write_all(file, "apk", 3));
+    mg_fs_mount_host_file(guest, file);
+    CHECK(!strcmp(get(guest), "apk"));
+    CHECK_INT(open_errno(guest, T_WRONLY | T_TRUNC), GE_ROFS);
+    CHECK(C.unlink(guest) == -1 && last_errno() == GE_BUSY);
+    CHECK(!strcmp(get(guest), "apk"));
+    mg_path_remove(file, NULL);
+    free(file);
+}
+
 /*
  * More other apps than the table of mounts once had places for (320: on a phone where 155 apps had run, their two parts
  * each left none for Play Store's APK, which is mounted after them -- 0.1.0.696). What is mounted after the folders are
@@ -2182,6 +2219,8 @@ static int run_in(const char *base, mg_storage_host_maker make, mg_test_sink sin
             test_check();
             test_no_links(data);
             test_many_apps(data);
+            test_read_only_cacerts(data);
+            test_read_only_module_apk(data);
             /* As the tests after this one found things: no links, nobody to ask, and the current directory where it was. */
             C.chdir("/");
         }

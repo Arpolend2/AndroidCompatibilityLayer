@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import Nemo.Configuration 1.0
 import AndroidCompatibilityLayer.Preview 1.0
 import "PreviewNavigation.js" as Navigation
 
@@ -7,7 +8,25 @@ ApplicationWindow {
     id: root
     readonly property bool systemDark: Theme.colorScheme === Theme.LightOnDark
     readonly property color systemAccent: Theme.highlightColor
+    property var systemOrientationLock: orientationLock.value
+    ConfigurationValue {
+        id: orientationLock
+        key: "/lipstick/orientationLock"
+        defaultValue: "dynamic"
+    }
     function previewOrientations(mask) {
+        switch (systemOrientationLock) {
+        case "portrait": return Orientation.Portrait
+        case "landscape": return Orientation.Landscape
+        case "portrait-inverted": return Orientation.PortraitInverted
+        case "landscape-inverted": return Orientation.LandscapeInverted
+        case "dynamic":
+        case undefined:
+        case null:
+            break
+        default:
+            console.warn("Unknown system orientation lock:", systemOrientationLock)
+        }
         if (mask < 0) return defaultAllowedOrientations
         var allowed = 0
         if (mask & Qt.PortraitOrientation) allowed |= Orientation.Portrait
@@ -130,6 +149,36 @@ ApplicationWindow {
                     wrapMode: Text.Wrap
                     text: qsTr("Diagnostic file could not be saved: %1").arg(guestPage.diagnosticFileError)
                 }
+            }
+            Rectangle {
+                id: logOverlay
+                objectName: "diagnosticOverlay"
+                anchors.top: parent.top
+                anchors.topMargin: guestPage.diagnosticFileError.length > 0 ? diagnosticErrorLabel.height + 2 * Theme.paddingSmall : 0
+                anchors.left: parent.left
+                width: Math.min(parent.width, Theme.dp(500))
+                height: Math.min(overlayLabel.contentHeight + 2 * Theme.paddingSmall, parent.height * 0.25)
+                color: "#99000000"
+                visible: overlayLabel.text.length > 0 && !guestPage.hidingCaptureControls
+                clip: true
+                Label {
+                    id: overlayLabel
+                    objectName: "diagnosticOverlayText"
+                    x: Theme.paddingSmall
+                    y: parent.height - height - Theme.paddingSmall
+                    width: parent.width - 2 * x
+                    font.pixelSize: Theme.fontSizeExtraSmall
+                    color: "white"
+                    textFormat: Text.PlainText
+                    wrapMode: Text.WrapAnywhere
+                }
+            }
+            Timer {
+                interval: 500
+                running: guestPage.status === PageStatus.Active
+                repeat: true
+                triggeredOnStart: true
+                onTriggered: overlayLabel.text = diagnosticLog.overlayText()
             }
             Connections {
                 target: preview

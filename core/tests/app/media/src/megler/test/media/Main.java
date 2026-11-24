@@ -22,6 +22,7 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -84,6 +85,34 @@ public final class Main extends Activity implements SurfaceHolder.Callback {
             for (int i = 0; i < config.size(); i++)
                 format.setByteBuffer("csd-" + i, ByteBuffer.wrap(config.get(i)));
             return format;
+        }
+    }
+
+    static final class VideoFrames {
+        private final List<Long> expected;
+        int count;
+        boolean ended;
+
+        VideoFrames(List<Long> inputTimes) {
+            expected = new ArrayList<Long>(inputTimes);
+            Collections.sort(expected);
+        }
+
+        boolean take(int flags, int size, long pts) throws IOException {
+            boolean end = (flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+            boolean picture = !end || size > 0;
+            if (ended) throw new IOException("output after H.264 end-of-stream");
+            if (picture) {
+                if (count >= expected.size()) throw new IOException("too many H.264 frames");
+                long wanted = expected.get(count);
+                if (pts != wanted) throw new IOException("H.264 frame " + count + " PTS " + pts + ", expected " + wanted);
+                count++;
+            }
+            if (end) {
+                ended = true;
+                if (count != expected.size()) throw new IOException("decoded " + count + "/" + expected.size() + " frames");
+            }
+            return picture;
         }
     }
 
@@ -173,7 +202,7 @@ public final class Main extends Activity implements SurfaceHolder.Callback {
             codec = decoder(stream.mime, stream.format(true), surface);
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             long start = System.nanoTime();
-            int frames = 0;
+            VideoFrames frames = new VideoFrames(stream.times);
             for (int k = 0; k < stream.samples.size() && !cancelled; k++) {
                 int index = codec.dequeueInputBuffer(10000);
                 if (index < 0) throw new IOException("H.264 input buffer timeout");
@@ -184,11 +213,11 @@ public final class Main extends Activity implements SurfaceHolder.Callback {
                 input.put(sample);
                 int flags = k + 1 == stream.samples.size() ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0;
                 codec.queueInputBuffer(index, 0, sample.length, stream.times.get(k), flags);
-                frames += drainVideo(codec, info, start, flags != 0, frames, stream.samples.size());
+                drainVideo(codec, info, start, flags != 0, frames);
             }
             if (cancelled) return;
-            if (frames != stream.samples.size()) throw new IOException("decoded " + frames + "/" + stream.samples.size() + " frames");
-            report(videoStatus, "H.264: PASS " + frames + " frames, " + stream.width + "x" + stream.height, true);
+            if (!frames.ended) throw new IOException("H.264 end-of-stream not received");
+            report(videoStatus, "H.264: PASS " + frames.count + " frames, " + stream.width + "x" + stream.height, true);
         } catch (Exception e) {
             report(videoStatus, "H.264: FAIL " + error(e), false);
         } finally {
@@ -196,14 +225,13 @@ public final class Main extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    private int drainVideo(MediaCodec codec, MediaCodec.BufferInfo info, long start, boolean untilEnd,
-                           int alreadyFrames, int expectedFrames) throws Exception {
-        int frames = 0;
+    private void drainVideo(MediaCodec codec, MediaCodec.BufferInfo info, long start, boolean untilEnd,
+                            VideoFrames frames) throws Exception {
         long deadline = System.nanoTime() + 20000000000L;
         while (!cancelled) {
             int index = codec.dequeueOutputBuffer(info, untilEnd ? 10000 : 0);
             if (index == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                if (!untilEnd) return frames;
+                if (!untilEnd) return;
                 if (System.nanoTime() >= deadline) throw new IOException("H.264 end-of-stream timeout");
             } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 MediaFormat format = codec.getOutputFormat();
@@ -212,7 +240,7 @@ public final class Main extends Activity implements SurfaceHolder.Callback {
                 if (width <= 0 || height <= 0) throw new IOException("invalid output size");
             } else if (index >= 0) {
                 boolean end = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
-                boolean hasPicture = !end || info.size > 0 || alreadyFrames + frames < expectedFrames;
+                boolean hasPicture = frames.take(info.flags, info.size, info.presentationTimeUs);
                 if (hasPicture) {
                     long target = start + Math.max(0, info.presentationTimeUs) * 1000L;
                     while (!cancelled && target > System.nanoTime()) {
@@ -220,16 +248,14 @@ public final class Main extends Activity implements SurfaceHolder.Callback {
                         if (wait > 0) Thread.sleep(wait);
                     }
                     codec.releaseOutputBuffer(index, true);
-                    frames++;
                 } else {
                     codec.releaseOutputBuffer(index, false);
                 }
                 if (end) {
-                    return frames;
+                    return;
                 }
             }
         }
-        return frames;
     }
 
     private void playAudio() {

@@ -10,7 +10,7 @@ Name=Android App Manager
 Name[ru]=Менеджер приложений Android
 
 [X-Application]
-Permissions=Internet;UserDirs;DeviceInfo;Camera;Sensors;Audio;Bluetooth;Location
+Permissions=Internet;UserDirs;DeviceInfo;Camera;Sensors;Audio;Bluetooth;Location;org.freedesktop.Notifications@org.freedesktop.Notifications
 OrganizationName=ru.androidcompatibilitylayer
 ApplicationName=appmanager
 ExecDBus=/usr/bin/ru.androidcompatibilitylayer.appmanager --microg-service

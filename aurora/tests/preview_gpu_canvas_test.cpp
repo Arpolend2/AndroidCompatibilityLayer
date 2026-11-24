@@ -4,6 +4,7 @@
 #include "../preview_gpu_snapshot.h"
 #include "../preview_frame.h"
 #include "../../core/src/mg_core.h"
+#include "../../core/src/drivers/mg_java_gfx.h"
 #include "../../core/tests/mg_gfx_standin.h"
 
 #include <QByteArray>
@@ -18,6 +19,8 @@
 #include <QPainter>
 #include <QRegion>
 #include <QThread>
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
 
 #include <atomic>
 #include <condition_variable>
@@ -56,6 +59,17 @@ struct PresentedPixels {
     bool accept = true;
 };
 
+struct RejectedGpuFrame {
+    PresentedPixels cpu;
+    int gpuCalls = 0;
+};
+
+bool MEGLER_CB rejectGpuFrame(void *user, uint32_t, int, int)
+{
+    ++static_cast<RejectedGpuFrame *>(user)->gpuCalls;
+    return false;
+}
+
 bool MEGLER_CB presentPixels(void *user, const void *pixels, int width, int height, int stride)
 {
     PresentedPixels *result = static_cast<PresentedPixels *>(user);
@@ -64,6 +78,16 @@ bool MEGLER_CB presentPixels(void *user, const void *pixels, int width, int heig
         return false;
     result->pixels = QByteArray(static_cast<const char *>(pixels), stride * height);
     return width > 0;
+}
+
+bool MEGLER_CB presentFallbackPixels(void *user, const void *pixels, int width, int height, int stride)
+{
+    return presentPixels(&static_cast<RejectedGpuFrame *>(user)->cpu, pixels, width, height, stride);
+}
+
+bool MEGLER_CB releaseFallbackTexture(void *, uint32_t)
+{
+    return true;
 }
 
 bool MEGLER_CB present(void *user, uint32_t texture, int width, int height)
@@ -93,6 +117,29 @@ bool isBgra(const QByteArray &pixels, int width, int x, int y, uchar b, uchar g,
 {
     const uchar *pixel = reinterpret_cast<const uchar *>(pixels.constData()) + (y * width + x) * 4;
     return pixel[0] == b && pixel[1] == g && pixel[2] == r && pixel[3] == a;
+}
+
+bool rejectedGpuUsesCpu(QOpenGLContext *context)
+{
+    RejectedGpuFrame result;
+    PreviewGpuCanvasHost gpu;
+    if (!gpu.prepareRemotePresentationWithCpuFallback(context, rejectGpuFrame,
+                                                        releaseFallbackTexture, presentFallbackPixels,
+                                                        &result))
+        return false;
+    megler_gfx_host host = *mg_gfx_standin();
+    gpu.install(&host);
+    const int width = 8, height = 8, stride = width * 4;
+    QByteArray pixels(stride * height, '\0');
+    void *canvas = host.canvas_new(host.user, pixels.data(), width, height, stride);
+    if (!canvas) return false;
+    host.draw_color(host.user, canvas, 0xffff0000u, MEGLER_GFX_BLEND_SRC);
+    const bool presented = host.present(host.user, canvas, 0, 0, width, height);
+    const bool ok = presented && result.gpuCalls == 1 && result.cpu.calls == 1 &&
+                    result.cpu.pixels.size() == stride * height &&
+                    isBgra(result.cpu.pixels, width, 4, 4, 0, 0, 255, 255);
+    host.canvas_free(host.user, canvas);
+    return ok;
 }
 
 bool pixelsMatch(const QByteArray &left, const QByteArray &right, int tolerance)
@@ -162,6 +209,191 @@ bool texturePixel(QOpenGLFunctions *gl, GLuint texture, uchar r, uchar g, uchar 
     gl->glDeleteFramebuffers(1, &framebuffer);
     return complete && error == GL_NO_ERROR &&
            pixel[0] == r && pixel[1] == g && pixel[2] == b && pixel[3] == a;
+}
+
+bool nativeEglTexture(QOpenGLContext *shareContext, bool remote, bool standalone = false)
+{
+    QSurface *consumerSurface = shareContext->surface();
+    PresentedPixels output;
+    PresentedTexture remoteOutput;
+    PreviewGpuCanvasHost gpu;
+    if (!expect(standalone
+                    ? gpu.prepare(shareContext, present, release, &remoteOutput)
+                    : remote
+                    ? gpu.prepareRemotePresentation(shareContext, present, release, &remoteOutput)
+                    : gpu.prepareCpuPresentation(shareContext, presentPixels, &output),
+                "prepare native EGL texture capture"))
+        return false;
+    const bool nativeReady = (remote || standalone) ? gpu.nativeEglDisplay() != nullptr : gpu.enableNativeEglTextures();
+    if (!nativeReady) {
+        megler_gfx_host disabled = *mg_gfx_standin();
+        gpu.install(&disabled);
+        if (qgetenv("ACL_TEST_EXPECT_WEBVIEW_GPU") == QByteArrayLiteral("1"))
+            return expect(false, "WebView GPU capture is ready without an extra remote startup opt-in");
+        std::fprintf(stderr, "SKIP: native EGL texture integration is unavailable on this display\n");
+        return expect(!disabled.texture_egl_frame,
+                      "unsupported native EGL display does not advertise texture capture");
+    }
+    megler_gfx_host host = *mg_gfx_standin();
+    gpu.install(&host);
+    if (!expect(host.texture_egl_frame && host.draw_texture,
+                "native EGL registration advertises both WebView GPU callbacks"))
+        return false;
+    EGLDisplay display = static_cast<EGLDisplay>(gpu.nativeEglDisplay());
+    EGLint configAttrs[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, standalone ? 0x40 : EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE
+    };
+    const EGLint surfaceAttrs[] = { EGL_WIDTH, 8, EGL_HEIGHT, 8, EGL_NONE };
+    const EGLint contextAttrs[] = { EGL_CONTEXT_CLIENT_VERSION, standalone ? 3 : 2, EGL_NONE };
+    EGLConfig config = nullptr;
+    EGLint count = 0;
+    bool choseConfig = display != EGL_NO_DISPLAY &&
+        eglChooseConfig(display, configAttrs, &config, 1, &count) && count == 1;
+    bool hostSurface = false;
+    if (!choseConfig && host.egl_surface_configs && host.egl_surface_new && host.egl_surface_free) {
+        count = host.egl_surface_configs(host.user, display, 2, &config, 1);
+        choseConfig = count == 1;
+        hostSurface = choseConfig;
+    }
+    if (!choseConfig)
+        std::fprintf(stderr, "EGL config count=%d error=0x%x\n", count, eglGetError());
+    if (!expect(choseConfig, "choose native EGL test configuration"))
+        return false;
+    if (hostSurface) {
+        void *invalidToken = reinterpret_cast<void *>(1);
+        if (!expect(host.egl_surface_configs(host.user, EGL_NO_DISPLAY, 2, &config, 1) == 0 &&
+                    !host.egl_surface_new(host.user, display, config, 0, 8, &invalidToken) &&
+                    invalidToken == nullptr, "reject invalid host surface requests"))
+            return false;
+    }
+    EGLContext producer = eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttrs);
+    void *token = nullptr;
+    EGLSurface surface = hostSurface
+        ? static_cast<EGLSurface>(host.egl_surface_new(host.user, display, config, 8, 8, &token))
+        : eglCreatePbufferSurface(display, config, surfaceAttrs);
+    QByteArray callbackPixels(64 * 64 * 4, '\0');
+    void *callbackCanvas = nullptr;
+    if (standalone) {
+        mg_java_gfx_set_host(&host);
+        callbackCanvas = host.canvas_new_bitmap(host.user, callbackPixels.data(), 64, 64, 64 * 4, 456);
+        if (!expect(callbackCanvas != nullptr, "create Canvas before a raw EGL context switch"))
+            return false;
+    } else {
+        shareContext->doneCurrent();
+    }
+    if (!expect(producer != EGL_NO_CONTEXT && surface != EGL_NO_SURFACE &&
+                eglMakeCurrent(display, surface, surface, producer), "create native EGL producer"))
+        return false;
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0, 1, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 4, 8, 4);
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    const bool rejected = host.texture_egl_frame &&
+        host.texture_egl_frame(host.user, 123, display, surface, 7, 8) == 0 &&
+        eglGetCurrentContext() == producer;
+    const bool captured = host.texture_egl_frame &&
+        host.texture_egl_frame(host.user, 123, display, surface, 8, 8) == 1 &&
+        eglGetCurrentContext() == producer && eglGetCurrentSurface(EGL_DRAW) == surface;
+    bool callbacksOk = true;
+    if (standalone) {
+        GLuint unpackBuffer = 0;
+        glGenBuffers(1, &unpackBuffer);
+        glBindBuffer(0x88EC, unpackBuffer); // GL_PIXEL_UNPACK_BUFFER
+        glBufferData(0x88EC, 16, nullptr, GL_STATIC_DRAW);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 8);
+        glPixelStorei(0x0CF2, 128); // GL_UNPACK_ROW_LENGTH
+        glPixelStorei(0x0CF3, 2); // GL_UNPACK_SKIP_ROWS
+        glPixelStorei(0x0CF4, 3); // GL_UNPACK_SKIP_PIXELS
+        for (int i = 0; i < callbackPixels.size(); i += 4) {
+            callbackPixels[i + 1] = char(255);
+            callbackPixels[i + 3] = char(255);
+        }
+        host.bitmap_changed(host.user, 456);
+        const bool uploaded = host.present(host.user, callbackCanvas, 0, 0, 64, 64);
+        const GLuint callbackTexture = remoteOutput.texture;
+        const bool producerRestored = eglGetCurrentContext() == producer &&
+            eglGetCurrentSurface(EGL_DRAW) == surface && eglGetCurrentSurface(EGL_READ) == surface;
+        eglMakeCurrent(display, surface, surface, producer);
+        GLint buffer = 0, alignment = 0, rowLength = 0, skipRows = 0, skipPixels = 0;
+        glGetIntegerv(0x88EF, &buffer); // GL_PIXEL_UNPACK_BUFFER_BINDING
+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+        glGetIntegerv(0x0CF2, &rowLength);
+        glGetIntegerv(0x0CF3, &skipRows);
+        glGetIntegerv(0x0CF4, &skipPixels);
+        const bool statePreserved = GLuint(buffer) == unpackBuffer && alignment == 8 &&
+            rowLength == 128 && skipRows == 2 && skipPixels == 3 && glGetError() == GL_NO_ERROR;
+        glBindBuffer(0x88EC, 0);
+        glDeleteBuffers(1, &unpackBuffer);
+        const bool pixelsOk = shareContext->makeCurrent(consumerSurface) &&
+            uploaded && texturePixel(shareContext->functions(), callbackTexture, 0, 255, 0, 255);
+        eglMakeCurrent(display, surface, surface, producer);
+        host.canvas_free(host.user, callbackCanvas);
+        host.bitmap_gone(host.user, 456);
+        const bool cleanupRestored = eglGetCurrentContext() == producer;
+        mg_java_gfx_set_host(nullptr);
+        callbacksOk = expect(uploaded && pixelsOk, "Canvas upload uses its own share group after raw GLES3 switch") &&
+            expect(producerRestored && cleanupRestored, "Canvas callbacks restore the guest EGL context and surfaces") &&
+            expect(statePreserved, "Canvas callbacks leave guest GLES3 unpack state untouched");
+    }
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (token) host.egl_surface_free(host.user, token);
+    else eglDestroySurface(display, surface);
+    eglDestroyContext(display, producer);
+    if (!expect(rejected && captured, "reject invalid frame and restore producer context"))
+        return false;
+    QByteArray pixels(32 * 16 * 4, '\0');
+    void *canvas = host.canvas_new(host.user, pixels.data(), 32, 16, 32 * 4);
+    if (!expect(canvas != nullptr, "create native EGL destination canvas"))
+        return false;
+    host.clip_rect(host.user, canvas, 8, 0, 16, 16, MEGLER_GFX_CLIP_INTERSECT);
+    host.draw_texture(host.user, canvas, 123, 4, 0, 20, 16, 255);
+    host.flush(host.user, canvas);
+    const bool imageOk = expect(isBgra(pixels, 32, 10, 2, 0, 0, 255, 255) &&
+                                isBgra(pixels, 32, 10, 13, 0, 255, 0, 255) &&
+                                isBgra(pixels, 32, 6, 2, 0, 0, 0, 0) &&
+                                isBgra(pixels, 32, 18, 2, 0, 0, 0, 0),
+                                "native EGL draw preserves orientation, scaling and clip");
+    QByteArray portrait(16 * 32 * 4, '\0');
+    void *fallback = host.canvas_new(host.user, portrait.data(), 16, 32, 16 * 4);
+    bool fallbackOk = expect(fallback != nullptr, "create portrait fallback canvas");
+    if (fallback) {
+        const float matrix[] = {1, 0, 0.5f, 0, 1, 0.5f};
+        host.set_matrix(host.user, fallback, matrix);
+        host.draw_texture(host.user, fallback, 123, 0, 0, 8, 16, 128);
+        host.flush(host.user, fallback);
+        fallbackOk = expect(isBgra(portrait, 16, 3, 3, 0, 0, 128, 128) &&
+                            isBgra(portrait, 16, 3, 13, 0, 128, 0, 128) &&
+                            isBgra(portrait, 16, 12, 3, 0, 0, 0, 0),
+                            "transformed portrait fallback preserves alpha and orientation") && fallbackOk;
+        host.canvas_free(host.user, fallback);
+    }
+    QByteArray landscape(2000 * 1200 * 4, '\0');
+    void *login = host.canvas_new(host.user, landscape.data(), 2000, 1200, 2000 * 4);
+    bool landscapeOk = expect(login != nullptr, "create landscape login canvas");
+    if (login) {
+        host.clip_rect(host.user, login, 0, 168, 2000, 1116, MEGLER_GFX_CLIP_INTERSECT);
+        host.draw_texture(host.user, login, 123, 0, 168, 2000, 1116, 255);
+        host.flush(host.user, login);
+        landscapeOk = expect(isBgra(landscape, 2000, 1000, 300, 0, 0, 255, 255) &&
+                             isBgra(landscape, 2000, 1000, 1000, 0, 255, 0, 255) &&
+                             isBgra(landscape, 2000, 1000, 100, 0, 0, 0, 0) &&
+                             isBgra(landscape, 2000, 1000, 1150, 0, 0, 0, 0),
+                             "2000x1200 login GPU texture preserves page orientation and chrome bounds");
+        host.canvas_free(host.user, login);
+    }
+    const bool released = host.texture_egl_frame(host.user, 123, nullptr, nullptr, 0, 0) == 1;
+    host.draw_color(host.user, canvas, 0, MEGLER_GFX_BLEND_SRC);
+    host.draw_texture(host.user, canvas, 123, 4, 0, 20, 16, 255);
+    host.flush(host.user, canvas);
+    const bool gone = expect(isBgra(pixels, 32, 10, 2, 0, 0, 0, 0),
+                             "released native EGL texture no longer draws");
+    host.canvas_free(host.user, canvas);
+    host.release_thread(host.user);
+    return callbacksOk && imageOk && fallbackOk && landscapeOk && gone && expect(released, "release native EGL texture");
 }
 
 }
@@ -335,6 +567,14 @@ int main(int argc, char **argv)
                      shareContext.format().minorVersion());
         return 77;
     }
+    if (!expect(rejectedGpuUsesCpu(&shareContext), "rejected GPU frame uses CPU pixels"))
+        return 1;
+    if (!shareContext.makeCurrent(&shareSurface) || !nativeEglTexture(&shareContext, false) ||
+        !shareContext.makeCurrent(&shareSurface) || !nativeEglTexture(&shareContext, true) ||
+        !shareContext.makeCurrent(&shareSurface) || !nativeEglTexture(&shareContext, false, true))
+        return 1;
+    if (!shareContext.makeCurrent(&shareSurface))
+        return 1;
 
     PresentedTexture presented;
     PreviewGpuCanvasHost gpuCanvas;

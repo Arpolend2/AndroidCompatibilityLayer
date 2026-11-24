@@ -42,6 +42,15 @@ megler_gfx_host previewGraphics()
     host.user = &graphicsSentinel;
     return host;
 }
+SharedMicrogGpuCanvas *createSharedMicrogGpuCanvas(
+    megler_gfx_host *, bool (MEGLER_CB *)(void *, const void *, int, int, int),
+    bool (MEGLER_CB *)(void *, uint32_t, int, int), void *)
+{
+    return nullptr;
+}
+void destroySharedMicrogGpuCanvas(SharedMicrogGpuCanvas *) {}
+bool MEGLER_CB shared_microg_gpu_present_pixels(void *, const void *, int, int, int) { return false; }
+bool shared_microg_gpu_frame_owner(uint64_t *, uint64_t *) { return false; }
 int shared_microg_worker_main(int, char **, const megler_gfx_host *graphics)
 {
     assert(qobject_cast<QGuiApplication *>(QCoreApplication::instance()));

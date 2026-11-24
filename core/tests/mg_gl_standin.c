@@ -34,7 +34,10 @@ typedef struct sb_surface {
 } sb_surface;
 
 /* What this OpenGL ES does with a surface whose keyed mutex it does not hold: nothing, as Direct3D drops it. */
-static bool held(const sb_surface *s) { return s && s->km == 1; }
+static bool native_surfaces;
+static bool held(const sb_surface *s) { return s && (native_surfaces || s->km == 1); }
+
+void mg_gl_standin_native_surfaces(bool enabled) { native_surfaces = enabled; }
 
 /* A texture's pixels, R, G, B, A, rows in the order given (bottom first, as OpenGL has it); shared by the EGL images of it. */
 typedef struct sb_store {

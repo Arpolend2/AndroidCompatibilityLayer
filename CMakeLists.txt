@@ -26,6 +26,7 @@ endif()
 
 find_package(Qt5 COMPONENTS Core Gui Qml Quick Multimedia Sensors Network DBus Positioning LinguistTools REQUIRED)
 find_package(PkgConfig REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 pkg_check_modules(AURORA REQUIRED auroraapp)
 pkg_check_modules(RUNTIME_MANAGER REQUIRED runtime-manager-qt5)
 pkg_check_modules(AURORA_WEBVIEW REQUIRED aurorawebview)
@@ -59,6 +60,8 @@ endforeach()
 
 add_library(acl_runtime_objects OBJECT
     aurora/main.cpp
+    aurora/system_cacerts.c
+    aurora/system_cacerts.h
     aurora/microg_watchdog.cpp
     aurora/microg_watchdog.h
     aurora/microg_watchdog_schedule.h
@@ -191,6 +194,64 @@ add_library(acl_runtime_objects OBJECT
     core/tests/mg_gfx_standin.c
     ${ZLIB_SOURCES}
 )
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(FFMPEG8_ARCH aarch64)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7.*|arm)$")
+    set(FFMPEG8_ARCH arm)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+    set(FFMPEG8_ARCH x86_64)
+else()
+    message(FATAL_ERROR "Unsupported architecture for the private FFmpeg bridge: ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+set(FFMPEG8_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg8")
+set(FFMPEG8_ARCHIVE "${CMAKE_CURRENT_SOURCE_DIR}/aurora/third_party/ffmpeg/ffmpeg-aurora-b545fc0.tar.gz")
+set(FFMPEG8_PATCH "${CMAKE_CURRENT_SOURCE_DIR}/aurora/third_party/ffmpeg/droidmedia-copy.patch")
+set(FFMPEG8_SYSROOT_ARG)
+if(CMAKE_SYSROOT)
+    set(FFMPEG8_SYSROOT_ARG "--sysroot=${CMAKE_SYSROOT}")
+endif()
+add_custom_command(
+    OUTPUT "${FFMPEG8_OUTPUT}/ACL-FFMPEG8.txt"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare-ffmpeg8.py"
+        "--arch=${FFMPEG8_ARCH}" "--cc=${CMAKE_C_COMPILER}" "--ar=${CMAKE_AR}"
+        "--ranlib=${CMAKE_RANLIB}" "--nm=${CMAKE_NM}" "--strip=${CMAKE_STRIP}"
+        ${FFMPEG8_SYSROOT_ARG} "--output=${FFMPEG8_OUTPUT}"
+    DEPENDS "${FFMPEG8_ARCHIVE}" "${FFMPEG8_PATCH}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare-ffmpeg8.py"
+    VERBATIM)
+add_custom_target(acl_ffmpeg8_build DEPENDS "${FFMPEG8_OUTPUT}/ACL-FFMPEG8.txt")
+set(DROIDMEDIA_TEST_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg8-droidmedia-test")
+add_custom_command(
+    OUTPUT "${DROIDMEDIA_TEST_OUTPUT}/ACL-DROIDMEDIA-TEST.txt"
+    BYPRODUCTS "${DROIDMEDIA_TEST_OUTPUT}/lib/libavcodec-acl-dmtest.so.62"
+               "${DROIDMEDIA_TEST_OUTPUT}/lib/libavutil-acl-dmtest.so.60"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare-droidmedia-test.py"
+        "--arch=${FFMPEG8_ARCH}" "--cc=${CMAKE_C_COMPILER}" "--ar=${CMAKE_AR}"
+        "--ranlib=${CMAKE_RANLIB}" "--nm=${CMAKE_NM}" "--strip=${CMAKE_STRIP}"
+        ${FFMPEG8_SYSROOT_ARG} "--output=${DROIDMEDIA_TEST_OUTPUT}"
+    DEPENDS "${FFMPEG8_ARCHIVE}" "${FFMPEG8_PATCH}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/aurora/tests/droidmedia-trace.patch"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare-ffmpeg8.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare-droidmedia-test.py"
+    VERBATIM)
+add_custom_target(acl_droidmedia_test_ffmpeg DEPENDS "${DROIDMEDIA_TEST_OUTPUT}/ACL-DROIDMEDIA-TEST.txt")
+add_executable(acl_droidmedia_probe EXCLUDE_FROM_ALL aurora/tests/droidmedia_probe.cpp)
+add_dependencies(acl_droidmedia_probe acl_droidmedia_test_ffmpeg)
+target_include_directories(acl_droidmedia_probe PRIVATE "${DROIDMEDIA_TEST_OUTPUT}/include")
+target_link_libraries(acl_droidmedia_probe PRIVATE
+    "${DROIDMEDIA_TEST_OUTPUT}/lib/libavcodec-acl-dmtest.so.62"
+    "${DROIDMEDIA_TEST_OUTPUT}/lib/libavutil-acl-dmtest.so.60")
+set_target_properties(acl_droidmedia_probe PROPERTIES CXX_STANDARD 11
+    BUILD_RPATH "${DROIDMEDIA_TEST_OUTPUT}/lib")
+add_library(acl_ffmpeg8 OBJECT aurora/codec_audio.cpp aurora/codec_demux.cpp)
+set_target_properties(acl_ffmpeg8 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_dependencies(acl_ffmpeg8 acl_ffmpeg8_build)
+target_include_directories(acl_ffmpeg8 PRIVATE "${FFMPEG8_OUTPUT}/include" ${AURORA_INCLUDE_DIRS})
+target_compile_definitions(acl_ffmpeg8 PRIVATE ACL_FFMPEG_8)
+target_link_libraries(acl_ffmpeg8 PRIVATE Qt5::Core Qt5::Quick)
+target_sources(acl_runtime_objects PRIVATE
+    aurora/codec_audio.h aurora/codec_media_host.cpp aurora/codec_mpp.cpp aurora/codec_mpp_abi.h)
+target_compile_definitions(acl_runtime_objects PRIVATE ACL_WITH_FFMPEG7_MEDIA)
 if(ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR)
     foreach(header
             libavcodec/avcodec.h
@@ -227,14 +288,20 @@ if(ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR)
                 "FFmpeg headers were prepared for '${FFMPEG7_ARCH_LINE}', but this build targets '${FFMPEG7_EXPECTED_ARCH}'.")
         endif()
     endif()
-    target_sources(acl_runtime_objects PRIVATE
-        aurora/codec_audio.cpp aurora/codec_audio.h aurora/codec_media_host.cpp)
-    target_include_directories(acl_runtime_objects PRIVATE
-        "${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}")
-    target_compile_definitions(acl_runtime_objects PRIVATE ACL_WITH_FFMPEG7_MEDIA)
+    add_library(acl_ffmpeg7 OBJECT aurora/codec_audio.cpp)
+    set_target_properties(acl_ffmpeg7 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(acl_ffmpeg7 PRIVATE "${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}")
+    target_link_libraries(acl_ffmpeg7 PRIVATE Qt5::Core)
+    target_compile_definitions(acl_runtime_objects PRIVATE ACL_WITH_FFMPEG7_BACKEND)
 endif()
 add_executable(${APP_ID} aurora/application_entry.cpp aurora/report_webview.cpp)
 add_executable(acl-runtime aurora/application_entry.cpp)
+foreach(target ${APP_ID} acl-runtime)
+    target_sources(${target} PRIVATE $<TARGET_OBJECTS:acl_ffmpeg8>)
+    if(TARGET acl_ffmpeg7)
+        target_sources(${target} PRIVATE $<TARGET_OBJECTS:acl_ffmpeg7>)
+    endif()
+endforeach()
 set_target_properties(acl-runtime PROPERTIES OUTPUT_NAME "${APP_ID}.runtime")
 target_link_libraries(${APP_ID} PRIVATE acl_runtime_objects)
 target_link_libraries(acl-runtime PRIVATE acl_runtime_objects)
@@ -267,9 +334,17 @@ target_include_directories(acl_runtime_objects PRIVATE
     core/third_party/zlib
 )
 target_compile_definitions(acl_runtime_objects PRIVATE _GNU_SOURCE MEGLER_NO_EMBEDDED_TESTS)
+target_compile_definitions(acl_runtime_objects PRIVATE ACL_AURORA_CACERTS)
 target_compile_definitions(acl_runtime_objects PRIVATE STANDALONE_RUNTIME_ABI="${STANDALONE_RUNTIME_ABI}")
 pkg_check_modules(EGL REQUIRED egl)
 pkg_check_modules(GLES2 REQUIRED glesv2)
+pkg_check_modules(WAYLAND_EGL QUIET wayland-client wayland-egl)
+set(ACL_QT_WAYLAND_NATIVE_HEADERS FALSE)
+foreach(path IN LISTS Qt5Gui_PRIVATE_INCLUDE_DIRS)
+    if(EXISTS "${path}/qpa/qplatformnativeinterface.h")
+        set(ACL_QT_WAYLAND_NATIVE_HEADERS TRUE)
+    endif()
+endforeach()
 target_sources(acl_runtime_objects PRIVATE
     aurora/egl_frame_transport.c aurora/preview_gpu.cpp aurora/preview_gpu.h
     aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h
@@ -278,19 +353,25 @@ target_compile_definitions(acl_runtime_objects PRIVATE
     MG_EXPERIMENTAL_NATIVE_EGL MG_EXPERIMENTAL_GPU_COMPOSITION MG_EXPERIMENTAL_GPU_CANVAS)
 target_include_directories(acl_runtime_objects PRIVATE ${EGL_INCLUDE_DIRS} ${GLES2_INCLUDE_DIRS})
 target_link_libraries(acl_runtime_objects PUBLIC ${EGL_LDFLAGS} ${GLES2_LDFLAGS})
+if(WAYLAND_EGL_FOUND AND ACL_QT_WAYLAND_NATIVE_HEADERS)
+    target_compile_definitions(acl_runtime_objects PRIVATE ACL_HAVE_WAYLAND_EGL)
+    target_include_directories(acl_runtime_objects PRIVATE ${WAYLAND_EGL_INCLUDE_DIRS} ${Qt5Gui_PRIVATE_INCLUDE_DIRS})
+    target_link_libraries(acl_runtime_objects PUBLIC ${WAYLAND_EGL_LDFLAGS})
+endif()
 target_link_libraries(acl_runtime_objects PUBLIC
     Qt5::Quick Qt5::Multimedia Qt5::Sensors Qt5::Network Qt5::DBus Qt5::Positioning
-    ${AURORA_LDFLAGS} ${RUNTIME_MANAGER_LDFLAGS} m pthread dl
+    OpenSSL::Crypto ${AURORA_LDFLAGS} ${RUNTIME_MANAGER_LDFLAGS} m pthread dl
 )
 
 if(ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS)
 find_package(Qt5 COMPONENTS Test REQUIRED)
 add_executable(android_compatibility_layer_report_webview_startup_test EXCLUDE_FROM_ALL
-    aurora/tests/report_webview_startup_test.cpp aurora/report_webview.cpp)
+    aurora/tests/report_webview_startup_test.cpp aurora/report_webview.cpp
+    aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h)
 set_target_properties(android_compatibility_layer_report_webview_startup_test PROPERTIES CXX_STANDARD 17)
 target_compile_definitions(android_compatibility_layer_report_webview_startup_test PRIVATE ACL_WITH_REPORT_WEBVIEW)
 target_include_directories(android_compatibility_layer_report_webview_startup_test PRIVATE ${AURORA_WEBVIEW_INCLUDE_DIRS})
-target_link_libraries(android_compatibility_layer_report_webview_startup_test PRIVATE Qt5::Core Qt5::Gui)
+target_link_libraries(android_compatibility_layer_report_webview_startup_test PRIVATE Qt5::Core Qt5::Gui ${EGL_LDFLAGS} ${GLES2_LDFLAGS})
 add_executable(android_compatibility_layer_shared_microg_graphics_test EXCLUDE_FROM_ALL
     aurora/tests/shared_microg_graphics_test.cpp aurora/preview_text.cpp aurora/preview_image.cpp
     core/tests/microg-binder-boundary/worker_graphics_fixture.c core/tests/mg_gfx_standin.c
@@ -366,13 +447,19 @@ target_link_libraries(android_compatibility_layer_gfx_native_test PRIVATE m pthr
     add_executable(android_compatibility_layer_gpu_canvas_test EXCLUDE_FROM_ALL
         aurora/tests/preview_gpu_canvas_test.cpp
         aurora/preview_gpu_canvas.cpp
+        aurora/egl_frame_transport.c
         core/tests/mg_gfx_standin.c
         ${CORE_SOURCES}
         ${ZLIB_SOURCES}
     )
     target_include_directories(android_compatibility_layer_gpu_canvas_test PRIVATE core/third_party/zlib)
     target_compile_definitions(android_compatibility_layer_gpu_canvas_test PRIVATE _GNU_SOURCE MEGLER_NO_EMBEDDED_TESTS)
-    target_link_libraries(android_compatibility_layer_gpu_canvas_test PRIVATE Qt5::Gui ${GPU_CANVAS_TEST_GLES2_LDFLAGS} m pthread dl)
+    target_link_libraries(android_compatibility_layer_gpu_canvas_test PRIVATE Qt5::Gui ${EGL_LDFLAGS} ${GPU_CANVAS_TEST_GLES2_LDFLAGS} m pthread dl)
+    if(WAYLAND_EGL_FOUND AND ACL_QT_WAYLAND_NATIVE_HEADERS)
+        target_compile_definitions(android_compatibility_layer_gpu_canvas_test PRIVATE ACL_HAVE_WAYLAND_EGL)
+        target_include_directories(android_compatibility_layer_gpu_canvas_test PRIVATE ${WAYLAND_EGL_INCLUDE_DIRS} ${Qt5Gui_PRIVATE_INCLUDE_DIRS})
+        target_link_libraries(android_compatibility_layer_gpu_canvas_test PRIVATE ${WAYLAND_EGL_LDFLAGS})
+    endif()
 
 add_library(jni_load_fixture SHARED EXCLUDE_FROM_ALL aurora/tests/jni_load_fixture.c)
 add_library(jni_load_failure SHARED EXCLUDE_FROM_ALL aurora/tests/jni_load_fixture.c)
@@ -471,6 +558,9 @@ add_executable(android_compatibility_layer_app_cache_clear_test EXCLUDE_FROM_ALL
 target_link_libraries(android_compatibility_layer_app_cache_clear_test PRIVATE Qt5::Core)
 
 add_executable(android_compatibility_layer_google_services_runtime_test EXCLUDE_FROM_ALL aurora/tests/google_services_runtime_test.cpp)
+add_executable(android_compatibility_layer_shared_microg_module_test EXCLUDE_FROM_ALL
+    aurora/tests/shared_microg_module_test.cpp)
+target_link_libraries(android_compatibility_layer_shared_microg_module_test PRIVATE Qt5::Core)
 add_executable(android_compatibility_layer_manager_lifecycle_test EXCLUDE_FROM_ALL
     aurora/tests/manager_lifecycle_test.cpp
     aurora/manager_lifecycle.cpp aurora/manager_lifecycle.h
@@ -482,8 +572,12 @@ target_include_directories(android_compatibility_layer_manager_lifecycle_test PR
 target_link_libraries(android_compatibility_layer_manager_lifecycle_test PRIVATE Qt5::Core Qt5::DBus ${RUNTIME_MANAGER_LDFLAGS})
 add_executable(android_compatibility_layer_shared_microg_supervisor_test EXCLUDE_FROM_ALL
     aurora/tests/shared_microg_supervisor_test.cpp
-    aurora/shared_microg_supervisor.cpp aurora/shared_microg_supervisor.h)
-target_link_libraries(android_compatibility_layer_shared_microg_supervisor_test PRIVATE Qt5::Core)
+    aurora/shared_microg_supervisor.cpp aurora/shared_microg_supervisor.h
+    aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h)
+target_compile_definitions(android_compatibility_layer_shared_microg_supervisor_test PRIVATE
+    MG_EXPERIMENTAL_GPU_COMPOSITION MG_EXPERIMENTAL_GPU_CANVAS)
+target_link_libraries(android_compatibility_layer_shared_microg_supervisor_test PRIVATE
+    Qt5::Core Qt5::Gui ${EGL_LDFLAGS} ${GLES2_LDFLAGS})
 add_executable(android_compatibility_layer_microg_watchdog_test EXCLUDE_FROM_ALL
     aurora/tests/microg_watchdog_test.cpp aurora/microg_watchdog.cpp aurora/shared_microg_ipc.cpp)
 target_link_libraries(android_compatibility_layer_microg_watchdog_test PRIVATE Qt5::Core Qt5::DBus)
@@ -543,6 +637,11 @@ add_executable(android_compatibility_layer_error_log_test EXCLUDE_FROM_ALL
 target_compile_definitions(android_compatibility_layer_error_log_test PRIVATE _GNU_SOURCE)
 target_link_libraries(android_compatibility_layer_error_log_test PRIVATE Qt5::Core Qt5::DBus pthread)
 
+add_executable(android_compatibility_layer_codec_overlay_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_overlay_test.cpp aurora/error_log.cpp aurora/memory_log_bus.cpp)
+target_compile_definitions(android_compatibility_layer_codec_overlay_test PRIVATE _GNU_SOURCE)
+target_link_libraries(android_compatibility_layer_codec_overlay_test PRIVATE Qt5::Core Qt5::DBus pthread)
+
 add_executable(android_compatibility_layer_memory_log_bus_test EXCLUDE_FROM_ALL
     aurora/tests/memory_log_bus_test.cpp aurora/memory_log_bus.cpp aurora/memory_log_bus.h)
 target_link_libraries(android_compatibility_layer_memory_log_bus_test PRIVATE Qt5::Core Qt5::DBus)
@@ -562,15 +661,113 @@ set(ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR "" CACHE PATH
     "Directory containing matching FFmpeg 7 libavcodec and libavutil headers")
 add_executable(android_compatibility_layer_codec_media_test EXCLUDE_FROM_ALL
     aurora/tests/codec_audio_test.cpp
-    aurora/codec_audio.cpp
     aurora/codec_media_host.cpp
+    aurora/codec_mpp.cpp
     aurora/audio_mp3_codec.cpp
+    $<TARGET_OBJECTS:acl_ffmpeg8_test>
 )
+add_library(acl_ffmpeg8_test OBJECT EXCLUDE_FROM_ALL aurora/codec_audio.cpp)
+set_target_properties(acl_ffmpeg8_test PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_dependencies(acl_ffmpeg8_test acl_ffmpeg8_build)
+target_include_directories(acl_ffmpeg8_test PRIVATE "${FFMPEG8_OUTPUT}/include")
+target_compile_definitions(acl_ffmpeg8_test PRIVATE ACL_FFMPEG_8
+    "ACL_FFMPEG8_TEST_DIRECTORY=\"${FFMPEG8_OUTPUT}/lib\"")
+target_link_libraries(acl_ffmpeg8_test PRIVATE Qt5::Core)
 if(ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR)
-    target_include_directories(android_compatibility_layer_codec_media_test PRIVATE
-        "${ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR}")
+    target_sources(android_compatibility_layer_codec_media_test PRIVATE $<TARGET_OBJECTS:acl_ffmpeg7>)
+    target_compile_definitions(android_compatibility_layer_codec_media_test PRIVATE ACL_WITH_FFMPEG7_BACKEND)
 endif()
-target_link_libraries(android_compatibility_layer_codec_media_test PRIVATE Qt5::Core)
+target_link_libraries(android_compatibility_layer_codec_media_test PRIVATE Qt5::Core dl)
+
+add_executable(android_compatibility_layer_codec_fallback_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_fallback_test.cpp aurora/codec_media_host.cpp)
+
+add_library(acl_fake_mpp SHARED EXCLUDE_FROM_ALL aurora/tests/fake_mpp.cpp)
+set_target_properties(acl_fake_mpp PROPERTIES OUTPUT_NAME rockchip_mpp SOVERSION 1
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/mpp-test")
+add_executable(android_compatibility_layer_codec_mpp_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_mpp_test.cpp aurora/codec_mpp.cpp)
+add_dependencies(android_compatibility_layer_codec_mpp_test acl_fake_mpp)
+set_target_properties(android_compatibility_layer_codec_mpp_test PROPERTIES
+    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}/mpp-test")
+target_link_libraries(android_compatibility_layer_codec_mpp_test PRIVATE dl)
+add_library(acl_fake_mpp_optional SHARED EXCLUDE_FROM_ALL aurora/tests/fake_mpp.cpp)
+target_compile_definitions(acl_fake_mpp_optional PRIVATE FAKE_MPP_OMIT_OPTIONAL)
+set_target_properties(acl_fake_mpp_optional PROPERTIES OUTPUT_NAME rockchip_mpp SOVERSION 1
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/mpp-optional-test")
+add_executable(android_compatibility_layer_codec_mpp_optional_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_mpp_test.cpp aurora/codec_mpp.cpp)
+add_dependencies(android_compatibility_layer_codec_mpp_optional_test acl_fake_mpp_optional)
+set_target_properties(android_compatibility_layer_codec_mpp_optional_test PROPERTIES
+    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}/mpp-optional-test")
+target_link_libraries(android_compatibility_layer_codec_mpp_optional_test PRIVATE dl)
+add_executable(android_compatibility_layer_codec_mpp_routed_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_mpp_routed_test.cpp aurora/codec_media_host.cpp aurora/codec_mpp.cpp)
+add_dependencies(android_compatibility_layer_codec_mpp_routed_test acl_fake_mpp)
+set_target_properties(android_compatibility_layer_codec_mpp_routed_test PROPERTIES
+    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}/mpp-test")
+target_link_libraries(android_compatibility_layer_codec_mpp_routed_test PRIVATE dl)
+add_library(acl_fake_mpp_incomplete SHARED EXCLUDE_FROM_ALL aurora/tests/fake_mpp_incomplete.cpp)
+set_target_properties(acl_fake_mpp_incomplete PROPERTIES OUTPUT_NAME rockchip_mpp SOVERSION 1
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/mpp-incomplete-test")
+add_executable(android_compatibility_layer_codec_mpp_unavailable_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_mpp_unavailable_test.cpp aurora/codec_mpp.cpp)
+add_dependencies(android_compatibility_layer_codec_mpp_unavailable_test acl_fake_mpp_incomplete)
+set_target_properties(android_compatibility_layer_codec_mpp_unavailable_test PROPERTIES
+    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}/mpp-incomplete-test")
+target_link_libraries(android_compatibility_layer_codec_mpp_unavailable_test PRIVATE dl)
+
+add_executable(android_compatibility_layer_codec_packet_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_packet_test.cpp)
+add_dependencies(android_compatibility_layer_codec_packet_test acl_ffmpeg8_build)
+target_include_directories(android_compatibility_layer_codec_packet_test PRIVATE "${FFMPEG8_OUTPUT}/include")
+target_compile_definitions(android_compatibility_layer_codec_packet_test PRIVATE ACL_FFMPEG_8
+    "ACL_FFMPEG8_TEST_DIRECTORY=\"${FFMPEG8_OUTPUT}/lib\"")
+target_link_libraries(android_compatibility_layer_codec_packet_test PRIVATE Qt5::Core)
+
+add_executable(android_compatibility_layer_codec_demux_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_demux_test.cpp aurora/codec_demux.cpp)
+add_dependencies(android_compatibility_layer_codec_demux_test acl_ffmpeg8_build)
+target_include_directories(android_compatibility_layer_codec_demux_test PRIVATE "${FFMPEG8_OUTPUT}/include")
+target_compile_definitions(android_compatibility_layer_codec_demux_test PRIVATE
+    "ACL_FFMPEG8_TEST_DIRECTORY=\"${FFMPEG8_OUTPUT}/lib\"")
+target_link_libraries(android_compatibility_layer_codec_demux_test PRIVATE Qt5::Core)
+
+add_executable(android_compatibility_layer_codec_ndk_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_ndk_test.cpp aurora/codec_demux.cpp aurora/codec_media_host.cpp aurora/codec_mpp.cpp
+    aurora/audio_mp3_codec.cpp $<TARGET_OBJECTS:acl_ffmpeg8_test> ${CORE_SOURCES} ${ZLIB_SOURCES})
+add_dependencies(android_compatibility_layer_codec_ndk_test acl_ffmpeg8_build)
+target_include_directories(android_compatibility_layer_codec_ndk_test PRIVATE
+    "${FFMPEG8_OUTPUT}/include" core/third_party/zlib)
+target_compile_definitions(android_compatibility_layer_codec_ndk_test PRIVATE
+    _GNU_SOURCE MEGLER_NO_EMBEDDED_TESTS "ACL_FFMPEG8_TEST_DIRECTORY=\"${FFMPEG8_OUTPUT}/lib\"")
+target_link_libraries(android_compatibility_layer_codec_ndk_test PRIVATE Qt5::Core m pthread dl)
+
+add_library(acl_ffmpeg8_missing_test OBJECT EXCLUDE_FROM_ALL aurora/codec_audio.cpp)
+set_target_properties(acl_ffmpeg8_missing_test PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_dependencies(acl_ffmpeg8_missing_test acl_ffmpeg8_build)
+target_include_directories(acl_ffmpeg8_missing_test PRIVATE "${FFMPEG8_OUTPUT}/include")
+target_compile_definitions(acl_ffmpeg8_missing_test PRIVATE ACL_FFMPEG_8
+    "ACL_FFMPEG8_TEST_DIRECTORY=\"${FFMPEG8_OUTPUT}/missing\"")
+target_link_libraries(acl_ffmpeg8_missing_test PRIVATE Qt5::Core)
+add_library(acl_codec_fake_avcodec SHARED EXCLUDE_FROM_ALL aurora/tests/fake_avcodec.c)
+set_target_properties(acl_codec_fake_avcodec PROPERTIES OUTPUT_NAME avcodec SOVERSION 61
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/codec-test-fake")
+add_executable(android_compatibility_layer_codec_unavailable_test EXCLUDE_FROM_ALL
+    aurora/tests/codec_unavailable_test.cpp aurora/codec_media_host.cpp aurora/codec_mpp.cpp
+    aurora/audio_mp3_codec.cpp $<TARGET_OBJECTS:acl_ffmpeg8_missing_test>)
+add_dependencies(android_compatibility_layer_codec_unavailable_test acl_codec_fake_avcodec)
+target_link_libraries(android_compatibility_layer_codec_unavailable_test PRIVATE Qt5::Core dl)
+if(ANDROID_COMPATIBILITY_LAYER_FFMPEG7_INCLUDE_DIR)
+    target_sources(android_compatibility_layer_codec_unavailable_test PRIVATE $<TARGET_OBJECTS:acl_ffmpeg7>)
+    target_compile_definitions(android_compatibility_layer_codec_unavailable_test PRIVATE ACL_WITH_FFMPEG7_BACKEND)
+    add_executable(android_compatibility_layer_codec_ffmpeg7_fallback_test EXCLUDE_FROM_ALL
+        aurora/tests/codec_audio_test.cpp aurora/codec_media_host.cpp aurora/codec_mpp.cpp
+        aurora/audio_mp3_codec.cpp $<TARGET_OBJECTS:acl_ffmpeg8_missing_test>
+        $<TARGET_OBJECTS:acl_ffmpeg7>)
+    target_compile_definitions(android_compatibility_layer_codec_ffmpeg7_fallback_test PRIVATE ACL_WITH_FFMPEG7_BACKEND)
+    target_link_libraries(android_compatibility_layer_codec_ffmpeg7_fallback_test PRIVATE Qt5::Core dl)
+endif()
 
 add_executable(android_compatibility_layer_audio_resampling_test EXCLUDE_FROM_ALL aurora/tests/audio_resampling_test.c)
 target_compile_options(android_compatibility_layer_audio_resampling_test PRIVATE -ffunction-sections -fdata-sections)
@@ -827,6 +1024,11 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv7.*|arm)$")
     install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/check_android_runtime.cmake")
 endif()
 set(SHARED_ANDROID_RUNTIME share/common/ru.androidcompatibilitylayer/appmanager/android-runtime)
+set(SHARED_FFMPEG8 share/common/ru.androidcompatibilitylayer/appmanager/ffmpeg8)
+install(DIRECTORY "${FFMPEG8_OUTPUT}/lib/" DESTINATION "${SHARED_FFMPEG8}"
+    FILES_MATCHING PATTERN "libavformat-acl.so*" PATTERN "libavcodec-acl.so*" PATTERN "libavutil-acl.so*")
+install(FILES "${FFMPEG8_OUTPUT}/COPYING.LGPLv2.1" "${FFMPEG8_ARCHIVE}" "${FFMPEG8_PATCH}"
+    DESTINATION "${SHARED_FFMPEG8}/source")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv7.*|arm)$")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
         set(WEBVIEW_PROVIDER "${CMAKE_CURRENT_SOURCE_DIR}/build/webview/arm64-v8a/webview.apk")

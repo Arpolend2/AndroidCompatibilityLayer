@@ -25,6 +25,11 @@
 #include "../bionic/mg_fd.h"
 #include "../ld/mg_ld.h"
 
+#ifdef ACL_AURORA_CACERTS
+#include "../../../aurora/system_cacerts.h"
+const char *megler_data_dir(void);
+#endif
+
 /* The layer's own C library, by name: these functions are its open, read and the rest, as the guest would call them. */
 static void *libc(const char *name)
 {
@@ -402,6 +407,31 @@ bool mg_dvm_load_libcore_natives(const char *root)
         }
         /* Android's own layout to the libraries: ICU maps /system/usr/icu/icudt60l.dat, libcore reads /system/usr/share/zoneinfo. */
         mg_fs_mount("/system", root);
+#ifdef ACL_AURORA_CACERTS
+        {
+            char error[512];
+            int system_available;
+            size_t count, excluded;
+            char *certs = acl_system_cacerts_prepare(root, megler_data_dir(), NULL, NULL, NULL,
+                                                     &system_available, &count, &excluded, error, sizeof(error));
+            /* A failed merge must not stop libjavacore/libopenjdk from loading below. */
+            if (!certs && error[0])
+                mg_warn("ACL CA: system certificate store failed: %s; using built-in certificates", error);
+            if (certs) {
+                mg_fs_mount_read_only("/system/etc/security/cacerts", certs);
+                if (system_available)
+                    mg_info("ACL CA: system certificate store ready (%zu certificates, %zu excluded)", count, excluded);
+                else
+                    mg_info("ACL CA: system bundle unavailable; using built-in certificates (%zu certificates, %zu excluded)", count, excluded);
+                free(certs);
+            } else {
+                char *builtin = mg_sprintf("%s/etc/security/cacerts", root);
+                mg_fs_mount_read_only("/system/etc/security/cacerts", builtin);
+                free(builtin);
+                mg_info("ACL CA: system bundle unavailable; using built-in certificates");
+            }
+        }
+#endif
         /* These are the runtime's libraries, not the app's: the linker keeps the two apart (ld/mg_ld.h). */
         mg_ld_add_runtime_dir(dir);
         /* libnativehelper keeps the classes and fields the two libraries name; Android's runtime has it look them up before either is loaded. */

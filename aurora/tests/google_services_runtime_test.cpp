@@ -47,6 +47,8 @@ extern "C" bool mg_apk_is_microg(const char *path)
     return found != apks.end() && found->second.microG;
 }
 
+extern "C" void mg_apk_info_free(mg_apk_info *) {}
+
 static bool writeFile(const QString &path)
 {
     QFile file(path);
@@ -124,6 +126,15 @@ int main(int argc, char **argv)
     setProvider(QStringLiteral("google"), gms);
     if (runtime.apply(run, &error) || error.isEmpty() || run.gms_apk_path || run.gsf_apk_path)
         return 1;
+
+    if (!runtime.applySharedModule(run, microG, &error) || !run.gms_apk_path ||
+        microG.toUtf8() != run.gms_apk_path || run.gms_package) return 1;
+    if (runtime.applySharedModule(run, gms, &error) || error.isEmpty() || run.gms_apk_path) return 1;
+    if (runtime.applySharedModule(run, revanced, &error) || error.isEmpty() || run.gms_apk_path) return 1;
+    apks[microG.toStdString()].split = true;
+    if (runtime.applySharedModule(run, microG, &error) || error.isEmpty() || run.gms_apk_path) return 1;
+    if (runtime.applySharedModule(run, temp.filePath(QStringLiteral("missing.apk")), &error) ||
+        error.isEmpty() || run.gms_apk_path) return 1;
 
     std::puts("Google services runtime settings OK");
     return 0;

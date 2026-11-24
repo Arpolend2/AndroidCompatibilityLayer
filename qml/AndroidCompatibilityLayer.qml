@@ -1057,11 +1057,6 @@ ApplicationWindow {
                             wrapMode: Text.Wrap
                             color: palette.highlightColor
                         }
-                        function newestFirst(text) {
-                            var lines = text.split("\n")
-                            if (lines[lines.length - 1] === "") lines.pop()
-                            return lines.reverse().join("\n")
-                        }
                         Item { width: parent.width; height: Theme.paddingMedium }
                         Label {
                             x: Theme.horizontalPageMargin
@@ -1113,6 +1108,23 @@ ApplicationWindow {
                             color: palette.highlightColor
                             text: qsTr("Log capture could not be started.")
                         }
+                        TextField {
+                            id: logSearch
+                            objectName: "logSearch"
+                            width: parent.width
+                            label: qsTr("Search log")
+                            placeholderText: qsTr("Search log")
+                            property string submitted: ""
+                            EnterKey.iconSource: "image://theme/icon-m-search"
+                            EnterKey.onClicked: {
+                                submitted = text
+                                probe.setLogQuery(text)
+                            }
+                            onTextChanged: if (!text && submitted) {
+                                submitted = ""
+                                probe.setLogQuery("")
+                            }
+                        }
                         Label {
                             objectName: "coreLogText"
                             x: Theme.horizontalPageMargin
@@ -1120,7 +1132,25 @@ ApplicationWindow {
                             wrapMode: Text.WrapAnywhere
                             textFormat: Text.PlainText
                             font.pixelSize: Theme.fontSizeExtraSmall
-                            text: probe.coreLog ? logContent.newestFirst(probe.coreLog) : qsTr("No core messages yet.")
+                            text: probe.coreLog
+                                  ? probe.coreLog
+                                  : (logSearch.submitted ? qsTr("No matching log lines.") : qsTr("No core messages yet."))
+                        }
+                        Label {
+                            x: Theme.horizontalPageMargin
+                            width: parent.width - 2 * x
+                            visible: probe.coreLogHasMore
+                            text: qsTr("Scroll down to load older entries.")
+                            color: palette.secondaryColor
+                            font.pixelSize: Theme.fontSizeExtraSmall
+                            wrapMode: Text.Wrap
+                        }
+                        Connections {
+                            target: scroll
+                            onAtYEndChanged: {
+                                if (scroll.atYEnd && logContent.visible && probe.coreLogHasMore)
+                                    probe.loadMoreLog()
+                            }
                         }
                     }
                     Column {
@@ -1335,7 +1365,7 @@ ApplicationWindow {
                             objectName: "managerReleaseNotes"
                             x: Theme.horizontalPageMargin
                             width: parent.width - 2 * x
-                            text: qsTr("- GPU acceleration for Aurora Store and microG settings, with improved image scaling.\n- Notifications from Android apps now appear in Aurora.\n- Standalone apps can continue background tasks after their window is closed.")
+                            text: qsTr("- Improved Google Maps rendering and OpenGL compatibility.\n- Improved microG integration, WebView rendering and Google sign-in compatibility.\n- Added hardware video decoding through Rockchip MPP and improved media support.\n- Improved camera preview and front-camera photo capture on Rockchip devices.\n- Android apps can use Aurora's system certificates.\n- Added a searchable log feed and diagnostic overlay; improved notifications.")
                             textFormat: Text.PlainText
                             wrapMode: Text.Wrap
                             color: palette.secondaryColor

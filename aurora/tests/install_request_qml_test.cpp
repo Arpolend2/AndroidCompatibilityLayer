@@ -25,6 +25,25 @@ public:
     qreal edgeZoneWidth = 0;
 };
 
+class FakeAuthSurface : public QQuickItem
+{
+    Q_OBJECT
+    Q_PROPERTY(QObject *host MEMBER host)
+    Q_PROPERTY(int pageOrientation MEMBER pageOrientation)
+public:
+    QObject *host = nullptr;
+    int pageOrientation = 0;
+};
+
+class FakeAuth : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(bool authenticationUiActive READ inactive CONSTANT)
+    Q_PROPERTY(bool authenticationFrameAvailable READ inactive CONSTANT)
+public:
+    bool inactive() const { return false; }
+};
+
 class FakeMicrog : public QObject
 {
     Q_OBJECT
@@ -90,6 +109,7 @@ class FakeProbe : public QObject
     Q_PROPERTY(bool autoCheckManagerUpdate READ autoCheckManagerUpdate NOTIFY managerUpdateChanged)
     Q_PROPERTY(QString runtimeSettingsError READ empty CONSTANT)
     Q_PROPERTY(QString coreLog READ coreLog NOTIFY coreLogChanged)
+    Q_PROPERTY(bool coreLogHasMore READ coreLogHasMore NOTIFY coreLogChanged)
     Q_PROPERTY(bool coreLogAvailable READ yes CONSTANT)
     Q_PROPERTY(bool detailedLogEnabled READ detailedLogEnabled NOTIFY detailedLogChanged)
     Q_PROPERTY(bool detailedLogPaused READ detailedLogPaused NOTIFY detailedLogChanged)
@@ -137,7 +157,18 @@ public:
     QString googleServicesProvider() const { return m_googleServicesProvider; }
     QString googleServicesGmsApkPath() const { return m_googleServicesGmsApkPath; }
     QString empty() const { return QString(); }
-    QString coreLog() const { return m_coreLog; }
+    QString coreLog() const
+    {
+        if (m_logQuery.isEmpty()) return m_coreLog;
+        QStringList result;
+        for (const QString &line : m_coreLog.split(QLatin1Char('\n')))
+            if (line.contains(m_logQuery, Qt::CaseInsensitive)) result.append(line);
+        return result.join(QLatin1Char('\n'));
+    }
+    bool coreLogHasMore() const { return false; }
+    Q_INVOKABLE void setLogQuery(const QString &query) { m_logQuery = query; emit coreLogChanged(); }
+    Q_INVOKABLE void loadMoreLog() {}
+    QString m_logQuery;
     bool detailedLogEnabled() const { return m_detailedLogEnabled; }
     bool detailedLogPaused() const { return m_detailedLogPaused; }
     Q_INVOKABLE void setDetailedLogEnabled(bool enabled) { m_detailedLogEnabled = enabled; m_detailedLogPaused = false; emit detailedLogChanged(); }
@@ -316,7 +347,7 @@ static void coverItemsNamed(QQuickItem *parent, const QString &name, QList<QQuic
     }
 }
 
-static bool checkDetailedLog(QObject *root, FakeProbe &probe)
+static bool checkDetailedLog(QObject *root, FakeProbe &probe, QQuickView &view)
 {
     auto *toggle = root->findChild<QQuickItem *>(QStringLiteral("toggleDetailedLog"));
     auto *hold = root->findChild<QQuickItem *>(QStringLiteral("holdDetailedLog"));
@@ -361,7 +392,7 @@ static bool checkDetailedLog(QObject *root, FakeProbe &probe)
     QCoreApplication::processEvents();
     QList<QQuickItem *> items;
     for (auto *item : toggle->parentItem()->childItems()) {
-        if (item->isVisible() && item->metaObject()->indexOfSignal("clicked()") >= 0)
+        if (item->isVisible() && item->metaObject()->indexOfMethod("clicked()") >= 0)
             items.append(item);
     }
     if (!content->isVisible() || !save->isVisible() || !send->isVisible() ||
@@ -375,17 +406,51 @@ static bool checkDetailedLog(QObject *root, FakeProbe &probe)
     }
     auto *message = root->findChild<QObject *>(QStringLiteral("logActionMessage"));
     if (!message || save->isEnabled() || !send->isEnabled() ||
-        probe.saveLogCount != 0 || !message->property("text").toString().isEmpty()) return false;
-    probe.setCoreLog(QStringLiteral("first line\nsecond line\n"));
+        probe.saveLogCount != 0 || !message->property("text").toString().isEmpty()) {
+        std::fprintf(stderr, "Initial log actions state incorrect\n");
+        return false;
+    }
+    probe.setCoreLog(QStringLiteral("Manager first line\nStandalone second line\n"));
     if (!QMetaObject::invokeMethod(hold, "clicked") || !probe.detailedLogPaused() ||
         hold->property("text").toString() != QStringLiteral("Resume logs") ||
-        !QMetaObject::invokeMethod(hold, "clicked") || probe.detailedLogPaused()) return false;
+        !QMetaObject::invokeMethod(hold, "clicked") || probe.detailedLogPaused()) {
+        std::fprintf(stderr, "Log pause/resume failed\n");
+        return false;
+    }
     auto *logText = root->findChild<QQuickItem *>(QStringLiteral("coreLogText"));
+    auto *search = root->findChild<QQuickItem *>(QStringLiteral("logSearch"));
     if (!logText ||
-        logText->property("text").toString() != QStringLiteral("second line\nfirst line") ||
+        !search || logText->property("text").toString() != QStringLiteral("Manager first line\nStandalone second line\n") ||
         !save->isEnabled() || !QMetaObject::invokeMethod(save, "clicked") ||
         probe.saveLogCount != 1 || message->property("text").toString() != probe.saveLogResult ||
-        !send->isEnabled() || probe.saveLogCount != 1) return false;
+        !send->isEnabled() || probe.saveLogCount != 1) {
+        std::fprintf(stderr, "Log text or save action incorrect (text=%s; save=%d; calls=%d; message=%s)\n",
+                     logText ? qPrintable(logText->property("text").toString()) : "(missing)",
+                     save->isEnabled(), probe.saveLogCount,
+                     qPrintable(message->property("text").toString()));
+        return false;
+    }
+    search->setProperty("text", QStringLiteral("sTaNdAlOnE"));
+    search->setProperty("submitted", QStringLiteral("sTaNdAlOnE"));
+    probe.setLogQuery(QStringLiteral("sTaNdAlOnE"));
+    QCoreApplication::processEvents();
+    if (logText->property("text").toString() != QStringLiteral("Standalone second line")) return false;
+    view.resize(854, 480);
+    QCoreApplication::processEvents();
+    if (search->width() <= 0 || search->width() > view.width() || !search->isVisible() ||
+        logText->property("text").toString() != QStringLiteral("Standalone second line")) {
+        std::fprintf(stderr, "Landscape log search layout incorrect (visible=%d, width=%g)\n",
+                     search->isVisible(), search->width());
+        return false;
+    }
+    view.resize(480, 854);
+    QCoreApplication::processEvents();
+    search->setProperty("text", QStringLiteral("not present"));
+    search->setProperty("submitted", QStringLiteral("not present"));
+    probe.setLogQuery(QStringLiteral("not present"));
+    QCoreApplication::processEvents();
+    if (logText->property("text").toString() != QStringLiteral("No matching log lines.")) return false;
+    search->setProperty("text", QString());
     menu->setProperty("active", false);
     QTest::qWait(100);
     if (!QMetaObject::invokeMethod(clear, "clicked")) return false;
@@ -432,10 +497,12 @@ int main(int argc, char **argv)
     QGuiApplication app(argc, argv);
     qmlRegisterType<SideMouseButtons>("AndroidCompatibilityLayer.Navigation", 1, 0, "SideMouseButtons");
     qmlRegisterType<FakeSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
+    qmlRegisterType<FakeAuthSurface>("AndroidCompatibilityLayer.MicroG", 1, 0, "SharedMicrogAuthSurface");
     if (argc != 2 && !(argc == 3 && (QByteArray(argv[2]) == "--permissions-only" ||
                                      QByteArray(argv[2]) == "--rpm-menu-only" ||
                                      QByteArray(argv[2]) == "--gesture-setting-only" ||
                                      QByteArray(argv[2]) == "--detailed-log-only" ||
+                                     QByteArray(argv[2]) == "--log-search-only" ||
                                      QByteArray(argv[2]) == "--auto-rpm-only" ||
                                      QByteArray(argv[2]) == "--launch-install-only" ||
                                      QByteArray(argv[2]) == "--cover-only" ||
@@ -448,11 +515,13 @@ int main(int argc, char **argv)
          !app.installTranslator(&translator))) return 1;
     FakeProbe probe;
     FakeMicrog microg;
+    FakeAuth auth;
     {
         QQuickView view;
         view.setResizeMode(QQuickView::SizeRootObjectToView);
         view.rootContext()->setContextProperty(QStringLiteral("probe"), &probe);
         view.rootContext()->setContextProperty(QStringLiteral("microgPreview"), &microg);
+        view.rootContext()->setContextProperty(QStringLiteral("sharedMicrogAuth"), &auth);
         view.resize(480, 854);
         view.setSource(QUrl::fromLocalFile(QString::fromLocal8Bit(argv[1])));
         if (view.status() != QQuickView::Ready) {
@@ -463,6 +532,34 @@ int main(int argc, char **argv)
         QTest::qWait(100);
 
         QObject *root = view.rootObject();
+        if (argc == 3 && QByteArray(argv[2]) == "--log-search-only") {
+            auto *prompt = root->findChild<QQuickItem *>(QStringLiteral("installConfirmation"));
+            if (!prompt || !prompt->parentItem() || !prompt->parentItem()->setProperty("section", 2)) return 1;
+            probe.setDetailedLogEnabled(true);
+            probe.setCoreLog(QStringLiteral("Manager first line\nStandalone second line\n"));
+            QCoreApplication::processEvents();
+            auto *log = root->findChild<QQuickItem *>(QStringLiteral("coreLogText"));
+            auto *search = root->findChild<QQuickItem *>(QStringLiteral("logSearch"));
+            if (!log || !search || !search->isVisible() ||
+                log->property("text").toString() != probe.coreLog()) return 1;
+            search->setProperty("text", QStringLiteral("sTaNdAlOnE"));
+            search->setProperty("submitted", QStringLiteral("sTaNdAlOnE"));
+            probe.setLogQuery(QStringLiteral("sTaNdAlOnE"));
+            QCoreApplication::processEvents();
+            if (log->property("text").toString() != QStringLiteral("Standalone second line")) return 1;
+            view.resize(854, 480);
+            QCoreApplication::processEvents();
+            if (!search->isVisible() || search->width() <= 0 || search->width() > view.width() ||
+                log->property("text").toString() != QStringLiteral("Standalone second line")) return 1;
+            search->setProperty("text", QStringLiteral("not present"));
+            search->setProperty("submitted", QStringLiteral("not present"));
+            probe.setLogQuery(QStringLiteral("not present"));
+            QCoreApplication::processEvents();
+            if (log->property("text").toString() != QStringLiteral("No matching log lines.")) return 1;
+            search->setProperty("text", QString());
+            QCoreApplication::processEvents();
+            return log->property("text").toString() == probe.coreLog() ? 0 : 1;
+        }
         if (argc == 3 && QByteArray(argv[2]) == "--cover-only") {
             probe.setVisible(false);
             QQmlExpression createCover(qmlContext(root), root,
@@ -764,7 +861,7 @@ int main(int argc, char **argv)
             if (!prompt || !prompt->parentItem()) return 1;
             probe.setVisible(false);
             if (!prompt->parentItem()->setProperty("section", 2)) return 1;
-            return checkDetailedLog(root, probe) ? 0 : 1;
+            return checkDetailedLog(root, probe, view) ? 0 : 1;
         }
         if (argc == 3 && QByteArray(argv[2]) == "--translation-only") {
             QObject *button = root->findChild<QObject *>(QStringLiteral("installApk"));
@@ -1279,7 +1376,7 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "Log menu visibility is incorrect\n");
             return 1;
         }
-        if (!checkDetailedLog(root, probe)) return 1;
+        if (!checkDetailedLog(root, probe, view)) return 1;
     }
     if (probe.uiReady) return 1;
     std::puts("Install confirmation QML OK");

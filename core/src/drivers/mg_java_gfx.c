@@ -3005,7 +3005,7 @@ N(G_textureGone)
 }
 
 /* Whether the shell keeps pictures on the graphics processor (texture_frame and draw_texture). */
-bool mg_java_gfx_textures(void) { return G.texture_frame != NULL && G.draw_texture != NULL; }
+bool mg_java_gfx_textures(void) { return (G.texture_frame != NULL || G.texture_egl_frame != NULL) && G.draw_texture != NULL; }
 
 /* -------------------------------------------------------------- Gfx: text */
 

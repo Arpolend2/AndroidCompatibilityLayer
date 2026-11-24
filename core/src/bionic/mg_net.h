@@ -45,6 +45,10 @@ void mg_net_give(const u8 *what, u32 n, void *out, u32 *len);
 #if !defined(_WIN32) && !defined(MG_CORE_ELF)
 /* Duplicate a connected host Unix stream into the guest table. Caller retains host_fd. */
 int mg_net_import_unix_stream(int host_fd);
+int mg_net_import_unix_seqpacket(int host_fd);
+/* Duplicate an imported connected Unix stream; caller owns the returned native descriptor. */
+int mg_net_dup_native_unix_stream(int fd);
+int mg_net_dup_native_unix_socket(int fd);
 #endif
 
 /* The host's interfaces under the names Android gives them: lo, wlan0, eth0, rmnet0. */

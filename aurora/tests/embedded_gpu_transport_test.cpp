@@ -41,6 +41,8 @@ int main(int argc, char **argv)
 
     AuroraDmaBufFrame outgoing;
     outgoing.id = 42;
+    outgoing.channel = 0x123456789ULL;
+    outgoing.generation = 0xabcdef012ULL;
     outgoing.width = 32;
     outgoing.height = 16;
     outgoing.fourcc = 0x34325241;
@@ -54,7 +56,8 @@ int main(int argc, char **argv)
 
     AuroraDmaBufFrame incoming;
     if (!EmbeddedGpuTransport::receiveFramePacket(sockets[1], &incoming) ||
-        incoming.id != outgoing.id || incoming.width != 32 || incoming.height != 16 ||
+        incoming.id != outgoing.id || incoming.channel != outgoing.channel ||
+        incoming.generation != outgoing.generation || incoming.width != 32 || incoming.height != 16 ||
         incoming.fourcc != outgoing.fourcc || incoming.planeCount != 1 ||
         incoming.modifier != outgoing.modifier || incoming.strides[0] != 128 ||
         incoming.offsets[0] != 0 || incoming.fds[0] < 0 || incoming.fds[0] == source)
@@ -79,6 +82,10 @@ int main(int argc, char **argv)
     invalid.strides[0] = 0;
     if (invalid.fds[0] < 0 || EmbeddedGpuTransport::sendFramePacket(sockets[0], invalid))
         return 7;
+    invalid.strides[0] = 128;
+    invalid.channel = 1;
+    if (EmbeddedGpuTransport::sendFramePacket(sockets[0], invalid))
+        return 25;
 
     incoming.close();
     errno = 0;
@@ -93,6 +100,40 @@ int main(int argc, char **argv)
     close(sockets[0]);
     close(sockets[1]);
     if (!closed) return 8;
+
+    int inherited[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, inherited) != 0) return 26;
+    EmbeddedGpuTransport inheritedServer, inheritedClient;
+    QString inheritedError;
+    if (!inheritedServer.adoptInheritedSocket(inherited[0], true, &inheritedError) ||
+        !inheritedClient.adoptInheritedSocket(inherited[1], false, &inheritedError))
+        return 27;
+    AuroraDmaBufFrame inheritedFrame;
+    inheritedFrame.id = 101;
+    inheritedFrame.channel = 11;
+    inheritedFrame.generation = 2;
+    inheritedFrame.width = 16;
+    inheritedFrame.height = 8;
+    inheritedFrame.fourcc = 0x34325241;
+    inheritedFrame.planeCount = 1;
+    inheritedFrame.fds[0] = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    inheritedFrame.strides[0] = 64;
+    if (inheritedFrame.fds[0] < 0) return 28;
+    QEventLoop inheritedLoop;
+    bool inheritedReceived = false;
+    inheritedServer.setFrameHandler([&](AuroraDmaBufFrame &&frame) {
+        inheritedReceived = frame.channel == 11 && frame.generation == 2 && frame.fds[0] >= 0;
+        if (!inheritedServer.sendReply(frame.id, inheritedReceived)) inheritedReceived = false;
+        inheritedLoop.quit();
+    });
+    std::atomic<bool> inheritedSent(false);
+    std::thread inheritedSender([&]() { inheritedSent.store(inheritedClient.sendFrame(inheritedFrame, &inheritedError)); });
+    QTimer::singleShot(1500, &inheritedLoop, &QEventLoop::quit);
+    inheritedLoop.exec();
+    inheritedSender.join();
+    if (!inheritedReceived || !inheritedSent.load()) return 29;
+    inheritedClient.close();
+    inheritedServer.close();
 
     QTemporaryDir directory;
     if (!directory.isValid()) return 9;

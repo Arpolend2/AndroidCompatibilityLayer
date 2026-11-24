@@ -249,6 +249,43 @@ static MEGLER_CB void torch(void *user, void *cam, bool on)
     mg_info("camera stand-in: the torch is %s", on ? "on" : "off");
 }
 
+static MEGLER_CB int picture_sizes(void *user, void *cam, megler_camera_picture_size *sizes, int max)
+{
+    static const megler_camera_picture_size back[] = { { 4032, 3024 }, { 1920, 1080 } };
+    static const megler_camera_picture_size front[] = { { 1280, 720 } };
+    const megler_camera_picture_size *reported;
+    int count, i;
+    camera *c = (camera *)cam;
+    (void)user;
+    if (!c || !sizes || max <= 0) return 0;
+    reported = c->index == 0 ? back : front;
+    count = c->index == 0 ? (int)MG_COUNT(back) : (int)MG_COUNT(front);
+    if (count > max) count = max;
+    for (i = 0; i < count; i++) sizes[i] = reported[i];
+    return count;
+}
+
+static MEGLER_CB bool capture(void *user, void *cam, int width, int height, int quality, int rotation,
+                              megler_camera_jpeg_write_fn write, void *context)
+{
+    static const u8 jpeg[] = { 0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9 };
+    camera *c = (camera *)cam;
+    bool supported = c && c->streaming && write && quality >= 1 && quality <= 100 &&
+                     (rotation == 0 || rotation == 90 || rotation == 180 || rotation == 270) &&
+                     ((c->index == 0 && ((width == 4032 && height == 3024) || (width == 1920 && height == 1080))) ||
+                      (c->index == 1 && width == 1280 && height == 720));
+    (void)user;
+    if (!supported || !write(context, jpeg, sizeof(jpeg))) return false;
+    mg_lock_acquire(&g_lock);
+    g_counts.captures++;
+    g_counts.picture_width = width;
+    g_counts.picture_height = height;
+    g_counts.picture_quality = quality;
+    g_counts.picture_rotation = rotation;
+    mg_lock_release(&g_lock);
+    return true;
+}
+
 static MEGLER_CB void close_camera(void *user, void *cam)
 {
     camera *c = (camera *)cam;
@@ -263,5 +300,11 @@ static MEGLER_CB void close_camera(void *user, void *cam)
 const megler_camera_host *mg_camera_standin(void)
 {
     static const megler_camera_host host = { NULL, count, info, open_camera, start, stop, focus, torch, close_camera };
+    return &host;
+}
+
+const megler_camera_capture_host *mg_camera_standin_capture_host(void)
+{
+    static const megler_camera_capture_host host = { NULL, picture_sizes, capture };
     return &host;
 }

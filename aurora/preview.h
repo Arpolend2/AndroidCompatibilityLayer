@@ -69,6 +69,7 @@ public:
     void setCloseToBackground(bool enabled) { m_closeToBackground = enabled; }
     void resumeFromBackground();
     void setSharedMicrog(bool enabled) { m_sharedMicrogEnabled = enabled; }
+    void setSharedMicrogModulePath(const QString &path) { m_sharedMicrogApkUtf8 = path.toUtf8(); }
     void setStandaloneSettings(const QString &locale, const QString &theme, const QString &location);
     void setDeniedPermissions(const QStringList &denied) { m_deniedPermissions = denied; }
     void setSystemTheme(bool dark, const QColor &accent);
@@ -160,6 +161,7 @@ private:
     QColor m_systemAccent;
     QByteArray m_rootUtf8;
     QByteArray m_apkUtf8;
+    QByteArray m_sharedMicrogApkUtf8;
     QByteArray m_splitsUtf8;
     QString m_status;
     QString m_frameCaptureStatus;

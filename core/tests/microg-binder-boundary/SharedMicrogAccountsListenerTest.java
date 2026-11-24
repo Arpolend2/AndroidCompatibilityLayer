@@ -64,8 +64,8 @@ public final class SharedMicrogAccountsListenerTest {
         Engine engine = new Engine();
         SharedMicrogAccounts.Server server = new SharedMicrogAccounts.Server(engine,
             new SharedMicrogAccounts.Foreground() {
-                @Override public boolean launch(long channel, Intent intent) { return false; }
-                @Override public void dismiss(long channel) {}
+                @Override public long launch(long channel, Intent intent) { return 0; }
+                @Override public void dismiss(long channel, long generation) {}
             }, 1, "fixture.client", 11001, 50001);
         Binder root = new Binder() {
             @Override protected boolean onTransact(int code, Parcel data, Parcel reply, int flags)

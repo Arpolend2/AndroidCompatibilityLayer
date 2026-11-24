@@ -697,6 +697,12 @@ static void use_window(void)
     const megler_run_config *run = mg_run_config();
     if (C.used || C.width <= 0 || C.height <= 0) return;
     C.used = true;
+    if (run->block_unowned_egl_layers) {
+        C.shell = -1;
+        compose_here();
+        mg_warn("java: shared worker cannot present windows with unowned EGL layers; authentication UI may be unavailable until they are released");
+        return;
+    }
     /* (The flag gl-compose-here: the core composes, as where the shell cannot -- to tell the shell's composing from the rest on a phone.) */
     if (mg_flag("gl-compose-here")) mg_warn("java: the flag gl-compose-here: the window with OpenGL ES views is composed here, the frames read back");
     else if (run->present_egl_views && run->present_egl_layer && run->place_egl_layer) {
@@ -823,7 +829,8 @@ static void show_part(i32 x0, i32 y0, i32 x1, i32 y1)
         part[3] = C.height;
         C.shown_whole = true;
     }
-    if (C.show) C.show(C.out, C.width, C.height, C.width * 4, part);
+    if (C.show && !mg_run_config()->block_unowned_egl_layers)
+        C.show(C.out, C.width, C.height, C.width * 4, part);
 }
 
 /* How the views' picture lies over a layer, row by row, for the screen's rows [top, bottom). */
@@ -1045,6 +1052,19 @@ static void layer_attach(layer *l)
     mg_lock_release(&g_window_lock);
 }
 
+static void release_blocked_compositor_if_unused(void)
+{
+    int i;
+    if (!mg_run_config()->block_unowned_egl_layers || !C.used) return;
+    for (i = 0; i < MAX_LAYERS; i++)
+        if (C.layers[i].active) return;
+    free(C.views);
+    free(C.out);
+    C.views = C.out = NULL;
+    C.used = C.have_views = C.shown_whole = false;
+    C.shell = 0;
+}
+
 /* With the lock held: a layer shows nothing any more; what was under the views there is gone from the window. */
 static void layer_off(layer *l)
 {
@@ -1060,6 +1080,7 @@ static void layer_off(layer *l)
         compose_part(l->x, l->y, l->x + l->w, l->y + l->h);
         show_part(l->x, l->y, l->x + l->w, l->y + l->h);
     }
+    release_blocked_compositor_if_unused();
 }
 
 /* A surface on the layer's view is gone. The layer is forgotten with its last surface, unless its view still means to show one. */
@@ -1796,6 +1817,12 @@ bool mg_java_gl_share_frame(void *display, void *pbuffer, mg_java_gl_share *shar
     bool taken;
     void *paused;
     if (id <= 0 || !mg_java_gl_shares_frames()) return false;
+    if (mg_java_gl_native_texture_frames()) {
+        int result = g_shell->texture_egl_frame(g_shell->user, id, display, pbuffer, width, height);
+        if (result < 0)
+            mg_warn("java: the producer EGL context could not be restored after copying a texture");
+        return result == 1;
+    }
     if (!share->asked) {
         void *handle = NULL;
         share->asked = true;
@@ -1816,11 +1843,37 @@ bool mg_java_gl_share_frame(void *display, void *pbuffer, mg_java_gl_share *shar
     return taken;
 }
 
-bool mg_java_gl_shares_frames(void) { return g_shell && g_shell->texture_frame && g_shell->draw_texture && egl_ready() && E.share; }
+bool mg_java_gl_native_texture_frames(void) { return g_shell && g_shell->texture_egl_frame && g_shell->draw_texture; }
+bool mg_java_gl_native_surfaces(void)
+{
+    return mg_java_gl_native_texture_frames() && g_shell->egl_surface_configs &&
+           g_shell->egl_surface_new && g_shell->egl_surface_free;
+}
+int mg_java_gl_native_surface_configs(void *display, int version, void **configs, int capacity)
+{
+    return mg_java_gl_native_surfaces() ? g_shell->egl_surface_configs(g_shell->user, display, version, configs, capacity) : 0;
+}
+void *mg_java_gl_native_surface_new(void *display, void *config, int width, int height, void **token)
+{
+    return mg_java_gl_native_surfaces() ? g_shell->egl_surface_new(g_shell->user, display, config, width, height, token) : NULL;
+}
+void mg_java_gl_native_surface_free(void *token)
+{
+    if (token && mg_java_gl_native_surfaces()) g_shell->egl_surface_free(g_shell->user, token);
+}
+
+bool mg_java_gl_shares_frames(void)
+{
+    return mg_java_gl_native_texture_frames() ||
+           (g_shell && g_shell->texture_frame && g_shell->draw_texture && egl_ready() && E.share);
+}
 
 void mg_java_gl_share_gone(int id)
 {
-    if (id > 0 && g_shell && g_shell->texture_frame) g_shell->texture_frame(g_shell->user, id, NULL, 0, 0);
+    if (id > 0 && mg_java_gl_native_texture_frames())
+        g_shell->texture_egl_frame(g_shell->user, id, NULL, NULL, 0, 0);
+    else if (id > 0 && g_shell && g_shell->texture_frame)
+        g_shell->texture_frame(g_shell->user, id, NULL, 0, 0);
 }
 
 /* A frame of a pbuffer on no view handed to the shell as the picture of `id` (mg_java_gl_share_frame). */
@@ -1844,6 +1897,7 @@ bool mg_java_gl_window_swap_texture(void *surface, int width, int height, int te
 {
     native_surf *n = (native_surf *)surface;
     bool on_gpu = false;
+    bool texture_taken = false;
     EGLContext current = E.current_context ? E.current_context() : NULL;
     if (current != n->ctx_of) {
         EGLint version = 2;
@@ -1853,9 +1907,17 @@ bool mg_java_gl_window_swap_texture(void *surface, int width, int height, int te
         n->ctx.version = version >= 3 ? 3 : 2;
         n->ctx.bgra = -1;
     }
+    if (!n->s->layer && texture_id > 0) {
+        texture_taken = texture_frame(n->s, texture_id);
+        if (!texture_taken && current && E.current_context && E.current_context() != current) {
+            mg_warn("java: cannot read a TextureView frame after its EGL context was lost");
+            pace(n->s);
+            return false;
+        }
+    }
     if (n->s->layer) {
         swap(n->s, &n->ctx);
-    } else if (texture_id > 0 && texture_frame(n->s, texture_id)) {
+    } else if (texture_taken) {
         /* On no view, for a TextureView: the frame the shell's picture of the texture's id, on the graphics processor. */
         static volatile i32 said;
         if (!mg_atomic_xchg(&said, 1)) mg_info("java: a TextureView's OpenGL ES frames stay on the graphics processor (the shell keeps them, nothing read back)");

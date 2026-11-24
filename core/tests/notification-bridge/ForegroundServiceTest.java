@@ -48,17 +48,24 @@ public final class ForegroundServiceTest {
         Notification n = new Notification.Builder(null, "downloads")
                 .setContentTitle("Downloading").build();
         service.startForeground(200, n, 4);
+        check(Native.logMessages.size() == 1 &&
+              "ACL background: foreground service started".equals(Native.logMessages.get(0)),
+              "foreground start diagnostic");
         check(manager.posts == 1 && manager.id == 200 && manager.notification == n &&
               (n.flags & Notification.FLAG_FOREGROUND_SERVICE) != 0 &&
               (n.flags & Notification.FLAG_ONGOING_EVENT) != 0 &&
               service.getForegroundServiceType() == 4, "initial foreground notification");
         service.startForeground(200, n);
+        check(Native.logMessages.size() == 1, "foreground update does not repeat start diagnostic");
         check(manager.posts == 2 && manager.cancels == 0 &&
               service.getForegroundServiceType() == 0, "same id updated");
         service.startForeground(201, n, 2);
         check(manager.posts == 3 && manager.id == 201 && manager.cancels == 1 &&
               manager.canceledId == 200, "changed id replaces foreground notification");
         service.stopForeground(Service.STOP_FOREGROUND_REMOVE);
+        check(Native.logMessages.size() == 2 &&
+              "ACL background: foreground service stopped".equals(Native.logMessages.get(1)),
+              "foreground stop diagnostic");
         check(manager.cancels == 2 && manager.canceledId == 201 &&
               service.getForegroundServiceType() == 0, "remove foreground notification");
         service.startForeground(202, n);
@@ -168,10 +175,12 @@ public final class ForegroundServiceTest {
         failing.meglerAttach(new ContextWrapper(null) {
             @Override public Object getSystemService(String name) { return failingManager; }
         });
+        int logCount = Native.logMessages.size();
         try {
             failing.startForeground(305, n);
             throw new AssertionError("publication failure swallowed");
         } catch (IllegalStateException expected) {}
+        check(Native.logMessages.size() == logCount, "failed start is not logged as active");
         firstManager.notify(305, n);
         firstManager.cancel(305);
         check(!Native.active.contains("null:305"), "failed start leaves no foreground protection");

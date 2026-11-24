@@ -348,6 +348,7 @@ int main(int argc, char **argv)
     standaloneEnvironment.insert(QStringLiteral("HOME"), standaloneHome.path());
     QProcess standaloneFile;
     standaloneFile.setProcessEnvironment(standaloneEnvironment);
+    standaloneFile.setProcessChannelMode(QProcess::ForwardedChannels);
     standaloneFile.start(app.applicationFilePath(), QStringList() << QStringLiteral("--standalone-file-error"));
     check(standaloneFile.waitForFinished(5000) && standaloneFile.exitCode() == 0,
           "unavailable Documents is reported");
@@ -359,14 +360,19 @@ int main(int argc, char **argv)
     QByteArray standaloneContents;
     const QDir outputDirectory(standaloneHome.path() +
                                QStringLiteral("/Documents/AndroidCompatibilityLayer-Error-Logs"));
-    while (fileTimer.elapsed() < 6200 && !standaloneContents.contains("standalone file private test")) {
+    while (fileTimer.elapsed() < 30000 && !standaloneContents.contains("private event after second re-enable")) {
+        const bool finished = standaloneFile.state() == QProcess::NotRunning;
         const QStringList files = outputDirectory.entryList(QStringList() << QStringLiteral("*.txt"), QDir::Files);
         if (files.size() == 1) {
             QFile file(outputDirectory.filePath(files.first()));
             if (file.open(QIODevice::ReadOnly)) standaloneContents = file.readAll();
         }
+        if (finished) break;
         QThread::msleep(25);
     }
+    if (!standaloneContents.contains("private event after second re-enable") ||
+        standaloneContents.contains("private event while disabled"))
+        std::fprintf(stderr, "standalone diagnostic contents:\n%s\n", standaloneContents.constData());
     check(standaloneContents.contains("private event after second re-enable") &&
           !standaloneContents.contains("private event while disabled"),
           "periodic legacy diagnostic file follows confirmed off/on state");
@@ -421,8 +427,182 @@ int main(int argc, char **argv)
     check(!ErrorLog::report().contains(gpuSummary), "GPU summary omitted while detailed capture is disabled");
     check(ErrorLog::setDetailedEnabled(true, &error), "enable detailed capture");
     check(ErrorLog::detailedCaptureEnabled(), "detailed capture state is visible");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("droidmedia started: PRIVATE-DETAIL"), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("uninteresting output"), false);
+    ErrorLog::record(QStringLiteral("worker stderr"), QStringLiteral("Shared microG client ordered broad"), false);
+    ErrorLog::record(QStringLiteral("worker stderr"), QStringLiteral("cast dispatch failed: PRIVATE-INTENT\n"), false);
+    check(ErrorLog::overlayText().contains(QStringLiteral("droidmedia started")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("ordered broadcast")) &&
+          !ErrorLog::overlayText().contains(QStringLiteral("PRIVATE")) &&
+          !ErrorLog::overlayText().contains(QStringLiteral("uninteresting")), "overlay captures filtered redacted complete lines");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Shared microG client account result: cancelled"), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Shared microG client ordered broadcast received"), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("droidmedia stop timed out; disabling hardware decoder for this process"), false);
+    ErrorLog::record(QStringLiteral("controller stderr"), QStringLiteral("ACL codec: first hardware picture\nACL codec: video software decoder selected\n"), false);
+    check(ErrorLog::overlayText().contains(QStringLiteral("account result: cancelled")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("ordered broadcast received")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("droidmedia stop timed out")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("first hardware picture")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("video software decoder selected")),
+          "overlay distinguishes account, broadcast and decoder outcomes");
+    const char *cameraStills[][2] = {
+        {"camera: Rockchip front stills use viewfinder JPEG at QSize(2592, 1944)", "Camera: front viewfinder still enabled"},
+        {"camera: viewfinder still JPEG captured", "Camera: front JPEG captured"},
+        {"camera: viewfinder still could not be encoded", "Camera: front JPEG failed"},
+        {"camera: Rockchip front viewfinder JPEG unavailable", "Camera: front JPEG unavailable"},
+    };
+    for (const auto &event : cameraStills) {
+        ErrorLog::record(QStringLiteral("Qt"), QString::fromLatin1(event[0]) + QStringLiteral(" PRIVATE"), false);
+        check(ErrorLog::overlayText().contains(QString::fromLatin1(event[1])) &&
+              !ErrorLog::overlayText().contains(QStringLiteral("PRIVATE")),
+              "camera still overlay reports fixed events without raw details");
+    }
+    const char *codecFailures[][2] = {
+        {"ACL codec: rockchip mpp decoder initialized", "Codec HW: rockchip mpp decoder initialized"},
+        {"ACL codec: rockchip mpp first picture", "Codec HW: rockchip mpp first picture"},
+        {"ACL codec: rockchip mpp capability rejected", "Codec HW: rockchip mpp capability rejected"},
+        {"ACL codec: rockchip mpp buffer synchronization failed", "Codec HW: rockchip mpp buffer synchronization failed"},
+        {"ACL codec: rockchip mpp output frame error", "Codec HW: rockchip mpp output frame error"},
+        {"ACL codec: hardware replay limit reached", "Codec HW: replay limit reached"},
+        {"ACL codec: droidmedia hardware fallback active", "Codec HW: droidmedia fallback active"},
+        {"ACL codec: droidmedia decoder or FFmpeg 8 unavailable", "decoder or FFmpeg 8 unavailable"},
+        {"ACL codec: droidmedia library or ABI unavailable", "library or ABI unavailable"},
+        {"ACL codec: droidmedia capability check rejected", "capability check rejected"},
+        {"ACL codec: droidmedia create or configure failed", "create or configure failed"},
+        {"ACL codec: droidmedia start failed", "start failed"},
+        {"ACL codec: droidmedia decoder initialization failed", "Codec HW: droidmedia initialization failed"},
+        {"ACL codec: droidmedia queue timeout", "queue timeout"},
+        {"ACL codec: droidmedia queue wait failed", "queue wait failed"},
+        {"ACL codec: droidmedia queue failed", "queue failed"},
+        {"ACL codec: droidmedia drain timeout", "drain timeout"},
+        {"ACL codec: droidmedia drain wait failed", "drain wait failed"},
+        {"ACL codec: droidmedia drain failed", "drain failed"},
+        {"ACL codec: droidmedia dequeue failed", "dequeue failed"},
+        {"Unsupported droidmedia output color format 0x1234", "unsupported output format"},
+        {"ACL codec: droidmedia output frame rejected", "output frame rejected"},
+        {"ACL codec: droidmedia asynchronous error", "asynchronous decoder error"},
+        {"ACL codec: droidmedia replay limit reached", "replay limit reached"},
+        {"ACL codec: AAC FFmpeg 62 initialization failed (-1)", "Codec AAC: FFmpeg 8 initialization failed"},
+        {"ACL codec: AAC FFmpeg 61 initialization failed (-1)", "Codec AAC: FFmpeg 7 initialization failed"},
+        {"ACL codec: video FFmpeg 62 initialization failed (-1)", "Codec video: FFmpeg 8 initialization failed"},
+        {"ACL codec: video FFmpeg 61 initialization failed (-1)", "Codec video: FFmpeg 7 initialization failed"},
+        {"AndroidCompatibilityLayer audio codec: decoder initialization failed", "Codec: decoder initialization failed"},
+        {"droidmedia disabled after a stop failure", "disabled after stop failure"},
+        {"cannot start bounded droidmedia stop", "stop worker unavailable"},
+    };
+    for (const auto &failure : codecFailures) {
+        const QString line = QString::fromLatin1(failure[0]) + QStringLiteral(" PRIVATE-DATA\n");
+        ErrorLog::record(QStringLiteral("controller stderr"), line.left(12), false);
+        ErrorLog::record(QStringLiteral("controller stderr"), line.mid(12), false);
+        check(ErrorLog::overlayText().contains(QString::fromLatin1(failure[1])) &&
+              !ErrorLog::overlayText().contains(QStringLiteral("PRIVATE-DATA")),
+              "standalone stderr overlay shows a fixed codec failure without raw data");
+    }
+    const QString beforeGoogleStartup = ErrorLog::overlayText();
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Google services already running"), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Shared microG identity already started"), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Google checkin completed without error"), false);
+    check(ErrorLog::overlayText() == beforeGoogleStartup,
+          "normal Google startup and unrelated text do not imply sign-in failure");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Shared microG service bind failed. PRIVATE-DETAIL"), true);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Google account is unavailable"), true);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Another Google sign-in is active or the account screen is unavailable"), true);
+    check(ErrorLog::overlayText().contains(QStringLiteral("Google / microG: bind failed")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Google / microG: requested account unavailable")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Google / microG: sign-in busy or screen unavailable")) &&
+          !ErrorLog::overlayText().contains(QStringLiteral("PRIVATE")),
+          "Google overlay reports fixed reasons without guessing or exposing details");
+    const char *gmsStartup[][2] = {
+        {"Shared microG client channel ready.", "client channel ready"},
+        {"Shared microG client channel open failed.", "client channel open failed"},
+        {"W/GmsClient: unable to connect to service: PRIVATE-ACTION", "GMS service connection failed"},
+        {"W/ServiceBindIntentUtils: Dynamic intent resolution failed: PRIVATE-DETAIL", "dynamic service resolution failed"},
+        {"E/DynamiteModule: Invalid GmsCore APK, remote loading disabled.", "GMS module package unavailable"},
+    };
+    for (const auto &event : gmsStartup) {
+        ErrorLog::record(QStringLiteral("Android"), QString::fromLatin1(event[0]), false);
+        check(ErrorLog::overlayText().contains(QStringLiteral("Google / microG: ") + QString::fromLatin1(event[1])) &&
+              !ErrorLog::overlayText().contains(QStringLiteral("PRIVATE")),
+              "GMS startup overlay distinguishes channel, binding, resolution and module failures");
+    }
+    ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("Shared microG module APK ready."), false);
+    ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("Shared microG module APK unavailable: PRIVATE-APK-DETAIL"), true);
+    check(ErrorLog::overlayText().contains(QStringLiteral("microG module: APK ready")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("microG module: APK unavailable")) &&
+          !ErrorLog::overlayText().contains(QStringLiteral("PRIVATE-APK-DETAIL")),
+          "overlay reports module APK availability without details or TLS provider claims");
+    ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("Experimental GPU Canvas active; Android 2D draws into a shared GLES texture"), false);
+    ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("Experimental GPU Canvas falling back to CPU: shared OpenGL context is unavailable"), true);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("ACL background: job started"), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("ACL background: job finished"), false);
+    ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("ACL notification: posted"), false);
+    ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("ACL notification: removed"), false);
+    check(ErrorLog::overlayText().contains(QStringLiteral("GPU Canvas active")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("shared context unavailable")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Background job: started")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Background job: finished")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Android notification: posted")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Android notification: removed")),
+          "overlay reports GPU, background work and notification transitions");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("System notification service is unavailable (D-Bus org.example.Error: PRIVATE-DATA)."), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("System notification permission denied (D-Bus org.freedesktop.DBus.Error.AccessDenied: PRIVATE-DATA)."), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("System notification post failed (PRIVATE-DATA)."), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("System notification update failed (PRIVATE-DATA)."), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("System notification cancellation failed."), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Android notification limit reached."), false);
+    check(ErrorLog::overlayText().contains(QStringLiteral("Android notification: D-Bus unavailable")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Android notification: permission denied")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Android notification: post failed")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Android notification: update failed")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Android notification: cancel failed")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Android notification: limit reached")) &&
+          !ErrorLog::overlayText().contains(QStringLiteral("PRIVATE-DATA")),
+          "notification overlay reports fixed failure reasons without raw details");
+    const QString beforeBenignNotificationText = ErrorLog::overlayText();
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("notification classification is unavailable in this runtime"), false);
+    check(ErrorLog::overlayText() == beforeBenignNotificationText,
+          "notification overlay ignores normal fallback");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Shared microG disconnect notification failed"), false);
+    check(ErrorLog::overlayText().endsWith(QStringLiteral("Crash or bridge error")) &&
+          !ErrorLog::overlayText().contains(QStringLiteral("Android notification: error")),
+          "unrelated microG notification text is not classified as a notification failure");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("ACL background: job stopped"), false);
+    check(ErrorLog::overlayText().contains(QStringLiteral("Background job: cancelled by app")),
+          "job stop reports the only modeled stop cause");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("ACL background: foreground service stopped"), false);
+    check(ErrorLog::overlayText().contains(QStringLiteral("Foreground service: finished")),
+          "normal foreground-service completion is not shown as an error");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("ACL background: WorkManager job started"), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("ACL background: WorkManager job finished"), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("ACL background: WorkManager job stopped"), false);
+    check(ErrorLog::overlayText().contains(QStringLiteral("WorkManager job: started")) &&
+          ErrorLog::overlayText().endsWith(QStringLiteral("WorkManager job: finished")),
+          "normal WorkManager stop is displayed as finished");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("media: extractor: 0 compressed tracks"), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("media: extractor: 12 compressed tracks"), false);
+    check(ErrorLog::overlayText().contains(QStringLiteral("Media extractor: no compressed tracks")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Media extractor: compressed tracks available")),
+          "overlay distinguishes empty and populated compressed extractors");
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Shared microG Binder descriptors sent PRIVATE-FD"), false);
+    ErrorLog::record(QStringLiteral("Android"), QStringLiteral("Shared microG Binder descriptors received PRIVATE-FD"), false);
+    check(ErrorLog::overlayText().contains(QStringLiteral("Shared microG Binder descriptors sent")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("Shared microG Binder descriptors received")) &&
+          !ErrorLog::overlayText().contains(QStringLiteral("PRIVATE-FD")),
+          "overlay distinguishes descriptor transfer directions without exposing details");
+    ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("WebView GPU: native EGL texture capture ready PRIVATE-WEBVIEW"), false);
+    ErrorLog::record(QStringLiteral("Qt"), QStringLiteral("WebView GPU: native EGL texture capture unavailable; software fallback PRIVATE-WEBVIEW"), false);
+    check(ErrorLog::overlayText().contains(QStringLiteral("WebView GPU: capture ready")) &&
+          ErrorLog::overlayText().contains(QStringLiteral("WebView GPU: software fallback")) &&
+          !ErrorLog::overlayText().contains(QStringLiteral("PRIVATE-WEBVIEW")),
+          "overlay distinguishes WebView GPU capability and software fallback without details");
+    for (int i = 0; i < 10; ++i)
+        ErrorLog::record(QStringLiteral("Android"), QStringLiteral("notification delivery failed"), false);
+    check(ErrorLog::overlayText().split(QLatin1Char('\n')).size() == 6 &&
+          !ErrorLog::overlayText().contains(QStringLiteral("droidmedia started")),
+          "overlay retains only the most recent bounded events");
     ErrorLog::record(QStringLiteral("PauseTest"), QStringLiteral("before hold"), false);
     check(ErrorLog::setDetailedPaused(true) && !ErrorLog::detailedCaptureEnabled(), "pause detailed capture");
+    check(ErrorLog::overlayText().isEmpty(), "overlay hidden when capture is paused");
     ErrorLog::record(QStringLiteral("PauseTest"), QStringLiteral("during hold"), false);
     QString pausedReport;
     check(ErrorLog::detailedReport(&pausedReport, &error) &&
@@ -513,7 +693,7 @@ int main(int argc, char **argv)
     const QString snapshotDirectory = sharedLogRoot.path() +
         QStringLiteral("/AndroidCompatibilityLayer-Standalone-Logs");
     const QStringList snapshotNames = QDir(snapshotDirectory).entryList(
-        QStringList() << QStringLiteral("standalone-*.json"), QDir::Files);
+        QStringList() << QStringLiteral("standalone-*.log"), QDir::Files);
     check(snapshotNames.size() == 1, "standalone publishes one per-instance snapshot");
     QString standaloneSnapshotPath = QDir(snapshotDirectory).filePath(snapshotNames.first());
     QFile snapshotFile(standaloneSnapshotPath);
@@ -527,6 +707,22 @@ int main(int argc, char **argv)
           detailed.contains(QStringLiteral("untrusted shared file")) &&
           detailed.contains(QStringLiteral("organization apps may access it")),
           "manager view reads standalone records from the shared file exactly once");
+    {
+        ErrorLog::record(QStringLiteral("test"), QStringLiteral("feed newer manager line"), false);
+        QString feed;
+        bool more = false;
+        check(ErrorLog::recentLines(QString(), 200, &feed, &more, &error) &&
+              feed.contains(QStringLiteral("[Android0123456789abcdef01234567] [Android] snapshot-only private event")) &&
+              feed.indexOf(QStringLiteral("feed newer manager line")) <
+                  feed.indexOf(QStringLiteral("snapshot-only private event")),
+              "log feed merges standalone lines with manager lines, newest first");
+        check(ErrorLog::recentLines(QStringLiteral("SNAPSHOT-ONLY"), 200, &feed, &more, &error) &&
+              feed.count(QLatin1Char('\n')) == 1 && !more,
+              "log feed search returns only matching standalone lines");
+        check(ErrorLog::recentLines(QString(), 1, &feed, &more, &error) &&
+              feed.count(QLatin1Char('\n')) == 1 && more,
+              "log feed respects its line limit");
+    }
     check(!ErrorLog::report().contains(QStringLiteral("snapshot-only private event")),
           "snapshot-only standalone content does not enter the D-Bus event history");
     ErrorLog::record(QStringLiteral("test"), QStringLiteral("detailed secret"), false);
@@ -594,7 +790,7 @@ int main(int argc, char **argv)
     check(!QFileInfo::exists(standaloneSnapshotPath),
           "successfully exported standalone snapshot is removed from organization storage");
     const QString snapshotLink = QDir(snapshotDirectory).filePath(
-        QStringLiteral("standalone-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"));
+        QStringLiteral("standalone-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log"));
     QFile snapshotLinkTarget(home.path() + QStringLiteral("/snapshot-link-target"));
     check(snapshotLinkTarget.open(QIODevice::WriteOnly) && snapshotLinkTarget.write("not a log") == 9 &&
           snapshotLinkTarget.link(snapshotLink), "create untrusted snapshot symlink fixture");
@@ -654,20 +850,18 @@ int main(int argc, char **argv)
     check(ErrorLog::saveDetailedReport(&stressPath, &error, &partialExport, &cleanupWarning) &&
           partialExport, "truncated standalone snapshot exports as partial");
     QFile firstLargeExport(stressPath);
-    check(firstLargeExport.open(QIODevice::ReadOnly), "open first bounded export");
+    check(firstLargeExport.open(QIODevice::ReadOnly), "open bounded export");
     const QByteArray firstLargeContents = firstLargeExport.readAll();
     check(firstLargeContents.size() <= 10000000 &&
-          firstLargeContents.contains("Report truncated at 10000000 bytes") &&
-          QFile::remove(stressPath), "first export respects total byte limit");
+          firstLargeContents.contains("startup retained") &&
+          firstLargeContents.contains("verbose event 6999") &&
+          QFile::remove(stressPath), "compacted append log stays within the report limit");
     check(ErrorLog::saveDetailedReport(&stressPath, &error, &partialExport, &cleanupWarning),
-          "export remaining standalone events");
+          "export after bounded standalone export");
     QFile secondLargeExport(stressPath);
     check(secondLargeExport.open(QIODevice::ReadOnly), "open second bounded export");
-    const QByteArray secondLargeContents = secondLargeExport.readAll();
-    check(secondLargeContents.size() <= 10000000 &&
-          secondLargeContents.contains("verbose event 6999") &&
-          !secondLargeContents.contains("startup retained") &&
-          QFile::remove(stressPath), "remaining events survive and are exported without duplicates");
+    check(!secondLargeExport.readAll().contains("verbose event 6999") && QFile::remove(stressPath),
+          "exported standalone events are not repeated");
     child.start(app.applicationFilePath(), QStringList() << QStringLiteral("--standalone-snapshot-repeats")
                 << sharedLogRoot.path());
     timeout.start(10000);
@@ -698,7 +892,7 @@ int main(int argc, char **argv)
     while (publishWait.elapsed() < 5000 && !beforeSnapshotPublished) {
         app.processEvents();
         const QStringList currentSnapshots = QDir(snapshotDirectory).entryList(
-            QStringList() << QStringLiteral("standalone-*.json"), QDir::Files);
+            QStringList() << QStringLiteral("standalone-*.log"), QDir::Files);
         if (currentSnapshots.size() == 1) {
             updateSnapshotPath = QDir(snapshotDirectory).filePath(currentSnapshots.first());
             QFile current(updateSnapshotPath);
@@ -708,7 +902,7 @@ int main(int argc, char **argv)
         if (!beforeSnapshotPublished) QThread::msleep(5);
     }
     check(beforeSnapshotPublished, "publish snapshot before concurrent export");
-    const QString lockPath = updateSnapshotPath.left(updateSnapshotPath.size() - 5) +
+    const QString lockPath = updateSnapshotPath.left(updateSnapshotPath.size() - 4) +
                              QStringLiteral(".lock");
     const QString raceTrigger = triggerPath;
     std::atomic<bool> triggerWritten(false);
@@ -784,12 +978,11 @@ int main(int argc, char **argv)
     standalone.close();
     unrelated.close();
     const QString clearSnapshotPath = QDir(snapshotDirectory).filePath(
-        QStringLiteral("standalone-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json"));
+        QStringLiteral("standalone-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.log"));
     QFile clearSnapshot(clearSnapshotPath);
     check(clearSnapshot.open(QIODevice::WriteOnly) &&
-          clearSnapshot.write("{\"version\":1,\"instance\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
-                              "\"applicationId\":\"ru.androidcompatibilitylayer.Android0123456789abcdef01234567\","
-                              "\"dropped\":\"0\",\"events\":[]}") > 0,
+          clearSnapshot.write("ACL-STANDALONE-LOG\t2\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t"
+                              "ru.androidcompatibilitylayer.Android0123456789abcdef01234567\n") > 0,
           "create organization snapshot cleanup fixture");
     int removed = 0;
     check(ErrorLog::clearSavedLogs(removed) && removed == 7 &&

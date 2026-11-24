@@ -10,10 +10,11 @@ public class IntentFilter implements android.os.Parcelable {
     public static class MalformedMimeTypeException extends Exception { public MalformedMimeTypeException() {} public MalformedMimeTypeException(String s) { super(s); } }
     private final ArrayList<String> mActions = new ArrayList<>(), mCategories = new ArrayList<>(), mSchemes = new ArrayList<>(), mTypes = new ArrayList<>();
     private int mPriority;
+    private boolean mComplexDataConstraints;
     public IntentFilter() {}
     public IntentFilter(String action) { addAction(action); }
     public IntentFilter(String action, String type) throws MalformedMimeTypeException { addAction(action); addDataType(type); }
-    public IntentFilter(IntentFilter o) { mActions.addAll(o.mActions); mCategories.addAll(o.mCategories); mSchemes.addAll(o.mSchemes); mTypes.addAll(o.mTypes); mPriority = o.mPriority; }
+    public IntentFilter(IntentFilter o) { mActions.addAll(o.mActions); mCategories.addAll(o.mCategories); mSchemes.addAll(o.mSchemes); mTypes.addAll(o.mTypes); mPriority = o.mPriority; mComplexDataConstraints = o.mComplexDataConstraints; }
     public static IntentFilter create(String action, String type) { try { return new IntentFilter(action, type); } catch (MalformedMimeTypeException e) { throw new RuntimeException(e); } }
     public final void setPriority(int p) { mPriority = p; }
     public final int getPriority() { return mPriority; }
@@ -33,9 +34,10 @@ public class IntentFilter implements android.os.Parcelable {
     public final String getDataScheme(int i) { return mSchemes.get(i); }
     public final boolean hasDataScheme(String s) { return mSchemes.contains(s); }
     public final void addDataType(String t) throws MalformedMimeTypeException { mTypes.add(t); }
-    public final void addDataAuthority(String host, String port) {}
-    public final void addDataPath(String path, int type) {}
-    public final void addDataSchemeSpecificPart(String ssp, int type) {}
+    public final void addDataAuthority(String host, String port) { mComplexDataConstraints = true; }
+    public final void addDataPath(String path, int type) { mComplexDataConstraints = true; }
+    public final void addDataSchemeSpecificPart(String ssp, int type) { mComplexDataConstraints = true; }
+    public final boolean meglerHasComplexDataConstraints() { return mComplexDataConstraints; }
     public final int countDataTypes() { return mTypes.size(); }
     public final boolean hasDataType(String t) { return mTypes.contains(t); }
     public final int match(String action, String type, String scheme, android.net.Uri data, java.util.Set<String> categories, String tag) { return hasAction(action) ? MATCH_CATEGORY_EMPTY : NO_MATCH_ACTION; }
@@ -59,22 +61,22 @@ public class IntentFilter implements android.os.Parcelable {
     public static final java.lang.String WILDCARD_PATH = "/*";
     public IntentFilter(android.os.Parcel p0) { this(); }
     public static boolean filterEquals(android.content.IntentFilter p0, android.content.IntentFilter p1) { return false; }
-    public void addDataAuthority(android.content.IntentFilter.AuthorityEntry p0) {}
-    public void addDataPath(android.os.PatternMatcher p0) {}
-    public void addDataSchemeSpecificPart(android.os.PatternMatcher p0) {}
-    public void addDynamicDataType(java.lang.String p0) {}
-    public void addExtra(java.lang.String p0, double p1) {}
-    public void addExtra(java.lang.String p0, int p1) {}
-    public void addExtra(java.lang.String p0, long p1) {}
-    public void addExtra(java.lang.String p0, java.lang.String p1) {}
-    public void addExtra(java.lang.String p0, boolean p1) {}
-    public void addExtra(java.lang.String p0, double[] p1) {}
-    public void addExtra(java.lang.String p0, int[] p1) {}
-    public void addExtra(java.lang.String p0, long[] p1) {}
-    public void addExtra(java.lang.String p0, java.lang.String[] p1) {}
-    public void addExtra(java.lang.String p0, boolean[] p1) {}
-    public void addMimeGroup(java.lang.String p0) {}
-    public void addUriRelativeFilterGroup(android.content.UriRelativeFilterGroup p0) {}
+    public void addDataAuthority(android.content.IntentFilter.AuthorityEntry p0) { mComplexDataConstraints = true; }
+    public void addDataPath(android.os.PatternMatcher p0) { mComplexDataConstraints = true; }
+    public void addDataSchemeSpecificPart(android.os.PatternMatcher p0) { mComplexDataConstraints = true; }
+    public void addDynamicDataType(java.lang.String p0) { mComplexDataConstraints = true; }
+    public void addExtra(java.lang.String p0, double p1) { mComplexDataConstraints = true; }
+    public void addExtra(java.lang.String p0, int p1) { mComplexDataConstraints = true; }
+    public void addExtra(java.lang.String p0, long p1) { mComplexDataConstraints = true; }
+    public void addExtra(java.lang.String p0, java.lang.String p1) { mComplexDataConstraints = true; }
+    public void addExtra(java.lang.String p0, boolean p1) { mComplexDataConstraints = true; }
+    public void addExtra(java.lang.String p0, double[] p1) { mComplexDataConstraints = true; }
+    public void addExtra(java.lang.String p0, int[] p1) { mComplexDataConstraints = true; }
+    public void addExtra(java.lang.String p0, long[] p1) { mComplexDataConstraints = true; }
+    public void addExtra(java.lang.String p0, java.lang.String[] p1) { mComplexDataConstraints = true; }
+    public void addExtra(java.lang.String p0, boolean[] p1) { mComplexDataConstraints = true; }
+    public void addMimeGroup(java.lang.String p0) { mComplexDataConstraints = true; }
+    public void addUriRelativeFilterGroup(android.content.UriRelativeFilterGroup p0) { mComplexDataConstraints = true; }
     public java.util.function.Predicate asPredicate() { return null; }
     public java.util.function.Predicate asPredicateWithTypeResolution(android.content.ContentResolver p0) { return null; }
     public java.util.Iterator authoritiesIterator() { return null; }

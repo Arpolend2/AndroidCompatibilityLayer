@@ -219,6 +219,57 @@ screen closes. These tests do not run Android's real sign-in Activity or verify
 the rendered/input path on a device. End-to-end Google sign-in and token
 issuance remain unconfirmed until tested on the target device.
 
+The manager-authorized service root also carries supported full `Intent`
+payloads for public GmsCore service binds and start/stop requests, including
+data, MIME type, categories and Bundle extras whose values the Binder bridge
+supports. Supported values include primitive scalars and arrays, string arrays,
+and homogeneous string or integer lists. Unsupported Parcelable extras,
+other list shapes, and file descriptors inside Bundle extras fail closed.
+Selector, clip data, source bounds, identifier, flags, oversized values and
+permission-protected services are rejected. Targeted broadcasts from a shared
+client are delivered only to enabled, exported GmsCore manifest receivers
+without a receiver permission. Both ordinary and ordered client-to-worker
+broadcasts reject the fixed protected-action list from AOSP Android 14
+`frameworks/base/core/res/AndroidManifest.xml` (`android-14.0.0_r75`), plus
+Google C2DM receive and registration actions. The list is not a full Android
+permission model: vendor, app-declared, and later platform protected actions
+are not automatically discovered. Host and worker-originated broadcasts are
+not subject to this client restriction. Ordinary broadcasts from the worker fan out
+only over active manager-authorized client channels, preserving target package,
+sender identity and receiver-permission filters; manifest receivers must be
+enabled and exported without a required permission. Client-to-worker ordered
+broadcasts support explicitly named receivers and action-only implicit intents,
+including dynamic receivers explicitly registered as exported, without permission filters,
+options, user or app-op overrides. Their initial and final results cross the
+channel, including completion after `goAsync`; a receiver
+must be enabled, exported and not protected by a receiver or application
+permission. Each channel permits at most 128 pending ordered broadcasts.
+Worker-to-client ordered broadcasts support an explicitly named receiver when
+exactly one channel exists for its package. Other implicit forms, dynamic
+receivers with unknown export status or unsupported data constraints,
+multi-channel ordered broadcasts, and permission or user filters are rejected
+rather than delivered with altered semantics. Unsupported result
+values or a disconnected channel cannot produce a final callback and are
+reported in the log. This path has not been validated on an Aurora device.
+
+In shared mode, a `com.google.*` content authority is resolved by the worker.
+Only enabled, exported GmsCore providers without read/write or path permissions
+are exposed. Query, call, MIME/stream-type, refresh, canonicalize, insert,
+update and delete results cross the bridge with bounds; cursors are limited to
+1024 rows, 128 columns and 512 KiB. Provider batches support up to 128
+operations with bounded primitive values, blobs and back references; unsupported
+values fail explicitly, and remote exception results preserve a description
+rather than their original exception type. Observer registrations and change
+notifications use per-channel callbacks and are removed on channel shutdown.
+Provider reads and `openOutputStream` writes (`w`, `wt`, `wa`) use 32 KiB chunks
+and a per-channel open-stream limit. These provider operations do not yet
+expose arbitrary writable or random-access file descriptors.
+The worker derives `ContentProvider.getCallingPackage()` from the authenticated
+channel UID, with Binder identity restored after nested calls and exceptions.
+Cross-process notification flags, user-scoped observers and multi-URI
+notification overloads are not implemented; sync-to-network is not forwarded.
+These paths have not yet been validated on an Aurora device.
+
 Caller package, UID and PID are passed by the manager to the worker and
 overwritten into authenticator options; they are not cryptographically
 authenticated application identity. The user accepted the risk of application
@@ -2068,19 +2119,30 @@ booleans, byte arrays, Binders and Bundles. It also serializes standalone
 Parcelables through `writeToParcel` and recreates them with the reader's
 `CREATOR`; their nested Parcel data is subject to the same limits and type
 restrictions. Arrays of Parcelables, including null elements, are supported.
-Parcelables inside Bundles, file descriptors, lists and other arrays of objects
-are not supported. The transport accepts only zero Parcelable write flags and
-rejects nonzero flags instead of discarding them.
+Parcelable support inside Bundles is restricted, and file descriptors inside
+Bundles are not supported. Lists and arrays of objects are restricted. Nonzero
+Parcelable write flags are rejected except for `PARCELABLE_WRITE_RETURN_VALUE`
+on a `ParcelFileDescriptor`.
 Two host JVMs exercise a synchronous transaction, a nested callback, a
 Bundle, a Parcelable containing a Bundle, and returning the callback to its
 owner. The Bundle test requires
 compiled framework classes and the boundary test's `-FrameworkClasses`
 option. The bridge can apply a UID and PID supplied by its connection owner,
 but does not authenticate peers or establish their identity. It has no handle
-release, per-object death, file
-descriptors or arbitrary Parcelables. Handles are kept until the
+release, per-object death, or unrestricted Parcelables. Handles are kept until the
 connection closes. Do not use it for accounts or other real data until those
 gaps and Aurora integration are addressed.
+
+On POSIX, the authenticated shared microG client and worker use an SCM_RIGHTS
+marker before every Binder frame. Up to 16 host-backed regular files, pipes,
+or Unix stream/seqpacket sockets can accompany a frame. Guest virtual
+ring-buffer pipes and sockets are rejected. Reliable `ParcelFileDescriptor`
+pipe and socket pairs use a separate status socket. The ordinary stream-only
+bridge does not transfer descriptors. Both endpoints must use the same framing
+version; a mixed old/new pair cannot interoperate. JVM tests use simulated
+descriptor operations, and Linux native tests exercise SCM_RIGHTS separately;
+the complete guest/JNI path and reliable status propagation have not yet been
+verified on Aurora or in a real two-guest end-to-end run.
 
 `FLAG_ONEWAY` sends without waiting for a response, and the receiver invokes
 the target with a null reply. Calls to the same target are dispatched in
@@ -2210,13 +2272,59 @@ APK's signature or certificate trust. This is intentional: an APK that claims a
 Google package name can supply an untrusted certificate and may consequently be
 accepted by microG as that package. This is not APK attestation and does not
 grant other Android permissions or bypass unrelated framework checks.
-New clients fall back to the legacy channel method when talking to an older
-manager; that compatibility path does not provide APK metadata. The earlier
-`OpenClientChannelWithApk` path method remains available to old clients when the
+The earlier `OpenClientChannelWithApk` path method remains available to old clients when the
 manager can read the exact supplied APK. Old standalone binaries that use that
 method must be rebuilt to use metadata transport when their APK is inaccessible
 to the manager; the manager never substitutes the library's possibly different
 APK or silently drops metadata on a path error.
+
+The manager validates the selected standalone microG APK and atomically publishes
+an ordinary copy at `microg/GmsCore.apk` under the organization common directory.
+It compares contents before replacing the copy, including when an already
+installed microG is first selected. The worker opens the installed APK; clients
+open the common copy directly and mount it read-only. No APK is sent over D-Bus.
+The common directory is shared and the copy is not immutable: another process
+with write access may replace or modify it, and this mechanism does not attest
+the APK publisher or guarantee that the worker and client see identical bytes.
+Access from standalone Sailjail must be verified on the device. If the copy is
+unavailable, the client retains the shared bridge but cannot load the module.
+The shared client exposes the APK's code and resources for
+Dynamite modules such as ProviderInstaller, but must not locally host microG
+services, providers, receivers, activities or its Application. Provider
+installation and actual Maps connectivity still require verification on the
+device. This does not change TLS certificate verification.
+
+Aurora standalone clients now request the shared microG channel at every launch,
+except for the `com.google.android.gms` provider itself. The legacy
+`sharedMicrog` boolean in `standalone.json` no longer selects the client route:
+both `false` and an absent field use the bridge. This fixes exports created
+before microG was selected in the manager. Newly exported clients always include
+the microG D-Bus and identification Sailjail permissions, independently of the
+provider setting at export time; the RPM cache policy is version 4.
+An old installed RPM may lack those permissions. Choosing the shared route at
+launch cannot grant missing OS permissions: that package needs an updated
+export/reinstallation or an authorized permission update. The manager still
+requires a selected, available trusted microG backend and rejects unavailable
+channels rather than silently launching private per-client services.
+
+The standalone overlay distinguishes channel readiness/open failure, GMS
+service connection failure, dynamic service resolution failure and an
+unavailable GMS module package. These are fixed diagnostics without raw service
+actions or account data. `Invalid GmsCore APK` alone does not prove a signature
+failure; an unavailable Chimera provider can also disable Dynamite loading.
+Channel readiness does not establish successful Google authentication.
+
+GPU texture presentation now enables native EGL capture before installing its
+graphics callbacks, including ordinary embedded microG previews. Previously,
+only the shared headless worker registered the native WebView texture path:
+an embedded preview could draw Android widgets on the GPU while Chromium saw
+no texture callbacks and selected software rendering. Remote previews also
+select that EGL display before Android EGL initialization. A failed capability
+probe is reported explicitly and retains the software fallback.
+`WebView GPU: native EGL texture capture ready` confirms registration, not a
+loaded or visible Google page. The GPU regression covers automatic remote
+registration, producer-context restoration, released textures, and a
+2000x1200 landscape page region without painting over the native chrome.
 
 For the guest test on Windows, with an existing Linux x86_64 runner, Android
 root, JDK 8 and Android SDK 29, and the local `aurora-build-tools:5.2.1.200`

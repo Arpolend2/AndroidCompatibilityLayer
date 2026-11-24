@@ -23,7 +23,16 @@ void mg_java_enable_shared_microg_worker(void);
 bool mg_java_set_shared_microg_client(int host_fd, int uid, int pid, const char *package);
 void mg_java_close_shared_microg_client(void);
 const mg_jhle *mg_java_shared_microg_client_natives(void);
+const mg_jhle *mg_java_shared_microg_fd_natives(void);
 const mg_jhle *mg_java_surface_texture_natives(void);
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+#define MG_JAVA_FD_MAX 16
+/* Caller serializes access to each stream direction; returned guest descriptors belong to the caller. */
+int mg_java_fd_send_marker(int stream, const int *fds, int count);
+int mg_java_fd_receive_marker(int stream, int *fds, int *count);
+int mg_java_fd_create_pipe(int fds[2]);
+int mg_java_fd_create_socketpair(int type, int fds[2]);
+#endif
 /*
  * For the tests: every frame a window draws in part (its dirty region) is checked against the same frame drawn whole, and a
  * difference is a line in the log ("ViewRoot: ... drawn in part missed"). Set before the app starts. Costs a second drawing
@@ -77,10 +86,12 @@ const mg_jhle *mg_java_audio_natives(void);
  */
 const mg_jhle *mg_java_media_natives(void);
 void mg_java_media_set_host(const megler_codec_host *host);
+void mg_java_media_set_checked_drain(bool (MEGLER_CB *drain)(void *user, void *decoder));
 /*
  * The same decoders without Java, as the natives use them, for the tests. A codec is made for a MIME type and configured
  * with what MediaFormat says (csd-0 to csd-2: NULL or empty when not there); each decode is one queued buffer with
- * MediaCodec's flags (2 codec-specific data, 4 the end of the stream). Frames come in display order with info = { time,
+ * MediaCodec's flags (2 codec-specific data, 4 the end of the stream); false means the host rejected input and further
+ * decoding is stopped until flush. Frames come in display order with info = { time,
  * width, height }; sound as 16-bit PCM in a block to free(), info = { time, rate, channels }.
  */
 typedef struct mg_mcodec mg_mcodec;
@@ -88,7 +99,7 @@ typedef struct mg_mframe mg_mframe;
 bool mg_mcodec_supported(const char *mime);
 mg_mcodec *mg_mcodec_create(const char *mime);
 bool mg_mcodec_configure(mg_mcodec *c, i32 width, i32 height, i32 rate, i32 channels, const u8 *const csd[3], const size_t csd_size[3]);
-void mg_mcodec_decode(mg_mcodec *c, const u8 *data, size_t size, i64 time_us, i32 flags);
+bool mg_mcodec_decode(mg_mcodec *c, const u8 *data, size_t size, i64 time_us, i32 flags);
 mg_mframe *mg_mcodec_next_frame(mg_mcodec *c, i64 info[3]);
 u8 *mg_mcodec_next_pcm(mg_mcodec *c, i64 info[3], size_t *bytes);
 /* The frame's picture in memory: one on the graphics processor is read into it the first time (NULL where it cannot be). */
@@ -113,6 +124,7 @@ i32 mg_mcodec_size(mg_mcodec *c);
  */
 const mg_jhle *mg_java_camera_natives(void);
 void mg_java_camera_set_host(const megler_camera_host *host);
+void mg_java_camera_set_capture_host(const megler_camera_capture_host *host);
 /*
  * megler.LocationNative: the phone's location behind android.location.LocationManager, over the shell's (megler_location_host;
  * mg_java_location.c). The host is copied; NULL or one left zero finds nothing. The same without Java for the tests:
@@ -154,6 +166,8 @@ bool mg_jcamera_info(int index, megler_camera_info *out);
 int mg_jcamera_features(void);
 mg_jcamera *mg_jcamera_open(int index, int *error);
 const megler_camera_caps *mg_jcamera_caps(mg_jcamera *c);
+int mg_jcamera_picture_sizes(mg_jcamera *c, megler_camera_picture_size *sizes, int max);
+bool mg_jcamera_capture(mg_jcamera *c, int width, int height, int quality, int rotation, u8 **jpeg, size_t *jpeg_size);
 bool mg_jcamera_start(mg_jcamera *c, int width, int height, int fps);
 void mg_jcamera_stop(mg_jcamera *c);
 int mg_jcamera_wait(mg_jcamera *c, int ms);

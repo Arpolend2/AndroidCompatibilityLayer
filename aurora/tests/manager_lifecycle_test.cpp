@@ -851,6 +851,7 @@ static bool fakeSendControl(int fd, quint32 type, quint64 channel)
     char packet[28] = {'M','G','R','1'};
     fake32Write(packet + 4, type);
     fake64Write(packet + 8, channel);
+    if (type == 8 || type == 9) fake64Write(packet + 16, 1);
     return ::send(fd, packet, sizeof(packet), MSG_NOSIGNAL) ==
            static_cast<ssize_t>(sizeof(packet));
 }
@@ -866,11 +867,11 @@ static quint32 fake32Read(const char *data)
 static bool fakeSizedFrame(quint64 channel, quint64 sequence, quint32 width, quint32 height)
 {
     const quint32 total = width * height * 4;
-    QByteArray packet(48 + 60 * 1024, char(0xff));
+    QByteArray packet(56 + 60 * 1024, char(0xff));
     for (quint32 offset = 0; offset < total;) {
         const quint32 length = qMin(quint32(60 * 1024), total - offset);
         std::memcpy(packet.data(), "MGUI", 4);
-        fake32Write(packet.data() + 4, 1);
+        fake32Write(packet.data() + 4, 2);
         fake64Write(packet.data() + 8, channel);
         fake64Write(packet.data() + 16, sequence);
         fake32Write(packet.data() + 24, width);
@@ -879,8 +880,9 @@ static bool fakeSizedFrame(quint64 channel, quint64 sequence, quint32 width, qui
         fake32Write(packet.data() + 36, total);
         fake32Write(packet.data() + 40, offset);
         fake32Write(packet.data() + 44, length);
-        if (::send(4, packet.constData(), 48 + length, MSG_NOSIGNAL) !=
-            static_cast<ssize_t>(48 + length)) return false;
+        fake64Write(packet.data() + 48, 1);
+        if (::send(4, packet.constData(), 56 + length, MSG_NOSIGNAL) !=
+            static_cast<ssize_t>(56 + length)) return false;
         offset += length;
     }
     return true;
@@ -918,9 +920,9 @@ int fakeMicrogQmlWorker()
         for (int i = 0; i < 8; ++i)
             channel = (channel << 8) | static_cast<unsigned char>(packet[8 + i]);
         if (type == 2) {
-            char frame[48 + 16];
+            char frame[56 + 16];
             std::memcpy(frame, "MGUI", 4);
-            fake32Write(frame + 4, 1);
+            fake32Write(frame + 4, 2);
             fake64Write(frame + 8, channel);
             fake64Write(frame + 16, 1);
             fake32Write(frame + 24, 2);
@@ -929,8 +931,9 @@ int fakeMicrogQmlWorker()
             fake32Write(frame + 36, 16);
             fake32Write(frame + 40, 0);
             fake32Write(frame + 44, 16);
+            fake64Write(frame + 48, 1);
             for (int i = 0; i < 16; ++i)
-                frame[48 + i] = static_cast<char>(i + 1);
+                frame[56 + i] = static_cast<char>(i + 1);
             if (::send(4, frame, sizeof(frame), MSG_NOSIGNAL) !=
                 static_cast<ssize_t>(sizeof(frame))) return 3;
             if (!fakeSendControl(3, 8, channel)) return 4;
@@ -945,17 +948,19 @@ int fakeMicrogQmlWorker()
             fakeSendControl(3, 5, channel);
             continue;
         }
-        if (!geometryLog.isEmpty() && type == 21 && count == 36) {
+        if (!geometryLog.isEmpty() && type == 21 && count == 44) {
+            if (fake32Read(packet + 28) != 0 || fake32Read(packet + 32) != 1) return 6;
             const quint32 width = fake32Read(packet + 16), height = fake32Read(packet + 20);
             if (!width || width > 2048 || !height || height > 2048) return 6;
             if (qgetenv("ACL_MICROG_SKIP_RESIZE_FRAME").isEmpty() &&
                 !fakeSizedFrame(channel, ++sequence, width, height)) return 7;
             continue;
         }
-        if (!geometryLog.isEmpty() && type == 12 && count == 36) {
+        if (!geometryLog.isEmpty() && type == 12 && count == 44) {
+            if (fake32Read(packet + 28) != 0 || fake32Read(packet + 32) != 1) return 6;
             append(geometryLog, QByteArray::number(fake32Read(packet + 16)) + ' ' +
-                   QByteArray::number(fake32Read(packet + 28)) + ' ' +
-                   QByteArray::number(fake32Read(packet + 32)) + '\n');
+                   QByteArray::number(fake32Read(packet + 36)) + ' ' +
+                   QByteArray::number(fake32Read(packet + 40)) + '\n');
             continue;
         }
         if (count >= 28) continue;

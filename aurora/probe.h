@@ -30,6 +30,7 @@
 #include "apk_bundle_install.h"
 #include "external_apk_install.h"
 #include "microg_install.h"
+#include "shared_microg_module.h"
 #include "official_store_download.h"
 #include "manager_update.h"
 #include "preview_sessions.h"
@@ -86,6 +87,7 @@ class Probe : public QObject
     Q_PROPERTY(bool autoCheckManagerUpdate READ autoCheckManagerUpdate NOTIFY runtimeSettingsChanged)
     Q_PROPERTY(QString runtimeSettingsError READ runtimeSettingsError NOTIFY runtimeSettingsChanged)
     Q_PROPERTY(QString coreLog READ coreLog NOTIFY coreLogChanged)
+    Q_PROPERTY(bool coreLogHasMore READ coreLogHasMore NOTIFY coreLogChanged)
     Q_PROPERTY(bool coreLogAvailable READ coreLogAvailable NOTIFY coreLogChanged)
     Q_PROPERTY(QString logStorageError READ logStorageError NOTIFY coreLogChanged)
     Q_PROPERTY(bool detailedLogEnabled READ detailedLogEnabled NOTIFY detailedLogChanged)
@@ -100,6 +102,7 @@ class Probe : public QObject
     Q_PROPERTY(bool installConfirmationIsBundle READ installConfirmationIsBundle NOTIFY installConfirmationChanged)
 
 public:
+    void setSharedMicrogModuleRoot(const QString &root) { m_sharedMicrogModuleRoot = root; }
     void setEmbeddedMicrog(EmbeddedEndpoint *embedded) { m_embeddedMicrog = embedded; }
     void offerStandaloneInstall(const QString &package, const QString &message)
     {
@@ -274,8 +277,12 @@ public:
             m_microgOpenAfter = false;
             m_microgStatus = message;
             if (installed) {
+                QString moduleError;
+                const bool published = SharedMicrogModule::publish(microgApkPath(), m_sharedMicrogModuleRoot, &moduleError);
                 if (!RuntimeSettings::save(QStringLiteral("googleServices/gmsApkPath"), microgApkPath())) {
                     m_microgStatus = tr("microG was downloaded, but its path could not be saved.");
+                } else if (!published) {
+                    m_microgStatus = tr("microG was installed, but its shared module APK could not be published: %1").arg(moduleError);
                 } else if (open) {
                     if (RuntimeSettings::save(QStringLiteral("googleServices/provider"), QStringLiteral("microg")))
                         launchMicrog(microgApkPath());
@@ -574,6 +581,20 @@ public:
     QString coreLog() const
     {
         return m_detailedLogEnabled ? m_detailedLogText : QString();
+    }
+    bool coreLogHasMore() const { return m_detailedLogEnabled && m_logHasMore; }
+    Q_INVOKABLE void setLogQuery(const QString &query)
+    {
+        if (m_logQuery == query) return;
+        m_logQuery = query;
+        m_logLimit = 200;
+        if (m_detailedLogEnabled) refreshDetailedLog();
+    }
+    Q_INVOKABLE void loadMoreLog()
+    {
+        if (!m_logHasMore || m_logLimit >= 20000) return;
+        m_logLimit += 200;
+        if (m_detailedLogEnabled) refreshDetailedLog();
     }
     QString logStorageError() const { return ErrorLog::persistenceError(); }
     Q_INVOKABLE QString diagnosticReport() const {
@@ -1017,13 +1038,13 @@ private:
     void refreshDetailedLog()
     {
         QString text, error;
-        if (!ErrorLog::detailedReport(&text, &error))
+        bool more = false;
+        if (!ErrorLog::recentLines(m_logQuery, m_logLimit,
+                                   &text, &more, &error))
             text = tr("Could not read the detailed log: %1").arg(error);
-        if (text.size() > 131072)
-            text = tr("[Earlier detailed output is not shown; save or share the log for more.]") +
-                   QLatin1Char('\n') + text.right(131072);
-        if (m_detailedLogText != text) {
+        if (m_detailedLogText != text || m_logHasMore != more) {
             m_detailedLogText = text;
+            m_logHasMore = more;
             emit coreLogChanged();
         }
     }
@@ -1217,6 +1238,7 @@ private:
         emit runtimeSettingsChanged();
     }
     QString m_runtimeSettingsError;
+    QString m_sharedMicrogModuleRoot;
     void clearConfirmation()
     {
         m_externalPrompt = false;
@@ -1347,6 +1369,9 @@ private:
     bool m_reportWebViewAvailable = false;
     QString m_detailedLogError;
     QString m_detailedLogText;
+    QString m_logQuery;
+    int m_logLimit = 200;
+    bool m_logHasMore = false;
     QTimer m_detailedLogTimer;
     QString m_installToken, m_installLabel, m_installPackage;
     QString m_result;

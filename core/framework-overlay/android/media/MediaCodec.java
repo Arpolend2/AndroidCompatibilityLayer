@@ -86,6 +86,7 @@ public final class MediaCodec {
        sixteen with 16 and 17: ArrayIndexOutOfBoundsException, and its next video never played). */
     private boolean mBuffersChanged;
     private boolean mFormatPending, mStartPending;
+    private CodecException mError;
     private int mOutW, mOutH, mRate, mChannels;
     private Callback mCallback; private Handler mCallbackHandler;
     private OnFrameRenderedListener mRendered; private Handler mRenderedHandler;
@@ -176,7 +177,10 @@ public final class MediaCodec {
         }
         for (Integer i : inputs) postInput(gen, i);
     }
-    private void requireRunning() { if (mState != ST_RUNNING) throw new IllegalStateException("not executing (state " + mState + ")"); }
+    private void requireRunning() {
+        if (mState != ST_RUNNING) throw new IllegalStateException("not executing (state " + mState + ")");
+        if (mError != null) throw mError;
+    }
     public int dequeueInputBuffer(long timeoutUs) {
         synchronized (mLock) {
             requireRunning();
@@ -197,13 +201,15 @@ public final class MediaCodec {
     public android.media.Image getInputImage(int i) { return null; }
     public void queueInputBuffer(int index, int offset, int size, long ptsUs, int flags) {
         if (index < 0 || index >= INPUTS) throw new IllegalArgumentException("bad input index " + index);
-        synchronized (mLock) { requireRunning(); }
+        int decodeGeneration;
+        synchronized (mLock) { requireRunning(); decodeGeneration = mGeneration; }
         byte[] data = new byte[Math.max(0, size)];
         if (size > 0) { ByteBuffer d = mInputs[index].duplicate(); d.clear(); d.position(offset); d.get(data, 0, size); }
-        decode(data, size, ptsUs, flags);
+        if (!decode(data, size, ptsUs, flags, decodeGeneration)) return;
         int gen;
         boolean back;
         synchronized (mLock) {
+            if (decodeGeneration != mGeneration || mError != null || mState != ST_RUNNING) return;
             gen = mGeneration;
             back = pendingOutputs() < (mVideo ? PENDING_VIDEO : PENDING_AUDIO);
             if (back) { mFreeInputs.add(index); mLock.notifyAll(); } else mHeldInputs.add(index);
@@ -216,7 +222,7 @@ public final class MediaCodec {
     private void handBack() {
         Integer index; int gen;
         synchronized (mLock) {
-            if (mHeldInputs.isEmpty() || mState != ST_RUNNING || pendingOutputs() >= (mVideo ? PENDING_VIDEO : PENDING_AUDIO)) return;
+            if (mHeldInputs.isEmpty() || mState != ST_RUNNING || mError != null || pendingOutputs() >= (mVideo ? PENDING_VIDEO : PENDING_AUDIO)) return;
             index = mHeldInputs.poll(); gen = mGeneration;
             mFreeInputs.add(index); mLock.notifyAll();
         }
@@ -232,10 +238,26 @@ public final class MediaCodec {
         for (Object o : infos) { BufferInfo b = (BufferInfo) o; queueInputBuffer(index, b.offset, b.size, b.presentationTimeUs, b.flags); }
     }
     public void queueSecureInputBuffers(int index, ArrayDeque infos, ArrayDeque cryptos) { throw new CryptoException(CryptoException.ERROR_UNSUPPORTED_OPERATION, "Megler cannot decrypt protected media"); }
-    private void decode(byte[] data, int size, long pts, int flags) {
-        megler.MediaCodecNative.decode(mNative, data, size, pts, flags);
+    private boolean decode(byte[] data, int size, long pts, int flags, int generation) {
+        if (megler.MediaCodecNative.decode(mNative, data, size, pts, flags) != 0) {
+            CodecException error;
+            int gen;
+            boolean async;
+            synchronized (mLock) {
+                if (generation != mGeneration || mState != ST_RUNNING) return false;
+                if (mError != null) return false;
+                error = mError = new CodecException(0x80001000, "the decoder failed on an input buffer");
+                gen = ++mGeneration;
+                async = mCallback != null;
+                mLock.notifyAll();
+            }
+            if (!async) throw error;
+            postCallback(gen, () -> mCallback.onError(this, error));
+            return false;
+        }
         collect();
         if ((flags & BUFFER_FLAG_END_OF_STREAM) != 0) { Out e = new Out(); e.pts = pts; e.flags = BUFFER_FLAG_END_OF_STREAM; emit(e, false); }
+        return true;
     }
     private void collect() {
         for (;;) {
@@ -264,6 +286,10 @@ public final class MediaCodec {
     private void emit(Out o, boolean formatChanged) {
         int gen; MediaFormat fmt;
         synchronized (mLock) {
+            if (mError != null) {
+                if (o.frame != 0) megler.MediaCodecNative.freeFrame(o.frame);
+                return;
+            }
             int i = 0; while (i < mSlots.length && mSlots[i] != null) i++;
             if (i == mSlots.length) { mSlots = java.util.Arrays.copyOf(mSlots, mSlots.length * 2); if (mCallback == null) mBuffersChanged = true; }
             o.index = i; mSlots[i] = o;
@@ -414,6 +440,7 @@ public final class MediaCodec {
         dropOutputs();
         synchronized (mLock) {
             mFreeInputs.clear(); mHeldInputs.clear(); for (int i = 0; i < INPUTS; i++) mFreeInputs.add(i);
+            mError = null;
             if (mCallback != null) mStartPending = true;
             mLock.notifyAll();
         }
@@ -422,7 +449,7 @@ public final class MediaCodec {
         synchronized (mLock) { if (mState == ST_RELEASED) throw new IllegalStateException(); mGeneration++; }
         if (mNative != 0) megler.MediaCodecNative.flush(mNative);
         dropOutputs();
-        synchronized (mLock) { if (mState == ST_RUNNING) mState = ST_CONFIGURED; mStartPending = false; mLock.notifyAll(); }
+        synchronized (mLock) { if (mState == ST_RUNNING) mState = ST_CONFIGURED; mStartPending = false; mError = null; mLock.notifyAll(); }
     }
     public void reset() {
         stop();

@@ -25,6 +25,8 @@ struct GpuRoot : QSGNode {
     QSGSimpleRectNode *background = new QSGSimpleRectNode;
     QSGClipNode *clip = new QSGClipNode;
     QSGTexture *native = nullptr;
+    quint64 nativeChannel = 0;
+    quint64 nativeGeneration = 0;
     QSGTexture *views = nullptr;
     QSGTexture *canvas = nullptr;
     QPointer<QOpenGLContext> canvasContext;
@@ -223,6 +225,11 @@ bool PreviewGpuState::submitDmaBuf(AuroraDmaBufFrame &&incoming, QObject *notifi
                                    const std::function<void(quint64, bool)> &completion)
 {
     QMutexLocker lock(&mutex);
+    if (dmaBufOwnerRequired && (!dmaBufOwnerChannel ||
+        incoming.channel != dmaBufOwnerChannel || incoming.generation != dmaBufOwnerGeneration)) {
+        failureReason = QStringLiteral("DMA-BUF frame belongs to a different sign-in session");
+        return false;
+    }
     if (dmaBufPending || incoming.id == 0 || !notifier || !completion) {
         failureReason = QStringLiteral("another DMA-BUF frame is still pending");
         return false;
@@ -239,6 +246,18 @@ bool PreviewGpuState::submitDmaBuf(AuroraDmaBufFrame &&incoming, QObject *notifi
         return false;
     }
     return true;
+}
+
+void PreviewGpuState::setDmaBufOwner(quint64 channel, quint64 generation)
+{
+    QMutexLocker lock(&mutex);
+    if (!channel || !generation) channel = generation = 0;
+    if (!dmaBufOwnerRequired || channel != dmaBufOwnerChannel || generation != dmaBufOwnerGeneration) {
+        clearLocked();
+        dmaBufOwnerRequired = true;
+        dmaBufOwnerChannel = channel;
+        dmaBufOwnerGeneration = generation;
+    }
 }
 
 EGLDisplay PreviewGpuState::qtDisplay() const
@@ -738,10 +757,15 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
     if (m_state->dmaBufPending) {
         const quint64 id = m_state->dmaBufFrame.id;
         const bool probeOnly = m_state->dmaBufFrame.probeOnly;
+        const quint64 channel = m_state->dmaBufFrame.channel;
+        const quint64 generation = m_state->dmaBufFrame.generation;
         QString importError;
         GLuint imported = 0;
         GLuint snapshot = 0;
-        if (!context || !context->isOpenGLES() || m_state->consumerDisplay == EGL_NO_DISPLAY) {
+        if (m_state->dmaBufOwnerRequired && (!m_state->dmaBufOwnerChannel ||
+            channel != m_state->dmaBufOwnerChannel || generation != m_state->dmaBufOwnerGeneration)) {
+            importError = QStringLiteral("DMA-BUF frame belongs to a different sign-in session");
+        } else if (!context || !context->isOpenGLES() || m_state->consumerDisplay == EGL_NO_DISPLAY) {
             importError = QStringLiteral("Qt scene graph has no current GLES EGL display");
         } else {
             imported = aurora_import_dma_buf_texture(m_state->dmaBufFrame, m_state->consumerDisplay, &importError);
@@ -775,6 +799,8 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
         } else if (ok) {
             delete root->native;
             root->native = texture;
+            root->nativeChannel = channel;
+            root->nativeGeneration = generation;
             m_state->nativeFrame = true;
             m_state->java = false;
             m_state->canvasMode = false;
@@ -849,6 +875,13 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
         failCapture(QStringLiteral("Qt scene graph did not produce a composed frame"));
         delete root;
         return nullptr;
+    }
+    if (m_state->dmaBufOwnerRequired && root->native &&
+        (!m_state->dmaBufOwnerChannel || root->nativeChannel != m_state->dmaBufOwnerChannel ||
+         root->nativeGeneration != m_state->dmaBufOwnerGeneration)) {
+        delete root->native;
+        root->native = nullptr;
+        m_state->nativeFrame = false;
     }
     if (m_state->java && !m_state->canvasMode && root->viewsRevision != m_state->viewsRevision) {
         QSGTexture *views = window() && !m_state->views.isNull() ?

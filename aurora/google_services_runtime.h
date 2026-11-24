@@ -59,6 +59,28 @@ public:
         return true;
     }
 
+    bool applySharedModule(megler_run_config &run, const QString &path, QString *error = nullptr)
+    {
+        run.gms_apk_path = nullptr;
+        run.gms_splits_dir = nullptr;
+        run.gms_package = nullptr;
+        m_gmsApk.clear();
+        m_gmsPackage.clear();
+        if (error) error->clear();
+        const QFileInfo file(path);
+        QString package;
+        bool isMicroG = false;
+        if (!file.isAbsolute() || file.isSymLink() ||
+            !servicePackage(path, &package, &isMicroG, error))
+            return fail(error, error && !error->isEmpty() ? *error :
+                        QStringLiteral("The shared microG module APK is unavailable."));
+        if (!isMicroG || package != QLatin1String("com.google.android.gms"))
+            return fail(error, QStringLiteral("The shared module APK is not standalone microG."));
+        m_gmsApk = path.toUtf8();
+        run.gms_apk_path = m_gmsApk.constData();
+        return true;
+    }
+
 private:
     static bool fail(QString *error, const QString &message)
     {
@@ -76,15 +98,19 @@ private:
         mg_apk_info info = {};
         if (!mg_apk_read_info(pathBytes.constData(), &info)) {
             const QString detail = QString::fromUtf8(info.error);
+            mg_apk_info_free(&info);
             return fail(error, detail.isEmpty() ? QStringLiteral("Could not inspect a selected Google services APK.")
                                                 : QStringLiteral("Could not inspect a selected Google services APK: %1").arg(detail));
         }
         if (info.split[0] || info.config_for_split[0] || info.feature_split ||
-            info.split_required || info.required_split_types[0])
+            info.split_required || info.required_split_types[0]) {
+            mg_apk_info_free(&info);
             return fail(error, QStringLiteral("Split microG APKs are not supported."));
+        }
 
         *package = QString::fromUtf8(info.package);
         *microG = mg_apk_gms_name(info.package) && mg_apk_is_microg(pathBytes.constData());
+        mg_apk_info_free(&info);
         return true;
     }
 

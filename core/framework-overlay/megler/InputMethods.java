@@ -55,9 +55,25 @@ public final class InputMethods {
     private InputMethods() {}
     public static View focused() { return sFocused; }
     public static boolean shown() { return sShown; }
+    static void resetShared() {
+        if (sShown && allowed(sFocused)) hideAllowed();
+        finish();
+        sShown = false;
+        sAsked = null;
+        sInfo = null;
+    }
+    private static boolean allowed(View view) {
+        return !SharedMicrogWorker.isActive() ||
+            (view != null && ViewRoot.sharedMicrogOwnsInputToken(view.getWindowToken()));
+    }
     public static void focusChanged(View old, View now) {
+        if (SharedMicrogWorker.isActive() && !allowed(now != null ? now : old)) return;
         if (now != null && now.onCheckIsTextEditor()) { start(now); }
-        else if (old != null && old == sFocused) { finish(); hide(); }
+        else if (old != null && old == sFocused) {
+            android.os.IBinder token = old.getWindowToken();
+            finish();
+            hideFromWindow(token);
+        }
     }
     private static void start(View v) {
         if (sFocused == v && sConn != null) return;
@@ -70,9 +86,9 @@ public final class InputMethods {
         sTypedInto = false;
     }
     private static void finish() { if (sConn != null) sConn.finishComposingText(); checkTyped(); sConn = null; sFocused = null; }
-    public static void restart(View v) { if (v == sFocused) { sConn = null; start(v); if (sShown) ask(true); } }
+    public static void restart(View v) { if (allowed(v) && v == sFocused) { sConn = null; start(v); if (sShown) ask(true); } }
     public static boolean show(View v) {
-        if (v == null) return false;
+        if (v == null || !allowed(v)) return false;
         if (v != sFocused) start(v);
         if (sConn == null) return false;
         boolean up = sShown;
@@ -80,7 +96,30 @@ public final class InputMethods {
         ask(up);
         return true;
     }
-    public static boolean hide() { boolean was = sShown; sShown = false; sAsked = null; Native.showKeyboard(false, 0, 0); return was; }
+    public static boolean hide() {
+        if (SharedMicrogWorker.isActive()) return false;
+        return hideAllowed();
+    }
+    public static boolean hide(View view) {
+        if (!allowed(view)) return false;
+        return hideAllowed();
+    }
+    public static boolean hideFromWindow(android.os.IBinder token) {
+        if (SharedMicrogWorker.isActive() && !ViewRoot.sharedMicrogOwnsInputToken(token)) return false;
+        return hideAllowed();
+    }
+    public static void toggleFromWindow(android.os.IBinder token) {
+        if (SharedMicrogWorker.isActive() && !ViewRoot.sharedMicrogOwnsInputToken(token)) return;
+        if (shown()) hideFromWindow(token);
+        else show(focused());
+    }
+    public static void toggle() {
+        if (SharedMicrogWorker.isActive()) return;
+        if (shown()) hide(); else show(focused());
+    }
+    private static boolean hideAllowed() {
+        boolean was = sShown; sShown = false; sAsked = null; Native.showKeyboard(false, 0, 0); return was;
+    }
     /**
      * The host is asked for its keyboard, for the field being edited (`up`: it was up already, as far as is known here). Once
      * more as it is, when it is up for this very connection and kind and the field's selection and length are as the
@@ -111,6 +150,13 @@ public final class InputMethods {
     public static void deliverPending() {
         String[] items = Native.pollText();
         if (items == null) return;
+        deliverItems(items);
+    }
+    static void deliverShared(String item) { deliverItems(new String[] { item }); }
+    static void sharedEnter() {
+        deliverShared(sInfo != null && (sInfo.imeOptions & 0x40000000) != 0 ? "t\n" : "e");
+    }
+    private static void deliverItems(String[] items) {
         for (String it : items) {
             if (it.isEmpty()) continue;
             char k = it.charAt(0);

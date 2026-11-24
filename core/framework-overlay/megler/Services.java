@@ -27,6 +27,86 @@ public final class Services {
     /* The id of the latest start of each of the app's services (postStart). */
     private static final HashMap<String, Integer> sLastStart = new HashMap<>();
     private Services() {}
+    private static SharedMicrogClientRouter sharedRouter(Intent intent) {
+        SharedMicrogClientRouter shared = sSharedMicrogRouter;
+        if (shared == null && SharedMicrogClientStartup.required() &&
+            SharedMicrogClientRouter.targetsSharedMicrog(intent))
+            throw new IllegalStateException("The shared microG client channel is unavailable.");
+        if (shared != null && SharedMicrogClientRouter.targetsSharedMicrog(intent)) {
+            if (!SharedMicrogClientRouter.canRoute(intent))
+                throw new IllegalArgumentException("Unsupported shared microG intent.");
+            return shared;
+        }
+        return null;
+    }
+
+    public static boolean hasSharedMicrogClientRouter(Intent intent) {
+        return sharedRouter(intent) != null;
+    }
+
+    public static boolean sendSharedMicrogBroadcast(Intent intent) {
+        SharedMicrogClientRouter shared = sharedRouter(intent);
+        if (shared == null) return false;
+        shared.sendBroadcast(intent);
+        return true;
+    }
+
+    static void sendSharedMicrogOrderedBroadcast(Intent intent, int code, String data,
+            android.os.Bundle extras, SharedMicrogClientRouter.OrderedResult result) {
+        SharedMicrogClientRouter shared = sharedRouter(intent);
+        if (shared == null) throw new IllegalStateException("The shared microG client channel is unavailable.");
+        shared.sendOrderedBroadcast(intent, code, data, extras, result);
+    }
+
+    public static ContentProvider sharedMicrogProvider(String authority) {
+        SharedMicrogClientRouter shared = sSharedMicrogRouter;
+        if (shared == null) {
+            if (SharedMicrogClientStartup.required())
+                throw new IllegalStateException("The shared microG client channel is unavailable.");
+            return null;
+        }
+        return shared.provider(authority);
+    }
+
+    public static boolean sharedMicrogRequired() { return SharedMicrogClientStartup.required(); }
+
+    public static boolean registerSharedMicrogObserver(android.net.Uri uri, boolean descendants,
+            android.database.ContentObserver observer) {
+        if (uri == null || uri.getAuthority() == null || !uri.getAuthority().startsWith("com.google."))
+            return false;
+        SharedMicrogClientRouter shared = sSharedMicrogRouter;
+        if (shared == null) {
+            if (SharedMicrogClientStartup.required())
+                throw new IllegalStateException("The shared microG client channel is unavailable.");
+            return false;
+        }
+        shared.registerProviderObserver(uri, descendants, observer);
+        return true;
+    }
+
+    public static void unregisterSharedMicrogObserver(android.database.ContentObserver observer) {
+        SharedMicrogClientRouter shared = sSharedMicrogRouter;
+        if (shared != null) shared.unregisterProviderObserver(observer);
+    }
+
+    public static boolean isSharedMicrogAuthority(android.net.Uri uri) {
+        return uri != null && uri.getAuthority() != null && uri.getAuthority().startsWith("com.google.") &&
+            (sSharedMicrogRouter != null || SharedMicrogClientStartup.required());
+    }
+
+    public static java.io.OutputStream openSharedMicrogOutputStream(android.net.Uri uri, String mode)
+            throws java.io.FileNotFoundException {
+        SharedMicrogClientRouter shared = sSharedMicrogRouter;
+        if (shared == null) throw new IllegalStateException("The shared microG client channel is unavailable.");
+        return shared.openProviderOutputStream(uri, mode);
+    }
+
+    public static void notifySharedMicrogChange(android.net.Uri uri, android.database.ContentObserver observer) {
+        SharedMicrogClientRouter shared = sSharedMicrogRouter;
+        if (shared == null) throw new IllegalStateException("The shared microG client channel is unavailable.");
+        shared.notifyProviderChange(uri, observer);
+    }
+
     /** The app's services that are running now (main thread). */
     public static java.util.List<Service> running() {
         synchronized (sRunning) { return new java.util.ArrayList<>(sRunning.values()); }
@@ -67,6 +147,8 @@ public final class Services {
         return m == null ? null : create(m);
     }
     public static ComponentName start(Context from, Intent i) {
+        SharedMicrogClientRouter shared = sharedRouter(i);
+        if (shared != null) return shared.startService(i);
         ComponentName external = MicroG.start(from, i);
         if (external != null) return external;
         Manifest.Component c = find(i);
@@ -110,6 +192,8 @@ public final class Services {
     }
     /* Stopped on the main thread, whichever thread asks, and later, as on Android (megler.MicroG.onMain). */
     public static boolean stop(Intent i) {
+        SharedMicrogClientRouter shared = sharedRouter(i);
+        if (shared != null) return shared.stopService(i);
         if (MicroG.stop(i)) return true;
         Manifest.Component c = find(i);
         if (c == null || !sRunning.containsKey(c.name)) return false;
@@ -139,15 +223,8 @@ public final class Services {
         });
     }
     public static boolean bind(Context from, Intent i, ServiceConnection conn) {
-        SharedMicrogClientRouter shared = sSharedMicrogRouter;
-        if (shared == null && SharedMicrogClientStartup.required() &&
-            SharedMicrogClientRouter.targetsSharedMicrog(i))
-            throw new IllegalStateException("The shared microG client channel is unavailable.");
-        if (shared != null && SharedMicrogClientRouter.targetsSharedMicrog(i)) {
-            if (!SharedMicrogClientRouter.canRoute(i))
-                throw new IllegalArgumentException("Unsupported shared microG bind intent.");
-            return shared.bind(i, conn);
-        }
+        SharedMicrogClientRouter shared = sharedRouter(i);
+        if (shared != null) return shared.bind(i, conn);
         if (MicroG.bind(from, i, conn)) return true;
         final IBinder play = PlayStore.bind(i);
         if (play != null) {

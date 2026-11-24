@@ -8,10 +8,6 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonParseError>
 #include <QLockFile>
 #include <QMutex>
 #include <QMutexLocker>
@@ -55,6 +51,179 @@ QString directory;
 QString recent;
 QString memoryHistory;
 QString memoryDetailed;
+QStringList overlayLines;
+QMap<QString, QString> overlayFragments;
+struct OverlayRule {
+    const char *feature;
+    const char *pattern;
+    const char *display;
+};
+const OverlayRule overlayRules[] = {
+    {"camera-still", "camera: Rockchip front stills use viewfinder JPEG", "Camera: front viewfinder still enabled"},
+    {"camera-still", "camera: viewfinder still JPEG captured", "Camera: front JPEG captured"},
+    {"camera-still", "camera: viewfinder still could not be encoded", "Camera: front JPEG failed"},
+    {"camera-still", "camera: Rockchip front viewfinder JPEG unavailable", "Camera: front JPEG unavailable"},
+    {"system-ca", "ACL CA: system certificate store ready", "CA: system certificates ready"},
+    {"system-ca", "ACL CA: system bundle unavailable", "CA: built-in certificates only"},
+    {"system-ca", "ACL CA: system certificate store failed", "CA: system certificate store failed"},
+    {"codecs", "ACL codec: rockchip mpp library unavailable", "Codec HW: rockchip mpp library unavailable"},
+    {"codecs", "ACL codec: rockchip mpp ABI unavailable", "Codec HW: rockchip mpp ABI unavailable"},
+    {"codecs", "ACL codec: rockchip mpp capability rejected", "Codec HW: rockchip mpp capability rejected"},
+    {"codecs", "ACL codec: rockchip mpp decoder initialized", "Codec HW: rockchip mpp decoder initialized"},
+    {"codecs", "ACL codec: rockchip mpp first picture", "Codec HW: rockchip mpp first picture"},
+    {"codecs", "ACL codec: rockchip mpp initialization failed", "Codec HW: rockchip mpp initialization failed"},
+    {"codecs", "ACL codec: rockchip mpp output timeout setup failed", "Codec HW: rockchip mpp output timeout setup failed"},
+    {"codecs", "ACL codec: rockchip mpp output frame rejected", "Codec HW: rockchip mpp output frame rejected"},
+    {"codecs", "ACL codec: rockchip mpp buffer synchronization failed", "Codec HW: rockchip mpp buffer synchronization failed"},
+    {"codecs", "ACL codec: rockchip mpp dequeue failed", "Codec HW: rockchip mpp dequeue failed"},
+    {"codecs", "ACL codec: rockchip mpp info change failed", "Codec HW: rockchip mpp info change failed"},
+    {"codecs", "ACL codec: rockchip mpp output frame error", "Codec HW: rockchip mpp output frame error"},
+    {"codecs", "ACL codec: rockchip mpp frame release failed", "Codec HW: rockchip mpp frame release failed"},
+    {"codecs", "ACL codec: rockchip mpp packet allocation failed", "Codec HW: rockchip mpp packet allocation failed"},
+    {"codecs", "ACL codec: rockchip mpp queue failed", "Codec HW: rockchip mpp queue failed"},
+    {"codecs", "ACL codec: rockchip mpp drain timeout", "Codec HW: rockchip mpp drain timeout"},
+    {"codecs", "ACL codec: rockchip mpp drain produced no pictures", "Codec HW: rockchip mpp drain produced no pictures"},
+    {"codecs", "ACL codec: rockchip mpp reset failed", "Codec HW: rockchip mpp reset failed"},
+    {"codecs", "ACL codec: hardware replay limit reached", "Codec HW: replay limit reached"},
+    {"codecs", "ACL codec: droidmedia hardware fallback active", "Codec HW: droidmedia fallback active"},
+    {"codecs", "ACL codec: droidmedia decoder or FFmpeg 8 unavailable", "Codec HW: droidmedia decoder or FFmpeg 8 unavailable"},
+    {"codecs", "ACL codec: droidmedia library or ABI unavailable", "Codec HW: droidmedia library or ABI unavailable"},
+    {"codecs", "ACL codec: droidmedia capability check rejected", "Codec HW: droidmedia capability check rejected"},
+    {"codecs", "ACL codec: droidmedia create or configure failed", "Codec HW: droidmedia create or configure failed"},
+    {"codecs", "ACL codec: droidmedia start failed", "Codec HW: droidmedia start failed"},
+    {"codecs", "ACL codec: droidmedia decoder initialization failed", "Codec HW: droidmedia initialization failed"},
+    {"codecs", "ACL codec: droidmedia queue timeout", "Codec HW: droidmedia queue timeout"},
+    {"codecs", "ACL codec: droidmedia queue wait failed", "Codec HW: droidmedia queue wait failed"},
+    {"codecs", "ACL codec: droidmedia queue failed", "Codec HW: droidmedia queue failed"},
+    {"codecs", "ACL codec: droidmedia drain timeout", "Codec HW: droidmedia drain timeout"},
+    {"codecs", "ACL codec: droidmedia drain wait failed", "Codec HW: droidmedia drain wait failed"},
+    {"codecs", "ACL codec: droidmedia drain failed", "Codec HW: droidmedia drain failed"},
+    {"codecs", "ACL codec: droidmedia dequeue failed", "Codec HW: droidmedia dequeue failed"},
+    {"codecs", "Unsupported droidmedia output color format", "Codec HW: droidmedia unsupported output format"},
+    {"codecs", "ACL codec: droidmedia output frame rejected", "Codec HW: droidmedia output frame rejected"},
+    {"codecs", "ACL codec: droidmedia asynchronous error", "Codec HW: droidmedia asynchronous decoder error"},
+    {"codecs", "ACL codec: droidmedia replay limit reached", "Codec HW: droidmedia replay limit reached"},
+    {"codecs", "ACL codec: AAC FFmpeg 62 initialization failed", "Codec AAC: FFmpeg 8 initialization failed"},
+    {"codecs", "ACL codec: AAC FFmpeg 61 initialization failed", "Codec AAC: FFmpeg 7 initialization failed"},
+    {"codecs", "ACL codec: video FFmpeg 62 initialization failed", "Codec video: FFmpeg 8 initialization failed"},
+    {"codecs", "ACL codec: video FFmpeg 61 initialization failed", "Codec video: FFmpeg 7 initialization failed"},
+    {"codecs", "AndroidCompatibilityLayer audio codec: decoder initialization failed", "Codec: decoder initialization failed"},
+    {"codecs", "droidmedia disabled after a stop failure", "Codec HW: droidmedia disabled after stop failure"},
+    {"codecs", "cannot start bounded droidmedia stop", "Codec HW: droidmedia stop worker unavailable"},
+    {"droidmedia", "droidmedia started:", "droidmedia started"},
+    {"droidmedia", "droidmedia stop timed out; disabling hardware decoder for this process", "droidmedia stop timed out; disabling hardware decoder for this process"},
+    {"droidmedia", "droidmedia.*(?:fail|error|timeout|timed out|fallback)", "droidmedia: error, timeout or fallback"},
+    {"codecs", "ACL codec: first hardware picture", "ACL codec: first hardware picture"},
+    {"codecs", "ACL codec: video software decoder selected", "ACL codec: video software decoder selected"},
+    {"codecs", "ACL codec: video software fallback active", "ACL codec: video software fallback active"},
+    {"codecs", "media: extractor: 0 compressed tracks", "Media extractor: no compressed tracks"},
+    {"codecs", "media: extractor: [1-9][0-9]* compressed tracks", "Media extractor: compressed tracks available"},
+    {"codecs", "(?:codec|decoder|encoder).*(?:(?<!\\b0 )fail|error|timeout|timed out|fallback|unavailable)|(?:fallback|timeout).*(?:codec|decoder|encoder)", "codec: error, timeout or fallback"},
+    {"gpu-canvas", "Experimental GPU Canvas active", "GPU Canvas active"},
+    {"gpu-canvas", "Experimental GPU presentation active; Qt consumed an EGLImage", "GPU presentation active: Qt consumed an EGLImage"},
+    {"gpu-canvas", "Experimental GPU Canvas unavailable; using the CPU Canvas fallback", "GPU Canvas unavailable: CPU fallback"},
+    {"gpu-canvas", "GPU Canvas falling back to CPU: could not create a complete color-filter framebuffer", "GPU Canvas CPU fallback: color-filter framebuffer"},
+    {"gpu-canvas", "GPU Canvas falling back to CPU: could not create a complete framebuffer", "GPU Canvas CPU fallback: framebuffer"},
+    {"gpu-canvas", "GPU Canvas falling back to CPU: shared OpenGL context is unavailable", "GPU Canvas CPU fallback: shared context unavailable"},
+    {"gpu-canvas", "GPU Canvas falling back to CPU: bitmap exceeds the GPU's maximum texture size", "GPU Canvas CPU fallback: texture too large"},
+    {"gpu-canvas", "GPU Canvas falling back to CPU: GPU bitmap allocation or upload failed", "GPU Canvas CPU fallback: bitmap allocation or upload"},
+    {"gpu-canvas", "Experimental GPU Canvas presentation failed", "GPU Canvas presentation failed: CPU fallback"},
+    {"gpu-canvas", "GPU Canvas.*(?:capture|import).*native EGL texture", "GPU Canvas: native EGL texture capture/import error"},
+    {"gpu-canvas", "GPU Canvas EGL.*(?:fail|cannot|unavailable)", "GPU Canvas: EGL capability error"},
+    {"gpu-canvas", "java:.*(?:no EGL|no OpenGL ES .*context|surface could be made|context was lost)", "Android EGL: context or surface error"},
+    {"gpu-canvas", "java: the shell did not take an OpenGL ES frame", "Android GL: CPU composition fallback"},
+    {"google-login-gpu", "WebView GPU: native EGL texture capture ready", "WebView GPU: capture ready"},
+    {"google-login-gpu", "WebView GPU: native EGL texture capture unavailable; software fallback", "WebView GPU: software fallback"},
+    {"google-login-frames", "Shared microG UI frame ready:", "Shared microG UI frame ready"},
+    {"google-login-frames", "Shared microG frame suppressed: window ownership is unavailable", "Shared microG frame suppressed: window ownership is unavailable"},
+    {"google-login-frames", "Shared microG UI cleanup is blocked; sign-in remains reserved", "Shared microG UI cleanup is blocked; sign-in remains reserved"},
+    {"ordered-broadcasts", "Shared microG client ordered broadcast received", "Shared microG client ordered broadcast received"},
+    {"ordered-broadcasts", "ordered broadcast.*(?:fail|error|closed|lost|reject|invalid|unavailable|pending|could not)", "microG: ordered broadcast error"},
+    {"microg-bridge", "Binder bridge disconnected:", "Binder bridge disconnected"},
+    {"microg-bridge", "Shared microG provider stream transfer failed:", "Shared microG provider stream transfer failed"},
+    {"microg-fd", "Shared microG Binder descriptors sent", "Shared microG Binder descriptors sent"},
+    {"microg-fd", "Shared microG Binder descriptors received", "Shared microG Binder descriptors received"},
+    {"microg-fd", "(?:microg|binder|parcel|bridge).*(?:\\bfd\\b|file descriptor)|(?:\\bfd\\b|file descriptor).*(?:microg|binder|parcel|bridge)", "microG: file descriptor / bridge"},
+    {"google-login", "Shared microG client account result: success", "Shared microG client account result: success"},
+    {"google-login", "Shared microG client account result: cancelled", "Shared microG client account result: cancelled"},
+    {"google-login", "Shared microG client account result: failed", "Shared microG client account result: failed"},
+    {"google-login", "Shared microG client channel ready\\.", "Google / microG: client channel ready"},
+    {"google-login", "Shared microG client channel open failed\\.", "Google / microG: client channel open failed"},
+    {"microg-tls-module", "Shared microG module APK ready\\.", "microG module: APK ready"},
+    {"microg-tls-module", "Shared microG module APK unavailable:", "microG module: APK unavailable"},
+    {"google-login", "GmsClient: unable to connect to service:", "Google / microG: GMS service connection failed"},
+    {"google-login", "ServiceBindIntentUtils: Dynamic intent resolution failed:", "Google / microG: dynamic service resolution failed"},
+    {"google-login", "DynamiteModule: Invalid GmsCore APK, remote loading disabled\\.", "Google / microG: GMS module package unavailable"},
+    {"google-login", "Shared microG service bind failed\\.|Shared microG rejected the bind transaction\\.", "Google / microG: bind failed"},
+    {"google-login", "Shared microG service binding refused: service unavailable or not public", "Google / microG: service unavailable or private"},
+    {"google-login", "Shared Google account service unavailable|Shared account service unavailable|Shared microG client bootstrap is unavailable", "Google / microG: account bridge unavailable"},
+    {"google-login", "The shared microG worker is unavailable\\.|Shared microG backend unavailable:", "Google / microG: worker unavailable"},
+    {"google-login", "Shared microG client startup is unavailable\\.|Shared microG descriptor is unavailable\\.", "Google / microG: client startup unavailable"},
+    {"google-login", "Shared microG client router is closed\\.|Shared microG client channel is closed\\.|Account channel closed", "Google / microG: client channel closed"},
+    {"google-login", "Google account is unavailable", "Google / microG: requested account unavailable"},
+    {"google-login", "Another Google sign-in is active or the account screen is unavailable", "Google / microG: sign-in busy or screen unavailable"},
+    {"google-login", "Shared microG account screen launch failed|starting shared microG activity failed", "Google / microG: sign-in screen launch failed"},
+    {"google-login", "Account request timed out|Shared microG account outcome: operation=[235] outcome=TIMEOUT\\b", "Google / microG: account request timeout"},
+    {"google-login", "Shared microG account outcome: operation=3 outcome=ERROR\\b", "Google / microG: auth token request failed"},
+    {"google-login", "Shared microG account outcome: operation=2 outcome=ERROR\\b", "Google / microG: add account request failed"},
+    {"google-login", "Shared microG client account callback failed", "Google / microG: account callback failed"},
+    {"google-login", "checkin: Google Play services has no Android ID after [0-9]+ ms", "Google / microG: check-in timed out"},
+    {"notifications", "System notification service is unavailable", "Android notification: D-Bus unavailable"},
+    {"notifications", "System notification permission denied", "Android notification: permission denied"},
+    {"notifications", "System notification post failed", "Android notification: post failed"},
+    {"notifications", "System notification update failed", "Android notification: update failed"},
+    {"notifications", "System notification cancellation failed\\.|notification cancellation failed", "Android notification: cancel failed"},
+    {"notifications", "notification delivery failed", "Android notification: post/update failed"},
+    {"notifications", "Android notification limit reached\\.", "Android notification: limit reached"},
+    {"notifications", "ACL notification: posted", "Android notification: posted"},
+    {"notifications", "ACL notification: removed", "Android notification: removed"},
+    {"background", "ACL background: job started", "Background job: started"},
+    {"background", "ACL background: job finished", "Background job: finished"},
+    {"background", "ACL background: job stopped", "Background job: cancelled by app"},
+    {"background", "ACL background: job failed", "Background job: failed"},
+    {"background", "ACL background: WorkManager job started", "WorkManager job: started"},
+    {"background", "ACL background: WorkManager job finished", "WorkManager job: finished"},
+    {"background", "ACL background: WorkManager job stopped", "WorkManager job: finished"},
+    {"background", "ACL background: alarm scheduled", "Alarm: scheduled"},
+    {"background", "ACL background: alarm fired", "Alarm: fired"},
+    {"background", "ACL background: alarm failed", "Alarm: failed"},
+    {"background", "ACL background: foreground service started", "Foreground service: started"},
+    {"background", "ACL background: foreground service stopped", "Foreground service: finished"},
+    {"crashes-and-bridges", "fatal|crash|sigsegv|sigabrt|segmentation fault|uncaught exception|(?:bridge|microg).*(?:fail|error|timeout|timed out|disconnect)", "Crash or bridge error"}
+};
+void appendOverlayLine(const QString &line)
+{
+    const QString trimmed = line.left(4096).trimmed();
+    if (trimmed.isEmpty()) return;
+    static const QVector<QRegularExpression> patterns = []() {
+        QVector<QRegularExpression> result;
+        for (const OverlayRule &rule : overlayRules)
+            result.append(QRegularExpression(QString::fromLatin1(rule.pattern),
+                                             QRegularExpression::CaseInsensitiveOption));
+        return result;
+    }();
+    for (int i = 0; i < patterns.size(); ++i) {
+        if (!patterns.at(i).match(trimmed).hasMatch()) continue;
+        overlayLines.append(QString::fromLatin1(overlayRules[i].display));
+        while (overlayLines.size() > 6) overlayLines.removeFirst();
+        return;
+    }
+}
+
+void appendOverlay(const QString &source, const QString &message)
+{
+    const bool stream = source.endsWith(QLatin1String("stdout")) ||
+                        source.endsWith(QLatin1String("stderr"));
+    QString text = stream ? overlayFragments.take(source) + message : message;
+    const QStringList lines = text.split(QLatin1Char('\n'));
+    const int complete = stream && !text.endsWith(QLatin1Char('\n')) ? lines.size() - 1 : lines.size();
+    for (int i = 0; i < complete; ++i) appendOverlayLine(lines.at(i));
+    if (complete < lines.size()) {
+        if (!overlayFragments.contains(source) && overlayFragments.size() >= 32)
+            overlayFragments.erase(overlayFragments.begin());
+        overlayFragments.insert(source, lines.last().right(4096));
+    }
+}
 std::atomic<bool> memoryDetailedEnabled(false);
 std::atomic<bool> memoryDetailedPaused(false);
 bool initialized = false;
@@ -97,6 +266,8 @@ struct StorageWorker {
 } storageWorker;
 StorageWorker standaloneFileWorker;
 std::atomic<bool> standaloneFileBusy(false);
+StorageWorker standaloneSnapshotWorker;
+std::atomic<bool> standaloneSnapshotBusy(false);
 QString standaloneFilePath;
 QString standaloneFileError;
 struct Snapshot {
@@ -304,7 +475,7 @@ QString newStandaloneInstanceId()
 
 bool validStandaloneFileName(const QString &fileName, QString *instance)
 {
-    static const QRegularExpression pattern(QStringLiteral("\\Astandalone-([0-9a-f]{32})\\.json\\z"));
+    static const QRegularExpression pattern(QStringLiteral("\\Astandalone-([0-9a-f]{32})\\.log\\z"));
     const QRegularExpressionMatch match = pattern.match(fileName);
     if (!match.hasMatch()) return false;
     if (instance) *instance = match.captured(1);
@@ -550,10 +721,6 @@ bool writeStandaloneFile(int directoryFd, const QString &fileName, const QByteAr
         }
         offset += int(count);
     }
-    if (ok && ::fsync(fd) < 0) {
-        ok = false;
-        if (error) *error = QString::fromLocal8Bit(std::strerror(errno));
-    }
     const int closeResult = ::close(fd);
     if (ok && closeResult < 0) {
         ok = false;
@@ -561,10 +728,6 @@ bool writeStandaloneFile(int directoryFd, const QString &fileName, const QByteAr
     }
     const QByteArray nativeName = QFile::encodeName(fileName);
     if (ok && ::renameat(directoryFd, nativeTemporary.constData(), directoryFd, nativeName.constData()) < 0) {
-        ok = false;
-        if (error) *error = QString::fromLocal8Bit(std::strerror(errno));
-    }
-    if (ok && ::fsync(directoryFd) < 0) {
         ok = false;
         if (error) *error = QString::fromLocal8Bit(std::strerror(errno));
     }
@@ -603,25 +766,112 @@ bool removeStandaloneFile(int directoryFd, const QString &fileName, QString *err
     return true;
 }
 
+QByteArray escapeStandaloneField(const QString &text)
+{
+    QByteArray bytes = text.toUtf8();
+    QByteArray escaped;
+    escaped.reserve(bytes.size());
+    for (const char character : bytes) {
+        if (character == '\\') escaped += "\\\\";
+        else if (character == '\n') escaped += "\\n";
+        else if (character == '\r') escaped += "\\r";
+        else if (character == '\t') escaped += "\\t";
+        else escaped += character;
+    }
+    return escaped;
+}
+
+QString unescapeStandaloneField(const QByteArray &bytes)
+{
+    QByteArray plain;
+    plain.reserve(bytes.size());
+    for (int i = 0; i < bytes.size(); ++i) {
+        const char character = bytes.at(i);
+        if (character != '\\' || i + 1 >= bytes.size()) {
+            plain += character;
+            continue;
+        }
+        const char next = bytes.at(++i);
+        plain += next == 'n' ? '\n' : next == 'r' ? '\r' : next == 't' ? '\t' : next;
+    }
+    return QString::fromUtf8(plain);
+}
+
+// Append-only standalone log: one header line, then one line per event ("E") or drop count ("D").
+QByteArray standaloneHeaderLine(const QString &instance, const QString &applicationId)
+{
+    return "ACL-STANDALONE-LOG\t2\t" + instance.toUtf8() + '\t' + applicationId.toUtf8() + '\n';
+}
+
+QByteArray standaloneEventLine(const StandaloneEvent &event)
+{
+    return "E\t" + QByteArray::number(event.sequence) + '\t' + event.time.toUtf8() + '\t' +
+           event.source.toUtf8() + '\t' + (event.error ? '1' : '0') + '\t' +
+           escapeStandaloneField(event.message) + '\n';
+}
+
+QByteArray standaloneDroppedLine(quint64 dropped)
+{
+    return "D\t" + QByteArray::number(dropped) + '\n';
+}
+
 QByteArray serializeStandaloneSnapshot(const StandaloneSnapshot &snapshot)
 {
-    QJsonObject root;
-    root.insert(QStringLiteral("version"), 1);
-    root.insert(QStringLiteral("instance"), snapshot.instance);
-    root.insert(QStringLiteral("applicationId"), snapshot.applicationId);
-    root.insert(QStringLiteral("dropped"), QString::number(snapshot.dropped));
-    QJsonArray events;
-    for (const StandaloneEvent &event : snapshot.events) {
-        QJsonObject item;
-        item.insert(QStringLiteral("sequence"), QString::number(event.sequence));
-        item.insert(QStringLiteral("time"), event.time);
-        item.insert(QStringLiteral("source"), event.source);
-        item.insert(QStringLiteral("message"), event.message);
-        item.insert(QStringLiteral("error"), event.error);
-        events.append(item);
+    QByteArray contents = standaloneHeaderLine(snapshot.instance, snapshot.applicationId);
+    if (snapshot.dropped) contents += standaloneDroppedLine(snapshot.dropped);
+    for (const StandaloneEvent &event : snapshot.events) contents += standaloneEventLine(event);
+    return contents;
+}
+
+bool parseStandaloneHeader(const QByteArray &line, const QString &expectedInstance, QString *applicationId)
+{
+    const QList<QByteArray> fields = line.split('\t');
+    if (fields.size() != 4 || fields.at(0) != "ACL-STANDALONE-LOG" || fields.at(1) != "2" ||
+        QString::fromUtf8(fields.at(2)) != expectedInstance)
+        return false;
+    *applicationId = QString::fromUtf8(fields.at(3));
+    return validStandaloneApplicationId(*applicationId);
+}
+
+// Parses complete lines from start; returns the offset after the last complete line.
+// An unfinished trailing line is left for the next read.
+int parseStandaloneLines(const QByteArray &bytes, int start, quint64 *lastSequence,
+                         QVector<StandaloneEvent> *events, quint64 *dropped)
+{
+    static const QRegularExpression sourcePattern(QStringLiteral("\\A[A-Za-z0-9_. -]{1,128}\\z"));
+    int offset = start;
+    while (offset < bytes.size()) {
+        const int end = bytes.indexOf('\n', offset);
+        if (end < 0) break;
+        const QByteArray line = bytes.mid(offset, end - offset);
+        offset = end + 1;
+        const QList<QByteArray> fields = line.split('\t');
+        if (fields.size() == 2 && fields.at(0) == "D") {
+            bool ok = false;
+            const quint64 count = fields.at(1).toULongLong(&ok);
+            if (ok) *dropped += qMin(count, std::numeric_limits<quint64>::max() - *dropped);
+            continue;
+        }
+        bool sequenceOk = false;
+        const quint64 sequence = fields.size() == 6 ? fields.at(1).toULongLong(&sequenceOk) : 0;
+        const QString time = sequenceOk ? QString::fromUtf8(fields.at(2)) : QString();
+        const QString source = sequenceOk ? QString::fromUtf8(fields.at(3)) : QString();
+        if (fields.at(0) != "E" || !sequenceOk || sequence <= *lastSequence || time.size() > 40 ||
+            !QDateTime::fromString(time, Qt::ISODate).isValid() ||
+            !sourcePattern.match(source).hasMatch() || (fields.at(4) != "0" && fields.at(4) != "1")) {
+            if (*dropped != std::numeric_limits<quint64>::max()) ++*dropped;
+            continue;
+        }
+        *lastSequence = sequence;
+        QString message = unescapeStandaloneField(fields.at(5));
+        if (message.size() > MaxStandaloneMessageChars) message.truncate(MaxStandaloneMessageChars);
+        events->append(StandaloneEvent{sequence, time, source, message, fields.at(4) == "1"});
+        if (events->size() > MaxStandaloneSnapshotEvents) {
+            events->removeFirst();
+            if (*dropped != std::numeric_limits<quint64>::max()) ++*dropped;
+        }
     }
-    root.insert(QStringLiteral("events"), events);
-    return QJsonDocument(root).toJson(QJsonDocument::Compact);
+    return offset;
 }
 
 bool parseStandaloneSnapshot(const QByteArray &contents, const QString &fileName,
@@ -634,54 +884,17 @@ bool parseStandaloneSnapshot(const QByteArray &contents, const QString &fileName
         if (error) *error = QStringLiteral("Invalid standalone snapshot.");
         return false;
     }
-    QJsonParseError parseError;
-    const QJsonDocument document = QJsonDocument::fromJson(contents, &parseError);
-    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-        if (error) *error = QStringLiteral("Standalone snapshot is not valid JSON.");
-        return false;
-    }
-    const QJsonObject root = document.object();
-    const QString instance = root.value(QStringLiteral("instance")).toString();
-    const QString applicationId = root.value(QStringLiteral("applicationId")).toString();
-    bool droppedOk = false;
-    const quint64 dropped = root.value(QStringLiteral("dropped")).toString().toULongLong(&droppedOk);
-    const QJsonArray events = root.value(QStringLiteral("events")).toArray();
-    if (root.value(QStringLiteral("version")).toInt(-1) != 1 || instance != expectedInstance ||
-        !validStandaloneApplicationId(applicationId) || !droppedOk ||
-        events.size() > MaxStandaloneSnapshotEvents) {
+    const int headerEnd = contents.indexOf('\n');
+    StandaloneSnapshot parsed;
+    if (headerEnd < 0 ||
+        !parseStandaloneHeader(contents.left(headerEnd), expectedInstance, &parsed.applicationId)) {
         if (error) *error = QStringLiteral("Standalone snapshot metadata is invalid.");
         return false;
     }
-    static const QRegularExpression sourcePattern(QStringLiteral("\\A[A-Za-z0-9_. -]{1,128}\\z"));
-    quint64 previousSequence = 0;
-    StandaloneSnapshot parsed;
     parsed.fileName = fileName;
-    parsed.instance = instance;
-    parsed.applicationId = applicationId;
-    parsed.dropped = dropped;
-    parsed.events.reserve(events.size());
-    for (const QJsonValue &value : events) {
-        if (!value.isObject()) {
-            if (error) *error = QStringLiteral("Standalone snapshot contains an invalid event.");
-            return false;
-        }
-        const QJsonObject item = value.toObject();
-        bool sequenceOk = false;
-        const quint64 sequence = item.value(QStringLiteral("sequence")).toString().toULongLong(&sequenceOk);
-        const QString time = item.value(QStringLiteral("time")).toString();
-        const QString source = item.value(QStringLiteral("source")).toString();
-        const QString message = item.value(QStringLiteral("message")).toString();
-        if (!sequenceOk || sequence <= previousSequence || time.size() > 40 ||
-            !QDateTime::fromString(time, Qt::ISODate).isValid() ||
-            !sourcePattern.match(source).hasMatch() || message.size() > MaxStandaloneMessageChars ||
-            !item.value(QStringLiteral("error")).isBool()) {
-            if (error) *error = QStringLiteral("Standalone snapshot contains an invalid event.");
-            return false;
-        }
-        previousSequence = sequence;
-        parsed.events.append(StandaloneEvent{sequence, time, source, message,
-                                              item.value(QStringLiteral("error")).toBool()});
-    }
+    parsed.instance = expectedInstance;
+    quint64 lastSequence = 0;
+    parseStandaloneLines(contents, headerEnd + 1, &lastSequence, &parsed.events, &parsed.dropped);
     *snapshot = parsed;
     return true;
 }
@@ -892,17 +1105,6 @@ QString composeDetailedReport(const QString &managerText, const QVector<Standalo
     return manager + standalone;
 }
 
-QByteArray serializeWriterSnapshot(const QString &instance, const QString &applicationId,
-                                   const QVector<StandaloneEvent> &events, quint64 dropped)
-{
-    StandaloneSnapshot snapshot;
-    snapshot.instance = instance;
-    snapshot.applicationId = applicationId;
-    snapshot.events = events;
-    snapshot.dropped = dropped;
-    return serializeStandaloneSnapshot(snapshot);
-}
-
 bool flushStandaloneWriter()
 {
     QString path;
@@ -945,7 +1147,7 @@ bool flushStandaloneWriter()
         standaloneWriter.error = QString::fromLocal8Bit(std::strerror(errno));
         return false;
     }
-    const QString fileName = QStringLiteral("standalone-%1.json").arg(instance);
+    const QString fileName = QStringLiteral("standalone-%1.log").arg(instance);
     QString error;
     const int lockFd = lockStandaloneSnapshot(directoryFd, fileName, &error);
     if (lockFd == -2) {
@@ -958,25 +1160,19 @@ bool flushStandaloneWriter()
         standaloneWriter.error = error;
         return false;
     }
-    QByteArray existingBytes;
-    bool exists = false;
-    StandaloneSnapshot snapshot;
-    bool ok = readStandaloneFile(directoryFd, fileName, &existingBytes, &exists, &error);
-    if (ok && exists) {
-        ok = parseStandaloneSnapshot(existingBytes, fileName, &snapshot, &error);
-        if (ok && snapshot.applicationId != applicationId) {
-            ok = false;
-            error = QStringLiteral("Standalone snapshot application identity does not match.");
-        }
-        if (ok && !snapshot.events.isEmpty() && !pending.isEmpty() &&
-            pending.first().sequence <= snapshot.events.last().sequence) {
-            ok = false;
-            error = QStringLiteral("Standalone snapshot sequence is inconsistent.");
-        }
-    } else if (ok) {
-        snapshot.fileName = fileName;
-        snapshot.instance = instance;
-        snapshot.applicationId = applicationId;
+    const QByteArray nativeName = QFile::encodeName(fileName);
+    QByteArray payload;
+    if (pendingDropped) payload += standaloneDroppedLine(pendingDropped);
+    for (const StandaloneEvent &event : pending) payload += standaloneEventLine(event);
+    struct stat status;
+    const bool exists = ::fstatat(directoryFd, nativeName.constData(), &status, AT_SYMLINK_NOFOLLOW) == 0;
+    bool ok = exists || errno == ENOENT;
+    if (!ok) error = QString::fromLocal8Bit(std::strerror(errno));
+    if (ok && exists && (!S_ISREG(status.st_mode) || status.st_nlink != 1)) {
+        ok = false;
+        error = QStringLiteral("Standalone snapshot is not an ordinary file.");
+    }
+    if (ok && !exists) {
         QVector<QString> names;
         if (!standaloneSnapshotNames(directoryFd, &names, &error)) {
             ok = false;
@@ -984,34 +1180,56 @@ bool flushStandaloneWriter()
             ok = false;
             error = QStringLiteral("Standalone snapshot limit reached.");
         }
-    }
-    if (ok) {
-        snapshot.events += pending;
-        const quint64 available = std::numeric_limits<quint64>::max() - snapshot.dropped;
-        snapshot.dropped += qMin(available, pendingDropped);
-        qint64 reportBytes = 0;
-        for (const StandaloneEvent &event : snapshot.events)
-            reportBytes += standalonePendingEventBytes(event);
-        while (reportBytes > MaxReportBytes || snapshot.events.size() > MaxStandaloneSnapshotEvents) {
-            const StandaloneEvent removed = dropStandaloneEvent(&snapshot.events);
-            reportBytes -= standalonePendingEventBytes(removed);
-            if (snapshot.dropped != std::numeric_limits<quint64>::max()) ++snapshot.dropped;
+        payload.prepend(standaloneHeaderLine(instance, applicationId));
+    } else if (ok && qint64(status.st_size) + payload.size() > MaxReportBytes) {
+        // Rare compaction: keep the newest half so the file stays bounded.
+        QByteArray existingBytes;
+        bool present = false;
+        StandaloneSnapshot snapshot;
+        ok = readStandaloneFile(directoryFd, fileName, &existingBytes, &present, &error);
+        if (ok && present) ok = parseStandaloneSnapshot(existingBytes, fileName, &snapshot, &error);
+        if (ok && present && snapshot.applicationId != applicationId) {
+            ok = false;
+            error = QStringLiteral("Standalone snapshot application identity does not match.");
         }
-        QByteArray contents;
-        while (true) {
-            contents = serializeStandaloneSnapshot(snapshot);
-            if (contents.size() <= MaxStandaloneSnapshotBytes) break;
-            if (snapshot.events.isEmpty()) {
-                ok = false;
-                error = QStringLiteral("Standalone snapshot metadata exceeds its safe limits.");
-                break;
-            }
-            for (int i = 0; i < 64 && !snapshot.events.isEmpty(); ++i) {
-                dropStandaloneEvent(&snapshot.events);
+        if (ok) {
+            snapshot.instance = instance;
+            snapshot.applicationId = applicationId;
+            qint64 bytes = 0;
+            for (const StandaloneEvent &event : snapshot.events) bytes += standaloneEventLine(event).size();
+            while (bytes > MaxReportBytes / 2 && !snapshot.events.isEmpty()) {
+                bytes -= standaloneEventLine(dropStandaloneEvent(&snapshot.events)).size();
                 if (snapshot.dropped != std::numeric_limits<quint64>::max()) ++snapshot.dropped;
             }
+            ok = writeStandaloneFile(directoryFd, fileName, serializeStandaloneSnapshot(snapshot), &error);
         }
-        if (ok) ok = writeStandaloneFile(directoryFd, fileName, contents, &error);
+    }
+    if (ok) {
+        const int fd = ::openat(directoryFd, nativeName.constData(),
+                                O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644);
+        struct stat opened;
+        if (fd < 0 || ::fstat(fd, &opened) < 0 || !S_ISREG(opened.st_mode) || opened.st_nlink != 1) {
+            ok = false;
+            error = fd < 0 ? QString::fromLocal8Bit(std::strerror(errno))
+                           : QStringLiteral("Standalone snapshot is not an ordinary file.");
+        }
+        int offset = 0;
+        while (ok && offset < payload.size()) {
+            const ssize_t count = ::write(fd, payload.constData() + offset, size_t(payload.size() - offset));
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) {
+                ok = false;
+                error = QString::fromLocal8Bit(std::strerror(errno));
+                // Do not leave a partial line behind.
+                if (::ftruncate(fd, opened.st_size) < 0) {}
+                break;
+            }
+            offset += int(count);
+        }
+        if (fd >= 0 && ::close(fd) < 0 && ok) {
+            ok = false;
+            error = QString::fromLocal8Bit(std::strerror(errno));
+        }
     }
     ::flock(lockFd, LOCK_UN);
     ::close(lockFd);
@@ -1187,7 +1405,7 @@ bool loadSnapshot(const QString &path, Snapshot *state, QString *error)
                 return false;
             }
             stream >> sequence;
-            if (!validStandaloneFileName(QStringLiteral("standalone-%1.json").arg(instance), nullptr) ||
+            if (!validStandaloneFileName(QStringLiteral("standalone-%1.log").arg(instance), nullptr) ||
                 state->standaloneExported.contains(instance) || stream.status() != QDataStream::Ok) {
                 *error = QStringLiteral("Invalid log snapshot; the original was preserved.");
                 return false;
@@ -1330,21 +1548,19 @@ void flushStandaloneFile()
     if (standaloneFilePath.isEmpty() || !ErrorLog::detailedCaptureEnabled() ||
         standaloneFileBusy.load(std::memory_order_acquire)) return;
     if (standaloneFileWorker.thread.joinable()) standaloneFileWorker.thread.join();
-    QString text, error;
-    if (!ErrorLog::detailedReport(&text, &error)) {
-        QMutexLocker lock(&mutex);
-        standaloneFileError = error;
-        return;
-    }
     const QString path = standaloneFilePath;
     standaloneFileBusy.store(true, std::memory_order_release);
-    standaloneFileWorker.thread = std::thread([path, text]() {
-        QSaveFile file(path);
-        const QByteArray contents = text.toUtf8();
-        const bool ok = file.open(QIODevice::WriteOnly) &&
-            file.setPermissions(QFile::ReadOwner | QFile::WriteOwner) &&
-            file.write(contents) == contents.size() && file.commit();
-        const QString error = ok ? QString() : file.errorString();
+    standaloneFileWorker.thread = std::thread([path]() {
+        QString text, error;
+        bool ok = ErrorLog::detailedReport(&text, &error);
+        if (ok) {
+            QSaveFile file(path);
+            const QByteArray contents = text.toUtf8();
+            ok = file.open(QIODevice::WriteOnly) &&
+                file.setPermissions(QFile::ReadOwner | QFile::WriteOwner) &&
+                file.write(contents) == contents.size() && file.commit();
+            if (!ok) error = file.errorString();
+        }
         {
             QMutexLocker lock(&mutex);
             standaloneFileError = error;
@@ -1384,6 +1600,7 @@ void ErrorLog::record(const QString &source, const QString &message, bool error)
     }
     RecordingGuard guard;
     QMutexLocker lock(&mutex);
+    if (detailedCaptureEnabled()) appendOverlay(source, message);
     if (standaloneSnapshotMode) {
         if (!MemoryLogBus::clientDetailedEnabled()) {
             appendStandaloneRepeatSummary();
@@ -1441,6 +1658,17 @@ void ErrorLog::record(const QString &source, const QString &message, bool error)
         if (cut < recent.size() && recent.at(cut).isLowSurrogate()) ++cut;
         recent.remove(0, cut);
     }
+}
+
+QString ErrorLog::overlayText()
+{
+    QMutexLocker lock(&mutex);
+    if (!detailedCaptureEnabled()) {
+        overlayLines.clear();
+        overlayFragments.clear();
+        return QString();
+    }
+    return overlayLines.join(QLatin1Char('\n'));
 }
 
 QString ErrorLog::displayText()
@@ -1502,6 +1730,10 @@ bool ErrorLog::setDetailedPaused(bool paused)
     QMutexLocker lock(&mutex);
     if (!memoryDetailedEnabled) return false;
     memoryDetailedPaused.store(paused, std::memory_order_relaxed);
+    if (paused) {
+        overlayLines.clear();
+        overlayFragments.clear();
+    }
     return true;
 }
 
@@ -1515,6 +1747,8 @@ bool ErrorLog::setDetailedEnabled(bool enabled, QString *error)
         memoryHistory.clear();
         recent.clear();
         memoryDetailed.clear();
+        overlayLines.clear();
+        overlayFragments.clear();
         remoteHistory.clear();
         rejectedRemoteEvents = 0;
         memoryDetailedEnabled = enabled;
@@ -1543,6 +1777,8 @@ bool ErrorLog::clearCurrentLog(QString *error)
         memoryHistory.clear();
         recent.clear();
         memoryDetailed.clear();
+        overlayLines.clear();
+        overlayFragments.clear();
         remoteHistory.clear();
         rejectedRemoteEvents = 0;
         changed();
@@ -1556,6 +1792,224 @@ bool ErrorLog::clearCurrentLog(QString *error)
             *error = storageError;
             return false;
         }
+    }
+    return true;
+}
+
+namespace {
+// Cached newest part of each append-only standalone log; only new bytes are read on refresh.
+struct StandaloneTail {
+    quint64 device = 0;
+    quint64 inode = 0;
+    qint64 offset = 0;
+    quint64 lastSequence = 0;
+    bool headerRead = false;
+    QString label;
+    QVector<QString> keys;
+    QVector<QString> lines;
+    qint64 chars = 0;
+};
+const qint64 MaxStandaloneTailChars = MaxReportBytes / 4;
+QMutex standaloneTailMutex;
+QMap<QString, StandaloneTail> standaloneTails;
+
+bool readRange(int fd, qint64 offset, qint64 size, QByteArray *bytes)
+{
+    bytes->resize(int(size));
+    qint64 done = 0;
+    while (done < size) {
+        const ssize_t count = ::pread(fd, bytes->data() + done, size_t(size - done), off_t(offset + done));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        done += count;
+    }
+    bytes->resize(int(done));
+    return done > 0;
+}
+
+void refreshStandaloneTails()
+{
+    QString path;
+    {
+        QMutexLocker lock(&mutex);
+        path = sharedStandaloneDirectory;
+    }
+    if (path.isEmpty()) {
+        standaloneTails.clear();
+        return;
+    }
+    const int directoryFd = ::open(QFile::encodeName(path).constData(),
+                                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (directoryFd < 0) return;
+    QVector<QString> names;
+    QString issue;
+    if (!standaloneSnapshotNames(directoryFd, &names, &issue)) {
+        ::close(directoryFd);
+        return;
+    }
+    if (names.size() > MaxStandaloneSnapshots) names.resize(MaxStandaloneSnapshots);
+    for (auto it = standaloneTails.begin(); it != standaloneTails.end();)
+        it = names.contains(it.key()) ? std::next(it) : standaloneTails.erase(it);
+    for (const QString &name : names) {
+        QString instance;
+        validStandaloneFileName(name, &instance);
+        const int fd = ::openat(directoryFd, QFile::encodeName(name).constData(),
+                                O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+        if (fd < 0) continue;
+        struct stat status;
+        if (::fstat(fd, &status) < 0 || !S_ISREG(status.st_mode) || status.st_nlink != 1) {
+            ::close(fd);
+            continue;
+        }
+        StandaloneTail &tail = standaloneTails[name];
+        if (tail.device != quint64(status.st_dev) || tail.inode != quint64(status.st_ino) ||
+            qint64(status.st_size) < tail.offset) {
+            tail = StandaloneTail();
+            tail.device = quint64(status.st_dev);
+            tail.inode = quint64(status.st_ino);
+        }
+        if (!tail.headerRead) {
+            QByteArray head;
+            const int headerEnd = readRange(fd, 0, qMin<qint64>(status.st_size, 512), &head)
+                ? head.indexOf('\n') : -1;
+            QString applicationId;
+            if (headerEnd < 0 || !parseStandaloneHeader(head.left(headerEnd), instance, &applicationId)) {
+                ::close(fd);
+                continue;
+            }
+            tail.headerRead = true;
+            tail.offset = headerEnd + 1;
+            tail.label = applicationId.mid(applicationId.lastIndexOf(QLatin1Char('.')) + 1);
+        }
+        qint64 start = tail.offset;
+        const bool skipPartial = qint64(status.st_size) - start > MaxStandaloneTailChars;
+        if (skipPartial) start = qint64(status.st_size) - MaxStandaloneTailChars;
+        QByteArray bytes;
+        if (qint64(status.st_size) > start && readRange(fd, start, qint64(status.st_size) - start, &bytes)) {
+            int first = 0;
+            if (skipPartial) first = bytes.indexOf('\n') + 1;
+            QVector<StandaloneEvent> events;
+            quint64 dropped = 0;
+            const int consumed = first > 0 || !skipPartial
+                ? parseStandaloneLines(bytes, first, &tail.lastSequence, &events, &dropped) : 0;
+            tail.offset = start + consumed;
+            for (const StandaloneEvent &event : events) {
+                const QString line = QStringLiteral("[%1 UTC] [%2] [%3]%4 %5")
+                    .arg(event.time, tail.label, safeSnapshotText(event.source),
+                         event.error ? QStringLiteral(" error") : QString(),
+                         safeSnapshotText(event.message));
+                tail.keys.append(event.time);
+                tail.lines.append(line);
+                tail.chars += line.size();
+            }
+            int remove = 0;
+            while (tail.chars > MaxStandaloneTailChars && remove < tail.lines.size())
+                tail.chars -= tail.lines.at(remove++).size();
+            if (remove) {
+                tail.keys.remove(0, remove);
+                tail.lines.remove(0, remove);
+            }
+        }
+        ::close(fd);
+    }
+    ::close(directoryFd);
+}
+
+// Returns the newest remaining entry of a manager text, newest line first.
+bool previousManagerEntry(const QString &text, int *end, QString *key, QStringList *lines)
+{
+    lines->clear();
+    key->clear();
+    while (*end > 0) {
+        if (text.at(*end - 1) == QLatin1Char('\n')) --*end;
+        if (*end <= 0) break;
+        const int start = text.lastIndexOf(QLatin1Char('\n'), *end - 1) + 1;
+        const QString line = text.mid(start, *end - start);
+        *end = start;
+        if (!line.trimmed().isEmpty()) lines->append(line);
+        const int close = line.startsWith(QLatin1Char('[')) ? line.indexOf(QLatin1String(" UTC]")) : -1;
+        if (close > 1 && close <= 41) {
+            *key = line.mid(1, close - 1);
+            return true;
+        }
+    }
+    return !lines->isEmpty();
+}
+}
+
+bool ErrorLog::recentLines(const QString &query, int maxLines, QString *text, bool *more,
+                           QString *error)
+{
+    if (!text || !more || !error) return false;
+    text->clear();
+    error->clear();
+    *more = false;
+    QMutexLocker tailLock(&standaloneTailMutex);
+    {
+        QMutexLocker lock(&mutex);
+        if (!memoryDetailedEnabled && !MemoryLogBus::clientDetailedEnabled()) {
+            *error = QStringLiteral("Detailed logging is not enabled.");
+            return false;
+        }
+    }
+    refreshStandaloneTails();
+    QMutexLocker lock(&mutex);
+    if (!storageError.isEmpty())
+        *text += QStringLiteral("[Automatic log storage failed; recent events may be lost.]\n");
+    struct Cursor {
+        const QString *text = nullptr;
+        int end = 0;
+        const StandaloneTail *tail = nullptr;
+        int index = 0;
+        bool valid = false;
+        QString key;
+        QStringList lines;
+    };
+    QVector<Cursor> cursors;
+    const auto addText = [&](const QString &source) {
+        Cursor cursor;
+        cursor.text = &source;
+        cursor.end = source.size();
+        cursors.append(cursor);
+    };
+    addText(memoryDetailed);
+    for (auto it = remoteHistory.constBegin(); it != remoteHistory.constEnd(); ++it)
+        addText(it.value().detailed);
+    for (auto it = standaloneTails.constBegin(); it != standaloneTails.constEnd(); ++it) {
+        Cursor cursor;
+        cursor.tail = &it.value();
+        cursor.index = it.value().lines.size() - 1;
+        cursors.append(cursor);
+    }
+    const auto advance = [](Cursor &cursor) {
+        if (cursor.text) {
+            cursor.valid = previousManagerEntry(*cursor.text, &cursor.end, &cursor.key, &cursor.lines);
+        } else {
+            cursor.valid = cursor.index >= 0;
+            if (!cursor.valid) return;
+            cursor.key = cursor.tail->keys.at(cursor.index);
+            cursor.lines = QStringList() << cursor.tail->lines.at(cursor.index);
+            --cursor.index;
+        }
+    };
+    for (Cursor &cursor : cursors) advance(cursor);
+    int count = 0;
+    while (true) {
+        Cursor *newest = nullptr;
+        for (Cursor &cursor : cursors)
+            if (cursor.valid && (!newest || cursor.key > newest->key)) newest = &cursor;
+        if (!newest) break;
+        for (const QString &line : newest->lines) {
+            if (!query.isEmpty() && !line.contains(query, Qt::CaseInsensitive)) continue;
+            if (count >= maxLines) {
+                *more = true;
+                return true;
+            }
+            *text += line;
+            *text += QLatin1Char('\n');
+            ++count;
+        }
+        advance(*newest);
     }
     return true;
 }
@@ -1906,8 +2360,16 @@ bool ErrorLog::startStandaloneSnapshots(const QString &sharedRoot, const QString
         return false;
     }
     QTimer *timer = new QTimer(QCoreApplication::instance());
-    timer->setInterval(500);
-    QObject::connect(timer, &QTimer::timeout, timer, []() { ErrorLog::flushStandaloneSnapshots(); });
+    timer->setInterval(2000);
+    QObject::connect(timer, &QTimer::timeout, timer, []() {
+        if (standaloneSnapshotBusy.load(std::memory_order_acquire)) return;
+        if (standaloneSnapshotWorker.thread.joinable()) standaloneSnapshotWorker.thread.join();
+        standaloneSnapshotBusy.store(true, std::memory_order_release);
+        standaloneSnapshotWorker.thread = std::thread([]() {
+            flushStandaloneWriter();
+            standaloneSnapshotBusy.store(false, std::memory_order_release);
+        });
+    });
     QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, []() {
         finishCoreChannel();
         ErrorLog::flushStandaloneSnapshots();
@@ -1918,6 +2380,7 @@ bool ErrorLog::startStandaloneSnapshots(const QString &sharedRoot, const QString
 
 bool ErrorLog::flushStandaloneSnapshots()
 {
+    if (standaloneSnapshotWorker.thread.joinable()) standaloneSnapshotWorker.thread.join();
     return flushStandaloneWriter();
 }
 

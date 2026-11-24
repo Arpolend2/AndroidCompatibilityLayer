@@ -855,7 +855,7 @@ public class TextView extends View implements ViewTreeObserver.OnPreDrawListener
         if (action == EditorInfo.IME_ACTION_NEXT) { View v = focusSearch(FOCUS_FORWARD); if (v != null && v.requestFocus(FOCUS_FORWARD)) return; }
         if (action == EditorInfo.IME_ACTION_PREVIOUS) { View v = focusSearch(FOCUS_BACKWARD); if (v != null && v.requestFocus(FOCUS_BACKWARD)) return; }
         if (action == EditorInfo.IME_ACTION_DONE || action == EditorInfo.IME_ACTION_GO || action == EditorInfo.IME_ACTION_SEND || action == EditorInfo.IME_ACTION_SEARCH || action == EditorInfo.IME_ACTION_NEXT) {
-            megler.InputMethods.hide();
+            megler.InputMethods.hide(this);
             if (action != EditorInfo.IME_ACTION_DONE) {
                 long t = android.os.SystemClock.uptimeMillis();
                 // the enter key the action stands for, as Android sends it to a single-line field
@@ -1014,7 +1014,7 @@ public class TextView extends View implements ViewTreeObserver.OnPreDrawListener
     }
     public void setPrecomputedText(Object p) { setText(p instanceof CharSequence ? (CharSequence) p : String.valueOf(p)); }
     public float getLineSpacingExtraMegler() { return mSpacingAdd; }
-    public void setEnabled(boolean e) { super.setEnabled(e); if (!e && megler.InputMethods.focused() == this) megler.InputMethods.hide(); }
+    public void setEnabled(boolean e) { super.setEnabled(e); if (!e && megler.InputMethods.focused() == this) megler.InputMethods.hide(this); }
     public boolean extractText(ExtractedTextRequest r, ExtractedText out) { out.text = mText; out.selectionStart = getSelectionStart(); out.selectionEnd = getSelectionEnd(); return true; }
     public void setExtractedText(ExtractedText t) { setText(t.text); }
     public void setTextAppearanceMegler(int r) { setTextAppearance(r); }

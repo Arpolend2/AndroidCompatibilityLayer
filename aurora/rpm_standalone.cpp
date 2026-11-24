@@ -153,7 +153,7 @@ QByteArray RpmStandalone::cacheFingerprint(const QString &package, const QString
     if (privateData.isEmpty())
         privateData = QDir(appDir.canonicalFilePath()).filePath(QStringLiteral("data"));
     QCryptographicHash hash(QCryptographicHash::Sha256);
-    for (const QByteArray &value : {QByteArray("standalone-rpm-cache-v3"), managerVersion.toUtf8(),
+    for (const QByteArray &value : {QByteArray("standalone-rpm-cache-v4"), managerVersion.toUtf8(),
          package.toUtf8(), label.toUtf8(),
          abi.toUtf8(), RuntimeSettings::selectedLocale().toUtf8(), RuntimeSettings::theme().toUtf8(),
          RuntimeSettings::location().toUtf8(), QJsonDocument(QJsonArray::fromStringList(denied)).toJson(QJsonDocument::Compact),
@@ -355,9 +355,7 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
     title.replace(QRegularExpression(QStringLiteral("[\\r\\n\\t]+")), QStringLiteral(" "));
     if (title.isEmpty()) title = package;
     title = title.left(512);
-    const bool sharedMicrog = package != QLatin1String("com.google.android.gms") &&
-        QSettings().value(QStringLiteral("googleServices/provider"), QStringLiteral("none")).toString() ==
-            QLatin1String("microg");
+    const bool sharedMicrog = package != QLatin1String("com.google.android.gms");
     QJsonObject metadata;
     metadata.insert(QStringLiteral("appId"), appId);
     metadata.insert(QStringLiteral("sharedRuntimeAbi"), runtimeVersion);

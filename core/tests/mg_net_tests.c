@@ -20,8 +20,10 @@
 #include "../src/bionic/mg_net.h"
 #include "../src/mg_base.h"
 #include "../src/host/mg_host.h"
+#include "../src/drivers/mg_java.h"
 
 #if !defined(_WIN32) && !defined(MG_CORE_ELF)
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -973,6 +975,17 @@ static void test_unix(void)
     CHECK(N.socketpair(AF_UNIX_, SOCK_STREAM_, 0, sv) == 0);
     CHECK(N.write(sv[0], "ping", 4) == 4 && N.read(sv[1], buf, sizeof(buf)) == 4 && !memcmp(buf, "ping", 4));
     CHECK(N.send(sv[1], "pong", 4, 0) == 4 && N.recv(sv[0], buf, sizeof(buf), 0) == 4 && !memcmp(buf, "pong", 4));
+    memset(&m, 0, sizeof(m));
+    iov.base = (void *)"x";
+    iov.len = 1;
+    m.iov = &iov;
+    m.iovlen = 1;
+    m.control = st;
+    m.controllen = sizeof(st);
+    CHECK(N.sendmsg(sv[0], &m, 0) == -1 && err() == GE_OPNOTSUPP);
+    m.control = NULL;
+    CHECK(N.sendmsg(sv[0], &m, 0) == -1 && err() == GE_FAULT);
+    CHECK(N.recv(sv[1], buf, sizeof(buf), MSG_DONTWAIT_) == -1 && err() == GE_AGAIN);
     memset(st, 0, sizeof(st));
     CHECK(N.fstat(sv[0], st) == 0 && (mg_rd32(st + ST_MODE_AT) & S_IFMT_) == S_IFSOCK_);
     len = 4;
@@ -1579,9 +1592,16 @@ static MG_HOSTCB void import_late_write(void *arg)
     write(*fd, "host", 4);
 }
 
+static MG_HOSTCB void guest_pipe_late_write(void *arg)
+{
+    int *fd = (int *)arg;
+    mg_sleep_ns(80000000ull);
+    mg_fd_write(*fd, "p", 1);
+}
+
 static void test_import_unix_stream(void)
 {
-    int pair[2], bad[2], guest, flags;
+    int pair[2], bad[2], guest, flags, native;
     char buf[8];
     mg_pollfd p;
     mg_thread *writer;
@@ -1651,14 +1671,196 @@ static void test_import_unix_stream(void)
         guest = mg_net_import_unix_stream(pair[0]);
         CHECK(guest >= 0);
         if (guest >= 0) {
+            native = mg_net_dup_native_unix_stream(guest);
+            CHECK(native >= 0 && (fcntl(native, F_GETFD) & FD_CLOEXEC));
             CHECK_INT(N.close(guest), 0);
-            CHECK_INT(write(pair[0], "x", 1), 1);
-            CHECK_INT(read(pair[1], buf, sizeof(buf)), 1);
-            CHECK(buf[0] == 'x');
+            close(pair[0]);
+            pair[0] = -1;
+            if (native >= 0) {
+                CHECK_INT(write(native, "x", 1), 1);
+                CHECK_INT(read(pair[1], buf, sizeof(buf)), 1);
+                CHECK(buf[0] == 'x');
+                close(native);
+            }
         }
-        close(pair[0]);
+        if (pair[0] >= 0) close(pair[0]);
         close(pair[1]);
     } else CHECK(false);
+}
+#endif
+
+#if !defined(_WIN32) && !defined(MG_CORE_ELF)
+static void test_regular_fd_transfer(void)
+{
+    FILE *file = tmpfile();
+    int guest, exported, pipes[2], pipeResult;
+    char data[4] = {0};
+    say("network: native regular descriptors retain their open file and offset");
+    CHECK(file != NULL);
+    if (!file) return;
+    CHECK(write(fileno(file), "abcd", 4) == 4);
+    CHECK(lseek(fileno(file), 1, SEEK_SET) == 1);
+    guest = mg_fd_import_native_regular(fileno(file));
+    CHECK(guest >= 0);
+    if (guest >= 0) {
+        exported = mg_fd_dup_native_regular(guest);
+        CHECK(exported >= 0 && (fcntl(exported, F_GETFD) & FD_CLOEXEC));
+        CHECK(fclose(file) == 0);
+        CHECK(mg_fd_read(guest, data, 1) == 1 && data[0] == 'b');
+        CHECK(exported >= 0 && read(exported, data, 1) == 1 && data[0] == 'c');
+        CHECK(mg_fd_seek(guest, 0, 0) == 0);
+        CHECK(mg_fd_close(guest) == 0);
+        CHECK(exported >= 0 && read(exported, data, 1) == 1 && data[0] == 'a');
+        if (exported >= 0) close(exported);
+    } else fclose(file);
+    CHECK(mg_fd_import_native_regular(-1) == -1 && err() == GE_BADF);
+    CHECK(mg_fd_dup_native_regular(-1) == -1 && err() == GE_BADF);
+    pipeResult = N.pipe2(pipes, 0);
+    CHECK(pipeResult == 0);
+    if (pipeResult == 0) {
+        CHECK(mg_fd_dup_native_regular(pipes[0]) == -1 && err() == GE_OPNOTSUPP);
+        N.close(pipes[0]); N.close(pipes[1]);
+    }
+    pipeResult = pipe(pipes);
+    CHECK(pipeResult == 0);
+    if (pipeResult == 0) {
+        CHECK(mg_fd_import_native_regular(pipes[0]) == -1 && err() == GE_OPNOTSUPP);
+        close(pipes[0]); close(pipes[1]);
+    }
+}
+
+static void test_fd_transport(void)
+{
+    int pair[2], stream[2], outgoing, incoming[MG_JAVA_FD_MAX], count = 0, virtualPipe[2], hostPipe[2], hostSocket[2];
+    FILE *file;
+    char ch;
+    mg_pollfd watched;
+    mg_thread *writer;
+    say("network: Unix stream ancillary marker carries guest descriptors");
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) { CHECK(false); return; }
+    stream[0] = mg_net_import_unix_stream(pair[0]);
+    stream[1] = mg_net_import_unix_stream(pair[1]);
+    CHECK(stream[0] >= 0 && stream[1] >= 0);
+    close(pair[0]); close(pair[1]);
+    if (stream[0] < 0 || stream[1] < 0) {
+        if (stream[0] >= 0) mg_fd_close(stream[0]);
+        if (stream[1] >= 0) mg_fd_close(stream[1]);
+        return;
+    }
+    file = tmpfile();
+    CHECK(file != NULL);
+    if (file) {
+        CHECK(write(fileno(file), "abc", 3) == 3);
+        CHECK(lseek(fileno(file), 1, SEEK_SET) == 1);
+        outgoing = mg_fd_import_native_regular(fileno(file));
+        CHECK(outgoing >= 0);
+        if (outgoing >= 0) {
+            CHECK(mg_java_fd_send_marker(stream[0], &outgoing, 1) == 0);
+            CHECK(mg_java_fd_receive_marker(stream[1], incoming, &count) == 1 && count == 1);
+            if (count == 1) {
+                CHECK(mg_fd_read(incoming[0], &ch, 1) == 1 && ch == 'b');
+                CHECK(mg_fd_read(outgoing, &ch, 1) == 1 && ch == 'c');
+                mg_fd_close(incoming[0]);
+            }
+            mg_fd_close(outgoing);
+        }
+        fclose(file);
+    }
+    CHECK(mg_java_fd_send_marker(stream[0], NULL, 0) == 0);
+    CHECK(mg_java_fd_receive_marker(stream[1], incoming, &count) == 1 && count == 0);
+    if (N.pipe2(virtualPipe, 0) == 0) {
+        CHECK(mg_java_fd_send_marker(stream[0], virtualPipe, 1) == -1 && err() == GE_OPNOTSUPP);
+        N.close(virtualPipe[0]); N.close(virtualPipe[1]);
+    } else CHECK(false);
+    if (mg_java_fd_create_pipe(hostPipe) == 0) {
+        CHECK(mg_java_fd_send_marker(stream[0], &hostPipe[1], 1) == 0);
+        CHECK(mg_java_fd_receive_marker(stream[1], incoming, &count) == 1 && count == 1);
+        mg_fd_close(hostPipe[1]);
+        if (count == 1) {
+            writer = mg_thread_start(guest_pipe_late_write, incoming, 128 * 1024, "fd-pipe");
+            CHECK(writer != NULL);
+            watched.fd = hostPipe[0]; watched.events = POLLIN_; watched.revents = 0;
+            if (writer) {
+                CHECK(mg_fd_poll(&watched, 1, 2000) == 1 && (watched.revents & POLLIN_));
+                mg_thread_join(writer);
+                CHECK(mg_fd_read(hostPipe[0], &ch, 1) == 1 && ch == 'p');
+            }
+            CHECK(N.fcntl(hostPipe[0], F_SETFL_, O_NONBLOCK_) == 0);
+            CHECK(mg_fd_read(hostPipe[0], &ch, 1) == -1 && err() == GE_AGAIN);
+            mg_fd_close(hostPipe[0]);
+            CHECK(mg_fd_write(incoming[0], "p", 1) == -1 && err() == GE_PIPE);
+            mg_fd_close(incoming[0]);
+        } else mg_fd_close(hostPipe[0]);
+    } else CHECK(false);
+    if (mg_java_fd_create_socketpair(SOCK_SEQPACKET, hostSocket) == 0) {
+        CHECK(mg_java_fd_send_marker(stream[0], &hostSocket[0], 1) == 0);
+        CHECK(mg_java_fd_receive_marker(stream[1], incoming, &count) == 1 && count == 1);
+        mg_fd_close(hostSocket[0]);
+        if (count == 1) {
+            char packet[4];
+            CHECK(mg_fd_write(incoming[0], "abc", 3) == 3);
+            CHECK(mg_fd_write(incoming[0], "de", 2) == 2);
+            CHECK(mg_fd_read(hostSocket[1], packet, 2) == 2 && !memcmp(packet, "ab", 2));
+            CHECK(mg_fd_read(hostSocket[1], packet, 2) == 2 && !memcmp(packet, "de", 2));
+            CHECK(N.shutdown(incoming[0], SHUT_WR_) == 0);
+            CHECK(mg_fd_read(hostSocket[1], packet, 2) == 0);
+            mg_fd_close(incoming[0]);
+        }
+        mg_fd_close(hostSocket[1]);
+    } else CHECK(false);
+    mg_fd_close(stream[0]);
+    CHECK(mg_java_fd_receive_marker(stream[1], incoming, &count) == 0);
+    mg_fd_close(stream[1]);
+}
+
+static int host_fd_count(void)
+{
+    DIR *dir = opendir("/proc/self/fd");
+    struct dirent *entry;
+    int count = 0;
+    if (!dir) return -1;
+    while ((entry = readdir(dir)) != NULL)
+        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) ++count;
+    closedir(dir);
+    return count;
+}
+
+static void test_fd_transport_truncated(void)
+{
+    union { struct cmsghdr align; char data[CMSG_SPACE((MG_JAVA_FD_MAX + 1) * sizeof(int))]; } control;
+    struct msghdr msg;
+    struct cmsghdr *cmsg;
+    struct iovec iov;
+    int pair[2], stream, native[MG_JAVA_FD_MAX + 1], incoming[MG_JAVA_FD_MAX], count, before, i;
+    FILE *file;
+    char marker = 0;
+    say("network: truncated ancillary data closes installed descriptors");
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) { CHECK(false); return; }
+    stream = mg_net_import_unix_stream(pair[1]);
+    close(pair[1]);
+    CHECK(stream >= 0);
+    file = tmpfile();
+    CHECK(file != NULL);
+    if (stream < 0 || !file) goto done;
+    for (i = 0; i <= MG_JAVA_FD_MAX; ++i) native[i] = fileno(file);
+    memset(&msg, 0, sizeof(msg));
+    memset(&control, 0, sizeof(control));
+    iov.iov_base = &marker; iov.iov_len = 1;
+    msg.msg_iov = &iov; msg.msg_iovlen = 1;
+    msg.msg_control = control.data; msg.msg_controllen = sizeof(control.data);
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET; cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(native));
+    memcpy(CMSG_DATA(cmsg), native, sizeof(native));
+    CHECK(sendmsg(pair[0], &msg, 0) == 1);
+    before = host_fd_count();
+    CHECK(before >= 0);
+    CHECK(mg_java_fd_receive_marker(stream, incoming, &count) == -1 && count == 0);
+    CHECK_INT(host_fd_count(), before);
+done:
+    if (file) fclose(file);
+    if (stream >= 0) mg_fd_close(stream);
+    close(pair[0]);
 }
 #endif
 
@@ -1676,6 +1878,9 @@ int mg_net_tests_run(mg_test_sink sink, void *user, int *checks)
     }
 #if !defined(_WIN32) && !defined(MG_CORE_ELF)
     test_import_unix_stream();
+    test_regular_fd_transfer();
+    test_fd_transport();
+    test_fd_transport_truncated();
 #endif
     /*
      * A phone may refuse an app its own loopback. There it is said once, and

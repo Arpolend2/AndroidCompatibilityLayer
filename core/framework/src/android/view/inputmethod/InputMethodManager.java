@@ -8,10 +8,10 @@ public final class InputMethodManager {
         RESULT_SHOWN = 2, RESULT_HIDDEN = 3;
     public boolean showSoftInput(View v, int flags) { return megler.InputMethods.show(v); }
     public boolean showSoftInput(View v, int flags, android.os.ResultReceiver r) { boolean s = megler.InputMethods.show(v); if (r != null) r.send(s ? RESULT_SHOWN : RESULT_UNCHANGED_SHOWN, null); return s; }
-    public boolean hideSoftInputFromWindow(android.os.IBinder token, int flags) { return megler.InputMethods.hide(); }
-    public boolean hideSoftInputFromWindow(android.os.IBinder token, int flags, android.os.ResultReceiver r) { boolean h = megler.InputMethods.hide(); if (r != null) r.send(h ? RESULT_HIDDEN : RESULT_UNCHANGED_HIDDEN, null); return h; }
-    public void toggleSoftInput(int show, int hide) { if (megler.InputMethods.shown()) megler.InputMethods.hide(); else megler.InputMethods.show(megler.InputMethods.focused()); }
-    public void toggleSoftInputFromWindow(android.os.IBinder token, int show, int hide) { toggleSoftInput(show, hide); }
+    public boolean hideSoftInputFromWindow(android.os.IBinder token, int flags) { return megler.InputMethods.hideFromWindow(token); }
+    public boolean hideSoftInputFromWindow(android.os.IBinder token, int flags, android.os.ResultReceiver r) { boolean h = megler.InputMethods.hideFromWindow(token); if (r != null) r.send(h ? RESULT_HIDDEN : RESULT_UNCHANGED_HIDDEN, null); return h; }
+    public void toggleSoftInput(int show, int hide) { megler.InputMethods.toggle(); }
+    public void toggleSoftInputFromWindow(android.os.IBinder token, int show, int hide) { megler.InputMethods.toggleFromWindow(token); }
     public boolean isActive() { return megler.InputMethods.focused() != null; }
     public boolean isActive(View v) { return megler.InputMethods.focused() == v; }
     public boolean isAcceptingText() { return megler.InputMethods.shown(); }

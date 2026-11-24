@@ -9,26 +9,66 @@ extern "C" {
 }
 
 #include <QDebug>
+#include <QDir>
 #include <QLibrary>
+
+#if defined(ACL_FFMPEG_8) && !defined(ACL_FFMPEG8_TEST_DIRECTORY)
+#include <auroraapp.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <limits>
 #include <memory>
 #include <vector>
 
+#if defined(ACL_FFMPEG_8)
+#if LIBAVCODEC_VERSION_MAJOR != 62 || LIBAVUTIL_VERSION_MAJOR != 60
+#error The FFmpeg 8 bridge requires libavcodec 62 and libavutil 60 headers.
+#endif
+#define ACL_AVCODEC_MAJOR 62
+#define ACL_AVUTIL_MAJOR 60
+#define ACL_CODEC_CALLBACKS auroraAudioCodec8Callbacks
+#define ACL_CODEC_DRAIN_CHECKED auroraAudioCodec8DrainChecked
+#else
 #if LIBAVCODEC_VERSION_MAJOR != 61 || LIBAVUTIL_VERSION_MAJOR != 59
-#error This bridge requires FFmpeg 7 libavcodec 61 and libavutil 59 headers.
+#error The FFmpeg 7 bridge requires libavcodec 61 and libavutil 59 headers.
+#endif
+#define ACL_AVCODEC_MAJOR 61
+#define ACL_AVUTIL_MAJOR 59
+#define ACL_CODEC_CALLBACKS auroraAudioCodec7Callbacks
+#define ACL_CODEC_DRAIN_CHECKED auroraAudioCodec7DrainChecked
 #endif
 
 namespace {
 
+#if defined(ACL_FFMPEG_8)
+int droidMediaBackend;
+#endif
+
 struct AvApi {
+#if defined(ACL_FFMPEG_8)
+    static QString privateLibrary(const char *name)
+    {
+#ifdef ACL_FFMPEG8_TEST_DIRECTORY
+        const QString root = QStringLiteral(ACL_FFMPEG8_TEST_DIRECTORY);
+#else
+        const QString root = Aurora::Application::organizationPathTo(
+            QStringLiteral("appmanager/ffmpeg8")).toLocalFile();
+#endif
+        return root.isEmpty() ? QString() : QDir(root).filePath(QString::fromLatin1(name));
+    }
+    QLibrary codec{privateLibrary("libavcodec-acl.so.62")};
+    QLibrary util{privateLibrary("libavutil-acl.so.60")};
+#else
     QLibrary codec{QStringLiteral("avcodec"), 61};
     QLibrary util{QStringLiteral("avutil"), 59};
+#endif
     decltype(&avcodec_version) version = nullptr;
+    decltype(&avutil_version) utilVersion = nullptr;
     decltype(&avcodec_find_decoder_by_name) find = nullptr;
     decltype(&avcodec_alloc_context3) alloc = nullptr;
     decltype(&avcodec_open2) open = nullptr;
@@ -48,7 +88,10 @@ struct AvApi {
 
     AvApi()
     {
+        codec.setLoadHints(QLibrary::DeepBindHint);
+        util.setLoadHints(QLibrary::DeepBindHint);
 #define LOAD(lib, member, name) member = reinterpret_cast<decltype(member)>(lib.resolve(#name))
+        LOAD(util, utilVersion, avutil_version);
         LOAD(codec, version, avcodec_version);
         LOAD(codec, find, avcodec_find_decoder_by_name);
         LOAD(codec, alloc, avcodec_alloc_context3);
@@ -66,10 +109,12 @@ struct AvApi {
         LOAD(util, frameUnref, av_frame_unref);
         LOAD(util, mallocz, av_mallocz);
 #undef LOAD
-        ready = version && (version() >> 16) == 61 && find && alloc && open && freeContext &&
+        ready = version && (version() >> 16) == ACL_AVCODEC_MAJOR && utilVersion &&
+                (utilVersion() >> 16) == ACL_AVUTIL_MAJOR && find && alloc && open && freeContext &&
                 send && receive && flush && packetAlloc && packetFree && newPacket &&
                 packetUnref && frameAlloc && frameFree && frameUnref && mallocz;
-        if (!ready) qWarning() << "AndroidCompatibilityLayer audio codec: FFmpeg 7 libraries or required symbols unavailable";
+        if (!ready) qWarning() << "AndroidCompatibilityLayer audio codec: FFmpeg" << ACL_AVCODEC_MAJOR
+                               << "libraries or required symbols unavailable";
     }
 };
 
@@ -97,6 +142,7 @@ struct Decoder {
     AVPacket *packet = nullptr;
     AVFrame *frame = nullptr;
     int kind = 0;
+    bool hardware = false;
     std::deque<Sound> ready;
     std::deque<Picture> readyPictures;
     Sound current;
@@ -113,18 +159,28 @@ struct Decoder {
     }
 };
 
-bool MEGLER_CB supports(void *, int kind)
+bool MEGLER_CB supports(void *user, int kind)
 {
     AvApi &a = api();
+#if defined(ACL_FFMPEG_8)
+    if (user == &droidMediaBackend) {
+        const char *name = kind == MEGLER_CODEC_H264 ? "h264_droidmedia" :
+                           kind == MEGLER_CODEC_H265 ? "hevc_droidmedia" : nullptr;
+        return name && a.ready && a.find(name);
+    }
+#else
+    (void)user;
+#endif
     const char *name = kind == MEGLER_CODEC_H264 ? "h264" :
+                       kind == MEGLER_CODEC_H265 ? "hevc" :
                        kind == MEGLER_CODEC_AAC ? "aac" :
                        kind == MEGLER_CODEC_MP3 ? "mp3" : nullptr;
     return name && a.ready && a.find(name);
 }
 
-void *MEGLER_CB openCodec(void *, int kind, const megler_codec_format *format)
+void *MEGLER_CB openCodec(void *user, int kind, const megler_codec_format *format)
 {
-    const bool video = kind == MEGLER_CODEC_H264;
+    const bool video = kind == MEGLER_CODEC_H264 || kind == MEGLER_CODEC_H265;
     const bool validAudio = (kind == MEGLER_CODEC_AAC || kind == MEGLER_CODEC_MP3) && format &&
                             format->sample_rate > 0 && format->sample_rate <= 192000 &&
                             format->channels >= 1 && format->channels <= 2;
@@ -132,20 +188,29 @@ void *MEGLER_CB openCodec(void *, int kind, const megler_codec_format *format)
                             format->width <= 8192 && format->height <= 8192 &&
                             (!format->width || !format->height ||
                              static_cast<int64_t>(format->width) * format->height <= 33554432);
-    if (!format || !supports(nullptr, kind) || (!validAudio && !validVideo) ||
+    if (!format || !supports(user, kind) || (!validAudio && !validVideo) ||
         format->config_size > 1048576 || (format->config_size && !format->config)) {
         qWarning() << "AndroidCompatibilityLayer audio codec: unsupported format or decoder";
         return nullptr;
     }
     std::unique_ptr<Decoder> d(new Decoder(api()));
     d->kind = kind;
+#if defined(ACL_FFMPEG_8)
+    d->hardware = user == &droidMediaBackend;
+#endif
     if (kind == MEGLER_CODEC_AAC) {
         if (!format->config || format->config_size < 2 || format->config_size > 1024) {
             qWarning() << "AndroidCompatibilityLayer audio codec: unsupported AAC configuration size";
             return nullptr;
         }
     }
-    const char *name = video ? "h264" : kind == MEGLER_CODEC_AAC ? "aac" : "mp3";
+    const char *name = kind == MEGLER_CODEC_H264 ? "h264" :
+                       kind == MEGLER_CODEC_H265 ? "hevc" :
+                       kind == MEGLER_CODEC_AAC ? "aac" : "mp3";
+#if defined(ACL_FFMPEG_8)
+    if (user == &droidMediaBackend)
+        name = kind == MEGLER_CODEC_H264 ? "h264_droidmedia" : "hevc_droidmedia";
+#endif
     const AVCodec *codec = d->av.find(name);
     d->context = d->av.alloc(codec);
     d->packet = d->av.packetAlloc();
@@ -154,7 +219,11 @@ void *MEGLER_CB openCodec(void *, int kind, const megler_codec_format *format)
         qWarning() << "AndroidCompatibilityLayer audio codec: allocation failed";
         return nullptr;
     }
-    if (video) d->context->pkt_timebase = AVRational{1, 1000000};
+    if (video) {
+        d->context->pkt_timebase = AVRational{1, 1000000};
+        d->context->width = format->width;
+        d->context->height = format->height;
+    }
     if (format->config_size) {
         d->context->extradata = static_cast<uint8_t *>(d->av.mallocz(format->config_size + AV_INPUT_BUFFER_PADDING_SIZE));
         if (!d->context->extradata) {
@@ -164,8 +233,19 @@ void *MEGLER_CB openCodec(void *, int kind, const megler_codec_format *format)
         std::memcpy(d->context->extradata, format->config, format->config_size);
         d->context->extradata_size = static_cast<int>(format->config_size);
     }
-    if (d->av.open(d->context, codec, nullptr) < 0) {
-        qWarning() << "AndroidCompatibilityLayer audio codec: decoder initialization failed";
+    const int openResult = d->av.open(d->context, codec, nullptr);
+    if (openResult < 0) {
+#if defined(ACL_FFMPEG_8)
+        if (user == &droidMediaBackend)
+            std::fprintf(stderr, "ACL codec: droidmedia decoder initialization failed (%d)\n", openResult);
+        else
+#endif
+        if (kind == MEGLER_CODEC_AAC)
+            std::fprintf(stderr, "ACL codec: AAC FFmpeg %d initialization failed (%d)\n",
+                         ACL_AVCODEC_MAJOR, openResult);
+        else
+            std::fprintf(stderr, "ACL codec: video FFmpeg %d initialization failed (%d)\n",
+                         ACL_AVCODEC_MAJOR, openResult);
         return nullptr;
     }
     return d.release();
@@ -187,19 +267,21 @@ bool collectPicture(Decoder &d, AVFrame *frame)
 {
     const int width = frame->width, height = frame->height;
     const AVPixelFormat format = static_cast<AVPixelFormat>(frame->format);
-    const bool planar = format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P;
+    const bool tenBit = format == AV_PIX_FMT_YUV420P10LE;
+    const bool planar = format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P || tenBit;
+    const int sampleBytes = tenBit ? 2 : 1;
     const bool nv12 = format == AV_PIX_FMT_NV12;
     if (width <= 0 || height <= 0 || width > 8192 || height > 8192 ||
         static_cast<int64_t>(width) * height > 33554432 ||
         (!planar && !nv12) || !frame->data[0] || !frame->data[1] ||
         (planar && !frame->data[2]) || frame->pts == AV_NOPTS_VALUE ||
-        std::abs(static_cast<int64_t>(frame->linesize[0])) < width) {
+        std::abs(static_cast<int64_t>(frame->linesize[0])) < width * sampleBytes) {
         qWarning() << "AndroidCompatibilityLayer video codec: unsupported decoded picture";
         return false;
     }
     const int chromaWidth = (width + 1) / 2;
-    if ((planar && (std::abs(static_cast<int64_t>(frame->linesize[1])) < chromaWidth ||
-                    std::abs(static_cast<int64_t>(frame->linesize[2])) < chromaWidth)) ||
+    if ((planar && (std::abs(static_cast<int64_t>(frame->linesize[1])) < chromaWidth * sampleBytes ||
+                    std::abs(static_cast<int64_t>(frame->linesize[2])) < chromaWidth * sampleBytes)) ||
         (nv12 && std::abs(static_cast<int64_t>(frame->linesize[1])) < chromaWidth * 2)) {
         qWarning() << "AndroidCompatibilityLayer video codec: invalid decoded picture stride";
         return false;
@@ -226,9 +308,13 @@ bool collectPicture(Decoder &d, AVFrame *frame)
             ? frame->data[1] + static_cast<int64_t>(y / 2) * frame->linesize[1] : nullptr;
         for (int x = 0; x < width; ++x) {
             const int chromaX = x / 2;
-            const int u = (planar ? uPlane[chromaX] : uvPlane[chromaX * 2]) - 128;
-            const int v = (planar ? vPlane[chromaX] : uvPlane[chromaX * 2 + 1]) - 128;
-            const int rawY = luma[x];
+            const auto sample = [tenBit](const uint8_t *p, int index) {
+                if (!tenBit) return static_cast<int>(p[index]);
+                return static_cast<int>((p[index * 2] | (p[index * 2 + 1] << 8)) >> 2);
+            };
+            const int u = (planar ? sample(uPlane, chromaX) : uvPlane[chromaX * 2]) - 128;
+            const int v = (planar ? sample(vPlane, chromaX) : uvPlane[chromaX * 2 + 1]) - 128;
+            const int rawY = sample(luma, x);
             const int yy = fullRange ? rawY : std::max(0, rawY - 16);
             int r, g, b;
             if (fullRange) {
@@ -260,17 +346,25 @@ bool collectPicture(Decoder &d, AVFrame *frame)
     return true;
 }
 
-bool collect(Decoder &d)
+bool collect(Decoder &d, bool *eof = nullptr)
 {
+    if (eof) *eof = false;
     for (;;) {
         const int result = d.av.receive(d.context, d.frame);
-        if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) return true;
+        if (result == AVERROR(EAGAIN)) return true;
+        if (result == AVERROR_EOF) {
+            if (eof) *eof = true;
+            return true;
+        }
         if (result < 0) {
-            qWarning() << "AndroidCompatibilityLayer audio codec: receive failed:" << result;
+            if (d.hardware)
+                std::fprintf(stderr, "ACL codec: droidmedia dequeue failed\n");
+            else
+                qWarning() << "AndroidCompatibilityLayer audio codec: receive failed:" << result;
             return false;
         }
         AVFrame *f = d.frame;
-        if (d.kind == MEGLER_CODEC_H264) {
+        if (d.kind == MEGLER_CODEC_H264 || d.kind == MEGLER_CODEC_H265) {
             const bool ok = collectPicture(d, f);
             d.av.frameUnref(f);
             if (!ok) return false;
@@ -313,6 +407,61 @@ bool collect(Decoder &d)
     }
 }
 
+bool startsWithAnnexB(const uint8_t *data, std::size_t size)
+{
+    std::size_t i = 0;
+    while (i < size && data[i] == 0) ++i;
+    return i >= 2 && i < size && data[i] == 1;
+}
+
+bool isLengthPrefixed(const uint8_t *data, std::size_t size, std::size_t lengthBytes)
+{
+    std::size_t at = 0;
+    while (at < size) {
+        if (size - at < lengthBytes) return false;
+        std::size_t length = 0;
+        for (std::size_t i = 0; i < lengthBytes; ++i)
+            length = (length << 8) | data[at++];
+        if (!length || length > size - at) return false;
+        at += length;
+    }
+    return at == size;
+}
+
+bool startsWithIdr(int kind, const uint8_t *data, std::size_t size)
+{
+    if ((kind != MEGLER_CODEC_H264 && kind != MEGLER_CODEC_H265) ||
+        !startsWithAnnexB(data, size) || isLengthPrefixed(data, size, 1) ||
+        isLengthPrefixed(data, size, 2) || isLengthPrefixed(data, size, 4)) return false;
+
+    std::size_t start = 0;
+    while (start + 3 < size) {
+        while (start + 3 < size &&
+               (data[start] || data[start + 1] || data[start + 2] != 1)) ++start;
+        if (start + 3 >= size) break;
+        const std::size_t nal = start + 3;
+        std::size_t end = nal;
+        while (end + 3 <= size &&
+               (data[end] || data[end + 1] || data[end + 2] != 1)) ++end;
+        if (end + 3 > size) end = size;
+        while (end > nal && !data[end - 1]) --end;
+
+        if (data[nal] & 0x80) return false;
+        if (kind == MEGLER_CODEC_H264) {
+            const int type = data[nal] & 0x1f;
+            if (type >= 1 && type <= 5)
+                return end > nal + 1 && type == 5;
+        } else {
+            if (end <= nal + 1 || !(data[nal + 1] & 7)) return false;
+            const int type = (data[nal] >> 1) & 0x3f;
+            if (type < 32)
+                return end > nal + 2 && (type == 19 || type == 20);
+        }
+        start = end;
+    }
+    return false;
+}
+
 bool sendPacket(Decoder &d, const uint8_t *data, std::size_t size, int64_t time)
 {
     if (size > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
@@ -322,11 +471,16 @@ bool sendPacket(Decoder &d, const uint8_t *data, std::size_t size, int64_t time)
     }
     std::memcpy(d.packet->data, data, size);
     d.packet->pts = time;
-    d.packet->dts = time;
+    d.packet->dts = AV_NOPTS_VALUE;
+    if (startsWithIdr(d.kind, data, size))
+        d.packet->flags |= AV_PKT_FLAG_KEY;
     const int result = d.av.send(d.context, d.packet);
     d.av.packetUnref(d.packet);
     if (result < 0) {
-        qWarning() << "AndroidCompatibilityLayer audio codec: packet rejected:" << result;
+        if (d.hardware)
+            std::fprintf(stderr, "ACL codec: droidmedia queue failed\n");
+        else
+            qWarning() << "AndroidCompatibilityLayer audio codec: packet rejected:" << result;
         return false;
     }
     return collect(d);
@@ -358,7 +512,7 @@ bool MEGLER_CB push(void *, void *handle, const uint8_t *data, size_t size, int6
         return false;
     }
     bool ok = true;
-    if (d->kind == MEGLER_CODEC_AAC || d->kind == MEGLER_CODEC_H264) {
+    if (d->kind == MEGLER_CODEC_AAC || d->kind == MEGLER_CODEC_H264 || d->kind == MEGLER_CODEC_H265) {
         ok = sendPacket(*d, data, size, time);
     } else {
         while (size && ok) {
@@ -385,16 +539,26 @@ bool MEGLER_CB push(void *, void *handle, const uint8_t *data, size_t size, int6
     return ok;
 }
 
-void MEGLER_CB drain(void *, void *handle)
+bool drainChecked(void *handle)
 {
     Decoder *d = static_cast<Decoder *>(handle);
-    if (!d || d->failed) return;
+    if (!d || d->failed) return false;
     const int result = d->av.send(d->context, nullptr);
-    if ((result < 0 && result != AVERROR_EOF) || !collect(*d)) {
-        qWarning() << "AndroidCompatibilityLayer audio codec: drain failed:" << result;
+    bool eof = false;
+    if ((result < 0 && result != AVERROR_EOF) || !collect(*d, &eof) || !eof) {
+        if (d->hardware)
+            std::fprintf(stderr, "ACL codec: droidmedia drain failed\n");
+        else
+            qWarning() << "AndroidCompatibilityLayer audio codec: drain failed:" << result;
         d->failed = true;
     }
     d->av.flush(d->context);
+    return !d->failed;
+}
+
+void MEGLER_CB drain(void *, void *handle)
+{
+    (void)drainChecked(handle);
 }
 
 bool MEGLER_CB pull(void *, void *handle, megler_codec_sound *out)
@@ -442,7 +606,7 @@ void MEGLER_CB closeCodec(void *, void *handle) { delete static_cast<Decoder *>(
 
 }
 
-megler_codec_host auroraAudioCodecCallbacks()
+megler_codec_host ACL_CODEC_CALLBACKS()
 {
     megler_codec_host host = {};
     host.reorder = 0;
@@ -457,3 +621,17 @@ megler_codec_host auroraAudioCodecCallbacks()
     host.close = closeCodec;
     return host;
 }
+
+bool ACL_CODEC_DRAIN_CHECKED(void *decoder)
+{
+    return drainChecked(decoder);
+}
+
+#if defined(ACL_FFMPEG_8)
+megler_codec_host auroraDroidMediaCodecCallbacks()
+{
+    megler_codec_host host = ACL_CODEC_CALLBACKS();
+    host.user = &droidMediaBackend;
+    return host;
+}
+#endif
