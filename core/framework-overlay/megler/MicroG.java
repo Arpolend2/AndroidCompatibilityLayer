@@ -39,6 +39,7 @@ public final class MicroG {
     private static final class Entry {
         ServiceInfo info = new ServiceInfo();
         ArrayList<IntentFilter> filters = new ArrayList<>();
+        boolean exportedDeclared;
     }
     /** A receiver of microG's manifest, which hears broadcasts for microG (send), and the boot's (boot). */
     private static final class Receiver {
@@ -351,6 +352,7 @@ public final class MicroG {
         info.applicationInfo = a;
         XmlBlock.Parser p = new XmlBlock(manifest, APK).newParser();
         Entry current = null; Receiver receiver = null; IntentFilter filter = null; boolean inApp = false;
+        String appPermission = null;
         ArrayList<String> permissions = new ArrayList<>();
         int event;
         while ((event = p.next()) != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) {
@@ -378,12 +380,15 @@ public final class MicroG {
             } else if ("application".equals(tag)) {
                 inApp = true; a.className = full(p.getAttributeValue(NS, "name"));
                 a.enabled = p.getAttributeBooleanValue(NS, "enabled", true);
+                appPermission = p.getAttributeValue(NS, "permission");
             } else if (inApp && "service".equals(tag)) {
                 current = new Entry(); ServiceInfo s = current.info;
                 s.name = full(p.getAttributeValue(NS, "name")); s.packageName = info.packageName;
                 s.applicationInfo = a; s.enabled = p.getAttributeBooleanValue(NS, "enabled", true);
-                s.exported = p.getAttributeBooleanValue(NS, "exported", true);
-                s.permission = p.getAttributeValue(NS, "permission"); s.processName = a.processName;
+                current.exportedDeclared = p.indexOf(NS, "exported") >= 0;
+                s.exported = p.getAttributeBooleanValue(NS, "exported", false);
+                s.permission = p.indexOf(NS, "permission") >= 0 ? p.getAttributeValue(NS, "permission") : appPermission;
+                s.processName = a.processName;
                 s.metaData = new Bundle(); services.add(current);
             } else if (inApp && "provider".equals(tag)) {
                 ProviderInfo provider = new ProviderInfo();
@@ -410,6 +415,7 @@ public final class MicroG {
                 else if (key != null && p.getAttributeValue(NS, "value") != null) current.info.metaData.putString(key, p.getAttributeValue(NS, "value"));
             } else if ((current != null || receiver != null) && "intent-filter".equals(tag)) {
                 filter = new IntentFilter(); (current != null ? current.filters : receiver.filters).add(filter);
+                if (current != null && !current.exportedDeclared) current.info.exported = true;
                 filter.setPriority(p.getAttributeIntValue(NS, "priority", 0));
             } else if (filter != null && "action".equals(tag)) filter.addAction(p.getAttributeValue(NS, "name"));
             else if (filter != null && "category".equals(tag)) filter.addCategory(p.getAttributeValue(NS, "name"));
@@ -1017,7 +1023,7 @@ public final class MicroG {
     private void destroyIfUnused(Running r) {
         if (!r.started && r.clients == 0) {
             synchronized (running) { running.values().remove(r); }
-            r.service.onDestroy();
+            r.service.meglerDestroy();
         }
     }
     /*

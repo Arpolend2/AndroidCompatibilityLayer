@@ -133,6 +133,13 @@ void mg_egl_probe(void (*line)(const char *fmt, ...));
  */
 bool mg_egl_external_upload(u32 external, u32 *helper, void **image, int *helper_w, int *helper_h, const u8 *rgba, int w, int h);
 
+/* SurfaceTexture's GL consumer, on the calling thread's current context. */
+bool mg_egl_surface_current(void **display, void **context);
+bool mg_egl_surface_bind(u32 texture, bool require_unused);
+bool mg_egl_surface_upload(u32 texture, const u8 *rgba, int width, int height);
+bool mg_egl_surface_delete(u32 texture);
+bool mg_egl_surface_presentation_time(i64 *timestamp);
+
 /*
  * Hardware buffers' textures (ndk/mg_ahb.c): an EGL image of a buffer's texture, made with the buffer's pixels the first
  * time (NULL when none can be); the texture read back into the buffer's pixels; the pixels uploaded to it; the texture

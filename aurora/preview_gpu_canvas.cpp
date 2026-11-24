@@ -3,6 +3,7 @@
 #include "preview_gpu_pixels.h"
 #include "store_worker_teardown.h"
 
+#include "../core/src/drivers/mg_java_gfx.h"
 #include "../core/tests/mg_gfx_standin.h"
 
 #include <QBrush>
@@ -31,6 +32,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <pthread.h>
 #include <sys/syscall.h>
 
@@ -48,6 +50,16 @@ namespace {
 
 std::atomic<quint64> nextContextId{1};
 constexpr quint64 multipleContexts = ~quint64(0);
+
+typedef void *GpuSync;
+typedef GpuSync (*GpuFenceSyncFn)(GLenum, GLbitfield);
+typedef GLenum (*GpuClientWaitSyncFn)(GpuSync, GLbitfield, quint64);
+typedef void (*GpuDeleteSyncFn)(GpuSync);
+
+constexpr GLenum gpuSyncGpuCommandsComplete = 0x9117;
+constexpr GLenum gpuAlreadySignaled = 0x911a;
+constexpr GLenum gpuConditionSatisfied = 0x911c;
+constexpr quint64 gpuTimeoutIgnored = ~quint64(0);
 
 struct ThreadFramebuffer {
     GLuint id = 0;
@@ -70,6 +82,11 @@ struct ThreadContext {
     GLint filterInputOpacityLocation = -1;
     GLint filterModeLocation = -1;
     GLint filterTextureLocation = -1;
+    GLint filterTexScaleLocation = -1;
+    GLint filterTexOffsetLocation = -1;
+    GpuFenceSyncFn fenceSync = nullptr;
+    GpuClientWaitSyncFn clientWaitSync = nullptr;
+    GpuDeleteSyncFn deleteSync = nullptr;
     // The guest thread can outlive the host on an unexpected exit.
     std::shared_ptr<PreviewGpuOffscreenContexts> offscreenContexts;
     long tid = 0;
@@ -77,19 +94,32 @@ struct ThreadContext {
 
     void clear()
     {
+        QOpenGLFunctions *gl = context && QOpenGLContext::currentContext() == context
+            ? context->functions() : nullptr;
         if (offscreenContexts) {
             QMutexLocker lock(&offscreenContexts->mutex);
             offscreenContexts->owners[tid].state = "releasing";
         }
         for (auto it = framebuffers.begin(); it != framebuffers.end(); ++it) {
+            if (gl) {
+                if (it->id) gl->glDeleteFramebuffers(1, &it->id);
+                if (it->filterId) gl->glDeleteFramebuffers(1, &it->filterId);
+                if (it->stencilBuffer) gl->glDeleteRenderbuffers(1, &it->stencilBuffer);
+                if (it->filterStencilBuffer) gl->glDeleteRenderbuffers(1, &it->filterStencilBuffer);
+                if (it->filterTexture) gl->glDeleteTextures(1, &it->filterTexture);
+            }
             delete it->device;
             delete it->filterDevice;
         }
         framebuffers.clear();
-        if (context && filterProgram && QOpenGLContext::currentContext() == context)
-            context->functions()->glDeleteProgram(filterProgram);
+        if (gl && filterProgram)
+            gl->glDeleteProgram(filterProgram);
         filterProgram = 0;
         filterTintLocation = filterOpacityLocation = filterInputOpacityLocation = filterModeLocation = filterTextureLocation = -1;
+        filterTexScaleLocation = filterTexOffsetLocation = -1;
+        fenceSync = nullptr;
+        clientWaitSync = nullptr;
+        deleteSync = nullptr;
         if (context && QOpenGLContext::currentContext() == context)
             context->doneCurrent();
         delete context;
@@ -112,6 +142,30 @@ struct ThreadContext {
 };
 
 thread_local ThreadContext threadContext;
+
+class ScopedOffscreenCurrent {
+public:
+    explicit ScopedOffscreenCurrent(PreviewGpuCanvasHost *) { ++depth; }
+    ~ScopedOffscreenCurrent()
+    {
+        if (--depth == 0 && threadContext.owner && threadContext.offscreenContexts) {
+            if (!mg_java_gfx_retains_thread_context()) {
+                threadContext.owner->releaseThreadContext();
+                return;
+            }
+            if (threadContext.context && QOpenGLContext::currentContext() == threadContext.context)
+                threadContext.context->doneCurrent();
+            QMutexLocker lock(&threadContext.offscreenContexts->mutex);
+            threadContext.offscreenContexts->owners[threadContext.tid].state = "unbound";
+            threadContext.wasBound = false;
+        }
+    }
+
+private:
+    static thread_local unsigned depth;
+};
+
+thread_local unsigned ScopedOffscreenCurrent::depth = 0;
 
 void clearGlErrors(QOpenGLFunctions *gl)
 {
@@ -137,6 +191,8 @@ bool ensureFilterProgram()
         "uniform float u_opacity;\n"
         "uniform float u_inputOpacity;\n"
         "uniform int u_filterMode;\n"
+        "uniform vec2 u_texScale;\n"
+        "uniform vec2 u_texOffset;\n"
         "varying vec2 v_texCoord;\n"
         "float overlayChannel(float s, float d, float sa, float da) {\n"
         "  float both = s * (1.0 - da) + d * (1.0 - sa);\n"
@@ -168,7 +224,7 @@ bool ensureFilterProgram()
         "  if (mode == 17) return both + max(x, y);\n"
         "  return s + d * (1.0 - sa);\n"
         "}\n"
-        "void main() { vec4 source = texture2D(u_mask, v_texCoord) * u_inputOpacity; "
+        "void main() { vec4 source = texture2D(u_mask, v_texCoord * u_texScale + u_texOffset) * u_inputOpacity; "
         "gl_FragColor = blendPremultiplied(u_filterMode, u_tint, source) * u_opacity; }\n";
     const auto compile = [gl](GLenum type, const char *source) -> GLuint {
         const GLuint shader = gl->glCreateShader(type);
@@ -224,7 +280,10 @@ bool ensureFilterProgram()
     const GLint inputOpacity = gl->glGetUniformLocation(program, "u_inputOpacity");
     const GLint mode = gl->glGetUniformLocation(program, "u_filterMode");
     const GLint texture = gl->glGetUniformLocation(program, "u_mask");
-    if (tint < 0 || opacity < 0 || inputOpacity < 0 || mode < 0 || texture < 0) {
+    const GLint texScale = gl->glGetUniformLocation(program, "u_texScale");
+    const GLint texOffset = gl->glGetUniformLocation(program, "u_texOffset");
+    if (tint < 0 || opacity < 0 || inputOpacity < 0 || mode < 0 || texture < 0 ||
+        texScale < 0 || texOffset < 0) {
         gl->glDeleteProgram(program);
         qWarning("GPU Canvas color-filter shader uniforms are unavailable");
         return false;
@@ -235,6 +294,8 @@ bool ensureFilterProgram()
     threadContext.filterInputOpacityLocation = inputOpacity;
     threadContext.filterModeLocation = mode;
     threadContext.filterTextureLocation = texture;
+    threadContext.filterTexScaleLocation = texScale;
+    threadContext.filterTexOffsetLocation = texOffset;
     return true;
 }
 
@@ -478,12 +539,13 @@ struct PreviewGpuCanvasHost::Canvas {
 
     quint64 id = 0;
     GLuint texture = 0;
+    Bitmap *bitmap = nullptr;
     void *pixels = nullptr;
     int width = 0;
     int height = 0;
     int stride = 0;
     void *cpuCanvas = nullptr;
-    bool cpuMirrorCurrent = true;
+    bool gpuBacked = true;
     std::atomic<quint64> contextId{0};
     QVector<State> states;
 
@@ -495,6 +557,45 @@ struct PreviewGpuCanvasHost::Canvas {
             contextId.store(multipleContexts);
     }
 };
+
+struct PreviewGpuCanvasHost::Bitmap {
+    struct ScopedLocks {
+        std::unique_lock<QMutex> first;
+        std::unique_lock<QMutex> second;
+        ScopedLocks(Bitmap *a, Bitmap *b);
+    };
+
+    explicit Bitmap(bool kept) : mutex(QMutex::Recursive), persistent(kept) {}
+    QMutex mutex;
+    quint32 id = 0;
+    quint64 framebufferId = 0;
+    GLuint texture = 0;
+    int canvasRefs = 0;
+    void *pixels = nullptr;
+    int width = 0;
+    int height = 0;
+    int stride = 0;
+    bool persistent = false;
+    bool cpuMirrorCurrent = true;
+    bool gpuCurrent = true;
+    GpuSync gpuFence = nullptr;
+    quint64 gpuWriterContextId = 0;
+};
+
+PreviewGpuCanvasHost::Bitmap::ScopedLocks::ScopedLocks(Bitmap *a, Bitmap *b)
+{
+    if (a == b) {
+        if (a)
+            first = std::unique_lock<QMutex>(a->mutex);
+        return;
+    }
+    Bitmap *low = !a ? b : !b ? a : std::less<Bitmap *>()(a, b) ? a : b;
+    Bitmap *high = low == a ? b : a;
+    if (low)
+        first = std::unique_lock<QMutex>(low->mutex);
+    if (high)
+        second = std::unique_lock<QMutex>(high->mutex);
+}
 
 struct PreviewGpuCanvasHost::Shader {
     QMutex mutex;
@@ -635,10 +736,14 @@ void PreviewGpuCanvasHost::install(megler_gfx_host *host)
         return;
     host->user = this;
     host->canvas_new = canvasNew;
+    host->canvas_new_bitmap = canvasNewBitmap;
     host->canvas_free = canvasFree;
     host->canvas_discard = canvasDiscard;
     host->flush = flush;
     host->touched = touched;
+    host->bitmap_readback = bitmapReadback;
+    host->bitmap_changed = bitmapChanged;
+    host->bitmap_gone = bitmapGone;
     host->save = save;
     host->save_layer = saveLayer;
     host->save_layer_blur = saveLayerBlur;
@@ -673,10 +778,21 @@ void MEGLER_CB PreviewGpuCanvasHost::releaseThread(void *user)
                   tid, int(ownsContext), int(current));
     traceStoreWorkerTeardown(stage);
     if (threadContext.owner == user) {
-        threadContext.clear();
+        PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+        self->releaseThreadContext();
         std::snprintf(stage, sizeof(stage), "GPU Canvas release thread complete tid=%ld", tid);
         traceStoreWorkerTeardown(stage);
     }
+}
+
+void PreviewGpuCanvasHost::releaseThreadContext()
+{
+    if (threadContext.owner != this)
+        return;
+    if (threadContext.context && QOpenGLContext::currentContext() != threadContext.context &&
+        !ensureCurrent("release-thread"))
+        qWarning("GPU Canvas could not make its context current during thread cleanup");
+    threadContext.clear();
 }
 
 bool PreviewGpuCanvasHost::ensureCurrent(const char *origin)
@@ -717,13 +833,45 @@ bool PreviewGpuCanvasHost::ensureCurrent(const char *origin)
         threadContext.offscreenContexts->owners[threadContext.tid].state = "was-bound";
         threadContext.wasBound = true;
     }
+    if (threadContext.context->isOpenGLES() && threadContext.context->format().majorVersion() >= 3 &&
+        !threadContext.fenceSync) {
+        threadContext.fenceSync = reinterpret_cast<GpuFenceSyncFn>(
+            threadContext.context->getProcAddress("glFenceSync"));
+        threadContext.clientWaitSync = reinterpret_cast<GpuClientWaitSyncFn>(
+            threadContext.context->getProcAddress("glClientWaitSync"));
+        threadContext.deleteSync = reinterpret_cast<GpuDeleteSyncFn>(
+            threadContext.context->getProcAddress("glDeleteSync"));
+        if (!threadContext.fenceSync || !threadContext.clientWaitSync || !threadContext.deleteSync) {
+            threadContext.fenceSync = nullptr;
+            threadContext.clientWaitSync = nullptr;
+            threadContext.deleteSync = nullptr;
+        }
+    }
     threadContext.context->functions()->initializeOpenGLFunctions();
+    return true;
+}
+
+bool PreviewGpuCanvasHost::waitForBitmap(Bitmap *bitmap, bool forceWait)
+{
+    if (!bitmap || !bitmap->gpuFence ||
+        (!forceWait && bitmap->gpuWriterContextId == threadContext.contextId))
+        return true;
+    if (!threadContext.clientWaitSync) {
+        qWarning("GPU Canvas cannot synchronize a bitmap written by another context");
+        return false;
+    }
+    const GLenum result = threadContext.clientWaitSync(bitmap->gpuFence, 0, gpuTimeoutIgnored);
+    if (result != gpuAlreadySignaled && result != gpuConditionSatisfied) {
+        qWarning("GPU Canvas waiting for another context's bitmap write failed (0x%x)",
+                 static_cast<unsigned int>(result));
+        return false;
+    }
     return true;
 }
 
 bool PreviewGpuCanvasHost::ensureFramebuffer(Canvas *canvas, const char *origin)
 {
-    if (!canvas || !ensureCurrent(origin))
+    if (!canvas || !canvas->gpuBacked || !ensureCurrent(origin))
         return false;
     canvas->noteContext();
     if (threadContext.framebuffers.contains(canvas->id))
@@ -817,16 +965,26 @@ bool PreviewGpuCanvasHost::ensureFilterFramebuffer(Canvas *canvas)
 
 bool PreviewGpuCanvasHost::readback(Canvas *canvas, PreviewGpuReadbackReason reason)
 {
-    if (canvas && canvas->cpuMirrorCurrent) {
+    if (!canvas || !canvas->bitmap)
+        return false;
+    QMutexLocker bitmapLock(&canvas->bitmap->mutex);
+    if (canvas->bitmap->cpuMirrorCurrent) {
         m_metrics->recordReadbackCacheHit(reason);
         return true;
     }
+    if (!canvas->gpuBacked)
+        return false;
     const PreviewGpuMetrics::Sample sample = m_metrics->beginReadback(reason);
     QElapsedTimer timer;
     QElapsedTimer phaseTimer;
     if (sample.sampled)
         timer.start();
     if (!ensureFramebuffer(canvas, "readback")) {
+        if (sample.sampled)
+            m_metrics->finishReadback(sample, static_cast<quint64>(timer.nsecsElapsed() / 1000), 0, 0);
+        return false;
+    }
+    if (!waitForBitmap(canvas->bitmap)) {
         if (sample.sampled)
             m_metrics->finishReadback(sample, static_cast<quint64>(timer.nsecsElapsed() / 1000), 0, 0);
         return false;
@@ -859,13 +1017,16 @@ bool PreviewGpuCanvasHost::readback(Canvas *canvas, PreviewGpuReadbackReason rea
     if (sample.sampled)
         m_metrics->finishReadback(sample, static_cast<quint64>(timer.nsecsElapsed() / 1000), glUs,
                                   static_cast<quint64>(phaseTimer.nsecsElapsed() / 1000));
-    canvas->cpuMirrorCurrent = true;
+    canvas->bitmap->cpuMirrorCurrent = true;
     return true;
 }
 
 bool PreviewGpuCanvasHost::upload(Canvas *canvas)
 {
-    if (!canvas || !ensureCurrent("upload"))
+    if (!canvas || !canvas->bitmap || !canvas->gpuBacked || !ensureCurrent("upload"))
+        return false;
+    QMutexLocker bitmapLock(&canvas->bitmap->mutex);
+    if (!waitForBitmap(canvas->bitmap))
         return false;
     canvas->noteContext();
     QByteArray rgba(canvas->width * canvas->height * 4, char(0));
@@ -889,9 +1050,106 @@ bool PreviewGpuCanvasHost::upload(Canvas *canvas)
     gl->glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous));
     if (error != GL_NO_ERROR)
         qWarning("GPU Canvas upload failed (OpenGL error 0x%x)", static_cast<unsigned int>(error));
-    else
-        canvas->cpuMirrorCurrent = true;
+    else {
+        gl->glFinish();
+        canvas->bitmap->cpuMirrorCurrent = true;
+        canvas->bitmap->gpuCurrent = true;
+    }
     return error == GL_NO_ERROR;
+}
+
+bool PreviewGpuCanvasHost::ensureBitmapCurrent(Canvas *canvas)
+{
+    if (!canvas || !canvas->bitmap || !canvas->gpuBacked)
+        return false;
+    QMutexLocker bitmapLock(&canvas->bitmap->mutex);
+    if (!ensureCurrent("bitmap-current"))
+        return false;
+    if (canvas->bitmap->gpuCurrent)
+        return waitForBitmap(canvas->bitmap);
+    return canvas->bitmap->cpuMirrorCurrent && upload(canvas);
+}
+
+bool PreviewGpuCanvasHost::ensureCpuMirrorCurrent(Bitmap *bitmap)
+{
+    if (!bitmap)
+        return false;
+    QMutexLocker bitmapLock(&bitmap->mutex);
+    if (bitmap->cpuMirrorCurrent)
+        return true;
+    if (!bitmap->gpuCurrent || !bitmap->texture)
+        return false;
+    const bool hadContext = threadContext.owner == this && threadContext.context;
+    Canvas canvas;
+    canvas.bitmap = bitmap;
+    canvas.texture = bitmap->texture;
+    canvas.id = bitmap->framebufferId;
+    canvas.pixels = bitmap->pixels;
+    canvas.width = bitmap->width;
+    canvas.height = bitmap->height;
+    canvas.stride = bitmap->stride;
+    const bool result = readback(&canvas, PreviewGpuReadbackReason::Self);
+    removeFramebuffer(&canvas);
+    if (!hadContext && threadContext.owner == this && threadContext.framebuffers.isEmpty())
+        threadContext.clear();
+    return result;
+}
+
+void PreviewGpuCanvasHost::finishGpuWrite(Canvas *canvas)
+{
+    if (!canvas || !canvas->bitmap || !canvas->gpuBacked || !threadContext.context)
+        return;
+    QMutexLocker bitmapLock(&canvas->bitmap->mutex);
+    QOpenGLFunctions *gl = threadContext.context->functions();
+    canvas->bitmap->cpuMirrorCurrent = false;
+    canvas->bitmap->gpuCurrent = false;
+    GLenum error = gl->glGetError();
+    if (error != GL_NO_ERROR) {
+        qWarning("GPU Canvas drawing completion failed (OpenGL error 0x%x)", static_cast<unsigned int>(error));
+        gl->glFinish();
+        error = gl->glGetError();
+        if (error != GL_NO_ERROR)
+            qWarning("GPU Canvas drawing completion failed (OpenGL error 0x%x)", static_cast<unsigned int>(error));
+        return;
+    }
+    if (threadContext.fenceSync && threadContext.deleteSync) {
+        GpuSync fence = threadContext.fenceSync(gpuSyncGpuCommandsComplete, 0);
+        if (fence && gl->glGetError() == GL_NO_ERROR) {
+            gl->glFlush();
+            error = gl->glGetError();
+            if (error == GL_NO_ERROR) {
+                if (canvas->bitmap->gpuFence)
+                    threadContext.deleteSync(canvas->bitmap->gpuFence);
+                canvas->bitmap->gpuFence = fence;
+                canvas->bitmap->gpuWriterContextId = threadContext.contextId;
+                canvas->bitmap->gpuCurrent = true;
+                return;
+            }
+            threadContext.deleteSync(fence);
+        }
+        clearGlErrors(gl);
+    }
+
+    gl->glFinish();
+    error = gl->glGetError();
+    if (error != GL_NO_ERROR)
+        qWarning("GPU Canvas drawing completion failed (OpenGL error 0x%x)", static_cast<unsigned int>(error));
+    else {
+        if (canvas->bitmap->gpuFence && threadContext.deleteSync)
+            threadContext.deleteSync(canvas->bitmap->gpuFence);
+        canvas->bitmap->gpuFence = nullptr;
+        canvas->bitmap->gpuWriterContextId = threadContext.contextId;
+        canvas->bitmap->gpuCurrent = true;
+    }
+}
+
+void PreviewGpuCanvasHost::markCpuWrite(Bitmap *bitmap)
+{
+    if (!bitmap)
+        return;
+    QMutexLocker bitmapLock(&bitmap->mutex);
+    bitmap->cpuMirrorCurrent = true;
+    bitmap->gpuCurrent = false;
 }
 
 bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *paint,
@@ -911,10 +1169,12 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
         return false;
     }
     const bool scaledCopy = copyCanvas && QSizeF(copySource.size()) != deviceBounds.size();
+    const bool shaderScaledCopy = scaledCopy && threadContext.context->isOpenGLES() &&
+                                  threadContext.context->format().majorVersion() < 3;
     const Canvas::State &state = canvas->states.last();
     if (copyCanvas && !state.copyClipValid)
         return false;
-    if (scaledCopy) {
+    if (scaledCopy && !shaderScaledCopy) {
         GLint readFramebuffer = 0, drawFramebuffer = 0;
         auto *gl = threadContext.context->functions();
         gl->glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
@@ -949,8 +1209,26 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     ThreadFramebuffer framebuffer = threadContext.framebuffers.value(canvas->id);
     QOpenGLFunctions *gl = threadContext.context->functions();
     GLint previousFramebuffer = 0;
+    GLuint scaledSnapshot = 0;
     gl->glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
-    if (scaledCopy) {
+    if (shaderScaledCopy) {
+        GLint previousTexture = 0;
+        gl->glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+        gl->glBindFramebuffer(GL_FRAMEBUFFER, threadContext.framebuffers.value(copyCanvas->id).id);
+        gl->glGenTextures(1, &scaledSnapshot);
+        gl->glBindTexture(GL_TEXTURE_2D, scaledSnapshot);
+        const GLint filtering = (paint->flags & MEGLER_GFX_FILTER_BITMAP) ? GL_LINEAR : GL_NEAREST;
+        gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
+        gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filtering);
+        gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, copySource.width(), copySource.height(), 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        gl->glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, copySource.x(),
+                                copyCanvas->height - copySource.y() - copySource.height(),
+                                copySource.width(), copySource.height());
+        gl->glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+    } else if (scaledCopy) {
         auto *extra = threadContext.context->extraFunctions();
         const auto target = deviceBounds.toRect();
         const bool smooth = (paint->flags & MEGLER_GFX_FILTER_BITMAP) != 0;
@@ -1035,20 +1313,14 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
     if (maskError != GL_NO_ERROR) {
         qWarning("GPU Canvas color-filter mask failed (OpenGL error 0x%x)", static_cast<unsigned int>(maskError));
+        if (scaledSnapshot)
+            gl->glDeleteTextures(1, &scaledSnapshot);
         clearGlErrors(gl);
         m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::GpuFailure);
         return false;
     }
 
     gl->glBindFramebuffer(GL_FRAMEBUFFER, framebuffer.id);
-    QPainter painter;
-    if (!painter.begin(framebuffer.device)) {
-        gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
-        m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::GpuFailure);
-        return false;
-    }
-    painter.beginNativePainting();
-
     GLint previousProgram = 0;
     GLint previousActiveTexture = 0;
     GLint previousTexture = 0;
@@ -1075,6 +1347,8 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     const GLboolean depthEnabled = gl->glIsEnabled(GL_DEPTH_TEST);
     const GLboolean cullEnabled = gl->glIsEnabled(GL_CULL_FACE);
     const GLboolean ditherEnabled = gl->glIsEnabled(GL_DITHER);
+    const GLboolean sampleCoverageEnabled = gl->glIsEnabled(GL_SAMPLE_COVERAGE);
+    const GLboolean alphaToCoverageEnabled = gl->glIsEnabled(GL_SAMPLE_ALPHA_TO_COVERAGE);
     gl->glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
     gl->glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture);
     gl->glActiveTexture(GL_TEXTURE0);
@@ -1106,13 +1380,15 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     gl->glDisable(GL_DEPTH_TEST);
     gl->glDisable(GL_CULL_FACE);
     gl->glDisable(GL_DITHER);
+    gl->glDisable(GL_SAMPLE_COVERAGE);
+    gl->glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
     gl->glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     gl->glEnable(GL_BLEND);
     gl->glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
     gl->glBlendFuncSeparate(blendFactors.sourceRgb, blendFactors.destinationRgb,
                             blendFactors.sourceAlpha, blendFactors.destinationAlpha);
     gl->glUseProgram(threadContext.filterProgram);
-    gl->glBindTexture(GL_TEXTURE_2D, framebuffer.filterTexture);
+    gl->glBindTexture(GL_TEXTURE_2D, shaderScaledCopy ? scaledSnapshot : framebuffer.filterTexture);
     const QColor tint = QColor::fromRgba(paint->filter_color);
     const GLfloat tintAlpha = static_cast<GLfloat>(tint.alphaF());
     gl->glUniform4f(threadContext.filterTintLocation,
@@ -1125,6 +1401,12 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
                     copyCanvas ? static_cast<GLfloat>(qAlpha(paint->color) / 255.0) : 1.0f);
     gl->glUniform1i(threadContext.filterModeLocation, paint->filter_mode);
     gl->glUniform1i(threadContext.filterTextureLocation, 0);
+    gl->glUniform2f(threadContext.filterTexScaleLocation,
+                    shaderScaledCopy ? canvas->width / deviceBounds.width() : 1.0,
+                    shaderScaledCopy ? canvas->height / deviceBounds.height() : 1.0);
+    gl->glUniform2f(threadContext.filterTexOffsetLocation,
+                    shaderScaledCopy ? -deviceBounds.left() / deviceBounds.width() : 0.0,
+                    shaderScaledCopy ? -(canvas->height - deviceBounds.bottom()) / deviceBounds.height() : 0.0);
     gl->glBindBuffer(GL_ARRAY_BUFFER, 0);
     gl->glEnableVertexAttribArray(0);
     gl->glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, vertices);
@@ -1177,9 +1459,11 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
     restoreEnabled(GL_DEPTH_TEST, depthEnabled);
     restoreEnabled(GL_CULL_FACE, cullEnabled);
     restoreEnabled(GL_DITHER, ditherEnabled);
-    painter.endNativePainting();
-    painter.end();
+    restoreEnabled(GL_SAMPLE_COVERAGE, sampleCoverageEnabled);
+    restoreEnabled(GL_SAMPLE_ALPHA_TO_COVERAGE, alphaToCoverageEnabled);
     gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
+    if (scaledSnapshot)
+        gl->glDeleteTextures(1, &scaledSnapshot);
 
     if (error != GL_NO_ERROR) {
         qWarning("GPU Canvas color-filter setup failed before drawing (OpenGL error 0x%x)",
@@ -1188,7 +1472,7 @@ bool PreviewGpuCanvasHost::drawFiltered(Canvas *canvas, const megler_gfx_paint *
         m_metrics->recordFilterFallback(PreviewGpuFilterFallbackReason::GpuFailure);
         return false;
     }
-    canvas->cpuMirrorCurrent = false;
+    finishGpuWrite(canvas);
     if (drawError != GL_NO_ERROR) {
         qWarning("GPU Canvas color-filter draw reported OpenGL error 0x%x", static_cast<unsigned int>(drawError));
         m_metrics->recordFilterDrawError();
@@ -1306,7 +1590,10 @@ bool PreviewGpuCanvasHost::drawFilteredBitmap(Canvas *canvas, const megler_gfx_i
 bool PreviewGpuCanvasHost::copyCanvasPixels(Canvas *canvas, Canvas *source, const float *src, const float *dst,
                                             const megler_gfx_paint *paint)
 {
-    if (!src || !dst || !paint ||
+    Bitmap::ScopedLocks bitmapLocks(canvas ? canvas->bitmap : nullptr,
+                                    source ? source->bitmap : nullptr);
+    if (!canvas || !source || !canvas->gpuBacked || !source->gpuBacked ||
+        !ensureBitmapCurrent(canvas) || !ensureBitmapCurrent(source) || !src || !dst || !paint ||
         paint->filter_mode > MEGLER_GFX_BLEND_LIGHTEN || source->states.size() != 1)
         return false;
     const Canvas::State &state = canvas->states.last();
@@ -1356,12 +1643,9 @@ bool PreviewGpuCanvasHost::copyCanvasPixels(Canvas *canvas, Canvas *source, cons
     megler_gfx_paint copyPaint = *paint;
     if (copyPaint.filter_mode < 0)
         copyPaint.filter_mode = MEGLER_GFX_BLEND_DST; // Identity filter.
-    // Sharing a texture is not enough to order writes submitted by different contexts.
-    // Decline rather than impose a new cross-context fence or read stale pixels.
-    if (!ensureCurrent("copy-canvas") || source->contextId.load() != threadContext.contextId ||
-        !threadContext.framebuffers.contains(source->id))
+    if (!ensureFramebuffer(source, "copy-canvas"))
         return false;
-    if (scaled && (!threadContext.context->isOpenGLES() || threadContext.context->format().majorVersion() < 3))
+    if (scaled && !threadContext.context->isOpenGLES())
         return false;
     return drawFiltered(canvas, &copyPaint, bounds, {}, source, sourceRect.toRect());
 }
@@ -1370,10 +1654,28 @@ bool MEGLER_CB PreviewGpuCanvasHost::drawCanvas(void *user, void *handle, void *
                                                 const float *dst, const megler_gfx_paint *paint)
 {
     auto *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     Canvas *source = self ? self->findCanvas(sourceHandle) : nullptr;
-    return canvas && source && canvas != source && canvas->pixels != source->pixels &&
-           self->copyCanvasPixels(canvas, source, src, dst, paint);
+    if (!canvas || !source || canvas == source || canvas->pixels == source->pixels)
+        return false;
+    Bitmap::ScopedLocks bitmapLocks(canvas->bitmap, source->bitmap);
+    if (!canvas->gpuBacked || !source->gpuBacked) {
+        if (!self->ensureCpuMirrorCurrent(source->bitmap))
+            return false;
+        if (canvas->gpuBacked && (!self->ensureBitmapCurrent(canvas) ||
+                                  !self->readback(canvas, PreviewGpuReadbackReason::Self)))
+            return false;
+        if (!canvas->gpuBacked && !self->ensureCpuMirrorCurrent(canvas->bitmap))
+            return false;
+        if (!self->m_cpu->draw_canvas ||
+            !self->m_cpu->draw_canvas(self->m_cpu->user, canvas->cpuCanvas, source->cpuCanvas,
+                                      src, dst, paint))
+            return false;
+        self->markCpuWrite(canvas->bitmap);
+        return !canvas->gpuBacked || self->upload(canvas);
+    }
+    return self->copyCanvasPixels(canvas, source, src, dst, paint);
 }
 
 void PreviewGpuCanvasHost::removeFramebuffer(Canvas *canvas)
@@ -1502,24 +1804,130 @@ void PreviewGpuCanvasHost::paintPath(Canvas *canvas, const QPainterPath &path, c
     painter.drawPath(path);
     painter.end();
     gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previous));
-    canvas->cpuMirrorCurrent = false;
+    finishGpuWrite(canvas);
 }
 
 void *MEGLER_CB PreviewGpuCanvasHost::canvasNew(void *user, void *pixels, int width, int height, int stride)
 {
-    PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
-    if (!self || !pixels || width <= 0 || height <= 0 || width > INT_MAX / 4 ||
-        height > INT_MAX / (width * 4) || stride < width * 4)
-        return self && self->m_cpu->canvas_new ? self->m_cpu->canvas_new(self->m_cpu->user, pixels, width, height, stride) : nullptr;
+    return canvasNewBitmap(user, pixels, width, height, stride, 0);
+}
 
-    void *cpuCanvas = self->m_cpu->canvas_new ? self->m_cpu->canvas_new(self->m_cpu->user, pixels, width, height, stride) : nullptr;
+void *MEGLER_CB PreviewGpuCanvasHost::canvasNewBitmap(void *user, void *pixels, int width, int height, int stride,
+                                                      uint32_t bitmapId)
+{
+    PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
+    if (!self)
+        return nullptr;
+    const auto cpuCanvasNew = [self, pixels, width, height, stride]() {
+        return self->m_cpu->canvas_new
+            ? self->m_cpu->canvas_new(self->m_cpu->user, pixels, width, height, stride) : nullptr;
+    };
+    if (!pixels || width <= 0 || height <= 0 || width > INT_MAX / 4 ||
+        height > INT_MAX / (width * 4) || stride < width * 4)
+        return cpuCanvasNew();
+    const bool hadContext = threadContext.owner == self && threadContext.context;
+    const auto cleanupTemporaryContext = [self, hadContext]() {
+        if (hadContext || threadContext.owner != self || !threadContext.framebuffers.isEmpty())
+            return;
+        threadContext.clear();
+    };
+    const auto cpuCanvasFallback = [self, pixels, width, height, stride, bitmapId, cpuCanvasNew,
+                                    cleanupTemporaryContext]() -> void * {
+        bool safe = true;
+        if (bitmapId) {
+            Bitmap *bitmap = nullptr;
+            {
+                QMutexLocker lock(&self->m_mutex);
+                bitmap = self->m_bitmaps.value(bitmapId, nullptr);
+            }
+            if (bitmap) {
+                QMutexLocker bitmapLock(&bitmap->mutex);
+                if (!bitmap->cpuMirrorCurrent) {
+                    if (!bitmap->gpuCurrent) {
+                        safe = false;
+                    } else {
+                        Canvas canvas;
+                        canvas.bitmap = bitmap;
+                        canvas.texture = bitmap->texture;
+                        canvas.id = bitmap->framebufferId;
+                        canvas.pixels = pixels;
+                        canvas.width = width;
+                        canvas.height = height;
+                        canvas.stride = stride;
+                        safe = self->readback(&canvas, PreviewGpuReadbackReason::Flush);
+                        self->removeFramebuffer(&canvas);
+                    }
+                }
+            }
+        }
+        if (!safe) {
+            qWarning("GPU Canvas cannot fall back without materializing current bitmap pixels");
+            cleanupTemporaryContext();
+            return static_cast<void *>(nullptr);
+        }
+        void *cpuCanvas = cpuCanvasNew();
+        if (!cpuCanvas) {
+            cleanupTemporaryContext();
+            return static_cast<void *>(nullptr);
+        }
+        Bitmap *bitmap = nullptr;
+        bool incompatible = false;
+        {
+            QMutexLocker lock(&self->m_mutex);
+            bitmap = bitmapId ? self->m_bitmaps.value(bitmapId, nullptr) : nullptr;
+            if (!bitmap) {
+                bitmap = new Bitmap(bitmapId != 0);
+                bitmap->id = bitmapId;
+                bitmap->framebufferId = self->m_nextCanvasId++;
+                bitmap->pixels = pixels;
+                bitmap->width = width;
+                bitmap->height = height;
+                bitmap->stride = stride;
+                bitmap->gpuCurrent = false;
+                if (bitmapId)
+                    self->m_bitmaps.insert(bitmapId, bitmap);
+            } else if (bitmap->pixels != pixels || bitmap->width != width ||
+                       bitmap->height != height || bitmap->stride != stride) {
+                incompatible = true;
+            }
+            if (!incompatible)
+                ++bitmap->canvasRefs;
+        }
+        if (incompatible) {
+            self->m_cpu->canvas_free(self->m_cpu->user, cpuCanvas);
+            qWarning("GPU Canvas bitmap ID was reused for different pixel storage");
+            cleanupTemporaryContext();
+            return static_cast<void *>(nullptr);
+        }
+        Canvas *canvas = new Canvas;
+        canvas->bitmap = bitmap;
+        canvas->texture = bitmap->texture;
+        canvas->id = bitmap->framebufferId;
+        canvas->pixels = pixels;
+        canvas->width = width;
+        canvas->height = height;
+        canvas->stride = stride;
+        canvas->cpuCanvas = cpuCanvas;
+        canvas->gpuBacked = false;
+        canvas->states.append(Canvas::State());
+        canvas->states.last().copyClip = QRegion(0, 0, width, height);
+        {
+            QMutexLocker lock(&self->m_mutex);
+            self->m_canvases.insert(canvas, canvas);
+        }
+        cleanupTemporaryContext();
+        return canvas;
+    };
+
+    void *cpuCanvas = cpuCanvasNew();
     const bool ready = self->ensureCurrent("canvas-new");
     if (!cpuCanvas || !ready) {
         if (!ready)
             warnCpuFallback("shared OpenGL context is unavailable");
         if (cpuCanvas && self->m_cpu->canvas_free)
             self->m_cpu->canvas_free(self->m_cpu->user, cpuCanvas);
-        return self->m_cpu->canvas_new(self->m_cpu->user, pixels, width, height, stride);
+        return cpuCanvasFallback();
     }
 
     GLint maxTextureSize = 0;
@@ -1527,10 +1935,43 @@ void *MEGLER_CB PreviewGpuCanvasHost::canvasNew(void *user, void *pixels, int wi
     if (width > maxTextureSize || height > maxTextureSize) {
         warnCpuFallback("bitmap exceeds the GPU's maximum texture size");
         self->m_cpu->canvas_free(self->m_cpu->user, cpuCanvas);
-        return self->m_cpu->canvas_new(self->m_cpu->user, pixels, width, height, stride);
+        return cpuCanvasFallback();
+    }
+
+    Bitmap *bitmap = nullptr;
+    bool created = false;
+    bool incompatible = false;
+    {
+        QMutexLocker lock(&self->m_mutex);
+        bitmap = bitmapId ? self->m_bitmaps.value(bitmapId, nullptr) : nullptr;
+        if (!bitmap) {
+            bitmap = new Bitmap(bitmapId != 0);
+            bitmap->id = bitmapId;
+            bitmap->framebufferId = self->m_nextCanvasId++;
+            bitmap->pixels = pixels;
+            bitmap->width = width;
+            bitmap->height = height;
+            bitmap->stride = stride;
+            if (bitmapId)
+                self->m_bitmaps.insert(bitmapId, bitmap);
+            created = true;
+        } else if (bitmap->pixels != pixels || bitmap->width != width ||
+                   bitmap->height != height || bitmap->stride != stride) {
+            incompatible = true;
+        }
+        if (!incompatible)
+            ++bitmap->canvasRefs;
+    }
+    if (incompatible) {
+        self->m_cpu->canvas_free(self->m_cpu->user, cpuCanvas);
+        qWarning("GPU Canvas bitmap ID was reused for different pixel storage");
+        return nullptr;
     }
 
     Canvas *canvas = new Canvas;
+    canvas->bitmap = bitmap;
+    canvas->texture = bitmap->texture;
+    canvas->id = bitmap->framebufferId;
     canvas->pixels = pixels;
     canvas->width = width;
     canvas->height = height;
@@ -1538,39 +1979,57 @@ void *MEGLER_CB PreviewGpuCanvasHost::canvasNew(void *user, void *pixels, int wi
     canvas->cpuCanvas = cpuCanvas;
     canvas->states.append(Canvas::State());
     canvas->states.last().copyClip = QRegion(0, 0, width, height);
-    {
-        QMutexLocker lock(&self->m_mutex);
-        canvas->id = self->m_nextCanvasId++;
-    }
 
-    QByteArray rgba(width * height * 4, char(0));
-    for (int y = 0; y < height; ++y) {
-        const uchar *src = static_cast<const uchar *>(pixels) + (height - 1 - y) * stride;
-        uchar *dst = reinterpret_cast<uchar *>(rgba.data()) + y * width * 4;
-        for (int x = 0; x < width; ++x) {
-            dst[x * 4 + 0] = src[x * 4 + 2];
-            dst[x * 4 + 1] = src[x * 4 + 1];
-            dst[x * 4 + 2] = src[x * 4 + 0];
-            dst[x * 4 + 3] = src[x * 4 + 3];
+    bool allocated = true;
+    bool createdTexture = false;
+    {
+        QMutexLocker bitmapLock(&bitmap->mutex);
+        QOpenGLFunctions *gl = threadContext.context->functions();
+        clearGlErrors(gl);
+        if (!bitmap->texture) {
+            GLint previous = 0;
+            gl->glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+            gl->glGenTextures(1, &bitmap->texture);
+            createdTexture = bitmap->texture != 0;
+            gl->glBindTexture(GL_TEXTURE_2D, bitmap->texture);
+            gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            gl->glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous));
+            bitmap->gpuCurrent = false;
+        }
+        canvas->texture = bitmap->texture;
+        allocated = bitmap->texture && gl->glGetError() == GL_NO_ERROR;
+        if (allocated && !bitmap->gpuCurrent)
+            allocated = bitmap->cpuMirrorCurrent && self->upload(canvas);
+        if (allocated)
+            allocated = self->ensureFramebuffer(canvas, "canvas-new");
+        if (!allocated && createdTexture) {
+            gl->glDeleteTextures(1, &bitmap->texture);
+            bitmap->texture = 0;
+            bitmap->gpuCurrent = false;
+            canvas->texture = 0;
         }
     }
-
-    QOpenGLFunctions *gl = threadContext.context->functions();
-    clearGlErrors(gl);
-    gl->glGenTextures(1, &canvas->texture);
-    gl->glBindTexture(GL_TEXTURE_2D, canvas->texture);
-    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.constData());
-    if (!canvas->texture || gl->glGetError() != GL_NO_ERROR || !self->ensureFramebuffer(canvas, "canvas-new")) {
-        if (canvas->texture)
-            gl->glDeleteTextures(1, &canvas->texture);
-        warnCpuFallback("GPU texture allocation failed");
+    if (!allocated) {
+        {
+            QMutexLocker lock(&self->m_mutex);
+            --bitmap->canvasRefs;
+            if (created && bitmapId)
+                self->m_bitmaps.remove(bitmapId);
+        }
+        if (created && bitmap->texture) {
+            QOpenGLFunctions *gl = threadContext.context->functions();
+            gl->glDeleteTextures(1, &bitmap->texture);
+        }
+        warnCpuFallback("GPU bitmap allocation or upload failed");
         self->m_cpu->canvas_free(self->m_cpu->user, cpuCanvas);
         delete canvas;
-        return self->m_cpu->canvas_new(self->m_cpu->user, pixels, width, height, stride);
+        if (created)
+            delete bitmap;
+        return cpuCanvasFallback();
     }
     {
         QMutexLocker lock(&self->m_mutex);
@@ -1582,6 +2041,7 @@ void *MEGLER_CB PreviewGpuCanvasHost::canvasNew(void *user, void *pixels, int wi
 void MEGLER_CB PreviewGpuCanvasHost::canvasFree(void *user, void *handle)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     if (!self || !handle)
         return;
     Canvas *canvas = self->findCanvas(handle);
@@ -1591,27 +2051,49 @@ void MEGLER_CB PreviewGpuCanvasHost::canvasFree(void *user, void *handle)
         return;
     }
     bool idle = false;
+    Bitmap *bitmap = canvas->bitmap;
+    bool releaseBitmap = false;
     {
         QMutexLocker lock(&self->m_mutex);
         self->m_canvases.remove(handle);
         idle = self->m_canvases.isEmpty();
+        if (bitmap) {
+            QMutexLocker bitmapLock(&bitmap->mutex);
+            releaseBitmap = --bitmap->canvasRefs == 0 && !bitmap->persistent;
+        }
     }
-    self->removeFramebuffer(canvas);
-    const bool released = !self->m_release || self->m_release(self->m_presentUser, canvas->texture);
-    if (released && self->ensureCurrent("canvas-free") && canvas->texture)
-        threadContext.context->functions()->glDeleteTextures(1, &canvas->texture);
-    else if (!released)
-        qWarning("GPU Canvas texture could not be released from the Qt scene graph; retaining it to avoid use-after-free");
+    if (canvas->gpuBacked)
+        self->removeFramebuffer(canvas);
+    if (releaseBitmap) {
+        const bool synchronized = !bitmap->gpuFence ||
+            (self->ensureCurrent("canvas-free") && self->waitForBitmap(bitmap, true));
+        if (synchronized && bitmap->gpuFence && threadContext.deleteSync) {
+            threadContext.deleteSync(bitmap->gpuFence);
+            bitmap->gpuFence = nullptr;
+        }
+        const bool released = synchronized && (!bitmap->texture || !self->m_release ||
+            self->m_release(self->m_presentUser, bitmap->texture));
+        if (!released)
+            qWarning("GPU Canvas texture could not be safely released; retaining it to avoid use-after-free");
+        else if (bitmap->texture) {
+            if (self->ensureCurrent("canvas-free"))
+                threadContext.context->functions()->glDeleteTextures(1, &bitmap->texture);
+            else
+                qWarning("GPU Canvas could not make its context current to delete a bitmap texture");
+        }
+        delete bitmap;
+    }
     if (self->m_cpu->canvas_free)
         self->m_cpu->canvas_free(self->m_cpu->user, canvas->cpuCanvas);
     delete canvas;
     if (idle && threadContext.owner == self)
-        threadContext.clear();
+        self->releaseThreadContext();
 }
 
 void MEGLER_CB PreviewGpuCanvasHost::canvasDiscard(void *user, void *handle)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     if (!self || !handle)
         return;
     Canvas *canvas = self->findCanvas(handle);
@@ -1623,57 +2105,191 @@ void MEGLER_CB PreviewGpuCanvasHost::canvasDiscard(void *user, void *handle)
         return;
     }
     bool idle = false;
+    Bitmap *bitmap = canvas->bitmap;
+    bool releaseBitmap = false;
     {
         QMutexLocker lock(&self->m_mutex);
         self->m_canvases.remove(handle);
         idle = self->m_canvases.isEmpty();
+        if (bitmap) {
+            QMutexLocker bitmapLock(&bitmap->mutex);
+            releaseBitmap = --bitmap->canvasRefs == 0 && !bitmap->persistent;
+        }
     }
-    self->removeFramebuffer(canvas);
-    const bool released = !self->m_release || self->m_release(self->m_presentUser, canvas->texture);
-    if (released && self->ensureCurrent("canvas-discard") && canvas->texture)
-        threadContext.context->functions()->glDeleteTextures(1, &canvas->texture);
-    else if (!released)
-        qWarning("GPU Canvas texture could not be released from the Qt scene graph; retaining it to avoid use-after-free");
+    if (canvas->gpuBacked)
+        self->removeFramebuffer(canvas);
+    if (releaseBitmap) {
+        const bool synchronized = !bitmap->gpuFence ||
+            (self->ensureCurrent("canvas-discard") && self->waitForBitmap(bitmap, true));
+        if (synchronized && bitmap->gpuFence && threadContext.deleteSync) {
+            threadContext.deleteSync(bitmap->gpuFence);
+            bitmap->gpuFence = nullptr;
+        }
+        const bool released = synchronized && (!bitmap->texture || !self->m_release ||
+            self->m_release(self->m_presentUser, bitmap->texture));
+        if (!released)
+            qWarning("GPU Canvas texture could not be safely released; retaining it to avoid use-after-free");
+        else if (bitmap->texture) {
+            if (self->ensureCurrent("canvas-discard"))
+                threadContext.context->functions()->glDeleteTextures(1, &bitmap->texture);
+            else
+                qWarning("GPU Canvas could not make its context current to delete a bitmap texture");
+        }
+        delete bitmap;
+    }
     if (self->m_cpu->canvas_discard)
         self->m_cpu->canvas_discard(self->m_cpu->user, canvas->cpuCanvas);
     else if (self->m_cpu->canvas_free)
         self->m_cpu->canvas_free(self->m_cpu->user, canvas->cpuCanvas);
     delete canvas;
     if (idle && threadContext.owner == self)
-        threadContext.clear();
+        self->releaseThreadContext();
 }
 
 void MEGLER_CB PreviewGpuCanvasHost::flush(void *user, void *handle)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->flush)
             self->m_cpu->flush(self->m_cpu->user, handle);
         return;
     }
-    if (self->readback(canvas, PreviewGpuReadbackReason::Flush) && self->m_cpu->flush)
+    Bitmap::ScopedLocks bitmapLock(canvas->bitmap, nullptr);
+    if (!canvas->gpuBacked) {
+        if (!self->ensureCpuMirrorCurrent(canvas->bitmap)) {
+            qWarning("GPU Canvas CPU fallback cannot draw with a stale bitmap mirror");
+            return;
+        }
+        if (self->m_cpu->flush)
+            self->m_cpu->flush(self->m_cpu->user, canvas->cpuCanvas);
+        return;
+    }
+    if (!self->ensureBitmapCurrent(canvas))
+        qWarning("GPU Canvas could not upload CPU changes before flushing the bitmap");
+    if (self->ensureCurrent("flush")) {
+        canvas->noteContext();
+        threadContext.context->functions()->glFinish();
+    } else {
+        qWarning("GPU Canvas flush could not make its context current");
+    }
+    if (!canvas->bitmap->persistent && !self->readback(canvas, PreviewGpuReadbackReason::Flush))
+        return;
+    if (self->m_cpu->flush)
         self->m_cpu->flush(self->m_cpu->user, canvas->cpuCanvas);
 }
 
 void MEGLER_CB PreviewGpuCanvasHost::touched(void *user, void *handle)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->touched)
             self->m_cpu->touched(self->m_cpu->user, handle);
         return;
     }
-    canvas->cpuMirrorCurrent = false;
+    self->markCpuWrite(canvas->bitmap);
     if (self->m_cpu->touched)
         self->m_cpu->touched(self->m_cpu->user, canvas->cpuCanvas);
-    self->upload(canvas);
+    if (canvas->gpuBacked && !self->upload(canvas))
+        qWarning("GPU Canvas could not upload externally changed bitmap pixels");
+}
+
+bool MEGLER_CB PreviewGpuCanvasHost::bitmapReadback(void *user, uint32_t id, void *pixels,
+                                                   int width, int height, int stride)
+{
+    PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
+    if (!self || !id || !pixels || width <= 0 || height <= 0 || width > INT_MAX / 4 ||
+        height > INT_MAX / (width * 4) || stride < width * 4)
+        return false;
+    Bitmap *bitmap = nullptr;
+    {
+        QMutexLocker lock(&self->m_mutex);
+        bitmap = self->m_bitmaps.value(id, nullptr);
+    }
+    if (!bitmap)
+        return true;
+    if (bitmap->pixels != pixels || bitmap->width != width || bitmap->height != height ||
+        bitmap->stride != stride)
+        return false;
+    QMutexLocker bitmapLock(&bitmap->mutex);
+    if (bitmap->cpuMirrorCurrent)
+        return true;
+    if (!bitmap->gpuCurrent || !bitmap->texture)
+        return false;
+    return self->ensureCpuMirrorCurrent(bitmap);
+}
+
+void MEGLER_CB PreviewGpuCanvasHost::bitmapChanged(void *user, uint32_t id)
+{
+    PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
+    if (!self || !id)
+        return;
+    Bitmap *bitmap = nullptr;
+    {
+        QMutexLocker lock(&self->m_mutex);
+        bitmap = self->m_bitmaps.value(id, nullptr);
+    }
+    if (bitmap)
+        self->markCpuWrite(bitmap);
+}
+
+void MEGLER_CB PreviewGpuCanvasHost::bitmapGone(void *user, uint32_t id)
+{
+    PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
+    if (!self || !id)
+        return;
+    Bitmap *bitmap = nullptr;
+    {
+        QMutexLocker lock(&self->m_mutex);
+        bitmap = self->m_bitmaps.value(id, nullptr);
+        if (!bitmap)
+            return;
+        QMutexLocker bitmapLock(&bitmap->mutex);
+        if (bitmap->canvasRefs != 0) {
+            qWarning("GPU Canvas bitmap %u was released while %d canvases still referenced it",
+                     id, bitmap->canvasRefs);
+            return;
+        }
+        self->m_bitmaps.remove(id);
+    }
+    const bool hadContext = threadContext.owner == self && threadContext.context;
+    const bool synchronized = !bitmap->gpuFence ||
+        (self->ensureCurrent("bitmap-gone") && self->waitForBitmap(bitmap, true));
+    if (synchronized && bitmap->gpuFence && threadContext.deleteSync) {
+        threadContext.deleteSync(bitmap->gpuFence);
+        bitmap->gpuFence = nullptr;
+    }
+    const bool released = synchronized && (!bitmap->texture || !self->m_release ||
+        self->m_release(self->m_presentUser, bitmap->texture));
+    if (!released) {
+        qWarning("GPU Canvas bitmap texture could not be safely released; retaining it to avoid use-after-free");
+    } else if (bitmap->texture) {
+        if (self->ensureCurrent("bitmap-gone")) {
+            Canvas framebufferCanvas;
+            framebufferCanvas.bitmap = bitmap;
+            framebufferCanvas.texture = bitmap->texture;
+            framebufferCanvas.id = bitmap->framebufferId;
+            self->removeFramebuffer(&framebufferCanvas);
+            threadContext.context->functions()->glDeleteTextures(1, &bitmap->texture);
+        } else {
+            qWarning("GPU Canvas could not make its context current to delete a bitmap texture");
+        }
+    }
+    if (!hadContext && threadContext.owner == self && threadContext.framebuffers.isEmpty())
+        threadContext.clear();
+    delete bitmap;
 }
 
 void MEGLER_CB PreviewGpuCanvasHost::save(void *user, void *handle)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->save)
@@ -1688,6 +2304,7 @@ void MEGLER_CB PreviewGpuCanvasHost::save(void *user, void *handle)
 void MEGLER_CB PreviewGpuCanvasHost::saveLayer(void *user, void *handle, const float *bounds, int alpha, int blend)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->save_layer)
@@ -1710,6 +2327,7 @@ void MEGLER_CB PreviewGpuCanvasHost::saveLayerBlur(void *user, void *handle, con
                                                    float radiusX, float radiusY, bool clamp)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->save_layer_blur)
@@ -1734,6 +2352,7 @@ void MEGLER_CB PreviewGpuCanvasHost::saveLayerBlur(void *user, void *handle, con
 void MEGLER_CB PreviewGpuCanvasHost::restore(void *user, void *handle)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->restore)
@@ -1749,6 +2368,7 @@ void MEGLER_CB PreviewGpuCanvasHost::restore(void *user, void *handle)
 void MEGLER_CB PreviewGpuCanvasHost::setMatrix(void *user, void *handle, const float *matrix)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->set_matrix)
@@ -1763,6 +2383,7 @@ void MEGLER_CB PreviewGpuCanvasHost::setMatrix(void *user, void *handle, const f
 void MEGLER_CB PreviewGpuCanvasHost::clipRect(void *user, void *handle, float left, float top, float right, float bottom, int op)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->clip_rect)
@@ -1779,6 +2400,7 @@ void MEGLER_CB PreviewGpuCanvasHost::clipRect(void *user, void *handle, float le
 void MEGLER_CB PreviewGpuCanvasHost::clipPath(void *user, void *handle, const float *path, int count, int fill, int op)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->clip_path)
@@ -1794,12 +2416,24 @@ void MEGLER_CB PreviewGpuCanvasHost::clipPath(void *user, void *handle, const fl
 void MEGLER_CB PreviewGpuCanvasHost::drawColor(void *user, void *handle, uint32_t color, int blend)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->draw_color)
             self->m_cpu->draw_color(self->m_cpu->user, handle, color, blend);
         return;
     }
+    Bitmap::ScopedLocks bitmapLock(canvas->bitmap, nullptr);
+    if (!canvas->gpuBacked) {
+        if (!self->ensureCpuMirrorCurrent(canvas->bitmap))
+            return;
+        if (self->m_cpu->draw_color)
+            self->m_cpu->draw_color(self->m_cpu->user, canvas->cpuCanvas, color, blend);
+        self->markCpuWrite(canvas->bitmap);
+        return;
+    }
+    if (!self->ensureBitmapCurrent(canvas))
+        return;
     if (!self->ensureFramebuffer(canvas, "draw-color"))
         return;
     const ThreadFramebuffer framebuffer = threadContext.framebuffers.value(canvas->id);
@@ -1819,27 +2453,40 @@ void MEGLER_CB PreviewGpuCanvasHost::drawColor(void *user, void *handle, uint32_
     painter.fillRect(QRectF(0, 0, canvas->width, canvas->height), QColor::fromRgba(color));
     painter.end();
     gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previous));
-    canvas->cpuMirrorCurrent = false;
+    self->finishGpuWrite(canvas);
 }
 
 void MEGLER_CB PreviewGpuCanvasHost::drawRect(void *user, void *handle, float left, float top, float right, float bottom,
                                              const megler_gfx_paint *paint, void *shader)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->draw_rect)
             self->m_cpu->draw_rect(self->m_cpu->user, handle, left, top, right, bottom, paint, self->cpuShader(shader));
         return;
     }
+    Bitmap::ScopedLocks bitmapLock(canvas->bitmap, nullptr);
+    if (!canvas->gpuBacked) {
+        if (!self->ensureCpuMirrorCurrent(canvas->bitmap))
+            return;
+        if (self->m_cpu->draw_rect)
+            self->m_cpu->draw_rect(self->m_cpu->user, canvas->cpuCanvas, left, top, right, bottom,
+                                   paint, self->cpuShader(shader));
+        self->markCpuWrite(canvas->bitmap);
+        return;
+    }
+    if (!self->ensureBitmapCurrent(canvas))
+        return;
     if (paint && paint->filter_mode >= 0) {
         QPainterPath path;
         path.addRect(QRectF(left, top, right - left, bottom - top));
         if (self->drawFilteredPath(canvas, path, paint, shader))
             return;
         if (self->readback(canvas, PreviewGpuReadbackReason::Filter)) {
-            canvas->cpuMirrorCurrent = false;
             self->m_cpu->draw_rect(self->m_cpu->user, canvas->cpuCanvas, left, top, right, bottom, paint, self->cpuShader(shader));
+            self->markCpuWrite(canvas->bitmap);
             self->upload(canvas);
         }
         return;
@@ -1853,12 +2500,25 @@ void MEGLER_CB PreviewGpuCanvasHost::drawRoundRect(void *user, void *handle, flo
                                                   float rx, float ry, const megler_gfx_paint *paint, void *shader)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->draw_round_rect)
             self->m_cpu->draw_round_rect(self->m_cpu->user, handle, left, top, right, bottom, rx, ry, paint, self->cpuShader(shader));
         return;
     }
+    Bitmap::ScopedLocks bitmapLock(canvas->bitmap, nullptr);
+    if (!canvas->gpuBacked) {
+        if (!self->ensureCpuMirrorCurrent(canvas->bitmap))
+            return;
+        if (self->m_cpu->draw_round_rect)
+            self->m_cpu->draw_round_rect(self->m_cpu->user, canvas->cpuCanvas, left, top, right, bottom,
+                                         rx, ry, paint, self->cpuShader(shader));
+        self->markCpuWrite(canvas->bitmap);
+        return;
+    }
+    if (!self->ensureBitmapCurrent(canvas))
+        return;
     if (paint && paint->filter_mode >= 0) {
         QPainterPath path;
         const QRectF rect(left, top, right - left, bottom - top);
@@ -1869,8 +2529,8 @@ void MEGLER_CB PreviewGpuCanvasHost::drawRoundRect(void *user, void *handle, flo
         if (self->drawFilteredPath(canvas, path, paint, shader))
             return;
         if (self->readback(canvas, PreviewGpuReadbackReason::Filter)) {
-            canvas->cpuMirrorCurrent = false;
             self->m_cpu->draw_round_rect(self->m_cpu->user, canvas->cpuCanvas, left, top, right, bottom, rx, ry, paint, self->cpuShader(shader));
+            self->markCpuWrite(canvas->bitmap);
             self->upload(canvas);
         }
         return;
@@ -1888,20 +2548,33 @@ void MEGLER_CB PreviewGpuCanvasHost::drawOval(void *user, void *handle, float le
                                              const megler_gfx_paint *paint, void *shader)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->draw_oval)
             self->m_cpu->draw_oval(self->m_cpu->user, handle, left, top, right, bottom, paint, self->cpuShader(shader));
         return;
     }
+    Bitmap::ScopedLocks bitmapLock(canvas->bitmap, nullptr);
+    if (!canvas->gpuBacked) {
+        if (!self->ensureCpuMirrorCurrent(canvas->bitmap))
+            return;
+        if (self->m_cpu->draw_oval)
+            self->m_cpu->draw_oval(self->m_cpu->user, canvas->cpuCanvas, left, top, right, bottom,
+                                   paint, self->cpuShader(shader));
+        self->markCpuWrite(canvas->bitmap);
+        return;
+    }
+    if (!self->ensureBitmapCurrent(canvas))
+        return;
     if (paint && paint->filter_mode >= 0) {
         QPainterPath path;
         path.addEllipse(QRectF(left, top, right - left, bottom - top));
         if (self->drawFilteredPath(canvas, path, paint, shader))
             return;
         if (self->readback(canvas, PreviewGpuReadbackReason::Filter)) {
-            canvas->cpuMirrorCurrent = false;
             self->m_cpu->draw_oval(self->m_cpu->user, canvas->cpuCanvas, left, top, right, bottom, paint, self->cpuShader(shader));
+            self->markCpuWrite(canvas->bitmap);
             self->upload(canvas);
         }
         return;
@@ -1915,18 +2588,31 @@ void MEGLER_CB PreviewGpuCanvasHost::drawPath(void *user, void *handle, const fl
                                              const megler_gfx_paint *paint, void *shader)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->draw_path)
             self->m_cpu->draw_path(self->m_cpu->user, handle, path, count, fill, paint, self->cpuShader(shader));
         return;
     }
+    Bitmap::ScopedLocks bitmapLock(canvas->bitmap, nullptr);
+    if (!canvas->gpuBacked) {
+        if (!self->ensureCpuMirrorCurrent(canvas->bitmap))
+            return;
+        if (self->m_cpu->draw_path)
+            self->m_cpu->draw_path(self->m_cpu->user, canvas->cpuCanvas, path, count, fill,
+                                   paint, self->cpuShader(shader));
+        self->markCpuWrite(canvas->bitmap);
+        return;
+    }
+    if (!self->ensureBitmapCurrent(canvas))
+        return;
     if (paint && paint->filter_mode >= 0) {
         if (self->drawFilteredPath(canvas, pathFrom(path, count, fill), paint, shader))
             return;
         if (self->readback(canvas, PreviewGpuReadbackReason::Filter)) {
-            canvas->cpuMirrorCurrent = false;
             self->m_cpu->draw_path(self->m_cpu->user, canvas->cpuCanvas, path, count, fill, paint, self->cpuShader(shader));
+            self->markCpuWrite(canvas->bitmap);
             self->upload(canvas);
         }
         return;
@@ -1938,6 +2624,7 @@ void MEGLER_CB PreviewGpuCanvasHost::drawBitmap(void *user, void *handle, const 
                                                const float *src, const float *dst, const megler_gfx_paint *paint)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     Canvas *canvas = self ? self->findCanvas(handle) : nullptr;
     if (!canvas) {
         if (self && self->m_cpu->draw_bitmap)
@@ -1946,12 +2633,69 @@ void MEGLER_CB PreviewGpuCanvasHost::drawBitmap(void *user, void *handle, const 
     }
     if (!image || !image->pixels || !src || !dst || !paint)
         return;
+    if (!canvas->gpuBacked) {
+        Bitmap *sourceBitmap = nullptr;
+        if (image->id) {
+            QMutexLocker lock(&self->m_mutex);
+            sourceBitmap = self->m_bitmaps.value(image->id, nullptr);
+        }
+        Bitmap::ScopedLocks bitmapLocks(canvas->bitmap, sourceBitmap);
+        if (sourceBitmap &&
+            (sourceBitmap->pixels != image->pixels || sourceBitmap->width != image->width ||
+             sourceBitmap->height != image->height || sourceBitmap->stride != image->stride)) {
+            qWarning("GPU Canvas bitmap ID was reused for different source pixels");
+            return;
+        }
+        if (sourceBitmap && !self->ensureCpuMirrorCurrent(sourceBitmap)) {
+            qWarning("GPU Canvas could not materialize bitmap pixels for the CPU draw fallback");
+            return;
+        }
+        if (!self->ensureCpuMirrorCurrent(canvas->bitmap))
+            return;
+        if (self->m_cpu->draw_bitmap)
+            self->m_cpu->draw_bitmap(self->m_cpu->user, canvas->cpuCanvas, image, src, dst, paint);
+        self->markCpuWrite(canvas->bitmap);
+        return;
+    }
+    Bitmap *sourceBitmap = nullptr;
+    if (image->id && image->id != canvas->bitmap->id) {
+        if (paint->filter_mode < 0) {
+            void *sourceHandle = canvasNewBitmap(self, const_cast<void *>(image->pixels), image->width,
+                                                 image->height, image->stride, image->id);
+            Canvas *sourceCanvas = self->findCanvas(sourceHandle);
+            if (sourceCanvas && self->copyCanvasPixels(canvas, sourceCanvas, src, dst, paint)) {
+                canvasFree(self, sourceHandle);
+                return;
+            }
+            if (sourceCanvas)
+                canvasFree(self, sourceHandle);
+        }
+        {
+            QMutexLocker lock(&self->m_mutex);
+            sourceBitmap = self->m_bitmaps.value(image->id, nullptr);
+        }
+        if (sourceBitmap) {
+            QMutexLocker bitmapLock(&sourceBitmap->mutex);
+            if (sourceBitmap->pixels != image->pixels || sourceBitmap->width != image->width ||
+                sourceBitmap->height != image->height || sourceBitmap->stride != image->stride) {
+                qWarning("GPU Canvas bitmap ID was reused for different source pixels");
+                return;
+            }
+            if (!self->ensureCpuMirrorCurrent(sourceBitmap)) {
+                qWarning("GPU Canvas could not materialize bitmap pixels for the CPU draw fallback");
+                return;
+            }
+        }
+    }
+    Bitmap::ScopedLocks bitmapLocks(canvas->bitmap, sourceBitmap);
+    if (!self->ensureBitmapCurrent(canvas))
+        return;
     if (paint->filter_mode >= 0) {
         if (self->drawFilteredBitmap(canvas, image, src, dst, paint))
             return;
         if (self->readback(canvas, PreviewGpuReadbackReason::Filter)) {
-            canvas->cpuMirrorCurrent = false;
             self->m_cpu->draw_bitmap(self->m_cpu->user, canvas->cpuCanvas, image, src, dst, paint);
+            self->markCpuWrite(canvas->bitmap);
             self->upload(canvas);
         }
         return;
@@ -1991,7 +2735,7 @@ void MEGLER_CB PreviewGpuCanvasHost::drawBitmap(void *user, void *handle, const 
                       QRectF(src[0], src[1], src[2] - src[0], src[3] - src[1]));
     painter.end();
     gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previous));
-    canvas->cpuMirrorCurrent = false;
+    self->finishGpuWrite(canvas);
 }
 
 void *MEGLER_CB PreviewGpuCanvasHost::shaderLinear(void *user, float x0, float y0, float x1, float y1, const uint32_t *colors,
@@ -2005,6 +2749,7 @@ void *MEGLER_CB PreviewGpuCanvasHost::shaderLinear(void *user, float x0, float y
     addStops(&gradient, colors, positions, count);
     shader->brush = QBrush(gradient);
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     if (self && self->m_cpu->shader_linear)
         shader->cpuShader = self->m_cpu->shader_linear(self->m_cpu->user, x0, y0, x1, y1, colors, positions, count, tile);
     return shader;
@@ -2021,6 +2766,7 @@ void *MEGLER_CB PreviewGpuCanvasHost::shaderRadial(void *user, float cx, float c
     addStops(&gradient, colors, positions, count);
     shader->brush = QBrush(gradient);
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     if (self && self->m_cpu->shader_radial)
         shader->cpuShader = self->m_cpu->shader_radial(self->m_cpu->user, cx, cy, radius, colors, positions, count, tile);
     return shader;
@@ -2036,6 +2782,7 @@ void *MEGLER_CB PreviewGpuCanvasHost::shaderSweep(void *user, float cx, float cy
     addStops(&gradient, colors, positions, count);
     shader->brush = QBrush(gradient);
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     if (self && self->m_cpu->shader_sweep)
         shader->cpuShader = self->m_cpu->shader_sweep(self->m_cpu->user, cx, cy, colors, positions, count);
     return shader;
@@ -2050,6 +2797,7 @@ void *MEGLER_CB PreviewGpuCanvasHost::shaderBitmap(void *user, const megler_gfx_
     Shader *shader = new Shader;
     shader->brush = QBrush(source.copy());
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     if (self && self->m_cpu->shader_bitmap)
         shader->cpuShader = self->m_cpu->shader_bitmap(self->m_cpu->user, image, tile);
     return shader;
@@ -2063,6 +2811,7 @@ void MEGLER_CB PreviewGpuCanvasHost::shaderMatrix(void *user, void *handle, cons
     QMutexLocker lock(&shader->mutex);
     shader->brush.setTransform(transformFrom(matrix));
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     if (self && self->m_cpu->shader_matrix && shader->cpuShader)
         self->m_cpu->shader_matrix(self->m_cpu->user, shader->cpuShader, matrix);
 }
@@ -2073,6 +2822,7 @@ void MEGLER_CB PreviewGpuCanvasHost::shaderFree(void *user, void *handle)
     if (!shader)
         return;
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     if (self && self->m_cpu->shader_free && shader->cpuShader)
         self->m_cpu->shader_free(self->m_cpu->user, shader->cpuShader);
     delete shader;
@@ -2081,6 +2831,7 @@ void MEGLER_CB PreviewGpuCanvasHost::shaderFree(void *user, void *handle)
 bool MEGLER_CB PreviewGpuCanvasHost::present(void *user, void *handle, int, int, int, int)
 {
     PreviewGpuCanvasHost *self = static_cast<PreviewGpuCanvasHost *>(user);
+    ScopedOffscreenCurrent scope(self);
     if (!self)
         return false;
     const PreviewGpuMetrics::Sample sample = self->m_metrics->beginPresent();
@@ -2088,7 +2839,26 @@ bool MEGLER_CB PreviewGpuCanvasHost::present(void *user, void *handle, int, int,
     if (sample.sampled)
         timer.start();
     Canvas *canvas = self->findCanvas(handle);
-    if (!canvas || (!self->m_present && !self->m_presentPixels) || !self->ensureCurrent("present")) {
+    if (!canvas) {
+        if (sample.enabled)
+            self->m_metrics->finishPresent(false, sample, sample.sampled ? static_cast<quint64>(timer.nsecsElapsed() / 1000) : 0, 0);
+        return false;
+    }
+    Bitmap::ScopedLocks bitmapLock(canvas->bitmap, nullptr);
+    if (!canvas->gpuBacked) {
+        if (!self->ensureCpuMirrorCurrent(canvas->bitmap))
+            return false;
+        const quint64 producerUs = sample.sampled ? static_cast<quint64>(timer.nsecsElapsed() / 1000) : 0;
+        const bool result = self->m_presentPixels &&
+            self->m_presentPixels(self->m_presentUser, canvas->pixels, canvas->width,
+                                  canvas->height, canvas->stride);
+        if (sample.enabled)
+            self->m_metrics->finishPresent(result, sample, producerUs, 0, true,
+                sample.sampled ? static_cast<quint64>(timer.nsecsElapsed() / 1000) : 0);
+        return result;
+    }
+    if ((!self->m_present && !self->m_presentPixels) ||
+        !self->ensureCurrent("present") || !self->ensureBitmapCurrent(canvas)) {
         if (sample.enabled)
             self->m_metrics->finishPresent(false, sample, sample.sampled ? static_cast<quint64>(timer.nsecsElapsed() / 1000) : 0, 0);
         return false;
@@ -2127,15 +2897,27 @@ bool MEGLER_CB PreviewGpuCanvasHost::present(void *user, void *handle, int, int,
 bool PreviewGpuCanvasHost::drawTextPath(void *handle, const float *path, int count, int fill,
                                         const megler_gfx_paint *paint, void *shader)
 {
+    ScopedOffscreenCurrent scope(this);
     Canvas *canvas = findCanvas(handle);
     if (!canvas)
         return false;
+    Bitmap::ScopedLocks bitmapLock(canvas->bitmap, nullptr);
+    if (!canvas->gpuBacked) {
+        if (!ensureCpuMirrorCurrent(canvas->bitmap))
+            return true;
+        if (m_cpu->draw_path)
+            m_cpu->draw_path(m_cpu->user, canvas->cpuCanvas, path, count, fill, paint, cpuShader(shader));
+        markCpuWrite(canvas->bitmap);
+        return true;
+    }
+    if (!ensureBitmapCurrent(canvas))
+        return true;
     if (paint && paint->filter_mode >= 0) {
         if (drawFilteredPath(canvas, pathFrom(path, count, fill), paint, shader))
             return true;
         if (readback(canvas, PreviewGpuReadbackReason::Filter)) {
-            canvas->cpuMirrorCurrent = false;
             m_cpu->draw_path(m_cpu->user, canvas->cpuCanvas, path, count, fill, paint, cpuShader(shader));
+            markCpuWrite(canvas->bitmap);
             upload(canvas);
         }
         return true;
@@ -2147,6 +2929,7 @@ bool PreviewGpuCanvasHost::drawTextPath(void *handle, const float *path, int cou
 bool PreviewGpuCanvasHost::drawTextFallbackPath(void *handle, const float *path, int count, int fill,
                                                 const megler_gfx_paint *paint, void *shader)
 {
+    ScopedOffscreenCurrent scope(this);
     Canvas *canvas = findCanvas(handle);
     if (canvas)
         return drawTextPath(handle, path, count, fill, paint, shader);

@@ -38,6 +38,8 @@ void mg_java_gfx_set_present_probe(bool (*due)(void), void (*probe)(const void *
 void mg_java_gfx_set_present_part(void (*fn)(const i32 part[4]));
 /* Until the frame last handed to the render thread has been shown (Gfx.frameWait): before the app's end. */
 void mg_java_gfx_frames_finish(void);
+/* Main and render threads release their graphics contexts explicitly at app exit. */
+bool mg_java_gfx_retains_thread_context(void);
 /* Bytes of bitmap memory now allocated and bitmaps alive, for the memory report. */
 void mg_java_gfx_stats(uint64_t *bitmap_bytes, uint32_t *bitmaps);
 /* Whether the shell keeps pictures on the graphics processor for views to draw (megler_gfx_host.texture_frame, draw_texture). */

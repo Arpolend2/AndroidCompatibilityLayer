@@ -435,6 +435,9 @@
 </context>
 <context>
     <name>AndroidCompatibilityLayer</name>
+    <message><source>Google sign-in</source><translation>Вход в Google</translation></message>
+    <message><source>Waiting for the Google sign-in screen...</source><translation>Ожидание экрана входа в Google...</translation></message>
+    <message><source>Cancel sign-in</source><translation>Отменить вход</translation></message>
     <message><source>What's new in this build</source><translation>Что нового в этой сборке</translation></message>
     <message><source>- GPU acceleration for Aurora Store and microG settings, with improved image scaling.&#10;- Notifications from Android apps now appear in Aurora.&#10;- Standalone apps can continue background tasks after their window is closed.</source><translation>- GPU-ускорение интерфейса Aurora Store и настроек microG, улучшенное масштабирование изображений.&#10;- Уведомления Android-приложений теперь отображаются в Авроре.&#10;- Standalone-приложения могут продолжать фоновые задачи после закрытия окна.</translation></message>
     <message><source>Could not open the link.</source><translation>Не удалось открыть ссылку.</translation></message>
@@ -1108,6 +1111,10 @@ Pick an Android app&apos;s APK to add it to the library.</source>
 </context>
 <context>
     <name>PreviewPlayer</name>
+    <message>
+        <source>Enable logging to capture diagnostic frames.</source>
+        <translation>Включите журнал для сохранения диагностических кадров.</translation>
+    </message>
     <message>
         <source>Starting Android app...</source>
         <translation>Запуск Android-приложения...</translation>

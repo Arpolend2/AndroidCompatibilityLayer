@@ -43,18 +43,26 @@ class PreviewPlayer : public QObject
     Q_OBJECT
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
     Q_PROPERTY(bool showStatus READ showStatus NOTIFY statusChanged)
+    Q_PROPERTY(QString frameCaptureStatus READ frameCaptureStatus NOTIFY frameCaptureStatusChanged)
+    Q_PROPERTY(bool frameCapturePending READ frameCapturePending NOTIFY frameCaptureStatusChanged)
+    Q_PROPERTY(bool frameCaptureEnabled READ frameCaptureEnabled NOTIFY frameCaptureEnabledChanged)
     Q_PROPERTY(int backGestureEdgeDp READ backGestureEdgeDp CONSTANT)
     Q_PROPERTY(bool closeOnBackGesture READ closeOnBackGesture CONSTANT)
+    Q_PROPERTY(int orientationMask READ orientationMask NOTIFY orientationMaskChanged)
 
 public:
     PreviewPlayer(const QString &root, const QString &data, const QString &apk = QString(), QObject *parent = nullptr);
     void enableStoreWorkerTeardownTrace();
     QString status() const { return m_status; }
     bool showStatus() const { return !m_running || m_closing || frame().isNull(); }
+    QString frameCaptureStatus() const { return m_frameCaptureStatus; }
+    bool frameCapturePending() const { return m_frameCapturePending; }
+    bool frameCaptureEnabled() const { return m_frameCaptureEnabled; }
     int renderCap() const { return m_renderCap; }
     int backGestureEdgeDp() const { return m_backGestureEdgeDp; }
     void setBackGestureEdgeDp(int width) { m_backGestureEdgeDp = width; }
     bool closeOnBackGesture() const { return m_closeOnBackGesture; }
+    int orientationMask() const { return m_orientationMask; }
     int exitStatus() const { return m_exitStatus; }
     void setCloseOnBackGesture(bool enabled) { m_closeOnBackGesture = enabled; }
     void setCloseOnExit(bool enabled) { m_closeOnExit = enabled; }
@@ -86,6 +94,7 @@ public:
     void setSurface(PreviewSurface *surface);
     virtual void setViewport(qreal width, qreal height, qreal pixelRatio, int rotation = -1);
     virtual void setDisplayRotation(int rotation);
+    void setScreenOrientations(int natural, int actual);
     int displayRotation() const { return m_displayRotation; }
     virtual bool usesGpuSurface() const { return true; }
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
@@ -98,15 +107,22 @@ public:
     Q_INVOKABLE bool gestureBack();
     Q_INVOKABLE bool hasFrameAfterGestureBack() const;
     Q_INVOKABLE void endGestureFrameWait();
+    Q_INVOKABLE void captureFramePair();
 
 signals:
     void statusChanged();
+    void frameCaptureStatusChanged();
+    void frameCaptureEnabledChanged();
+    void orientationMaskChanged();
     void frameChanged();
     void finished();
     void returnToManagerRequested();
 
 private slots:
     void publishFrame();
+    void setRequestedOrientation(int requested);
+    void finishFrameCapture();
+    void updateFrameCaptureEnabled();
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     void requestGpuFrame();
 #endif
@@ -120,6 +136,7 @@ private:
     static int MEGLER_CB presentEglLayer(void *user, int layer, void *display, void *surface, int width, int height);
     static bool MEGLER_CB presentEglViews(void *user, const void *pixels, int width, int height, int stride);
     static void MEGLER_CB placeEglLayer(void *user, int layer, int x, int y, int width, int height, int flags);
+    void queueFrameCaptureResult();
 #endif
 #ifdef MG_EXPERIMENTAL_GPU_CANVAS
     static bool MEGLER_CB presentGpuCanvas(void *user, uint32_t texture, int width, int height);
@@ -128,7 +145,10 @@ private:
     static bool MEGLER_CB releaseRemoteGpuCanvas(void *user, uint32_t texture);
 #endif
     static void MEGLER_CB appExited(void *user, int status, const char *reason);
+    static void MEGLER_CB orientationRequested(void *user, int requested);
+    void updateOrientationMask();
     void setStatus(const QString &status);
+    void setFrameCaptureStatus(const QString &status);
 
     QString m_data;
     int m_renderCap;
@@ -142,6 +162,11 @@ private:
     QByteArray m_apkUtf8;
     QByteArray m_splitsUtf8;
     QString m_status;
+    QString m_frameCaptureStatus;
+    quint64 m_frameCaptureSequence = 0;
+    bool m_frameCapturePending = false;
+    bool m_frameCaptureEnabled = false;
+    QAtomicInt m_frameCaptureResultQueued = 0;
     mutable QMutex m_frameMutex;
     QImage m_frame;
     QImage m_gestureFrame;
@@ -173,6 +198,10 @@ private:
     int m_surfaceHeight = 800;
     int m_density = 160;
     int m_displayRotation = 0;
+    int m_requestedOrientation = MEGLER_ORIENTATION_UNSPECIFIED;
+    int m_naturalOrientation = 0;
+    int m_actualOrientation = 0;
+    int m_orientationMask = -1;
     QPointer<PreviewKeyboard> m_keyboard;
     QPointer<PreviewSurface> m_surface;
     QTimer *m_backgroundMonitor = nullptr;

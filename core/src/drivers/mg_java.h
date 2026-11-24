@@ -23,6 +23,7 @@ void mg_java_enable_shared_microg_worker(void);
 bool mg_java_set_shared_microg_client(int host_fd, int uid, int pid, const char *package);
 void mg_java_close_shared_microg_client(void);
 const mg_jhle *mg_java_shared_microg_client_natives(void);
+const mg_jhle *mg_java_surface_texture_natives(void);
 /*
  * For the tests: every frame a window draws in part (its dirty region) is checked against the same frame drawn whole, and a
  * difference is a line in the log ("ViewRoot: ... drawn in part missed"). Set before the app starts. Costs a second drawing

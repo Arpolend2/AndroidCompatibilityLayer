@@ -2194,6 +2194,173 @@ public class Main extends Activity {
         insetFraction();
         workSource();
         parcelMarshall();
+        step("text-charsequence-creator", () -> {
+            android.os.Parcel p = android.os.Parcel.obtain();
+            android.text.TextUtils.writeToParcel(null, p, 0);
+            android.text.TextUtils.writeToParcel("H\u00e9", p, 0);
+            android.text.SpannableString original = new android.text.SpannableString("hello");
+            android.text.style.TextAppearanceSpan appearance = new android.text.style.TextAppearanceSpan("serif", 3, 21, null, null);
+            android.text.style.ForegroundColorSpan color = new android.text.style.ForegroundColorSpan(0xff001122);
+            Object marker = new Object();
+            original.setSpan(appearance, 1, 4, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            original.setSpan(color, 0, 3, android.text.Spanned.SPAN_INCLUSIVE_EXCLUSIVE);
+            original.setSpan(marker, 0, 1, 0);
+            android.text.TextUtils.writeToParcel(original, p, 0);
+            p.writeInt(0x13572468);
+            p.setDataPosition(0);
+            boolean plain = android.text.TextUtils.CHAR_SEQUENCE_CREATOR.createFromParcel(p) == null
+                && "H\u00e9".contentEquals(android.text.TextUtils.CHAR_SEQUENCE_CREATOR.createFromParcel(p))
+                && android.text.TextUtils.CHAR_SEQUENCE_CREATOR.newArray(3).length == 3;
+            CharSequence decoded = android.text.TextUtils.CHAR_SEQUENCE_CREATOR.createFromParcel(p);
+            boolean styled = decoded instanceof android.text.Spanned && "hello".contentEquals(decoded);
+            if (styled) {
+                android.text.Spanned text = (android.text.Spanned) decoded;
+                android.text.style.TextAppearanceSpan[] appearances = text.getSpans(0, text.length(), android.text.style.TextAppearanceSpan.class);
+                android.text.style.ForegroundColorSpan[] colors = text.getSpans(0, text.length(), android.text.style.ForegroundColorSpan.class);
+                styled = appearances.length == 1 && "serif".equals(appearances[0].getFamily()) && appearances[0].getTextSize() == 21
+                    && text.getSpanStart(appearances[0]) == 1 && text.getSpanEnd(appearances[0]) == 4
+                    && text.getSpanFlags(appearances[0]) == android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    && colors.length == 1 && colors[0].getForegroundColor() == 0xff001122
+                    && text.getSpanStart(colors[0]) == 0 && text.getSpanEnd(colors[0]) == 3 && text.getSpanStart(marker) == 0;
+            }
+            styled = styled && p.readInt() == 0x13572468 && p.dataAvail() == 0;
+            p.recycle();
+            detail = "plain=" + plain + " styled=" + styled;
+            return plain && styled;
+        });
+        step("text-appearance-parcel", () -> {
+            class DerivedSpan extends android.text.style.TextAppearanceSpan {
+                DerivedSpan(android.content.res.ColorStateList colors) { super("serif", 3, 21, colors, null); }
+            }
+            int[][] states = { { android.R.attr.state_pressed }, {} };
+            android.content.res.ColorStateList colors = new android.content.res.ColorStateList(states, new int[] { 0xff123456, 0xffabcdef });
+            DerivedSpan original = new DerivedSpan(colors);
+            android.text.ParcelableSpan[] spans = { original, new android.text.style.ForegroundColorSpan(0xff001122) };
+            boolean assignment = spans[0] == original && spans[0].getSpanTypeId() == 17;
+            android.os.Parcel p = android.os.Parcel.obtain();
+            original.writeToParcel(p, 0);
+            p.writeInt(0x13572468);
+            byte[] bytes = p.marshall();
+            android.os.Parcel q = android.os.Parcel.obtain();
+            q.unmarshall(bytes, 0, bytes.length);
+            q.setDataPosition(0);
+            android.text.style.TextAppearanceSpan copy = new android.text.style.TextAppearanceSpan(q);
+            boolean roundTrip = "serif".equals(copy.getFamily()) && copy.getTextStyle() == 3 && copy.getTextSize() == 21
+                && copy.getLinkTextColor() == null && copy.getTextColor() != null
+                && copy.getTextColor().getColorForState(new int[] { android.R.attr.state_pressed }, 0) == 0xff123456
+                && copy.getTextColor().getDefaultColor() == 0xffabcdef && q.readInt() == 0x13572468;
+            p.recycle();
+            q.recycle();
+            p = android.os.Parcel.obtain();
+            p.writeInt(2); p.writeIntArray(new int[0]); p.writeIntArray(null); p.writeIntArray(new int[] { 1, 2 });
+            p.setDataPosition(0);
+            boolean invalidState = false;
+            try { android.content.res.ColorStateList.CREATOR.createFromParcel(p); } catch (NullPointerException expected) { invalidState = true; }
+            p.recycle();
+            p = android.os.Parcel.obtain();
+            p.writeInt(1); p.writeIntArray(new int[0]); p.writeIntArray(null);
+            p.setDataPosition(0);
+            boolean invalidColors = false;
+            try { android.content.res.ColorStateList.CREATOR.createFromParcel(p); } catch (IllegalArgumentException expected) { invalidColors = true; }
+            p.recycle();
+            p = android.os.Parcel.obtain();
+            p.writeInt(0); p.writeInt(2); p.writeInt(1);
+            p.setDataPosition(0);
+            boolean truncatedColors = false;
+            try { android.content.res.ColorStateList.CREATOR.createFromParcel(p); } catch (IllegalArgumentException expected) { truncatedColors = true; }
+            p.recycle();
+
+            p = android.os.Parcel.obtain();
+            p.writeInt(1); p.writeIntArray(null); p.writeIntArray(new int[] { 0xff123456 });
+            p.setDataPosition(0);
+            android.content.res.ColorStateList nullableState = android.content.res.ColorStateList.CREATOR.createFromParcel(p);
+            q = android.os.Parcel.obtain();
+            nullableState.writeToParcel(q, 0);
+            q.setDataPosition(0);
+            boolean nullableArrays = q.readInt() == 1 && q.createIntArray() == null && q.createIntArray()[0] == 0xff123456;
+            p.recycle();
+            q.recycle();
+            p = android.os.Parcel.obtain();
+            p.writeInt(0); p.writeIntArray(null);
+            p.setDataPosition(0);
+            android.content.res.ColorStateList nullableColors = android.content.res.ColorStateList.CREATOR.createFromParcel(p);
+            q = android.os.Parcel.obtain();
+            nullableColors.writeToParcel(q, 0);
+            q.setDataPosition(0);
+            nullableArrays = nullableArrays && q.readInt() == 0 && q.createIntArray() == null;
+            p.recycle();
+            q.recycle();
+            p = android.os.Parcel.obtain();
+            p.writeInt(3); p.writeIntArray(new int[] { android.R.attr.state_pressed }); p.writeIntArray(null);
+            p.writeIntArray(new int[0]); p.writeIntArray(new int[] { 1, 2, 3 });
+            p.setDataPosition(0);
+            nullableState = android.content.res.ColorStateList.CREATOR.createFromParcel(p);
+            q = android.os.Parcel.obtain();
+            nullableState.writeToParcel(q, 0);
+            q.setDataPosition(0);
+            nullableArrays = nullableArrays && q.readInt() == 3 && q.createIntArray()[0] == android.R.attr.state_pressed
+                && q.createIntArray() == null && q.createIntArray().length == 0 && q.createIntArray()[2] == 3
+                && nullableState.getDefaultColor() == 3;
+            p.recycle();
+            q.recycle();
+            p = android.os.Parcel.obtain();
+            p.writeString(null); p.writeInt(0); p.writeInt(-1); p.writeInt(0); p.writeInt(0);
+            p.writeInt(android.os.Process.myPid()); p.writeInt(0);
+            p.setDataPosition(0);
+            boolean localTypefaceRejected = false;
+            try { new android.text.style.TextAppearanceSpan(p); } catch (UnsupportedOperationException expected) { localTypefaceRejected = true; }
+            p.recycle();
+
+            p = android.os.Parcel.obtain();
+            p.writeString(null); p.writeInt(0); p.writeInt(-1); p.writeInt(0); p.writeInt(0);
+            p.writeInt(-1); p.writeInt(-1); p.writeInt(600);
+            p.writeString("android.os.LocaleList");
+            android.os.LocaleList.forLanguageTags("en-US,ru-RU").writeToParcel(p, 0);
+            p.writeFloat(2); p.writeFloat(3); p.writeFloat(4); p.writeInt(0xff010203);
+            p.writeBoolean(true); p.writeBoolean(true); p.writeBoolean(true); p.writeFloat(0.25f);
+            p.writeString("liga"); p.writeString("wght");
+            p.writeInt(0x24681357);
+            p.setDataPosition(0);
+            android.text.style.TextAppearanceSpan extended = new android.text.style.TextAppearanceSpan(p);
+            boolean extras = extended.getTextColor() == null && extended.getLinkTextColor() == null && extended.getTextFontWeight() == 600
+                && "en-US,ru-RU".equals(extended.getTextLocales().toLanguageTags())
+                && extended.getShadowRadius() == 2 && extended.getShadowDx() == 3 && extended.getShadowDy() == 4
+                && extended.getShadowColor() == 0xff010203 && extended.isElegantTextHeight()
+                && ((Float) extended.getClass().getMethod("getLetterSpacing").invoke(extended)).floatValue() == 0.25f
+                && "liga".equals(extended.getFontFeatureSettings()) && "wght".equals(extended.getFontVariationSettings())
+                && p.readInt() == 0x24681357;
+            p.recycle();
+            p = android.os.Parcel.obtain();
+            extended.writeToParcel(p, 0);
+            bytes = p.marshall();
+            q = android.os.Parcel.obtain();
+            q.unmarshall(bytes, 0, bytes.length);
+            q.setDataPosition(0);
+            copy = new android.text.style.TextAppearanceSpan(q);
+            extras = extras && copy.getTextFontWeight() == 600 && "en-US,ru-RU".equals(copy.getTextLocales().toLanguageTags())
+                && copy.getShadowColor() == 0xff010203
+                && ((Float) copy.getClass().getMethod("getLetterSpacing").invoke(copy)).floatValue() == 0.25f && q.dataAvail() == 0;
+            p.recycle();
+            q.recycle();
+            p = android.os.Parcel.obtain();
+            p.writeString(null); p.writeInt(0); p.writeInt(-1); p.writeInt(0); p.writeInt(0);
+            p.writeInt(-1); p.writeInt(-1); p.writeInt(600); p.writeString(null);
+            p.writeFloat(0); p.writeFloat(0); p.writeFloat(0); p.writeInt(0);
+            p.writeBoolean(false); p.writeBoolean(false); p.writeBoolean(false); p.writeFloat(0);
+            p.writeString(null); p.writeString(null); p.setDataPosition(0);
+            android.text.style.TextAppearanceSpan weightOnly = new android.text.style.TextAppearanceSpan(p);
+            android.text.TextPaint paint = new android.text.TextPaint();
+            android.graphics.Typeface before = paint.getTypeface();
+            weightOnly.updateMeasureState(paint);
+            boolean weightOnlyUnchanged = weightOnly.getTextFontWeight() == 600 && paint.getTypeface() == before;
+            weightOnly.updateDrawState(paint);
+            weightOnlyUnchanged = weightOnlyUnchanged && paint.getTypeface() == before;
+            p.recycle();
+            detail = "assignment=" + assignment + " roundTrip=" + roundTrip + " extras=" + extras
+                + " nullableArrays=" + nullableArrays + " invalidState=" + invalidState + " invalidColors=" + invalidColors
+                + " truncatedColors=" + truncatedColors + " localTypefaceRejected=" + localTypefaceRejected + " weightOnlyUnchanged=" + weightOnlyUnchanged;
+            return assignment && roundTrip && extras && nullableArrays && invalidState && invalidColors && truncatedColors && localTypefaceRejected && weightOnlyUnchanged;
+        });
         packageFlags();
         resourcesLoader();
         locationRequest();

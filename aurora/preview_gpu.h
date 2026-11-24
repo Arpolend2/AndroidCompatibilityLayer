@@ -4,8 +4,10 @@
 #include "egl_frame_transport.h"
 #include "embedded_gpu_transport.h"
 
+#include <QDateTime>
 #include <QMutex>
 #include <QImage>
+#include <QMetaObject>
 #include <QOpenGLContext>
 #include <QPointer>
 #include <QQuickItem>
@@ -16,6 +18,15 @@
 
 #include <functional>
 #include <memory>
+
+struct PreviewGpuFrameCapture
+{
+    quint64 sequence = 0;
+    QDateTime capturedAt;
+    QImage beforeTransfer;
+    QImage composedAfter;
+    QString failure;
+};
 
 class PreviewGpuState
 {
@@ -29,6 +40,10 @@ public:
     QOpenGLContext *qtContext() const;
     bool presentCanvas(uint32_t texture, int width, int height, QObject *notifier);
     bool releaseCanvasTexture(uint32_t texture, QObject *notifier);
+    bool requestFramePairCapture(quint64 sequence);
+    bool framePairCaptureReady() const;
+    bool takeFramePairCapture(PreviewGpuFrameCapture *capture);
+    void cancelFramePairCapture(quint64 sequence, const QString &reason);
     void clear();
     void invalidate();
     QString lastFailure() const;
@@ -76,6 +91,15 @@ private:
     AuroraDmaBufFrame dmaBufFrame;
     std::function<void(quint64, bool)> dmaBufCompletion;
     bool dmaBufPending = false;
+    bool frameCaptureRequested = false;
+    bool frameCaptureActive = false;
+    bool frameCaptureAwaitingRender = false;
+    bool frameCaptureCompleted = false;
+    quint64 frameCaptureSequence = 0;
+    QDateTime frameCaptureAt;
+    QImage frameCaptureBefore;
+    QImage frameCaptureAfter;
+    QString frameCaptureFailure;
 };
 
 class PreviewGpuItem : public QQuickItem
@@ -91,6 +115,7 @@ protected:
 private:
     std::shared_ptr<PreviewGpuState> m_state;
     QMetaObject::Connection m_invalidation;
+    QMetaObject::Connection m_afterRendering;
 };
 
 #endif

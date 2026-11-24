@@ -8,6 +8,7 @@
 #include <QStringList>
 #include <QVariantList>
 #include <QVector>
+#include <memory>
 
 class AuroraStorageHost
 {
@@ -23,12 +24,16 @@ public:
 
     megler_storage_host host();
     static QVariantList options();
+    // Configure before handing callbacks to the runtime.
+    bool configureCameraPictures(const QString &package, bool allowed, QString *error);
 
 private:
+    struct Directory;
     struct Link {
         QString name;
         QString root;
         bool writable;
+        std::shared_ptr<Directory> directory;
     };
 
     static void *MEGLER_CB open(void *user, int link, const char *path, int flags, int kind, int *error);
@@ -37,7 +42,10 @@ private:
     static bool MEGLER_CB rename(void *user, int fromLink, const char *from, int toLink, const char *to, int *error);
 
     void setFolders(const QVector<Folder> &folders);
+    void publishLinks();
     bool resolve(int link, const char *path, bool allowMissingLeaf, QString *resolved, int *error) const;
+    bool canWrite(int link, int *error) const;
+    int parentDescriptor(int link, const char *path, QByteArray *leaf, int *error) const;
     static QString systemFolderPath(const QString &name);
 
     QVector<Link> m_links;

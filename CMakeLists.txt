@@ -61,6 +61,7 @@ add_library(acl_runtime_objects OBJECT
     aurora/main.cpp
     aurora/microg_watchdog.cpp
     aurora/microg_watchdog.h
+    aurora/microg_watchdog_schedule.h
     aurora/probe.h
     aurora/runtime_settings.h
     aurora/log_channel.cpp
@@ -161,6 +162,8 @@ add_library(acl_runtime_objects OBJECT
     aurora/shared_microg_worker.h
     aurora/preview.cpp
     aurora/preview.h
+    aurora/preview_frame_export.cpp
+    aurora/preview_frame_export.h
     aurora/notification_host.cpp aurora/notification_host.h
     aurora/embedded_preview.cpp
     aurora/embedded_preview.h
@@ -282,6 +285,20 @@ target_link_libraries(acl_runtime_objects PUBLIC
 
 if(ANDROID_COMPATIBILITY_LAYER_BUILD_TEST_TARGETS)
 find_package(Qt5 COMPONENTS Test REQUIRED)
+add_executable(android_compatibility_layer_report_webview_startup_test EXCLUDE_FROM_ALL
+    aurora/tests/report_webview_startup_test.cpp aurora/report_webview.cpp)
+set_target_properties(android_compatibility_layer_report_webview_startup_test PROPERTIES CXX_STANDARD 17)
+target_compile_definitions(android_compatibility_layer_report_webview_startup_test PRIVATE ACL_WITH_REPORT_WEBVIEW)
+target_include_directories(android_compatibility_layer_report_webview_startup_test PRIVATE ${AURORA_WEBVIEW_INCLUDE_DIRS})
+target_link_libraries(android_compatibility_layer_report_webview_startup_test PRIVATE Qt5::Core Qt5::Gui)
+add_executable(android_compatibility_layer_shared_microg_graphics_test EXCLUDE_FROM_ALL
+    aurora/tests/shared_microg_graphics_test.cpp aurora/preview_text.cpp aurora/preview_image.cpp
+    core/tests/microg-binder-boundary/worker_graphics_fixture.c core/tests/mg_gfx_standin.c
+    ${ZLIB_SOURCES})
+target_compile_options(android_compatibility_layer_shared_microg_graphics_test PRIVATE
+    -ffunction-sections -fdata-sections)
+target_link_libraries(android_compatibility_layer_shared_microg_graphics_test PRIVATE
+    Qt5::Gui -Wl,--gc-sections m pthread)
 add_subdirectory(aurora/tests/shared_microg_headless EXCLUDE_FROM_ALL)
     add_executable(android_compatibility_layer_webview_native_probe EXCLUDE_FROM_ALL aurora/tests/webview_native_probe.cpp)
     set_property(TARGET android_compatibility_layer_webview_native_probe PROPERTY CXX_STANDARD 17)
@@ -324,7 +341,7 @@ target_link_libraries(android_compatibility_layer_native_egl_image_test PRIVATE 
 add_executable(android_compatibility_layer_preview_gpu_order_test EXCLUDE_FROM_ALL aurora/tests/preview_gpu_order_test.cpp)
     add_executable(android_compatibility_layer_preview_gpu_state_test EXCLUDE_FROM_ALL
         aurora/tests/preview_gpu_state_test.cpp aurora/preview_gpu.cpp aurora/preview_gpu.h
-        aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h
+        aurora/preview_frame_export.cpp aurora/embedded_gpu_transport.cpp aurora/embedded_gpu_transport.h
         aurora/egl_frame_transport.c)
     target_include_directories(android_compatibility_layer_preview_gpu_state_test PRIVATE ${EGL_INCLUDE_DIRS} ${GLES2_INCLUDE_DIRS})
     target_link_libraries(android_compatibility_layer_preview_gpu_state_test PRIVATE Qt5::Quick ${EGL_LDFLAGS} ${GLES2_LDFLAGS} pthread)
@@ -416,6 +433,12 @@ target_link_libraries(android_compatibility_layer_preview_image_test PRIVATE Qt5
 add_executable(android_compatibility_layer_preview_frame_test EXCLUDE_FROM_ALL aurora/tests/preview_frame_test.cpp)
 target_link_libraries(android_compatibility_layer_preview_frame_test PRIVATE Qt5::Gui)
 
+add_executable(android_compatibility_layer_preview_frame_export_test EXCLUDE_FROM_ALL
+    aurora/tests/preview_frame_export_test.cpp
+    aurora/preview_frame_export.cpp
+)
+target_link_libraries(android_compatibility_layer_preview_frame_export_test PRIVATE Qt5::Gui)
+
 add_executable(android_compatibility_layer_preview_keyboard_test EXCLUDE_FROM_ALL
     aurora/tests/preview_keyboard_test.cpp
     aurora/preview_keyboard.cpp
@@ -464,6 +487,9 @@ target_link_libraries(android_compatibility_layer_shared_microg_supervisor_test 
 add_executable(android_compatibility_layer_microg_watchdog_test EXCLUDE_FROM_ALL
     aurora/tests/microg_watchdog_test.cpp aurora/microg_watchdog.cpp aurora/shared_microg_ipc.cpp)
 target_link_libraries(android_compatibility_layer_microg_watchdog_test PRIVATE Qt5::Core Qt5::DBus)
+add_executable(android_compatibility_layer_microg_watchdog_schedule_test EXCLUDE_FROM_ALL
+    aurora/tests/microg_watchdog_schedule_test.cpp)
+target_link_libraries(android_compatibility_layer_microg_watchdog_schedule_test PRIVATE Qt5::Core)
 
 add_executable(android_compatibility_layer_shared_microg_startup_client EXCLUDE_FROM_ALL
     tools/shared-microg-startup-client.cpp aurora/shared_microg_ipc.cpp
@@ -566,6 +592,7 @@ add_executable(android_compatibility_layer_audio_preview_codec_test EXCLUDE_FROM
     aurora/tests/audio_preview_codec_test.cpp
     aurora/preview.cpp
     aurora/preview.h
+    aurora/preview_frame_export.cpp aurora/preview_frame_export.h
     aurora/notification_host.cpp aurora/notification_host.h
     aurora/error_log.cpp aurora/error_log.h
     aurora/memory_log_bus.cpp aurora/memory_log_bus.h
@@ -593,7 +620,8 @@ set(EMBEDDED_PREVIEW_TEST_SOURCES
     aurora/error_log.cpp aurora/error_log.h
     aurora/memory_log_bus.cpp aurora/memory_log_bus.h
     aurora/shared_folders.cpp aurora/shared_folders.h
-    aurora/preview_image.cpp aurora/audio_mp3_codec.cpp
+    aurora/preview_image.cpp aurora/preview_frame_export.cpp aurora/preview_frame_export.h
+    aurora/audio_mp3_codec.cpp
     aurora/media_mp3_host.cpp aurora/log_channel.cpp aurora/log_channel.h
     aurora/store_preview_supervisor.cpp aurora/store_preview_supervisor.h
     core/src/drivers/mg_store_restart.c)
@@ -618,6 +646,10 @@ add_executable(android_compatibility_layer_embedded_preview_silica_test EXCLUDE_
     aurora/tests/embedded_preview_silica_test.cpp
     aurora/tests/embedded_preview_silica_test.qml)
 target_link_libraries(android_compatibility_layer_embedded_preview_silica_test PRIVATE Qt5::Quick)
+
+add_executable(android_compatibility_layer_preview_navigation_silica_test EXCLUDE_FROM_ALL
+    aurora/tests/preview_navigation_silica_test.cpp)
+target_link_libraries(android_compatibility_layer_preview_navigation_silica_test PRIVATE Qt5::Quick)
 
 add_executable(android_compatibility_layer_audio_mixer_path_test EXCLUDE_FROM_ALL
     aurora/tests/audio_mixer_path_test.cpp

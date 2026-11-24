@@ -4,7 +4,8 @@
     // TextureView showing the texture draws it and the listener hears of it on its handler. Drawn into a canvas of the
     // texture's first, it would be drawn twice and, on the graphics processor, read back once a picture.
     /** A frame that is a whole bitmap: the front buffer from now on. The producer does not write into it while it is. False when released or locked. */
-    public boolean meglerPostBitmap(Bitmap b) {
+    public boolean meglerPostBitmap(Bitmap b) { return meglerPostBitmap(b, System.nanoTime()); }
+    public boolean meglerPostBitmap(Bitmap b, long timestamp) {
         synchronized (mLock) {
             if (mReleased || mLocked || b == null) return false;
             if (mFrontCanvas != null) mFrontCanvas.meglerRelease();
@@ -13,7 +14,8 @@
             if (mBackCanvas != null) mBackCanvas.meglerRelease();
             mBack = null;
             mBackCanvas = null;
-            mTimestamp = System.nanoTime();
+            mTimestamp = timestamp;
+            mPostedAt = System.nanoTime();
         }
         android.view.View v = meglerView;
         if (v != null) v.postInvalidate();
@@ -61,6 +63,6 @@
         if (l != null && hd != null) hd.post(() -> l.onFrameAvailable(this));
     }
     /** Whether the newest frame is the shell's, on the graphics processor, rather than a bitmap of this texture's (meglerFront). */
-    public boolean meglerGpuNewest() { return mMeglerGpuId != 0 && mMeglerGpuAt != 0 && mMeglerGpuAt >= getTimestamp(); }
+    public boolean meglerGpuNewest() { return mMeglerGpuId != 0 && mMeglerGpuAt != 0 && mMeglerGpuAt >= mPostedAt; }
     /** When the newest frame on the graphics processor came (System.nanoTime): a new one for every frame, 0 before the first. */
     public long meglerGpuAt() { return mMeglerGpuAt; }

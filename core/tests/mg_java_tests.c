@@ -90,6 +90,7 @@
 #include "../src/mg_base.h"
 #include "../src/host/mg_host.h"
 #include "../src/ndk/mg_egl.h"
+#include "../src/ndk/mg_ndk.h"
 #include "../src/run/mg_run.h"
 #include "../src/zip/mg_zip.h"
 #include "zlib.h"
@@ -1955,6 +1956,10 @@ static int run_screen(void)
     expect_line("I/ScreenTest: Main.onRestoreInstanceState field=typed", &at, 10);
     expect_line("I/ScreenTest: Main.onResume", &at, 10);
     CHECK(wait_line("I/ScreenTest: App.display 0 rotation=1 size=800x480", 0, 10) >= 0);
+    /* This is an Activity recreation with restored state, not a process restart. */
+    CHECK(count_lines("I/ScreenTest: Main.onCreate count=2 state=saved retained=kept1") == 1);
+    CHECK(count_lines("I/ScreenTest: Main.onRestoreInstanceState field=typed") == 1);
+    CHECK(count_lines("I/ScreenTest: App.onCreate ") == 1);
     settle();
     CHECK(halves(800, 480, RED, BLUE, true));
     write_picture("screen-2-turned");
@@ -2152,6 +2157,203 @@ static void say_cost(const char *what, const cost *a, const cost *b)
             (unsigned)(steps / 1000 / (u64)pictures));
 }
 
+static void test_native_surface_texture(void)
+{
+    mg_nwindow *(*from)(void *, mg_jobj *) = (mg_nwindow *(*)(void *, mg_jobj *))mg_bionic_find("ASurfaceTexture_fromSurfaceTexture");
+    mg_nwindow *(*window)(mg_nwindow *) = (mg_nwindow *(*)(mg_nwindow *))mg_bionic_find("ASurfaceTexture_acquireANativeWindow");
+    void (*release)(mg_nwindow *) = (void (*)(mg_nwindow *))mg_bionic_find("ASurfaceTexture_release");
+    mg_jvalue arg = { 0 };
+    mg_jobj *texture, *wrong;
+    mg_nwindow *a, *b, *producer;
+    CHECK(from && window && release);
+    if (!from || !window || !release) return;
+    CHECK(from(NULL, NULL) == NULL);
+    CHECK(window(NULL) == NULL);
+    wrong = mg_dvm_new_string("not a SurfaceTexture");
+    CHECK(wrong && !from(NULL, wrong));
+    texture = mg_dvm_new("android/graphics/SurfaceTexture", "(Z)V", &arg);
+    CHECK(texture != NULL);
+    if (!texture) return;
+    a = from(NULL, texture);
+    b = from(NULL, texture);
+    CHECK(a && b && a == b);
+    if (!a || !b) {
+        if (a) release(a);
+        if (b) release(b);
+        return;
+    }
+    producer = window(a);
+    CHECK(producer == a);
+    release(a);
+    CHECK(mg_nwindow_valid(b));
+    CHECK(mg_dvm_call_virtual(texture, "release", "()V", NULL, NULL));
+    CHECK(!mg_nwindow_valid(b));
+    CHECK(window(b) == NULL);
+    CHECK(from(NULL, texture) == NULL);
+    if (producer) mg_nwindow_release(producer);
+    release(b);
+}
+
+/* Run with the system EGL backend and a real EGL/GLES provider. */
+static void test_surface_texture_gl(void)
+{
+    typedef void *(*get_display_fn)(void *);
+    typedef int (*init_fn)(void *, int *, int *);
+    typedef int (*choose_fn)(void *, const int *, void **, int, int *);
+    typedef void *(*create_context_fn)(void *, void *, void *, const int *);
+    typedef void *(*create_surface_fn)(void *, void *, const int *);
+    typedef int (*make_current_fn)(void *, void *, void *, void *);
+    typedef int (*destroy_fn)(void *, void *);
+    typedef void (*gen_fn)(int, unsigned *);
+    typedef unsigned (*create_shader_fn)(unsigned);
+    typedef void (*source_fn)(unsigned, int, const char *const *, const int *);
+    typedef void (*one_fn)(unsigned);
+    typedef void (*two_fn)(unsigned, unsigned);
+    typedef void (*shader_iv_fn)(unsigned, unsigned, int *);
+    typedef unsigned (*create_program_fn)(void);
+    typedef void (*attrib_location_fn)(unsigned, unsigned, const char *);
+    typedef int (*uniform_location_fn)(unsigned, const char *);
+    typedef void (*uniform_fn)(int, int);
+    typedef void (*attrib_fn)(unsigned, int, unsigned, unsigned char, int, const void *);
+    typedef void (*viewport_fn)(int, int, int, int);
+    typedef void (*draw_fn)(unsigned, int, int);
+    typedef void (*read_fn)(int, int, int, int, unsigned, unsigned, void *);
+    typedef unsigned char (*is_texture_fn)(unsigned);
+    typedef unsigned (*error_fn)(void);
+    typedef struct test_buffer { i32 width, height, stride, format; void *bits; u32 reserved[6]; } test_buffer;
+    get_display_fn get_display = (get_display_fn)mg_egl_host("eglGetDisplay");
+    init_fn init = (init_fn)mg_egl_host("eglInitialize");
+    choose_fn choose = (choose_fn)mg_egl_host("eglChooseConfig");
+    create_context_fn create_context = (create_context_fn)mg_egl_host("eglCreateContext");
+    create_surface_fn create_surface = (create_surface_fn)mg_egl_host("eglCreatePbufferSurface");
+    make_current_fn make_current = (make_current_fn)mg_egl_host("eglMakeCurrent");
+    destroy_fn destroy_context = (destroy_fn)mg_egl_host("eglDestroyContext"), destroy_surface = (destroy_fn)mg_egl_host("eglDestroySurface");
+    gen_fn gen = (gen_fn)mg_egl_host("glGenTextures");
+    create_shader_fn create_shader = (create_shader_fn)mg_egl_host("glCreateShader");
+    source_fn source = (source_fn)mg_egl_host("glShaderSource");
+    one_fn compile = (one_fn)mg_egl_host("glCompileShader"), link = (one_fn)mg_egl_host("glLinkProgram"), use = (one_fn)mg_egl_host("glUseProgram");
+    one_fn enable = (one_fn)mg_egl_host("glEnableVertexAttribArray");
+    two_fn attach_shader = (two_fn)mg_egl_host("glAttachShader");
+    shader_iv_fn shader_iv = (shader_iv_fn)mg_egl_host("glGetShaderiv"), program_iv = (shader_iv_fn)mg_egl_host("glGetProgramiv");
+    create_program_fn create_program = (create_program_fn)mg_egl_host("glCreateProgram");
+    attrib_location_fn attrib_location = (attrib_location_fn)mg_egl_host("glBindAttribLocation");
+    uniform_location_fn uniform_location = (uniform_location_fn)mg_egl_host("glGetUniformLocation");
+    uniform_fn uniform = (uniform_fn)mg_egl_host("glUniform1i");
+    attrib_fn attrib = (attrib_fn)mg_egl_host("glVertexAttribPointer");
+    viewport_fn viewport = (viewport_fn)mg_egl_host("glViewport");
+    draw_fn draw = (draw_fn)mg_egl_host("glDrawArrays");
+    read_fn read = (read_fn)mg_egl_host("glReadPixels");
+    is_texture_fn is_texture = (is_texture_fn)mg_egl_host("glIsTexture");
+    error_fn error = (error_fn)mg_egl_host("glGetError");
+    mg_nwindow *(*from)(void *, mg_jobj *) = (mg_nwindow *(*)(void *, mg_jobj *))mg_bionic_find("ASurfaceTexture_fromSurfaceTexture");
+    mg_nwindow *(*window)(mg_nwindow *) = (mg_nwindow *(*)(mg_nwindow *))mg_bionic_find("ASurfaceTexture_acquireANativeWindow");
+    void (*release)(mg_nwindow *) = (void (*)(mg_nwindow *))mg_bionic_find("ASurfaceTexture_release");
+    int (*attach)(mg_nwindow *, u32) = (int (*)(mg_nwindow *, u32))mg_bionic_find("ASurfaceTexture_attachToGLContext");
+    int (*detach)(mg_nwindow *) = (int (*)(mg_nwindow *))mg_bionic_find("ASurfaceTexture_detachFromGLContext");
+    int (*update)(mg_nwindow *) = (int (*)(mg_nwindow *))mg_bionic_find("ASurfaceTexture_updateTexImage");
+    i64 (*timestamp)(mg_nwindow *) = (i64 (*)(mg_nwindow *))mg_bionic_find("ASurfaceTexture_getTimestamp");
+    void (*matrix)(mg_nwindow *, float *) = (void (*)(mg_nwindow *, float *))mg_bionic_find("ASurfaceTexture_getTransformMatrix");
+    int (*lock)(mg_nwindow *, void *, void *) = (int (*)(mg_nwindow *, void *, void *))mg_bionic_find("ANativeWindow_lock");
+    int (*post)(mg_nwindow *) = (int (*)(mg_nwindow *))mg_bionic_find("ANativeWindow_unlockAndPost");
+    static const int config_attrs[] = { 0x3033, 1, 0x3040, 4, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3038 };
+    static const int surface_attrs[] = { 0x3057, 1, 0x3056, 1, 0x3038 }, context_attrs[] = { 0x3098, 2, 0x3038 };
+    static const char *vertex = "attribute vec2 p; void main(){gl_Position=vec4(p,0.,1.);}";
+    static const char *fragment = "#extension GL_OES_EGL_image_external : require\nprecision mediump float; uniform samplerExternalOES s; void main(){gl_FragColor=texture2D(s,vec2(.25,.25));}";
+    static const float vertices[] = { -1,-1, 3,-1, -1,3 };
+    static const u8 blue[16] = { 0,0,255,255, 0,0,255,255, 0,0,255,255, 0,0,255,255 };
+    void *display, *config, *surface, *ctx1, *ctx2;
+    mg_jobj *texture;
+    mg_nwindow *st, *producer;
+    mg_jvalue arg[5];
+    mg_jvalue timestamp_args[3], timestamp_result;
+    test_buffer buffer;
+    unsigned tex1 = 0, tex2 = 0, vs, fs, program;
+    int count = 0, ok = 0, x, y;
+    i64 first;
+    u8 pixel[4];
+    float transform[16];
+    say("SurfaceTexture: real EGL producer, latch, pixels and context ownership");
+    memset(timestamp_args, 0, sizeof(timestamp_args));
+    timestamp_args[0].j = 1234567;
+    timestamp_args[1].z = 0;
+    timestamp_args[2].j = 9000000000ll;
+    memset(&timestamp_result, 0, sizeof(timestamp_result));
+    CHECK(mg_dvm_call_static("android/media/MediaCodec", "surfaceTextureTimestampNs", "(JZJ)J", timestamp_args, &timestamp_result) &&
+          timestamp_result.j == 1234567000ll);
+    timestamp_args[1].z = 1;
+    CHECK(mg_dvm_call_static("android/media/MediaCodec", "surfaceTextureTimestampNs", "(JZJ)J", timestamp_args, &timestamp_result) &&
+          timestamp_result.j == 9000000000ll);
+    CHECK(get_display && init && choose && create_context && create_surface && make_current && destroy_context && destroy_surface &&
+          gen && create_shader && source && compile && link && use && enable && attach_shader && shader_iv && program_iv &&
+          create_program && attrib_location && uniform_location && uniform && attrib && viewport && draw && read && is_texture && error &&
+          from && window && release && attach && detach && update && timestamp && matrix && lock && post);
+    if (!get_display || !init || !choose || !create_context || !create_surface || !make_current || !destroy_context || !destroy_surface ||
+        !gen || !create_shader || !source || !compile || !link || !use || !enable || !attach_shader || !shader_iv || !program_iv ||
+        !create_program || !attrib_location || !uniform_location || !uniform || !attrib || !viewport || !draw || !read || !is_texture || !error ||
+        !from || !window || !release || !attach || !detach || !update || !timestamp || !matrix || !lock || !post) return;
+    display = get_display(NULL);
+    CHECK(display && init(display, NULL, NULL));
+    if (!display || !choose(display, config_attrs, &config, 1, &count) || !count) { CHECK(false); return; }
+    surface = create_surface(display, config, surface_attrs);
+    ctx1 = create_context(display, config, NULL, context_attrs);
+    ctx2 = create_context(display, config, NULL, context_attrs);
+    CHECK(surface && ctx1 && ctx2 && make_current(display, surface, surface, ctx1));
+    if (!surface || !ctx1 || !ctx2 || !make_current(display, surface, surface, ctx1)) return;
+    memset(arg, 0, sizeof(arg));
+    texture = mg_dvm_new("android/graphics/SurfaceTexture", "(Z)V", arg);
+    CHECK(texture != NULL);
+    if (!texture) return;
+    arg[0].i = 2; arg[1].i = 2;
+    CHECK(mg_dvm_call_virtual(texture, "setDefaultBufferSize", "(II)V", arg, NULL));
+    st = from(NULL, texture);
+    producer = st ? window(st) : NULL;
+    CHECK(st && producer);
+    if (!st || !producer) return;
+    gen(1, &tex1);
+    CHECK(attach(st, tex1) == 0 && attach(st, tex1) != 0 && timestamp(st) == 0);
+    CHECK(lock(producer, &buffer, NULL) == 0 && buffer.width == 2 && buffer.height == 2 && buffer.stride >= 2);
+    if (buffer.bits && buffer.width == 2 && buffer.height == 2) {
+        for (y = 0; y < 2; y++) for (x = 0; x < 2; x++) {
+            u8 *p = (u8 *)buffer.bits + ((size_t)y * (size_t)buffer.stride + (size_t)x) * 4;
+            p[0] = 255; p[1] = p[2] = 0; p[3] = 255;
+        }
+        CHECK(post(producer) == 0);
+    }
+    CHECK(timestamp(st) == 0 && update(st) == 0 && timestamp(st) > 0);
+    first = timestamp(st);
+    memset(transform, 0, sizeof(transform));
+    matrix(st, transform);
+    CHECK(transform[0] == 1 && transform[5] == -1 && transform[10] == 1 && transform[13] == 1 && transform[15] == 1);
+    vs = create_shader(0x8B31); fs = create_shader(0x8B30);
+    source(vs, 1, &vertex, NULL); source(fs, 1, &fragment, NULL);
+    compile(vs); compile(fs); shader_iv(vs, 0x8B81, &ok); CHECK(ok); shader_iv(fs, 0x8B81, &ok); CHECK(ok);
+    program = create_program(); attach_shader(program, vs); attach_shader(program, fs); attrib_location(program, 0, "p");
+    link(program); program_iv(program, 0x8B82, &ok); CHECK(ok);
+    use(program); uniform(uniform_location(program, "s"), 0);
+    attrib(0, 2, 0x1406, 0, 0, vertices); enable(0); viewport(0, 0, 1, 1);
+    draw(4, 0, 3); memset(pixel, 0, sizeof(pixel)); read(0, 0, 1, 1, 0x1908, 0x1401, pixel);
+    CHECK(error() == 0 && pixel[0] == 255 && pixel[1] == 0 && pixel[2] == 0 && pixel[3] == 255);
+    memset(arg, 0, sizeof(arg));
+    arg[0].j = (i64)(mg_addr)blue; arg[1].i = 2; arg[2].i = 2; arg[3].z = 0; arg[4].j = 123456789;
+    CHECK(mg_dvm_call_virtual(texture, "meglerPostRgba", "(JIIZJ)V", arg, NULL));
+    CHECK(timestamp(st) == first && update(st) == 0 && timestamp(st) == 123456789);
+    draw(4, 0, 3); memset(pixel, 0, sizeof(pixel)); read(0, 0, 1, 1, 0x1908, 0x1401, pixel);
+    CHECK(error() == 0 && pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 255 && pixel[3] == 255);
+    CHECK(make_current(display, surface, surface, ctx2));
+    CHECK(update(st) != 0 && detach(st) != 0);
+    CHECK(make_current(display, surface, surface, ctx1));
+    CHECK(detach(st) == 0 && !is_texture(tex1) && update(st) != 0);
+    CHECK(make_current(display, surface, surface, ctx2));
+    gen(1, &tex2);
+    CHECK(attach(st, tex2) == 0 && timestamp(st) == 123456789);
+    CHECK(detach(st) == 0);
+    CHECK(mg_dvm_call_virtual(texture, "release", "()V", NULL, NULL));
+    CHECK(!mg_nwindow_valid(producer) && update(st) != 0);
+    mg_nwindow_release(producer); release(st);
+    CHECK(make_current(display, NULL, NULL, NULL));
+    CHECK(destroy_context(display, ctx1) && destroy_context(display, ctx2) && destroy_surface(display, surface));
+}
+
 static int run_hello(void)
 {
     int at = -1, layout, button[4], swatch[4], mark[4], text[4], root[4], i, black_before, black_after, dp = g_screen_dpi / 160;
@@ -2174,6 +2376,8 @@ static int run_hello(void)
     expect_line("I/HelloTest: onResume", &at, 30);
     layout = wait_line("I/HelloTest: layout focus=true", 0, 30);
     CHECK(layout >= 0);
+    test_native_surface_texture();
+    if (getenv("MG_TEST_SURFACE_TEXTURE_EGL")) test_surface_texture_gl();
     /* ... and the copy, sent, arrives at the first one's handler saying what the first said. */
     CHECK(wait_line("I/HelloTest: message what=7 arg=1,2 obj=word when=true", 0, 30) >= 0);
     {
@@ -3715,6 +3919,8 @@ static int run_data(void)
                                          /* And a Parcelable kept as its marshalled bytes and restored from them in another parcel, as Facebook
                                             keeps an activity's (OpaqueParcelable): the objects it wrote come back with the bytes. */
                                          "parcel-marshall",
+                                         "text-charsequence-creator",
+                                         "text-appearance-parcel",
                                          /* And Android 13's PackageManager calls with a flags object, answered as those with an int. */
                                          "package-flags",
                                          /* And a module's resources as Google Play services' DynamiteLoader makes them: the platform's
@@ -5360,7 +5566,9 @@ int mg_tests_java_run(const char *which, const char *apk, const char *android_ro
      * asks the GPU's name is told "stand-in for OpenGL ES". It makes OpenGL ES 1 as ANGLE does, with a configuration alone --
      * but in the runs whose shell refuses the frames ("readback"), where it plays an EGL without version 1: `gl` checks both.
      */
-    if (getenv("MG_JAVA_ANGLE") && *getenv("MG_JAVA_ANGLE")) {
+    if (getenv("MG_TEST_SURFACE_TEXTURE_EGL")) {
+        mg_egl_set_provider(NULL);
+    } else if (getenv("MG_JAVA_ANGLE") && *getenv("MG_JAVA_ANGLE")) {
         /* ANGLE itself, loaded from that folder; EGL then finds it loaded by its name (ndk/mg_egl.c, angle). */
         char *gles = mg_sprintf("%s/libGLESv2.dll", getenv("MG_JAVA_ANGLE")), *egl = mg_sprintf("%s/libEGL.dll", getenv("MG_JAVA_ANGLE"));
         AT.on = mg_dl_open(gles) != NULL && mg_dl_open(egl) != NULL;

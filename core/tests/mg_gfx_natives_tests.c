@@ -2050,12 +2050,44 @@ static bool walk_frame(i64 screen_cv, i64 screen, i64 whole, bool compare, i32 *
 }
 
 static u32 teardown_present_thread, teardown_release_threads[2];
-static unsigned teardown_releases;
+static unsigned teardown_releases, teardown_draws, teardown_presents, teardown_canvas_presents;
+static mg_lock teardown_lock = MG_LOCK_INIT;
+static mg_cond teardown_cond = MG_COND_INIT;
+static bool teardown_block, teardown_entered, teardown_resume, teardown_finish_started, teardown_finished;
+static bool teardown_worker_retains, teardown_present_retains;
+static i64 teardown_canvas;
+
+static void MEGLER_CB capture_teardown_draw(void *user, void *canvas, u32 color, int blend)
+{
+    const megler_gfx_host *standin = mg_gfx_standin();
+    (void)user;
+    teardown_draws++;
+    mg_lock_acquire(&teardown_lock);
+    if (teardown_block) {
+        teardown_entered = true;
+        mg_cond_broadcast(&teardown_cond);
+        while (!teardown_resume) mg_cond_wait(&teardown_cond, &teardown_lock);
+    }
+    mg_lock_release(&teardown_lock);
+    standin->draw_color(standin->user, canvas, color, blend);
+}
 
 static void capture_teardown_frame(void *user, const void *pixels, int width, int height, int stride)
 {
     (void)user; (void)pixels; (void)width; (void)height; (void)stride;
     teardown_present_thread = mg_thread_self_id();
+    teardown_present_retains = mg_java_gfx_retains_thread_context();
+    teardown_presents++;
+}
+
+static bool capture_teardown_canvas(void *user, void *canvas, int width, int height)
+{
+    (void)user; (void)canvas; (void)width; (void)height;
+    teardown_present_thread = mg_thread_self_id();
+    teardown_present_retains = mg_java_gfx_retains_thread_context();
+    teardown_presents++;
+    teardown_canvas_presents++;
+    return true;
 }
 
 static void MEGLER_CB capture_thread_release(void *user)
@@ -2064,6 +2096,27 @@ static void MEGLER_CB capture_thread_release(void *user)
     if (teardown_releases < 2)
         teardown_release_threads[teardown_releases] = mg_thread_self_id();
     teardown_releases++;
+}
+
+static MG_HOSTCB void teardown_draw_worker(void *arg)
+{
+    (void)arg;
+    teardown_worker_retains = mg_java_gfx_retains_thread_context();
+    call("cvDrawColor", 3, J(teardown_canvas), I((i32)0xffffffffu), I(3));
+}
+
+static MG_HOSTCB void teardown_finish_worker(void *arg)
+{
+    (void)arg;
+    mg_lock_acquire(&teardown_lock);
+    teardown_finish_started = true;
+    mg_cond_broadcast(&teardown_cond);
+    mg_lock_release(&teardown_lock);
+    mg_java_gfx_frames_finish();
+    mg_lock_acquire(&teardown_lock);
+    teardown_finished = true;
+    mg_cond_broadcast(&teardown_cond);
+    mg_lock_release(&teardown_lock);
 }
 
 static void test_frame_teardown(void)
@@ -2075,20 +2128,87 @@ static void test_frame_teardown(void)
     const i64 recording = call("cvRecord", 2, I(8), I(8)).j;
     teardown_present_thread = 0;
     teardown_releases = 0;
+    teardown_draws = 0;
+    teardown_presents = 0;
+    teardown_canvas_presents = 0;
     host.release_thread = capture_thread_release;
+    host.draw_color = capture_teardown_draw;
     mg_java_gfx_set_host(&host);
     mg_java_gfx_set_present(capture_teardown_frame, NULL);
+    mg_java_gfx_set_present_canvas(capture_teardown_canvas, NULL);
     call("cvDrawColor", 3, J(recording), I((i32)0xffffffffu), I(3));
     call("frame", 7, J(canvas), J(bitmap), J(recording), I(0), I(0), I(0), I(0));
     mg_java_gfx_frames_finish();
     CHECK(teardown_present_thread != 0);
+    CHECK(teardown_canvas_presents != 0);
+    CHECK(teardown_present_retains);
+    CHECK(mg_java_gfx_retains_thread_context());
     CHECK_INT(teardown_releases, teardown_present_thread == main_thread ? 1 : 2);
     CHECK_INT(teardown_release_threads[0], teardown_present_thread);
     if (teardown_present_thread != main_thread) CHECK_INT(teardown_release_threads[1], main_thread);
+    {
+        unsigned draws = teardown_draws;
+        call("cvDrawColor", 3, J(canvas), I((i32)0xff000000u), I(3));
+        CHECK_INT(teardown_draws, draws);
+    }
+    {
+        unsigned presents = teardown_presents;
+        call("cvDrawColor", 3, J(recording), I((i32)0xff000000u), I(3));
+        call("frame", 7, J(canvas), J(bitmap), J(recording), I(0), I(0), I(0), I(0));
+        call("frameWait", 0);
+        CHECK_INT(teardown_presents, presents);
+    }
+    mg_java_gfx_set_present_canvas(NULL, NULL);
     mg_java_gfx_set_present(NULL, NULL);
     mg_java_gfx_set_host(mg_gfx_standin());
     call("cvFree", 1, J(recording));
     call("cvFree", 1, J(canvas));
+    call("bmFree", 1, J(bitmap));
+}
+
+static void test_host_teardown_barrier(void)
+{
+    megler_gfx_host host = *mg_gfx_standin();
+    const i64 bitmap = call("bmNew", 2, I(8), I(8)).j;
+    mg_thread *draw, *finish;
+    bool waited;
+    teardown_canvas = call("cvNew", 1, J(bitmap)).j;
+    teardown_block = true;
+    teardown_entered = teardown_resume = teardown_finish_started = teardown_finished = false;
+    teardown_draws = 0;
+    host.draw_color = capture_teardown_draw;
+    host.release_thread = capture_thread_release;
+    mg_java_gfx_set_host(&host);
+    draw = mg_thread_start(teardown_draw_worker, NULL, 0, "gfx teardown draw");
+    CHECK(draw != NULL);
+    if (!draw) goto cleanup;
+    mg_lock_acquire(&teardown_lock);
+    while (!teardown_entered) mg_cond_wait(&teardown_cond, &teardown_lock);
+    mg_lock_release(&teardown_lock);
+    finish = mg_thread_start(teardown_finish_worker, NULL, 0, "gfx teardown finish");
+    CHECK(finish != NULL);
+    mg_lock_acquire(&teardown_lock);
+    if (finish) {
+        while (!teardown_finish_started) mg_cond_wait(&teardown_cond, &teardown_lock);
+        mg_cond_wait_ns(&teardown_cond, &teardown_lock, 30000000ull);
+    }
+    waited = !teardown_finished;
+    teardown_resume = true;
+    mg_cond_broadcast(&teardown_cond);
+    mg_lock_release(&teardown_lock);
+    mg_thread_join(draw);
+    CHECK(!teardown_worker_retains);
+    if (finish) mg_thread_join(finish);
+    CHECK(waited && (!finish || teardown_finished));
+    if (finish) {
+        unsigned draws = teardown_draws;
+        call("cvDrawColor", 3, J(teardown_canvas), I((i32)0xff000000u), I(3));
+        CHECK_INT(teardown_draws, draws);
+    }
+cleanup:
+    teardown_block = false;
+    mg_java_gfx_set_host(mg_gfx_standin());
+    call("cvFree", 1, J(teardown_canvas));
     call("bmFree", 1, J(bitmap));
 }
 
@@ -2709,6 +2829,7 @@ int mg_gfx_natives_tests_run(mg_test_sink sink, void *user, int *checks)
     test_lists();
     test_walk();
     test_frame_teardown();
+    test_host_teardown_barrier();
     test_inverse("over the stand-in");
 #ifdef MG_GFX_WINDOWS
     test_lists_on_shell();

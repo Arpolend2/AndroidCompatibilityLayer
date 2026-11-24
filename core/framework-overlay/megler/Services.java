@@ -4,8 +4,9 @@
 // a component back until the code it loads after the start is there. And a service stopped from another thread is destroyed
 // on the main thread, as on Android, and a start has its id when it is asked for (postStart). And a service the manifest puts in
 // another process (android:process) is made in that process's class scope, with its Application (megler.Processes). And the
-// services running can be listed (running), for a configuration change they hear (megler.Screen). Everything else is the
-// original's, unchanged unless SharedMicrogClientSession explicitly installs shared bind routing.
+// services running can be listed (running), for a configuration change they hear (megler.Screen). Destruction uses the
+// system-owned foreground cleanup even when a service omits super.onDestroy(). Everything else is the original's,
+// unchanged unless SharedMicrogClientSession explicitly installs shared bind routing.
 // An installed but disconnected router fails closed; there is no implicit shared startup.
 package megler;
 
@@ -116,7 +117,7 @@ public final class Services {
             Service s;
             synchronized (sRunning) { s = sRunning.remove(c.name); }
             synchronized (sStarted) { sStarted.remove(c.name); }
-            if (s != null) s.onDestroy();
+            if (s != null) s.meglerDestroy();
             AppRunner.backgroundWorkChanged();
         });
         return true;
@@ -133,7 +134,7 @@ public final class Services {
             boolean still;
             synchronized (sRunning) { still = sRunning.get(name) == s; if (still) sRunning.remove(name); }
             if (still) synchronized (sStarted) { sStarted.remove(name); }
-            if (still) s.onDestroy();
+            if (still) s.meglerDestroy();
             AppRunner.backgroundWorkChanged();
         });
     }

@@ -926,7 +926,10 @@ static void classify(mg_apk_info *info, mg_zip *const *zips, int nzips, char (*b
     char prefix[40], others[120];
     int i, k;
     bool v7 = false, v5 = false, any64 = false, in_parts = info->nsplits > 0 || info->nleft_out > 0, abi_split_missing;
+    bool has_dex = false;
     info->native_entry = -2;
+    for (k = 0; k < nzips; k++)
+        if (mg_zip_find(zips[k], "classes.dex")) has_dex = true;
     for (k = 0; k < nzips; k++) mg_zip_each(zips[k], "lib/", abi_seen, info);
     /* (The processor's own ABI elsewhere than on 32-bit ARM: MG_APK_ABI_ARM.) */
     for (i = 0; i < info->nabis; i++) {
@@ -974,13 +977,13 @@ static void classify(mg_apk_info *info, mg_zip *const *zips, int nzips, char (*b
      * libcocos2dcpp.so among them, was refused as an app "built on cocos2d-x", for which there is no driver. It goes on
      * below as the others do (NativeActivity, then Java). The engine with nothing to start it is still one.
      */
-    else if (w.has[L_COCOS] && !(info->activity[0] && mg_zip_find(zips[0], "classes.dex"))) strcpy(info->engine, "cocos2d-x");
+    else if (w.has[L_COCOS] && !(info->activity[0] && has_dex)) strcpy(info->engine, "cocos2d-x");
     /*
      * A Flutter app is a Java app: its activity (FlutterActivity or the app's own on top of it) starts Flutter's engine,
      * libflutter.so, through JNI, and the engine runs the app's Dart code (libapp.so) and draws into the activity's
      * SurfaceView. The Java driver runs it as any other. Without bytecode and an activity there is nothing to start it.
      */
-    else if (w.has[L_FLUTTER] && info->activity[0] && mg_zip_find(zips[0], "classes.dex")) strcpy(info->engine, "java");
+    else if (w.has[L_FLUTTER] && info->activity[0] && has_dex) strcpy(info->engine, "java");
     else if (w.has[L_FLUTTER]) strcpy(info->engine, "flutter");
     /*
      * android.app.lib_name on an activity of the app's own is a subclass of NativeActivity's -- unless the library has no
@@ -990,9 +993,9 @@ static void classify(mg_apk_info *info, mg_zip *const *zips, int nzips, char (*b
      * in 681, its dynamic section being past the part of the library that was read). Where the library cannot be looked
      * into (native_entry -1), it is a NativeActivity here and the start asks the library itself (core/src/run/mg_run.c).
      */
-    else if (!strcmp(info->activity, "android.app.NativeActivity") || (!info->has_code && w.count) ||
+    else if (!strcmp(info->activity, "android.app.NativeActivity") || (!info->has_code && !has_dex && w.count) ||
              (info->native_library[0] &&
-              !(info->has_code && info->activity[0] && mg_zip_find(zips[0], "classes.dex") && (info->native_entry = native_entry(zips, nzips, info)) == 0)))
+              !(has_dex && info->activity[0] && (info->native_entry = native_entry(zips, nzips, info)) == 0)))
         strcpy(info->engine, "native-activity");
     /*
      * And an SDL app: SDLActivity (or the app's own on top of it) is an activity that loads libSDL2.so and the app's
@@ -1000,20 +1003,20 @@ static void classify(mg_apk_info *info, mg_zip *const *zips, int nzips, char (*b
      * own through JNI and gives it its input; the game draws with EGL on the surface's ANativeWindow and plays its sound
      * through SDLAudioManager's AudioTrack. ("Minecraft: Story Mode" was refused as an engine with no driver.)
      */
-    else if (w.has[L_SDL] && info->activity[0] && mg_zip_find(zips[0], "classes.dex")) strcpy(info->engine, "java");
+    else if (w.has[L_SDL] && info->activity[0] && has_dex) strcpy(info->engine, "java");
     else if (w.has[L_SDL]) strcpy(info->engine, "sdl");
     /*
      * libGDX is a Java app as well: its AndroidApplication is an activity that draws with OpenGL ES on a GLSurfaceView, and
      * libgdx.so holds a few of its classes' natives (buffers, matrices), loaded with System.loadLibrary. ("Durak" was
      * refused as an engine with no driver.)
      */
-    else if (w.has[L_GDX] && info->activity[0] && mg_zip_find(zips[0], "classes.dex")) strcpy(info->engine, "java");
+    else if (w.has[L_GDX] && info->activity[0] && has_dex) strcpy(info->engine, "java");
     else if (w.has[L_GDX]) strcpy(info->engine, "libgdx");
     /*
      * Everything else that has bytecode and an activity to start is an ordinary Android app: Java, which loads what
      * native libraries it has itself (System.loadLibrary) when it wants them. The Java driver runs it.
      */
-    else if (info->activity[0] && mg_zip_find(zips[0], "classes.dex")) strcpy(info->engine, "java");
+    else if (info->activity[0] && has_dex) strcpy(info->engine, "java");
     else strcpy(info->engine, "unknown");
     info->supported = mg_driver_supported(info->engine);
 
@@ -1049,10 +1052,10 @@ static void classify(mg_apk_info *info, mg_zip *const *zips, int nzips, char (*b
          * does not run yet" from before there was a Java driver: Sticky Note's widget and a framework-res.apk got it.)
          */
         info->runnable = false;
-        if (!info->activity[0] && mg_zip_find(zips[0], "classes.dex"))
+        if (!info->activity[0] && has_dex)
             mg_strlcpy(info->reason, "This app has no activity to start: it is a widget, a keyboard, a service or a part of another app, which is not run on its own.",
                        sizeof(info->reason));
-        else if (!mg_zip_find(zips[0], "classes.dex"))
+        else if (!has_dex)
             mg_strlcpy(info->reason, "This APK has no code to run: no Java code (classes.dex) and no native code. It may hold resources for other apps, or be a part of a bundle.",
                        sizeof(info->reason));
         else

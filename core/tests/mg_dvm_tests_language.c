@@ -60,6 +60,84 @@ static void test_switches(void)
     CHECK_STR(thrown(), "");
 }
 
+static void test_array_store_diagnostic(void)
+{
+    mg_dvm_class actual, inherited, component, other, unrelated;
+    mg_dvm_class *actual_ifaces[1], *inherited_ifaces[1];
+    mg_dvm_method methods[10];
+    mg_dvm_frame frames[10];
+    volatile i32 reports = 0;
+    char detail[512];
+    int i;
+
+    memset(&actual, 0, sizeof(actual));
+    memset(&inherited, 0, sizeof(inherited));
+    memset(&component, 0, sizeof(component));
+    memset(&other, 0, sizeof(other));
+    memset(&unrelated, 0, sizeof(unrelated));
+    component.name = "android/text/ParcelableSpan";
+    component.scope = 0;
+    component.flags = DVM_ACC_INTERFACE;
+    other.name = component.name;
+    other.scope = 8;
+    other.flags = DVM_ACC_INTERFACE;
+    inherited.name = "t/Inherited";
+    inherited.scope = 4;
+    inherited.nifaces = 1;
+    inherited.ifaces = inherited_ifaces;
+    inherited_ifaces[0] = &other;
+    actual.name = "t/Span";
+    actual.scope = 4;
+    actual.super = &inherited;
+
+    say("ArrayStoreException type diagnostics");
+    CHECK(mg_dvm_array_store_diagnostic_format(&actual, &component, detail, sizeof(detail)));
+    CHECK(strstr(detail, "actual=t/Span(loader-scope=4)") != NULL);
+    CHECK(strstr(detail, "component=android/text/ParcelableSpan(loader-scope=0)") != NULL);
+    CHECK(strstr(detail, "assignable=false") != NULL);
+    CHECK(strstr(detail, "matching-interface=other-identity(loader-scope=8)") != NULL);
+
+    actual.super = NULL;
+    actual.nifaces = 1;
+    actual.ifaces = actual_ifaces;
+    actual_ifaces[0] = &component;
+    CHECK(mg_dvm_array_store_diagnostic_format(&actual, &component, detail, sizeof(detail)));
+    CHECK(strstr(detail, "assignable=true") != NULL && strstr(detail, "matching-interface=exact") != NULL);
+
+    actual.nifaces = 0;
+    CHECK(mg_dvm_array_store_diagnostic_format(&actual, &component, detail, sizeof(detail)));
+    CHECK(strstr(detail, "matching-interface=none") != NULL);
+
+    unrelated.name = "t/Other";
+    CHECK(!mg_dvm_array_store_diagnostic_format(&actual, &unrelated, detail, sizeof(detail)));
+    CHECK(detail[0] == 0);
+
+    memset(methods, 0, sizeof(methods));
+    memset(frames, 0, sizeof(frames));
+    for (i = 0; i < 10; i++) {
+        methods[i].cls = &actual;
+        methods[i].name = "run";
+        frames[i].m = &methods[i];
+        frames[i].pc = (u32)(100 + i);
+        frames[i].prev = i < 9 ? &frames[i + 1] : NULL;
+    }
+    methods[1].flags = DVM_ACC_NATIVE;
+    mg_dvm_array_store_stack_format(frames, 7, detail, sizeof(detail));
+    CHECK(strstr(detail, "t/Span.run(pc=7) < t/Span.run(native) < t/Span.run(pc=102)") == detail);
+    CHECK(strstr(detail, "(pc=107) < ...") != NULL);
+    CHECK(strstr(detail, "(pc=108)") == NULL);
+    methods[0].name = "bad\nname";
+    frames[0].prev = NULL;
+    mg_dvm_array_store_stack_format(frames, 19, detail, sizeof(detail));
+    CHECK_STR(detail, "t/Span.bad?name(pc=19)");
+    mg_dvm_array_store_stack_format(NULL, 0, detail, sizeof(detail));
+    CHECK(detail[0] == 0);
+    for (i = 0; i < 4; i++) CHECK(mg_dvm_array_store_stack_claim(&reports));
+    CHECK(!mg_dvm_array_store_stack_claim(&reports));
+    CHECK(!mg_dvm_array_store_stack_claim(&reports));
+    CHECK_INT(reports, 4);
+}
+
 static void test_arrays(void)
 {
     mg_jobj *a;
@@ -685,6 +763,7 @@ void test_language(void)
 {
     test_wide();
     test_switches();
+    test_array_store_diagnostic();
     test_arrays();
     test_exceptions();
     test_dispatch();

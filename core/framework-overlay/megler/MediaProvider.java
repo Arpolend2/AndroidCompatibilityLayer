@@ -957,7 +957,10 @@ public final class MediaProvider extends ContentProvider {
        folders walked. `mtime` is the folder's time as its parent's listing has it (-1: not known, as for the storage's
        own folders, which are always listed). */
     private void walk(Scan s, String dir, long mtime) {
+        dir = canonical(dir);
         String k = key(dir);
+        // A canonical alias must not empty the same directory already indexed by this scan.
+        if (s.after.containsKey(k)) return;
         Folder was = s.before.get(k);
         Boolean again = null;
         if (was != null && mtime >= 0 && was.mtime == mtime && !was.hasDirs && s.now - was.listed < RELIST_MS) {
@@ -1153,6 +1156,7 @@ public final class MediaProvider extends ContentProvider {
      * before the first scan, which a phone would have indexed as they came).
      */
     private ContentValues describe(String path, long size, long mtime, String owner, long added) {
+        path = canonical(path);
         File f = new File(path);
         String name = f.getName(), parent = f.getParent();
         String mime = MediaFiles.mimeOf(name);
@@ -1291,7 +1295,7 @@ public final class MediaProvider extends ContentProvider {
             throw new IllegalArgumentException("Primary directory " + parts.get(0) + " not allowed for " + Uri.parse("content://media/" + t.volume + "/" + t.collectionPath)
                     + "; allowed directories are " + Arrays.toString(allowed));
         parts.set(0, topDir);
-        File dir = new File(ROOT, String.join("/", parts));
+        File dir = new File(canonical(new File(ROOT, String.join("/", parts)).getPath()));
         dir.mkdirs();
         File f = unique(dir, name);
         try {
@@ -1413,7 +1417,7 @@ public final class MediaProvider extends ContentProvider {
         throw new IllegalStateException("Failed to build unique file: " + new File(dir, name));
     }
     private boolean taken(File f) {
-        return f.exists() || DatabaseUtils.longForQuery(db(), "SELECT COUNT(*) FROM files WHERE _data = ?", new String[] { f.getPath() }) > 0;
+        return f.exists() || DatabaseUtils.longForQuery(db(), "SELECT COUNT(*) FROM files WHERE _data = ?", new String[] { canonical(f.getPath()) }) > 0;
     }
 
     // ------------------------------------------------------------------------------------------------- update and delete

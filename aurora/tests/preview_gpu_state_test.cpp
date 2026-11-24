@@ -1,13 +1,17 @@
 #include "../preview_gpu.h"
+#include "../preview_frame_export.h"
 #include "../../core/include/megler.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QElapsedTimer>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QImage>
 #include <QOffscreenSurface>
 #include <QOpenGLFunctions>
 #include <QQuickWindow>
+#include <QTemporaryDir>
 #include <QThread>
 
 #include <atomic>
@@ -68,6 +72,8 @@ static bool checkLayerComposition()
     if (!surface.isValid()) return false;
     std::atomic<int> requested{1}, completed{0};
     std::atomic<bool> ok{true};
+    PreviewGpuFrameCapture frameCapture;
+    bool frameCaptureValid = false;
     std::thread producer([&]() {
         QOpenGLContext context;
         context.setFormat(share->format());
@@ -113,7 +119,17 @@ static bool checkLayerComposition()
             pixel[0] >= 240 && pixel[1] <= 15 && pixel[2] <= 15 &&
             state.presentCanvas(canvas, 64, 64, &notifier);
         state.place(0, 0, 0, 64, 64, 0, &notifier);
-        ok.store(canvasReady && state.submit(display, eglSurface, 8, 8, &notifier, 0) == 1);
+        const bool captureArmed = state.requestFramePairCapture(73);
+        const int submitted = state.submit(display, eglSurface, 8, 8, &notifier, 0);
+        frameCaptureValid = state.takeFramePairCapture(&frameCapture) &&
+            frameCapture.sequence == 73 && frameCapture.failure.isEmpty() &&
+            frameCapture.beforeTransfer.size() == QSize(8, 8) &&
+            frameCapture.composedAfter.size() == QSize(64, 64) &&
+            frameCapture.beforeTransfer.pixelColor(4, 4).red() >= 240 &&
+            frameCapture.beforeTransfer.pixelColor(4, 4).green() <= 15 &&
+            frameCapture.composedAfter.pixelColor(16, 32).red() >= 240 &&
+            frameCapture.composedAfter.pixelColor(48, 32).green() >= 240;
+        ok.store(canvasReady && captureArmed && submitted == 1 && frameCaptureValid);
         if (!context.makeCurrent(&surface)) ok.store(false);
         if (guest != EGL_NO_CONTEXT) eglDestroyContext(display, guest);
         if (eglSurface != EGL_NO_SURFACE) eglDestroySurface(display, eglSurface);
@@ -167,6 +183,19 @@ static bool checkLayerComposition()
         return matches;
     };
     bool passed = waitStep(1) && checkPixels(Qt::red, Qt::green);
+    QTemporaryDir exportRoot;
+    QString exportDirectory, exportError;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const bool exported = frameCaptureValid && exportRoot.isValid() &&
+        PreviewFrameExport::savePair(exportRoot.path(), frameCapture.sequence, frameCapture.capturedAt,
+                                     frameCapture.beforeTransfer, frameCapture.composedAfter, now,
+                                     &exportDirectory, &exportError) &&
+        QFileInfo(QDir(exportDirectory).filePath(QStringLiteral("gl-before-transfer.png"))).isFile() &&
+        QFileInfo(QDir(exportDirectory).filePath(QStringLiteral("composed-after.png"))).isFile();
+    if (!exported) {
+        std::fprintf(stderr, "FAIL: GPU frame-pair capture/export: %s\n", qPrintable(exportError));
+        passed = false;
+    }
     requested.store(2);
     passed = waitStep(2) && checkPixels(Qt::red, Qt::blue) && passed;
     requested.store(3);

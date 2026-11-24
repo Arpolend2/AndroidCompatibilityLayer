@@ -83,6 +83,7 @@ int main(void)
         const int green = frame & 1;
         const int opaque = frame & 2;
         GLubyte pixel[4] = {0, 0, 0, 0}, top[4] = {0, 0, 0, 0}, clear[4] = {0, 0, 0, 0};
+        GLubyte source_rgba[4 * 4 * 4] = {0};
         REQUIRE(eglMakeCurrent(display, producer_surface, producer_surface, producer), "Producer context unavailable");
         if (!frame) {
             REQUIRE(eglMakeCurrent(display, producer_surface, consumer_surface, producer) &&
@@ -115,10 +116,18 @@ int main(void)
                 strstr(failure, "no EGL display"),
                 "Capture accepted an incorrect display");
         glEnable(0xffffffffu);
-        REQUIRE(aurora_egl_frame_capture(display, producer_surface, 4, 4, opaque, &image,
-                                         failure, sizeof(failure)) == AURORA_EGL_FRAME_READY &&
+        REQUIRE(aurora_egl_frame_capture_with_readback(display, producer_surface, 4, 4, opaque, &image,
+                                                        source_rgba, sizeof(source_rgba),
+                                                        failure, sizeof(failure)) == AURORA_EGL_FRAME_READY &&
                 !failure[0],
                 "EGL image export failed");
+        REQUIRE(source_rgba[(2 * 4 + 0) * 4 + 2] == 255 &&
+                source_rgba[(2 * 4 + 0) * 4 + 3] >= 127 &&
+                source_rgba[(2 * 4 + 0) * 4 + 3] <= 128 &&
+                source_rgba[(2 * 4 + 3) * 4 + 0] == 255 &&
+                source_rgba[(2 * 4 + 3) * 4 + 2] == 255 &&
+                source_rgba[(2 * 4 + 3) * 4 + 3] == 0,
+                "Pre-transfer readback changed source colors or alpha");
         REQUIRE(eglGetCurrentContext() == producer && eglGetCurrentSurface(EGL_DRAW) == producer_surface &&
                 eglGetCurrentSurface(EGL_READ) == producer_surface && glGetError() == GL_INVALID_ENUM,
                 "Producer context or error state changed");

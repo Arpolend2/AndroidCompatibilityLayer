@@ -5064,6 +5064,93 @@ static void test_audio_callback_stack(void)
     mg_voice_destroy(v);
 }
 
+static bool window_invalid(const mg_nwindow *w) { (void)w; return false; }
+
+static void test_window_dataspace(void)
+{
+    static const mg_nwindow_ops invalid_ops = { NULL, window_invalid, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+    int (*get)(mg_nwindow *) = (int (*)(mg_nwindow *))mg_bionic_find("ANativeWindow_getBuffersDataSpace");
+    mg_nwindow window = { 0 };
+    say("native window buffer dataspace");
+    CHECK(get != NULL);
+    if (!get) return;
+    CHECK_INT(get(&window), 0);
+    CHECK_INT(get(NULL), -22);
+    window.ops = &invalid_ops;
+    CHECK_INT(get(&window), -22);
+}
+
+static struct {
+    void *(*instance)(void);
+    void *(*prepare)(int);
+    void (*post)(void *, mg_addr, void *);
+    void (*delayed)(void *, mg_addr, void *, u32);
+    int (*poll)(int, int *, int *, void **);
+    void *choreographer;
+    u64 started, first, second, delayed_at;
+    u32 thread, callback_thread;
+    int without_looper, stable, count, cross_thread;
+    volatile i32 ready;
+} G_CHOREO;
+
+static void choreo_test_callback(i64 frame, void *data)
+{
+    int which = (int)(mg_addr)data;
+    G_CHOREO.callback_thread = mg_thread_self_id();
+    G_CHOREO.count++;
+    if (which == 1) {
+        G_CHOREO.first = (u64)frame;
+        G_CHOREO.post(G_CHOREO.choreographer, (mg_addr)choreo_test_callback, (void *)(mg_addr)2);
+    } else if (which == 2) G_CHOREO.second = (u64)frame;
+    else if (which == 3) G_CHOREO.delayed_at = mg_time_monotonic_ns();
+    else G_CHOREO.cross_thread = 1;
+}
+
+static MG_HOSTCB void choreo_test_thread(void *arg)
+{
+    u64 until;
+    (void)arg;
+    G_CHOREO.thread = mg_thread_self_id();
+    G_CHOREO.without_looper = G_CHOREO.instance() == NULL;
+    G_CHOREO.prepare(0);
+    G_CHOREO.choreographer = G_CHOREO.instance();
+    G_CHOREO.stable = G_CHOREO.choreographer && G_CHOREO.instance() == G_CHOREO.choreographer;
+    G_CHOREO.started = mg_time_monotonic_ns();
+    G_CHOREO.post(G_CHOREO.choreographer, (mg_addr)choreo_test_callback, (void *)(mg_addr)1);
+    G_CHOREO.delayed(G_CHOREO.choreographer, (mg_addr)choreo_test_callback, (void *)(mg_addr)3, 60);
+    mg_atomic_xchg(&G_CHOREO.ready, 1);
+    until = G_CHOREO.started + 2000000000ull;
+    while (G_CHOREO.count < 4 && mg_time_monotonic_ns() < until) G_CHOREO.poll(100, NULL, NULL, NULL);
+}
+
+static void test_choreographer(void)
+{
+    mg_thread *thread;
+    int waited;
+    memset(&G_CHOREO, 0, sizeof(G_CHOREO));
+    G_CHOREO.instance = (void *(*)(void))mg_bionic_find("AChoreographer_getInstance");
+    G_CHOREO.prepare = (void *(*)(int))mg_bionic_find("ALooper_prepare");
+    G_CHOREO.post = (void (*)(void *, mg_addr, void *))mg_bionic_find("AChoreographer_postFrameCallback64");
+    G_CHOREO.delayed = (void (*)(void *, mg_addr, void *, u32))mg_bionic_find("AChoreographer_postFrameCallbackDelayed64");
+    G_CHOREO.poll = (int (*)(int, int *, int *, void **))mg_bionic_find("ALooper_pollOnce");
+    say("native choreographer");
+    CHECK(G_CHOREO.instance && G_CHOREO.prepare && G_CHOREO.post && G_CHOREO.delayed && G_CHOREO.poll);
+    if (!G_CHOREO.instance || !G_CHOREO.prepare || !G_CHOREO.post || !G_CHOREO.delayed || !G_CHOREO.poll) return;
+    thread = mg_thread_start(choreo_test_thread, NULL, 256 * 1024, "test-choreographer");
+    CHECK(thread != NULL);
+    if (!thread) return;
+    for (waited = 0; waited < 1000 && !G_CHOREO.ready; waited++) mg_sleep_ns(1000000ull);
+    if (G_CHOREO.ready)
+        G_CHOREO.post(G_CHOREO.choreographer, (mg_addr)choreo_test_callback, (void *)(mg_addr)4);
+    mg_thread_join(thread);
+    CHECK(G_CHOREO.without_looper && G_CHOREO.stable);
+    CHECK_INT(G_CHOREO.count, 4);
+    CHECK(G_CHOREO.cross_thread);
+    CHECK(G_CHOREO.thread == G_CHOREO.callback_thread);
+    CHECK(G_CHOREO.first >= G_CHOREO.started && G_CHOREO.second > G_CHOREO.first);
+    CHECK(G_CHOREO.delayed_at >= G_CHOREO.started + 60000000ull);
+}
+
 static void test_input(void)
 {
     enum { TAPS = 60000 };
@@ -7224,6 +7311,8 @@ int mg_tests_run(const char *libdir, const char *scratch, mg_test_sink sink, voi
     test_chromium_oom_report();
     test_shm_views();
     test_free_stretches();
+    test_window_dataspace();
+    test_choreographer();
     test_input();
     test_audio_callback_stack();
     {

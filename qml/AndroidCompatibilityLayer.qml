@@ -2,6 +2,7 @@ import QtQuick 2.0
 import Sailfish.Silica 1.0
 import Sailfish.Pickers 1.0
 import Nemo.Notifications 1.0
+import AndroidCompatibilityLayer.MicroG 1.0
 
 ApplicationWindow {
     id: window
@@ -11,6 +12,8 @@ ApplicationWindow {
     readonly property bool systemDark: Theme.colorScheme === Theme.LightOnDark
     readonly property color systemAccent: Theme.highlightColor
     property var microgPage: null
+    property var authenticationPage: null
+    property var authenticationReturnPage: null
     property var launcherPage: null
     property var yandexFormComponent: null
     readonly property var libraryApps: {
@@ -54,7 +57,27 @@ ApplicationWindow {
             logActions.message = qsTr("Aurora WebView is unavailable.")
         }
     }
+    function synchronizeAuthenticationPage() {
+        if (sharedMicrogAuth.authenticationUiActive) {
+            if (authenticationPage) return
+            authenticationReturnPage = pageStack.currentPage
+            authenticationPage = pageStack.push(authenticationPageComponent)
+            if (!authenticationPage) {
+                authenticationReturnPage = null
+                sharedMicrogAuth.authenticationBack()
+            }
+        } else if (authenticationPage) {
+            var returnPage = authenticationReturnPage
+            authenticationPage = null
+            authenticationReturnPage = null
+            if (returnPage && pageStack.currentPage !== returnPage)
+                pageStack.pop(returnPage, PageStackAction.Immediate)
+            else if (pageStack.currentPage)
+                pageStack.pop()
+        }
+    }
     allowedOrientations: probe.installConfirmationVisible || launchInstallBanner.offered ||
+                         sharedMicrogAuth.authenticationUiActive ||
                          (pageStack.depth > 1 && pageStack.find(function(page) {
                              return page && page.objectName === "yandexFormPage"
                          }))
@@ -62,6 +85,7 @@ ApplicationWindow {
     Component.onCompleted: {
         probe.setInstallUiReady(true)
         probe.checkManagerUpdateAtStart()
+        synchronizeAuthenticationPage()
     }
     Component.onDestruction: probe.setInstallUiReady(false)
     cover: Component {
@@ -210,6 +234,10 @@ ApplicationWindow {
         previewSummary: qsTr("Android App Manager")
     }
     Connections {
+        target: sharedMicrogAuth
+        onAuthenticationUiChanged: window.synchronizeAuthenticationPage()
+    }
+    Connections {
         target: probe
         onManagerUpdateAvailable: {
             managerUpdateBanner.previewBody = message
@@ -340,6 +368,62 @@ ApplicationWindow {
     Component {
         id: microgPageComponent
         EmbeddedMicrogPage { onClosed: window.microgPage = null }
+    }
+    Component {
+        id: authenticationPageComponent
+        Page {
+            id: authenticationPageRoot
+            objectName: "sharedMicrogAuthenticationPage"
+            allowedOrientations: Orientation.All
+            backNavigation: false
+            Keys.onEscapePressed: sharedMicrogAuth.authenticationBack()
+            PageHeader { id: authenticationHeader; title: qsTr("Google sign-in") }
+            SharedMicrogAuthSurface {
+                id: authenticationSurface
+                objectName: "sharedMicrogAuthenticationSurface"
+                anchors.top: authenticationHeader.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: cancelAuthentication.top
+                host: sharedMicrogAuth
+                pageOrientation: {
+                    switch (authenticationPageRoot.orientation) {
+                    case Orientation.Portrait: return Qt.PortraitOrientation
+                    case Orientation.Landscape: return Qt.LandscapeOrientation
+                    case Orientation.PortraitInverted: return Qt.InvertedPortraitOrientation
+                    case Orientation.LandscapeInverted: return Qt.InvertedLandscapeOrientation
+                    default: return Qt.PrimaryOrientation
+                    }
+                }
+                Component.onCompleted: sharedMicrogAuth.setAuthenticationSurface(
+                                           authenticationSurface,
+                                           authenticationSurface.width,
+                                           authenticationSurface.height)
+                onWidthChanged: sharedMicrogAuth.setAuthenticationSurface(
+                                    authenticationSurface,
+                                    authenticationSurface.width,
+                                    authenticationSurface.height)
+                onHeightChanged: sharedMicrogAuth.setAuthenticationSurface(
+                                     authenticationSurface,
+                                     authenticationSurface.width,
+                                     authenticationSurface.height)
+                Label {
+                    anchors.centerIn: parent
+                    visible: !sharedMicrogAuth.authenticationFrameAvailable
+                    text: qsTr("Waiting for the Google sign-in screen...")
+                    color: "white"
+                }
+            }
+            Button {
+                id: cancelAuthentication
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                anchors.margins: Theme.paddingMedium
+                text: qsTr("Cancel sign-in")
+                onClicked: sharedMicrogAuth.cancelAuthentication()
+            }
+        }
     }
     Rectangle {
         objectName: "installConfirmation"

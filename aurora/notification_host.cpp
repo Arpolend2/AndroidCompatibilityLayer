@@ -12,6 +12,7 @@ namespace {
 const int TimeoutMs = 5000;
 const int MaxNotifications = 256;
 const int OnlyAlertOnce = 8;
+const int Ongoing = 2 | 32 | 64;
 
 bool bounded(const char *text, size_t max)
 {
@@ -79,15 +80,16 @@ bool MEGLER_CB NotificationHost::send(void *user, int operation, const char *pac
 
 bool MEGLER_CB NotificationHost::sendDetailed(void *user, const char *package, const char *tag, int id,
                                               const char *title, const char *body, int flags, int max,
-                                              int progress, bool indeterminate)
+                                              int progress, bool indeterminate, int importance, bool silent)
 {
     return user && static_cast<NotificationHost *>(user)->process(MEGLER_NOTIFICATION_POST, package, tag, id,
-                                                                   title, body, flags, max, progress, indeterminate);
+                                                                   title, body, flags, max, progress, indeterminate,
+                                                                   importance, silent);
 }
 
 bool NotificationHost::process(int operation, const char *package, const char *tag, int id,
                                const char *title, const char *body, int flags, int max,
-                               int progress, bool indeterminate)
+                               int progress, bool indeterminate, int importance, bool silent)
 {
     if (!package || !*package || !bounded(package, 255) || !bounded(tag, 1024) ||
         !bounded(title, 4096) || !bounded(body, 16384) ||
@@ -123,18 +125,28 @@ bool NotificationHost::process(int operation, const char *package, const char *t
         }
         const bool hasProgress = indeterminate || max > 0;
         QVariantMap hints;
+        hints.insert(QStringLiteral("x-nemo-origin-package"), app);
         if (hasProgress)
             hints.insert(QStringLiteral("x-nemo-progress"),
                          indeterminate ? -1.0 : qBound(0.0, double(progress) / double(max), 1.0));
-        if (current != m_ids.end() && (hasProgress || (flags & OnlyAlertOnce))) {
+        const bool quiet = importance >= MEGLER_NOTIFICATION_IMPORTANCE_MIN &&
+                           importance <= MEGLER_NOTIFICATION_IMPORTANCE_LOW;
+        const bool noPreview = (importance >= MEGLER_NOTIFICATION_IMPORTANCE_MIN &&
+                                importance <= MEGLER_NOTIFICATION_IMPORTANCE_DEFAULT) ||
+                               (current != m_ids.end() && (hasProgress || (flags & OnlyAlertOnce)));
+        if (importance >= MEGLER_NOTIFICATION_IMPORTANCE_MIN &&
+            importance <= MEGLER_NOTIFICATION_IMPORTANCE_MAX)
+            hints.insert(QStringLiteral("urgency"), QVariant::fromValue<uchar>(quiet ? 0 : 1));
+        if (noPreview) {
             hints.insert(QStringLiteral("x-nemo-preview-summary"), QString());
             hints.insert(QStringLiteral("x-nemo-preview-body"), QString());
-            hints.insert(QStringLiteral("suppress-sound"), true);
         }
+        if (silent || quiet || (current != m_ids.end() && (hasProgress || (flags & OnlyAlertOnce))))
+            hints.insert(QStringLiteral("suppress-sound"), true);
         QDBusMessage message = method(owner, QStringLiteral("Notify"));
         message << app << (current == m_ids.end() ? uint(0) : current.value()) << QString()
                 << QString::fromUtf8(title ? title : "") << QString::fromUtf8(body ? body : "")
-                << QStringList() << hints << int(hasProgress ? 0 : -1);
+                << QStringList() << hints << int(hasProgress || (flags & Ongoing) ? 0 : -1);
         const QDBusMessage reply = call(message);
         if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().size() != 1 ||
             !reply.arguments().first().toUInt()) {

@@ -660,16 +660,15 @@ public:
     {
         return QUrl(QStringLiteral("https://forms.yandex.ru/u/6b006dde2c4f89816ddbc8a3"));
     }
-    void setReportWebViewInitializer(void (*init)()) { m_initReportWebView = init; }
+    void setReportWebViewAvailable(bool available) { m_reportWebViewAvailable = available; }
     Q_INVOKABLE QString openYandexLogForm()
     {
         if (!m_detailedLogEnabled)
             return tr("The log is empty or unavailable.");
-        if (!m_initReportWebView) {
+        if (!m_reportWebViewAvailable) {
             qWarning("Yandex form: WebView is not linked into this executable.");
             return tr("The report form is unavailable: the system WebView could not start.");
         }
-        m_initReportWebView();
         return QString();
     }
     Q_INVOKABLE void setRenderSizeCap(int value)
@@ -1345,7 +1344,7 @@ private:
     bool m_detailedLogEnabled = false;
     bool m_detailedLogPaused = false;
     quint64 m_logCleanupGeneration = 0;
-    void (*m_initReportWebView)() = nullptr;
+    bool m_reportWebViewAvailable = false;
     QString m_detailedLogError;
     QString m_detailedLogText;
     QTimer m_detailedLogTimer;

@@ -4,7 +4,15 @@
 #include "../standalone_microg_diagnostic.h"
 
 #include <QCoreApplication>
+#include <QGuiApplication>
+#include <QMouseEvent>
+#include <QPainter>
 #include <QDBusMessage>
+#include <QQmlComponent>
+#include <QQmlContext>
+#include <QQmlEngine>
+#include <QQuickItem>
+#include <QQuickWindow>
 #include <QDBusConnectionInterface>
 #include <QDBusPendingCallWatcher>
 #include <QDir>
@@ -22,10 +30,16 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+extern "C" void megler_text_commit(const char *) {}
+extern "C" void megler_text_key(int) {}
+extern "C" void megler_keyboard_closed(void) {}
+extern "C" void megler_keyboard_height(int) {}
 
 namespace {
 class IdentityFixture : public QDBusVirtualObject
@@ -815,10 +829,367 @@ void testSingleInstanceLock(const QString &root)
     check(otherProcessCanLock(path), "lock is released on exit");
     std::puts("Single-instance lock handover OK");
 }
+
+static void fake32Write(char *buffer, quint32 value)
+{
+    buffer[0] = static_cast<char>(value >> 24);
+    buffer[1] = static_cast<char>(value >> 16);
+    buffer[2] = static_cast<char>(value >> 8);
+    buffer[3] = static_cast<char>(value);
+}
+
+static void fake64Write(char *buffer, quint64 value)
+{
+    for (int i = 7; i >= 0; --i) {
+        buffer[i] = static_cast<char>(value);
+        value >>= 8;
+    }
+}
+
+static bool fakeSendControl(int fd, quint32 type, quint64 channel)
+{
+    char packet[28] = {'M','G','R','1'};
+    fake32Write(packet + 4, type);
+    fake64Write(packet + 8, channel);
+    return ::send(fd, packet, sizeof(packet), MSG_NOSIGNAL) ==
+           static_cast<ssize_t>(sizeof(packet));
+}
+
+static quint32 fake32Read(const char *data)
+{
+    return (quint32(static_cast<unsigned char>(data[0])) << 24) |
+           (quint32(static_cast<unsigned char>(data[1])) << 16) |
+           (quint32(static_cast<unsigned char>(data[2])) << 8) |
+           quint32(static_cast<unsigned char>(data[3]));
+}
+
+static bool fakeSizedFrame(quint64 channel, quint64 sequence, quint32 width, quint32 height)
+{
+    const quint32 total = width * height * 4;
+    QByteArray packet(48 + 60 * 1024, char(0xff));
+    for (quint32 offset = 0; offset < total;) {
+        const quint32 length = qMin(quint32(60 * 1024), total - offset);
+        std::memcpy(packet.data(), "MGUI", 4);
+        fake32Write(packet.data() + 4, 1);
+        fake64Write(packet.data() + 8, channel);
+        fake64Write(packet.data() + 16, sequence);
+        fake32Write(packet.data() + 24, width);
+        fake32Write(packet.data() + 28, height);
+        fake32Write(packet.data() + 32, width * 4);
+        fake32Write(packet.data() + 36, total);
+        fake32Write(packet.data() + 40, offset);
+        fake32Write(packet.data() + 44, length);
+        if (::send(4, packet.constData(), 48 + length, MSG_NOSIGNAL) !=
+            static_cast<ssize_t>(48 + length)) return false;
+        offset += length;
+    }
+    return true;
+}
+
+int fakeMicrogQmlWorker()
+{
+    const QString geometryLog = QString::fromLocal8Bit(qgetenv("ACL_MICROG_GEOMETRY_FILE"));
+    quint64 sequence = 1;
+    char ready[28] = {'M','G','R','1'};
+    fake32Write(ready + 4, 1);
+    if (::send(3, ready, sizeof(ready), MSG_NOSIGNAL) !=
+        static_cast<ssize_t>(sizeof(ready))) return 1;
+
+    char packet[28 + 255];
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control;
+    struct iovec vector = {packet, sizeof(packet)};
+    struct msghdr message = {};
+    for (;;) {
+        std::memset(&control, 0, sizeof(control));
+        std::memset(&message, 0, sizeof(message));
+        vector.iov_base = packet;
+        vector.iov_len = sizeof(packet);
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1;
+        message.msg_control = control.bytes;
+        message.msg_controllen = sizeof(control.bytes);
+        ssize_t count = ::recvmsg(3, &message, MSG_CMSG_CLOEXEC);
+        if (count < 28) return 2;
+        quint32 type = (static_cast<unsigned char>(packet[4]) << 24) |
+                       (static_cast<unsigned char>(packet[5]) << 16) |
+                       (static_cast<unsigned char>(packet[6]) << 8) |
+                       static_cast<unsigned char>(packet[7]);
+        quint64 channel = 0;
+        for (int i = 0; i < 8; ++i)
+            channel = (channel << 8) | static_cast<unsigned char>(packet[8 + i]);
+        if (type == 2) {
+            char frame[48 + 16];
+            std::memcpy(frame, "MGUI", 4);
+            fake32Write(frame + 4, 1);
+            fake64Write(frame + 8, channel);
+            fake64Write(frame + 16, 1);
+            fake32Write(frame + 24, 2);
+            fake32Write(frame + 28, 2);
+            fake32Write(frame + 32, 8);
+            fake32Write(frame + 36, 16);
+            fake32Write(frame + 40, 0);
+            fake32Write(frame + 44, 16);
+            for (int i = 0; i < 16; ++i)
+                frame[48 + i] = static_cast<char>(i + 1);
+            if (::send(4, frame, sizeof(frame), MSG_NOSIGNAL) !=
+                static_cast<ssize_t>(sizeof(frame))) return 3;
+            if (!fakeSendControl(3, 8, channel)) return 4;
+            if (!fakeSendControl(3, 5, channel)) return 5;
+            continue;
+        }
+        if (type == 4) {
+            fakeSendControl(3, 5, 0);
+            return 0;
+        }
+        if (type == 3) {
+            fakeSendControl(3, 5, channel);
+            continue;
+        }
+        if (!geometryLog.isEmpty() && type == 21 && count == 36) {
+            const quint32 width = fake32Read(packet + 16), height = fake32Read(packet + 20);
+            if (!width || width > 2048 || !height || height > 2048) return 6;
+            if (qgetenv("ACL_MICROG_SKIP_RESIZE_FRAME").isEmpty() &&
+                !fakeSizedFrame(channel, ++sequence, width, height)) return 7;
+            continue;
+        }
+        if (!geometryLog.isEmpty() && type == 12 && count == 36) {
+            append(geometryLog, QByteArray::number(fake32Read(packet + 16)) + ' ' +
+                   QByteArray::number(fake32Read(packet + 28)) + ' ' +
+                   QByteArray::number(fake32Read(packet + 32)) + '\n');
+            continue;
+        }
+        if (count >= 28) continue;
+    }
+}
+
+int managerMicrogQmlClient(int argc, char **argv)
+{
+    QCoreApplication app(argc, argv);
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) return 21;
+    QDBusMessage open = QDBusMessage::createMethodCall(
+        QStringLiteral("ru.androidcompatibilitylayer.appmanager"),
+        QStringLiteral("/ru/androidcompatibilitylayer/appmanager/microg"),
+        QStringLiteral("ru.androidcompatibilitylayer.appmanager.microg"),
+        QStringLiteral("OpenChannel"));
+    QDBusPendingReply<QDBusUnixFileDescriptor> opened(
+        waitFor(bus.asyncCall(open, 10000), 10000));
+    if (opened.isError() || !opened.value().isValid()) {
+        std::fprintf(stderr, "open channel failed: %s / %s\n",
+                     qPrintable(opened.error().name()), qPrintable(opened.error().message()));
+        return 22;
+    }
+    std::puts("QML client opened pre-ACK channel");
+    if (!qgetenv("ACL_MICROG_GEOMETRY_FILE").isEmpty())
+        (void)std::getchar();
+    return 0;
+}
+
+int managerMicrogQmlFrameFixture(int argc, char **argv)
+{
+    const bool matching = argc == 2 && QByteArray(argv[1]) == "--manager-microg-matching-frame-fixture";
+    const bool geometry = matching || (argc == 2 && QByteArray(argv[1]) == "--manager-microg-geometry-fixture");
+    qputenv("QT_QPA_PLATFORM", "minimal");
+    QGuiApplication app(argc, argv);
+    app.setOrganizationName(QStringLiteral("ru.androidcompatibilitylayer"));
+    app.setApplicationName(QStringLiteral("appmanager-qml-frame"));
+
+    QTemporaryDir directory;
+    if (!directory.isValid()) return 10;
+    const QString geometryLog = QDir(directory.path()).filePath(QStringLiteral("geometry-events"));
+    if (geometry) qputenv("ACL_MICROG_GEOMETRY_FILE", geometryLog.toLocal8Bit());
+    if (matching) qputenv("ACL_MICROG_SKIP_RESIZE_FRAME", "1");
+    qputenv("XDG_CONFIG_HOME", directory.path().toLocal8Bit());
+    qputenv("XDG_DATA_HOME", directory.path().toLocal8Bit());
+    const QString identityDirectory =
+        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (!QDir().mkpath(identityDirectory)) return 10;
+    QSettings settings;
+    settings.setValue(QStringLiteral("googleServices/provider"), QStringLiteral("microg"));
+    settings.sync();
+
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) return 11;
+    IdentityFixture identity;
+    identity.executable = QStringLiteral("/usr/bin/ru.androidcompatibilitylayer.Android0123456789abcdef01234567");
+    if (!bus.registerVirtualObject(QStringLiteral("/ru/omp/am"), &identity) ||
+        !bus.registerService(QStringLiteral("ru.omp.am"))) return 12;
+
+    ManagerLifecycle lifecycle([]() { return true; });
+    QString error;
+    if (!lifecycle.start(true, &error)) {
+        std::fprintf(stderr, "manager start failed: %s\n", qPrintable(error));
+        return 13;
+    }
+    if (!lifecycle.configureSharedMicrogWorker(
+            QFileInfo(app.applicationFilePath()).absoluteFilePath(),
+            QStringList(),
+            [](const QString &, const QString &, QString *) {
+                return QStringLiteral("org.example.app");
+            }, &error)) {
+        std::fprintf(stderr, "worker configure failed: %s\n", qPrintable(error));
+        return 14;
+    }
+
+    QProcess client;
+    client.start(app.applicationFilePath(),
+                 QStringList() << QStringLiteral("--manager-microg-qml-client"));
+    if (!client.waitForStarted(5000)) {
+        std::fprintf(stderr, "QML client process did not start\n");
+        return 15;
+    }
+
+    qmlRegisterType<SharedMicrogAuthSurface>(
+        "AndroidCompatibilityLayer.MicroG", 1, 0, "SharedMicrogAuthSurface");
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("lifecycle"), &lifecycle);
+    QQmlComponent component(&engine);
+    component.setData(
+        "import QtQuick 2.2\n"
+        "import AndroidCompatibilityLayer.MicroG 1.0\n"
+        "Item {\n"
+        "  width: 800\n"
+        "  height: 480\n"
+        "  SharedMicrogAuthSurface { objectName: 'authSurface'; anchors.fill: parent; host: lifecycle }\n"
+        "  Text { objectName: 'waitingLabel'; text: 'Waiting for the Google sign-in screen...'; "
+        "visible: !lifecycle.authenticationFrameAvailable }\n"
+        "}\n",
+        QUrl());
+    if (component.isError()) {
+        std::fprintf(stderr, "%s\n", qPrintable(component.errorString()));
+        return 16;
+    }
+    QObject *root = component.create();
+    if (!root) return 17;
+    QPointer<QObject> rootPointer(root);
+    QQuickWindow window;
+    QQuickItem *rootItem = qobject_cast<QQuickItem *>(root);
+    if (geometry) {
+        if (!rootItem) return 22;
+        rootItem->setParentItem(window.contentItem());
+        rootItem->setWidth(matching ? 2 : 480);
+        rootItem->setHeight(matching ? 2 : 800);
+    }
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    while (!lifecycle.authenticationFrameAvailable() && elapsed.elapsed() < 3000)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    if (!geometry && client.state() == QProcess::Running)
+        client.waitForFinished(5000);
+    if (!geometry && (client.exitStatus() != QProcess::NormalExit || client.exitCode() != 0)) {
+        std::fprintf(stderr, "QML client failed: %s\n",
+                     qPrintable(client.readAllStandardError()));
+        delete rootPointer.data();
+        return 21;
+    }
+    if (!lifecycle.authenticationFrameAvailable()) {
+        std::fprintf(stderr, "fixture frame unavailable; UI active=%d\n", lifecycle.authenticationUiActive());
+        delete rootPointer.data();
+        return 18;
+    }
+    QQuickItem *authSurface = rootPointer->findChild<QQuickItem*>(QStringLiteral("authSurface"));
+    QObject *waiting = rootPointer->findChild<QObject*>(QStringLiteral("waitingLabel"));
+    if (!authSurface || !waiting ||
+        (!geometry && (lifecycle.authenticationFrame().width() != 2 ||
+                       lifecycle.authenticationFrame().height() != 2)) ||
+        waiting->property("visible").toBool()) {
+        delete rootPointer.data();
+        return 19;
+    }
+    quint64 nonzero = 0;
+    const QImage frame = lifecycle.authenticationFrame();
+    for (int y = 0; y < frame.height(); ++y) {
+        const unsigned char *row = frame.constBits() + y * frame.bytesPerLine();
+        for (int x = 0; x < frame.width() * 4; ++x)
+            if (row[x]) ++nonzero;
+    }
+    if (!nonzero) {
+        delete rootPointer.data();
+        return 20;
+    }
+    if (matching) {
+        if (lifecycle.authenticationFrame().size() != QSize(2, 2)) return 28;
+        client.write("x\n");
+        client.closeWriteChannel();
+        if (!client.waitForFinished(5000) || client.exitCode() != 0) return 29;
+        std::puts("Matching pre-ACK frame retained without another frame");
+    } else if (geometry) {
+        auto waitFrame = [&](const QSize &size) {
+            QElapsedTimer timer;
+            timer.start();
+            while (lifecycle.authenticationFrame().size() != size && timer.elapsed() < 5000) {
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                QThread::msleep(1);
+            }
+            return lifecycle.authenticationFrame().size() == size;
+        };
+        auto touch = [&](const QPointF &point, bool expected) {
+            QMouseEvent press(QEvent::MouseButtonPress, point, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+            QCoreApplication::sendEvent(authSurface, &press);
+            if (press.isAccepted() != expected) return false;
+            if (expected) {
+                QMouseEvent release(QEvent::MouseButtonRelease, point, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+                QCoreApplication::sendEvent(authSurface, &release);
+            }
+            return true;
+        };
+        auto noBars = [&]() {
+            SharedMicrogAuthSurface *surface = qobject_cast<SharedMicrogAuthSurface *>(authSurface);
+            if (!surface) return false;
+            QImage image(int(surface->width()), int(surface->height()), QImage::Format_ARGB32);
+            image.fill(Qt::black);
+            QPainter painter(&image);
+            surface->paint(&painter);
+            painter.end();
+            return image.pixel(0, 0) == 0xffffffffu &&
+                   image.pixel(image.width() - 1, image.height() - 1) == 0xffffffffu;
+        };
+        if (!waitFrame(QSize(480, 800)) || !noBars() ||
+            !touch(QPointF(240, 400), true)) return 23;
+        rootItem->setWidth(800);
+        rootItem->setHeight(480);
+        if (!touch(QPointF(400, 240), false) || !waitFrame(QSize(800, 480)) ||
+            !noBars() || !touch(QPointF(400, 240), true)) return 24;
+        rootItem->setHeight(300);
+        if (!touch(QPointF(400, 150), false) || !waitFrame(QSize(800, 300)) ||
+            !noBars() || !touch(QPointF(400, 150), true)) return 25;
+        QElapsedTimer timer;
+        timer.start();
+        QByteArray events;
+        do {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            QFile file(geometryLog);
+            if (file.open(QIODevice::ReadOnly)) events = file.readAll();
+            if (events.count('\n') >= 6) break;
+            QThread::msleep(1);
+        } while (timer.elapsed() < 3000);
+        if (events != "0 240 400\n2 240 400\n0 400 240\n2 400 240\n0 400 150\n2 400 150\n")
+            return 26;
+        client.write("x\n");
+        client.closeWriteChannel();
+        if (!client.waitForFinished(5000) || client.exitCode() != 0) return 27;
+        std::puts("Manager/QML portrait, landscape and resized touch fixture passed");
+    }
+    if (!geometry) std::puts("Manager/QML pre-ACK frame fixture passed");
+    delete rootPointer.data();
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     qputenv("AURORA_APP_ID", "ru.androidcompatibilitylayer.appmanager");
     qputenv("AURORA_APP_INSTANCE_ID", "ru.androidcompatibilitylayer.appmanager");
+    if (argc >= 2 && QByteArray(argv[1]) == "--shared-microg-worker")
+        return fakeMicrogQmlWorker();
+    if (argc == 2 && QByteArray(argv[1]) == "--manager-microg-qml-client")
+        return managerMicrogQmlClient(argc, argv);
+    if (argc == 2 && QByteArray(argv[1]) == "--manager-microg-qml-frame-fixture")
+        return managerMicrogQmlFrameFixture(argc, argv);
+    if (argc == 2 && QByteArray(argv[1]) == "--manager-microg-geometry-fixture")
+        return managerMicrogQmlFrameFixture(argc, argv);
+    if (argc == 2 && QByteArray(argv[1]) == "--manager-microg-matching-frame-fixture")
+        return managerMicrogQmlFrameFixture(argc, argv);
     QCoreApplication app(argc, argv);
     app.setOrganizationName(QStringLiteral("ru.androidcompatibilitylayer"));
     app.setApplicationName(QStringLiteral("appmanager"));

@@ -186,6 +186,7 @@ public class Activity extends ContextThemeWrapper implements Window.Callback, Ke
         mLastNonConfig = null;             /* as Activity.performResume: only onCreate and onStart had it */
         mCalled = false;
         onResume();
+        megler.SharedMicrogWorker.activityResumed(this);
         mResumed = true;
         fragmentHost(FragmentManager.HOST_RESUMED);
         onPostResume();

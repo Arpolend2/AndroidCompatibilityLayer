@@ -77,9 +77,10 @@ void aurora_egl_frame_release(AuroraEglFrame *frame)
     memset(frame, 0, sizeof(*frame));
 }
 
-AuroraEglFrameResult aurora_egl_frame_capture(EGLDisplay display, EGLSurface surface,
-                                               int width, int height, int opaque, AuroraEglFrame *frame,
-                                               char *failure, size_t failure_size)
+static AuroraEglFrameResult capture_frame(EGLDisplay display, EGLSurface surface,
+                                          int width, int height, int opaque, AuroraEglFrame *frame,
+                                          void *rgba, size_t rgba_size,
+                                          char *failure, size_t failure_size)
 {
     const EGLint context_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
     const EGLint image_attrs[] = { EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE };
@@ -108,6 +109,14 @@ AuroraEglFrameResult aurora_egl_frame_capture(EGLDisplay display, EGLSurface sur
     if (draw != surface || read != surface)
         return reject(failure, failure_size, "EGL surface is not current for both drawing and reading");
     if (width <= 0 || height <= 0) return reject(failure, failure_size, "invalid EGL frame dimensions");
+    if (rgba) {
+        size_t row_size;
+        if ((size_t)width > SIZE_MAX / 4)
+            return reject(failure, failure_size, "source readback dimensions overflow");
+        row_size = (size_t)width * 4;
+        if ((size_t)height > SIZE_MAX / row_size || rgba_size < row_size * (size_t)height)
+            return reject(failure, failure_size, "source readback buffer is too small");
+    }
     extensions = eglQueryString(display, EGL_EXTENSIONS);
     if (!has_extension(extensions, "EGL_KHR_image_base"))
         return reject(failure, failure_size, "missing EGL_KHR_image_base");
@@ -189,9 +198,35 @@ AuroraEglFrameResult aurora_egl_frame_capture(EGLDisplay display, EGLSurface sur
             goto done;
         }
     }
+    if (rgba) {
+        GLenum status;
+        GLint pack = 4;
+        if (!fbo) glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
+        status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (!fbo || status != GL_FRAMEBUFFER_COMPLETE) {
+            if (failure && failure_size)
+                snprintf(failure, failure_size, "source readback framebuffer is incomplete (status 0x%04x)", status);
+            goto done;
+        }
+        glGetIntegerv(GL_PACK_ALIGNMENT, &pack);
+        if (pack != 4) glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        {
+            const GLenum error = glGetError();
+            if (error != GL_NO_ERROR) {
+                if (failure && failure_size)
+                    snprintf(failure, failure_size, "source glReadPixels failed (GL error 0x%04x)", error);
+                goto done;
+            }
+        }
+        if (pack != 4) glPixelStorei(GL_PACK_ALIGNMENT, pack);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
     if (opaque) {
         GLenum status;
-        glGenFramebuffers(1, &fbo);
+        if (!fbo) glGenFramebuffers(1, &fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
         status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
@@ -250,6 +285,24 @@ done:
     if (!ok && failure && failure_size && !failure[0])
         set_failure(failure, failure_size, "native EGL frame copy failed");
     return ok ? AURORA_EGL_FRAME_READY : AURORA_EGL_FRAME_REJECTED;
+}
+
+AuroraEglFrameResult aurora_egl_frame_capture(EGLDisplay display, EGLSurface surface,
+                                               int width, int height, int opaque, AuroraEglFrame *frame,
+                                               char *failure, size_t failure_size)
+{
+    return capture_frame(display, surface, width, height, opaque, frame, NULL, 0, failure, failure_size);
+}
+
+AuroraEglFrameResult aurora_egl_frame_capture_with_readback(EGLDisplay display, EGLSurface surface,
+                                                             int width, int height, int opaque,
+                                                             AuroraEglFrame *frame, void *rgba,
+                                                             size_t rgba_size, char *failure,
+                                                             size_t failure_size)
+{
+    if (!rgba) return reject(failure, failure_size, "source readback buffer is null");
+    return capture_frame(display, surface, width, height, opaque, frame, rgba, rgba_size,
+                         failure, failure_size);
 }
 
 GLuint aurora_egl_frame_import(const AuroraEglFrame *frame)

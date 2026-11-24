@@ -26,10 +26,11 @@ private:
                                const char *tag, int id, const char *title, const char *body);
     static bool MEGLER_CB sendDetailed(void *user, const char *package, const char *tag, int id,
                                        const char *title, const char *body, int flags, int max,
-                                       int progress, bool indeterminate);
+                                       int progress, bool indeterminate, int importance, bool silent);
     bool process(int operation, const char *package, const char *tag, int id,
                  const char *title, const char *body, int flags = 0, int max = 0,
-                 int progress = 0, bool indeterminate = false);
+                 int progress = 0, bool indeterminate = false, int importance = -1,
+                 bool silent = false);
 
     QMutex m_mutex;
     QString m_package;

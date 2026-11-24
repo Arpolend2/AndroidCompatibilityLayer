@@ -291,8 +291,10 @@ int DVM_LOOP(mg_dvm_thread *t, mg_dvm_frame *f, mg_jvalue *ret)
             mg_jobj *a, *v = RL(AA);
             i32 i;
             ARRAY(a, i, 0);
-            if (v && !mg_dvm_is_instance(v, mg_dvm_class_of(a)->component))
+            if (v && !mg_dvm_is_instance(v, mg_dvm_class_of(a)->component)) {
+                mg_dvm_array_store_diagnostic(v, mg_dvm_class_of(a)->component, f, pc);
                 THROW("java/lang/ArrayStoreException", "%s cannot be stored in an array of type %s", mg_dvm_class_of(v)->name, mg_dvm_class_of(a)->name);
+            }
             a->u.oarr.v[i] = v;
             NEXT(2);
         }

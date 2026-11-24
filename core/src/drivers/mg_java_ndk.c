@@ -23,6 +23,7 @@
  */
 #include "../bionic/mg_bionic.h"
 #include "../dvm/mg_dvm_internal.h"
+#include "../ndk/mg_egl.h"
 #include "../ndk/mg_ndk.h"
 #include "../zip/mg_zip.h"
 #include "mg_java.h"
@@ -232,15 +233,23 @@ static bool vw_valid(const mg_nwindow *b)
 
 /* A frame for a texture: w x h, R, G, B, A, rows bottom first when `flip` (as OpenGL reads them), handed to it. */
 /* A frame posted to a texture: false when the texture's Java threw, which is said once for each `said` (nothing else would). */
-static bool post_rgba(mg_jobj *texture, const void *rgba, int width, int height, bool flip, bool *said)
+static bool post_rgba(mg_jobj *texture, const void *rgba, int width, int height, bool flip, i64 timestamp, bool *said)
 {
-    mg_jvalue args[4];
+    mg_jvalue args[5];
+    mg_dvm_class *cls = mg_dvm_find_class("android/graphics/SurfaceTexture");
     memset(args, 0, sizeof(args));
     args[0].j = (i64)(mg_addr)rgba;
     args[1].i = width;
     args[2].i = height;
     args[3].z = flip;
-    if (mg_dvm_call_virtual(texture, "meglerPostRgba", "(JIIZ)V", args, NULL)) return true;
+    args[4].j = timestamp;
+    if (cls && mg_dvm_find_method(cls, "meglerPostRgba", "(JIIZJ)V", false)) {
+        if (mg_dvm_call_virtual(texture, "meglerPostRgba", "(JIIZJ)V", args, NULL)) return true;
+    } else {
+        mg_dvm_clear_pending();
+        mg_note_once("java: the framework DEX cannot carry a SurfaceTexture producer timestamp");
+        if (mg_dvm_call_virtual(texture, "meglerPostRgba", "(JIIZ)V", args, NULL)) return true;
+    }
     if (said && !*said) {
         char why[300];
         *said = true;
@@ -308,7 +317,11 @@ static bool vw_egl_swap(void *p)
         }
         /* (The frame read back is kept apart from the surface, which the swap may have replaced by one of a new size.) */
         rgba = mg_java_gl_window_pixels(s->gl, &fw, &fh);
-        if (rgba) post_rgba(s->w->texture, rgba, fw, fh, true, NULL);
+        if (rgba) {
+            i64 timestamp;
+            if (!mg_egl_surface_presentation_time(&timestamp)) timestamp = (i64)mg_time_monotonic_ns();
+            post_rgba(s->w->texture, rgba, fw, fh, true, timestamp, NULL);
+        }
         return true;
     }
     mg_java_gl_window_swap(s->gl, width, height);
@@ -486,7 +499,7 @@ static void post_texture(view_window *w)
         }
         rgba = w->rgba;
     }
-    if (post_rgba(w->texture, rgba, w->bw, w->bh, false, &w->failed_said)) w->posts++;
+    if (post_rgba(w->texture, rgba, w->bw, w->bh, false, (i64)mg_time_monotonic_ns(), &w->failed_said)) w->posts++;
 }
 
 /*
@@ -697,6 +710,228 @@ static mg_nwindow *g_window_from_surface(void *env, mg_jobj *surface)
     return NULL;
 }
 
+/* An ASurfaceTexture reference holds the producer window, which in turn
+ * keeps the Java texture alive. Releasing it does not release the texture. */
+static mg_nwindow *g_surface_texture_from_java(void *env, mg_jobj *texture)
+{
+    (void)env;
+    if (!texture || !texture->dvm || !mg_dvm_instance_of(texture, "android/graphics/SurfaceTexture")) return NULL;
+    return window_of(NULL, texture);
+}
+
+static void g_surface_texture_release(mg_nwindow *texture) { mg_nwindow_release(texture); }
+
+static mg_nwindow *g_surface_texture_window(mg_nwindow *texture)
+{
+    if (!mg_nwindow_valid(texture)) return NULL;
+    mg_nwindow_acquire(texture);
+    return texture;
+}
+
+typedef struct texture_consumer {
+    u8 *pixels;
+    int width, height;
+} texture_consumer;
+
+/* These methods run under SurfaceTexture.mLock, shared with every producer. */
+static bool texture_field(mg_jobj *texture, const char *name, mg_jvalue *value)
+{
+    memset(value, 0, sizeof(*value));
+    return mg_dvm_get_field(texture, name, value);
+}
+
+static bool texture_set_long(mg_jobj *texture, const char *name, i64 n)
+{
+    mg_jvalue value;
+    memset(&value, 0, sizeof(value));
+    value.j = n;
+    return mg_dvm_set_field(texture, name, value);
+}
+
+static bool texture_context(mg_jobj *texture, void **display, void **context)
+{
+    mg_jvalue d, c;
+    if (!mg_egl_surface_current(display, context) ||
+        !texture_field(texture, "mConsumerDisplay", &d) || !texture_field(texture, "mConsumerContext", &c)) return false;
+    return (!d.j && !c.j) || ((void *)(mg_addr)d.j == *display && (void *)(mg_addr)c.j == *context);
+}
+
+static bool texture_save_context(mg_jobj *texture, void *display, void *context)
+{
+    return texture_set_long(texture, "mConsumerDisplay", (i64)(mg_addr)display) &&
+           texture_set_long(texture, "mConsumerContext", (i64)(mg_addr)context);
+}
+
+static void texture_update_native(mg_jcall *call)
+{
+    mg_jobj *texture = call->self;
+    mg_jvalue tex, front, timestamp, state, newest, yes;
+    mg_java_gfx_bitmap bitmap;
+    texture_consumer *consumer;
+    void *display, *context;
+    u8 *pixels;
+    size_t size, x, y;
+    i64 bm;
+    call->ret.i = NW_INVALID_OPERATION;
+    if (!texture_context(texture, &display, &context) || !texture_field(texture, "mTex", &tex) ||
+        !texture_field(texture, "mFront", &front) || !texture_field(texture, "mTimestamp", &timestamp) ||
+        !texture_field(texture, "mConsumer", &state)) return;
+    memset(&newest, 0, sizeof(newest));
+    if (!mg_dvm_call_virtual(texture, "meglerGpuNewest", "()Z", NULL, &newest)) return;
+    if (newest.z) {
+        mg_note_once("java: a GPU-only SurfaceTexture frame cannot be latched into an external GL texture");
+        return;
+    }
+    if (!front.l) {
+        if (mg_egl_surface_bind((u32)tex.i, false) && texture_save_context(texture, display, context)) call->ret.i = 0;
+        return;
+    }
+    bm = bitmap_of(front.l);
+    if (!bm || !mg_java_gfx_bitmap_info(bm, &bitmap) || bitmap.width <= 0 || bitmap.height <= 0 ||
+        (size_t)bitmap.width > SIZE_MAX / 4 / (size_t)bitmap.height || bitmap.stride < 0 ||
+        (size_t)bitmap.stride < (size_t)bitmap.width * 4) return;
+    size = (size_t)bitmap.width * (size_t)bitmap.height * 4;
+    pixels = (u8 *)mg_alloc(size);
+    for (y = 0; y < (size_t)bitmap.height; y++) {
+        const u8 *src = (const u8 *)bitmap.pixels + y * (size_t)bitmap.stride;
+        u8 *dst = pixels + y * (size_t)bitmap.width * 4;
+        for (x = 0; x < (size_t)bitmap.width; x++, src += 4, dst += 4) {
+            dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0]; dst[3] = src[3];
+        }
+    }
+    if (!mg_egl_surface_upload((u32)tex.i, pixels, bitmap.width, bitmap.height)) {
+        free(pixels);
+        mg_warn("java: failed to upload a SurfaceTexture frame to the current GL context");
+        return;
+    }
+    consumer = (texture_consumer *)(mg_addr)state.j;
+    if (!consumer) {
+        consumer = (texture_consumer *)mg_alloc(sizeof(*consumer));
+        memset(consumer, 0, sizeof(*consumer));
+        if (!texture_set_long(texture, "mConsumer", (i64)(mg_addr)consumer)) {
+            free(consumer);
+            free(pixels);
+            return;
+        }
+    }
+    free(consumer->pixels);
+    consumer->pixels = pixels;
+    consumer->width = bitmap.width;
+    consumer->height = bitmap.height;
+    memset(&yes, 0, sizeof(yes));
+    yes.z = 1;
+    if (!texture_save_context(texture, display, context) || !texture_set_long(texture, "mLatchedTimestamp", timestamp.j) ||
+        !mg_dvm_set_field(texture, "mHasLatched", yes)) return;
+    call->ret.i = 0;
+}
+
+static void texture_attach_native(mg_jcall *call)
+{
+    mg_jvalue state;
+    texture_consumer *consumer;
+    void *display, *context;
+    u32 texture = (u32)call->args[0].i;
+    call->ret.i = NW_INVALID_OPERATION;
+    if (!mg_egl_surface_current(&display, &context) || !texture_field(call->self, "mConsumer", &state) ||
+        !mg_egl_surface_bind(texture, true)) return;
+    consumer = (texture_consumer *)(mg_addr)state.j;
+    if ((consumer && consumer->pixels && !mg_egl_surface_upload(texture, consumer->pixels, consumer->width, consumer->height)) ||
+        !texture_save_context(call->self, display, context)) {
+        mg_egl_surface_delete(texture);
+        return;
+    }
+    call->ret.i = 0;
+}
+
+static void texture_detach_native(mg_jcall *call)
+{
+    mg_jvalue tex;
+    void *display, *context;
+    call->ret.i = NW_INVALID_OPERATION;
+    if (!texture_context(call->self, &display, &context) || !texture_field(call->self, "mTex", &tex) ||
+        !mg_egl_surface_delete((u32)tex.i) || !texture_save_context(call->self, NULL, NULL)) return;
+    call->ret.i = 0;
+}
+
+static void texture_free_native(mg_jcall *call)
+{
+    mg_jvalue state;
+    texture_consumer *consumer;
+    if (!texture_field(call->self, "mConsumer", &state)) return;
+    consumer = (texture_consumer *)(mg_addr)state.j;
+    if (!texture_set_long(call->self, "mConsumer", 0)) return;
+    if (consumer) {
+        free(consumer->pixels);
+        free(consumer);
+    }
+}
+
+static const mg_jhle k_surface_texture_natives[] = {
+    { "android/graphics/SurfaceTexture", "meglerUpdateTexImage", "()I", texture_update_native },
+    { "android/graphics/SurfaceTexture", "meglerAttachToGLContext", "(I)I", texture_attach_native },
+    { "android/graphics/SurfaceTexture", "meglerDetachFromGLContext", "()I", texture_detach_native },
+    { "android/graphics/SurfaceTexture", "meglerFreeConsumer", "()V", texture_free_native },
+    { NULL, NULL, NULL, NULL }
+};
+
+const mg_jhle *mg_java_surface_texture_natives(void) { return k_surface_texture_natives; }
+
+static int texture_invoke(mg_nwindow *handle, const char *name, const char *sig, mg_jvalue *args, mg_jvalue *ret)
+{
+    view_window *window = (view_window *)handle;
+    mg_dvm_class *cls;
+    if (!mg_nwindow_valid(handle) || !window->texture) return NW_INVALID_OPERATION;
+    cls = mg_dvm_find_class("android/graphics/SurfaceTexture");
+    if (!cls || !mg_dvm_find_method(cls, "meglerUpdateTexImage", "()I", false)) {
+        mg_warn("java: ASurfaceTexture GL consumer requires the updated framework DEX");
+        mg_dvm_clear_pending();
+        return NW_INVALID_OPERATION;
+    }
+    if (!mg_dvm_call_virtual(window->texture, name, sig, args, ret)) {
+        char why[300];
+        mg_warn("java: ASurfaceTexture.%s failed: %s", name, mg_dvm_describe_pending(why, sizeof(why)));
+        mg_dvm_clear_pending();
+        return NW_INVALID_OPERATION;
+    }
+    return 0;
+}
+
+static int g_surface_texture_attach(mg_nwindow *texture, u32 name)
+{
+    mg_jvalue arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.i = (i32)name;
+    return texture_invoke(texture, "attachToGLContext", "(I)V", &arg, NULL);
+}
+
+static int g_surface_texture_detach(mg_nwindow *texture)
+{
+    return texture_invoke(texture, "detachFromGLContext", "()V", NULL, NULL);
+}
+
+static int g_surface_texture_update(mg_nwindow *texture)
+{
+    return texture_invoke(texture, "updateTexImage", "()V", NULL, NULL);
+}
+
+static i64 g_surface_texture_timestamp(mg_nwindow *texture)
+{
+    mg_jvalue ret;
+    memset(&ret, 0, sizeof(ret));
+    texture_invoke(texture, "getTimestamp", "()J", NULL, &ret);
+    return ret.j;
+}
+
+static void g_surface_texture_matrix(mg_nwindow *texture, float *matrix)
+{
+    mg_jvalue arg;
+    if (!matrix) return;
+    memset(&arg, 0, sizeof(arg));
+    arg.l = mg_dvm_new_array("[F", 16);
+    if (arg.l && !texture_invoke(texture, "getTransformMatrix", "([F)V", &arg, NULL))
+        memcpy(matrix, arg.l->u.arr.data, 16 * sizeof(*matrix));
+}
+
 /* --------------------------------------------- the asset manager of an AssetManager
  *
  * AAssetManager_fromJava. The framework's AssetManager is one of three kinds (android/content/res/AssetManager.java): the
@@ -752,6 +987,14 @@ static const mg_sym k_java_ndk[] = {
     MG_WRAP("AndroidBitmap_getInfo", g_bitmap_get_info), MG_WRAP("AndroidBitmap_lockPixels", g_bitmap_lock),
     MG_WRAP("AndroidBitmap_unlockPixels", g_bitmap_unlock),
     MG_WRAP("ANativeWindow_fromSurface", g_window_from_surface),
+    MG_WRAP("ASurfaceTexture_fromSurfaceTexture", g_surface_texture_from_java),
+    MG_WRAP("ASurfaceTexture_release", g_surface_texture_release),
+    MG_WRAP("ASurfaceTexture_acquireANativeWindow", g_surface_texture_window),
+    MG_WRAP("ASurfaceTexture_attachToGLContext", g_surface_texture_attach),
+    MG_WRAP("ASurfaceTexture_detachFromGLContext", g_surface_texture_detach),
+    MG_WRAP("ASurfaceTexture_updateTexImage", g_surface_texture_update),
+    MG_WRAP("ASurfaceTexture_getTimestamp", g_surface_texture_timestamp),
+    MG_WRAP("ASurfaceTexture_getTransformMatrix", g_surface_texture_matrix),
     MG_WRAP("AAssetManager_fromJava", g_am_from_java),
     MG_END
 };

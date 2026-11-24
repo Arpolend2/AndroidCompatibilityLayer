@@ -16,7 +16,18 @@
 
 namespace {
 enum { Ready = 1, Open = 2, Close = 3, Stop = 4, Ack = 5, Nack = 6, Disconnected = 7 };
-enum { HeaderSize = 28 };
+enum { HeaderSize = 28, FrameHeaderSize = 48, FrameChunk = 60 * 1024 };
+
+bool sawFrameDelivered = false;
+bool sawFrameSuppressed = false;
+
+void captureDiagnostics(QtMsgType, const QMessageLogContext &, const QString &message)
+{
+    if (message.startsWith(QLatin1String("Shared microG UI frame delivered:")))
+        sawFrameDelivered = true;
+    if (message.startsWith(QLatin1String("Shared microG UI frame suppressed:")))
+        sawFrameSuppressed = true;
+}
 
 void write32(char *buffer, quint32 value)
 {
@@ -58,7 +69,79 @@ bool sendReply(int fd, quint32 type, quint64 channelId)
     return ::send(fd, packet, sizeof(packet), MSG_NOSIGNAL) == sizeof(packet);
 }
 
-int fakeWorker(bool rejectOpen, bool disconnectOpen, bool disconnectOnClose, bool exitAfterReady)
+bool sendFrameDiagnostic(int fd, quint32 type, quint64 channelId)
+{
+    char packet[HeaderSize] = { 'M', 'G', 'R', '1' };
+    write32(packet + 4, type);
+    write64(packet + 8, channelId);
+    write32(packet + 16, 800);
+    write32(packet + 20, 480);
+    write32(packet + 24, 0);
+    return ::send(fd, packet, sizeof(packet), MSG_NOSIGNAL) == sizeof(packet);
+}
+
+bool sendKeyboardShow(int fd, quint64 channelId, quint32 enter)
+{
+    char packet[HeaderSize] = { 'M', 'G', 'R', '1' };
+    write32(packet + 4, 10);
+    write64(packet + 8, channelId);
+    write32(packet + 16, 3);
+    write32(packet + 20, 128);
+    write32(packet + 24, enter);
+    return ::send(fd, packet, sizeof(packet), MSG_NOSIGNAL) == sizeof(packet);
+}
+
+bool sendFrame(int fd, quint64 channelId, quint64 sequence, bool nonzero)
+{
+    const quint32 width = 800, height = 480, stride = width * 4;
+    const quint32 total = stride * height;
+    char packet[FrameHeaderSize + FrameChunk];
+    for (quint32 offset = 0; offset < total;) {
+        quint32 chunk = total - offset;
+        if (chunk > FrameChunk) chunk = FrameChunk;
+        std::memcpy(packet, "MGUI", 4);
+        write32(packet + 4, 1);
+        write64(packet + 8, channelId);
+        write64(packet + 16, sequence);
+        write32(packet + 24, width);
+        write32(packet + 28, height);
+        write32(packet + 32, stride);
+        write32(packet + 36, total);
+        write32(packet + 40, offset);
+        write32(packet + 44, chunk);
+        unsigned char *pixels = reinterpret_cast<unsigned char *>(packet + FrameHeaderSize);
+        for (quint32 i = 0; i < chunk; ++i)
+            pixels[i] = nonzero ? static_cast<unsigned char>((offset + i) * 37 + 11) : 0;
+        if (::send(fd, packet, FrameHeaderSize + chunk, MSG_NOSIGNAL) !=
+            static_cast<ssize_t>(FrameHeaderSize + chunk))
+            return false;
+        offset += chunk;
+    }
+    return true;
+}
+
+bool sendSmallFrame(int fd, quint64 channelId, quint64 sequence = 1)
+{
+    char packet[FrameHeaderSize + 16];
+    std::memcpy(packet, "MGUI", 4);
+    write32(packet + 4, 1);
+    write64(packet + 8, channelId);
+    write64(packet + 16, sequence);
+    write32(packet + 24, 2);
+    write32(packet + 28, 2);
+    write32(packet + 32, 8);
+    write32(packet + 36, 16);
+    write32(packet + 40, 0);
+    write32(packet + 44, 16);
+    for (int i = 0; i < 16; ++i)
+        packet[FrameHeaderSize + i] = static_cast<char>(i + 1);
+    return ::send(fd, packet, sizeof(packet), MSG_NOSIGNAL) ==
+           static_cast<ssize_t>(sizeof(packet));
+}
+
+int fakeWorker(bool rejectOpen, bool disconnectOpen, bool disconnectOnClose, bool exitAfterReady,
+               bool sendFrames, bool sendFrameBeforeUi, bool sendKeyboard, bool receiveResize,
+               bool sendBurst)
 {
     struct Channel {
         quint64 id;
@@ -110,7 +193,28 @@ int fakeWorker(bool rejectOpen, bool disconnectOpen, bool disconnectOnClose, boo
             }
             if (channelCount == 32) return 26;
             channels[channelCount++] = Channel{channelId, receivedFd};
+            if (sendFrameBeforeUi) {
+                if (!sendSmallFrame(4, channelId)) return 39;
+                if (!sendFrameDiagnostic(3, 18, channelId)) return 41;
+                if (!sendReply(3, 8, channelId)) return 40;
+            }
+            if (sendBurst) {
+                for (quint64 sequence = 1; sequence <= 64; ++sequence)
+                    if (!sendSmallFrame(4, channelId, sequence)) return 49;
+                if (!sendReply(3, 8, channelId)) return 50;
+            }
+            if (sendFrames) {
+                if (!sendReply(3, 8, channelId)) return 36;
+            }
+            if ((sendKeyboard || receiveResize) && !sendReply(3, 8, channelId)) return 44;
             if (!sendReply(3, Ack, channelId)) return 27;
+            if (sendKeyboard && !sendKeyboardShow(3, channelId, 5)) return 45;
+            if (sendFrames) {
+                if (!sendFrame(4, channelId, 1, true)) return 37;
+                if (!sendFrameDiagnostic(3, 18, channelId)) return 42;
+                if (!sendFrame(4, channelId, 2, false)) return 38;
+                if (!sendFrameDiagnostic(3, 19, channelId)) return 43;
+            }
             if (disconnectOpen) {
                 if (!sendReply(3, Disconnected, channelId)) return 28;
                 ::close(receivedFd);
@@ -125,9 +229,18 @@ int fakeWorker(bool rejectOpen, bool disconnectOpen, bool disconnectOnClose, boo
                     break;
                 }
             }
+            if ((sendKeyboard || receiveResize) && !sendReply(3, 9, channelId)) return 46;
             if (disconnectOnClose && !sendReply(3, Disconnected, channelId)) return 34;
             if (!sendReply(3, Ack, channelId)) return 30;
             if (disconnectOnClose && !sendReply(3, Disconnected, channelId)) return 35;
+        } else if (type == 21 && receiveResize) {
+            if (count != HeaderSize + 8 || receivedCount || packageLength != 8 ||
+                !((uid == 480 && pid == 800 && read32(packet + HeaderSize) == 160 &&
+                   read32(packet + HeaderSize + 4) == 0) ||
+                  (uid == 800 && pid == 480 && read32(packet + HeaderSize) == 160 &&
+                   read32(packet + HeaderSize + 4) == 1)))
+                return 47;
+            if (!sendKeyboardShow(3, channelId, 5)) return 48;
         } else if (type == Stop) {
             if (count != HeaderSize || receivedCount || channelId || uid || pid || packageLength) return 31;
             for (int i = 0; i < channelCount; ++i) ::close(channels[i].fd);
@@ -165,6 +278,7 @@ bool check(bool value, const char *description)
 int main(int argc, char **argv)
 {
     bool workerMode = false, rejectOpen = false, disconnectOpen = false, disconnectOnClose = false;
+    bool sendFrames = false, sendFrameBeforeUi = false, sendKeyboard = false, receiveResize = false, sendBurst = false;
     bool exitAfterReady = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shared-microg-worker") == 0) workerMode = true;
@@ -172,10 +286,17 @@ int main(int argc, char **argv)
         else if (std::strcmp(argv[i], "--fake-worker-disconnect") == 0) disconnectOpen = true;
         else if (std::strcmp(argv[i], "--fake-worker-disconnect-on-close") == 0) disconnectOnClose = true;
         else if (std::strcmp(argv[i], "--fake-worker-exit-after-ready") == 0) exitAfterReady = true;
+        else if (std::strcmp(argv[i], "--fake-worker-frames") == 0) sendFrames = true;
+        else if (std::strcmp(argv[i], "--fake-worker-frame-before-ui") == 0) sendFrameBeforeUi = true;
+        else if (std::strcmp(argv[i], "--fake-worker-keyboard") == 0) sendKeyboard = true;
+        else if (std::strcmp(argv[i], "--fake-worker-resize") == 0) receiveResize = true;
+        else if (std::strcmp(argv[i], "--fake-worker-burst") == 0) sendBurst = true;
     }
-    if (workerMode) return fakeWorker(rejectOpen, disconnectOpen, disconnectOnClose, exitAfterReady);
+    if (workerMode) return fakeWorker(rejectOpen, disconnectOpen, disconnectOnClose, exitAfterReady,
+                                      sendFrames, sendFrameBeforeUi, sendKeyboard, receiveResize, sendBurst);
 
     QCoreApplication app(argc, argv);
+    qInstallMessageHandler(captureDiagnostics);
     const QString realWorker = QString::fromLocal8Bit(qgetenv("MEGLER_SHARED_MICROG_TEST_WORKER"));
     if (!realWorker.isEmpty()) {
         const QString apk = QString::fromLocal8Bit(qgetenv("MEGLER_SHARED_MICROG_TEST_APK"));
@@ -347,6 +468,178 @@ int main(int argc, char **argv)
             char byte = 0;
             ok &= check(disconnected && ::read(clientFd, &byte, 1) == 0,
                         "DISCONNECTED revokes the local bridge");
+            ::close(clientFd);
+        }
+    }
+    {
+        SharedMicrogSupervisor supervisor;
+        ok &= check(supervisor.configure(program, QStringList() << QStringLiteral("--fake-worker-frame-before-ui"),
+                                         &error), "configure frame-before-UiStarted fixture");
+        int frameClientFd = -1;
+        int frameCount = 0, uiStartedCount = 0;
+        quint64 readyChannel = 0;
+        quint64 nonzeroBytes = 0;
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationUiChanged,
+                         [&uiStartedCount](quint64, bool active) {
+            if (active) ++uiStartedCount;
+        });
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationFrameChanged,
+                         [&frameCount, &readyChannel, &nonzeroBytes]
+                         (quint64 channelId, const QImage &frame) {
+            ++frameCount;
+            if (!frame.isNull()) {
+                readyChannel = channelId;
+                const quint64 bytes = static_cast<quint64>(frame.width()) *
+                                      static_cast<quint64>(frame.height()) * 4;
+                const unsigned char *pixels = frame.constBits();
+                for (quint64 i = 0; i < bytes; ++i)
+                    if (pixels[i]) ++nonzeroBytes;
+            }
+        });
+        ok &= check(openTestChannel(&supervisor, 20, &frameClientFd, &error),
+                    "open frame-before-UiStarted channel");
+        if (frameClientFd >= 0) {
+            QEventLoop loop;
+            QTimer timeout;
+            timeout.setSingleShot(true);
+            QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+            timeout.start(3000);
+            loop.exec();
+            supervisor.closeChannel(20);
+            ::close(frameClientFd);
+        }
+        ok &= check(uiStartedCount == 1, "UiStarted activates frame-before-UiStarted channel");
+        ok &= check(frameCount == 1 && readyChannel == 20,
+                    "saved frame is emitted after UI activation without another frame");
+        ok &= check(nonzeroBytes > 0, "saved frame carries nonzero pixels");
+    }
+    {
+        SharedMicrogSupervisor supervisor;
+        ok &= check(supervisor.configure(program, QStringList() << QStringLiteral("--fake-worker-frames"),
+                                         &error), "configure frame fixture");
+        int frameClientFd = -1;
+        int frameCount = 0, readyCount = 0, uiStartedCount = 0;
+        quint64 readyChannel = 0;
+        quint64 nonzeroBytes = 0;
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationUiChanged,
+                         [&uiStartedCount](quint64, bool active) {
+            if (active) ++uiStartedCount;
+        });
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationFrameChanged,
+                         [&frameCount, &readyCount, &readyChannel, &nonzeroBytes]
+                         (quint64 channelId, const QImage &frame) {
+            ++frameCount;
+            if (!frame.isNull() && frame.width() == 800 && frame.height() == 480) {
+                ++readyCount;
+                readyChannel = channelId;
+                for (int y = 0; y < frame.height(); ++y) {
+                    const unsigned char *row = frame.constBits() + y * frame.bytesPerLine();
+                    for (int x = 0; x < frame.width() * 4; ++x)
+                        if (row[x]) ++nonzeroBytes;
+                }
+            }
+        });
+        ok &= check(openTestChannel(&supervisor, 19, &frameClientFd, &error),
+                    "open frame fixture channel");
+        if (frameClientFd >= 0) {
+            QEventLoop loop;
+            QTimer timeout;
+            timeout.setSingleShot(true);
+            QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+            timeout.start(3000);
+            loop.exec();
+            supervisor.closeChannel(19);
+            ::close(frameClientFd);
+        }
+        ok &= check(uiStartedCount == 1, "UiStarted becomes ready before frames");
+        ok &= check(frameCount == 2 && readyCount == 2,
+                    "nonzero and later-zero complete frames are assembled");
+        ok &= check(readyChannel == 19, "assembled frames retain the active channel");
+        ok &= check(nonzeroBytes > 0, "first complete frame carries nonzero pixels");
+        ok &= check(sawFrameDelivered && sawFrameSuppressed,
+                    "frame diagnostics are accepted before and after ACK");
+    }
+    {
+        SharedMicrogSupervisor supervisor;
+        ok &= check(supervisor.configure(program, QStringList() << QStringLiteral("--fake-worker-keyboard"),
+                                         &error), "configure keyboard fixture");
+        ok &= check(supervisor.startRetained(&error), "start retained keyboard worker");
+        int keyboardCount = 0, deathCount = 0;
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::workerDied,
+                         [&deathCount]() { ++deathCount; });
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationKeyboardRequested,
+                         [&keyboardCount](quint64 channel, int kind, int flags, int enter) {
+            if ((channel == 31 || channel == 32) && kind == 3 && flags == 128 && enter == 5)
+                ++keyboardCount;
+        });
+        for (quint64 channel = 31; channel <= 32; ++channel) {
+            int clientFd = -1;
+            ok &= check(openTestChannel(&supervisor, channel, &clientFd, &error),
+                        "open keyboard channel");
+            if (clientFd >= 0) {
+                QEventLoop loop;
+                QTimer::singleShot(100, &loop, SLOT(quit()));
+                loop.exec();
+                supervisor.closeChannel(channel);
+                ::close(clientFd);
+            }
+        }
+        ok &= check(keyboardCount == 2, "keyboard show survives channel reopen");
+        ok &= check(deathCount == 0, "keyboard show does not kill retained worker");
+        supervisor.releaseRetention();
+    }
+    {
+        SharedMicrogSupervisor supervisor;
+        ok &= check(supervisor.configure(program, QStringList() << QStringLiteral("--fake-worker-resize"),
+                                         &error), "configure resize fixture");
+        bool beforeAck = false;
+        int received = 0, deaths = 0;
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationUiChanged,
+                         [&supervisor, &beforeAck](quint64 channel, bool active) {
+            if (active) beforeAck = supervisor.sendUiResize(channel, 480, 800, 160, 0);
+        });
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationKeyboardRequested,
+                         [&received](quint64, int, int, int) { ++received; });
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::workerDied,
+                         [&deaths]() { ++deaths; });
+        int clientFd = -1;
+        ok &= check(openTestChannel(&supervisor, 40, &clientFd, &error), "open resize channel");
+        ok &= check(beforeAck, "send portrait resize during channel opening");
+        ok &= check(supervisor.sendUiResize(40, 800, 480, 160, 1), "send landscape resize");
+        ok &= check(!supervisor.sendUiResize(40, 2049, 480, 160, 1) &&
+                    !supervisor.sendUiResize(40, 800, 480, 160, 4) &&
+                    !supervisor.sendUiResize(41, 800, 480, 160, 1), "reject invalid resize");
+        QEventLoop loop;
+        QTimer::singleShot(100, &loop, SLOT(quit()));
+        loop.exec();
+        ok &= check(received == 2 && deaths == 0, "resize packets received without worker failure");
+        if (clientFd >= 0) {
+            supervisor.closeChannel(40);
+            ::close(clientFd);
+        }
+    }
+    {
+        SharedMicrogSupervisor supervisor;
+        ok &= check(supervisor.configure(program, QStringList() << QStringLiteral("--fake-worker-burst"),
+                                         &error), "configure frame burst fixture");
+        int frames = 0, timerAtFrame = 0;
+        QObject::connect(&supervisor, &SharedMicrogSupervisor::authenticationFrameChanged,
+                         [&supervisor, &frames, &timerAtFrame](quint64, const QImage &frame) {
+            if (frame.isNull()) return;
+            ++frames;
+            if (frames == 1)
+                QTimer::singleShot(0, &supervisor, [&frames, &timerAtFrame]() { timerAtFrame = frames; });
+        });
+        int clientFd = -1;
+        ok &= check(openTestChannel(&supervisor, 41, &clientFd, &error), "open burst channel");
+        QEventLoop loop;
+        QTimer::singleShot(300, &loop, SLOT(quit()));
+        loop.exec();
+        ok &= check(frames == 64, "all queued frames are received");
+        ok &= check(timerAtFrame > 0 && timerAtFrame < 64,
+                    "frame burst yields to the GUI event loop");
+        if (clientFd >= 0) {
+            supervisor.closeChannel(41);
             ::close(clientFd);
         }
     }

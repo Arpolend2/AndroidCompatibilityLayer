@@ -14,20 +14,39 @@ is Russian and otherwise use English. Android apps choose their own language;
 the Android language setting is independent of the manager interface.
 
 Android notifications from a running app are sent to the system notification
-service when its notification permission and channel allow them. Updates and
-removals are tracked while that app process remains alive. Progress notifications
-include their progress and stay visible until updated or removed; updates to
-progress or notifications marked `onlyAlertOnce` suppress repeat previews and
-sound. Notification actions
-and PendingIntent taps are not supported, and notifications left after a process
-exit cannot yet be updated or removed by a later process.
+service when its notification permission and channel allow them. Channel
+importance `MIN` and `LOW` maps to low urgency without sound or a preview;
+`DEFAULT` has normal urgency and no preview, while `HIGH` and `MAX` permit a
+normal-urgency preview. A channel with no sound suppresses sound independently
+of importance. Legacy apps use notification priority and sound settings. Aurora
+decides whether to display previews, and has no exact equivalent of Android's
+status-bar visibility or channel controls.
+
+Updates and removals are tracked while that app process remains alive. Progress
+and ongoing notifications request no automatic expiry; progress updates and
+notifications marked `onlyAlertOnce` suppress repeat previews and sound. Ongoing
+notifications remain manually dismissible to avoid leaving an unremovable
+notification if the app exits. Custom sounds, vibration, notification actions,
+and PendingIntent taps are not supported. Foreground services publish their
+notifications through the same bridge. The Android package is supplied as
+`x-nemo-origin-package`; compatible Lipstick implementations suppress default
+vibration for Android notifications, independently of `suppress-sound`.
+The app and hosted microG service managers clean up foreground notifications
+when they destroy a service, even if its `onDestroy` does not call the superclass.
+Notifications left after a process exit cannot yet be updated or removed by a
+later process. These mappings and their presentation require device verification.
 
 When microG is selected, the manager starts and retains its shared worker even
 without an attached client, and retries after a worker failure while the manager
 is running. A RuntimeManager periodic task is registered with a 15-minute
 interval and autostart. If the manager's D-Bus service is absent, it attempts to
 start a detached background manager; otherwise it asks the manager to check and
-restart the shared worker. The task is disabled when microG is deselected.
+restart the shared worker. When microG is deselected, the manager requests that
+the task be disabled. Failed scheduling or disable requests are logged and
+retried every 30 seconds while the manager remains running; operations are
+serialized and converge on the latest selection.
+The watchdog task omits Camera and Audio permissions, which the SDK disallows
+for background tasks; the main application's permissions are unchanged.
 Aurora may suspend or stop the background manager, including after
 the task exits; uninterrupted operation, restart after reboot and permissions
 require device verification. This does not yet deliver FCM to stopped Android
@@ -55,6 +74,9 @@ build ABI, rather than the device CPU; unknown builds are reported as such.
 Standalone processes receive the paused state through the existing polling
 channel, so they may take a moment to stop recording. Capture resumes when
 the manager restarts; this does not control system logs outside the manager.
+Diagnostic frame-pair capture is available only while detailed logging is
+active, not while it is paused. The control follows the same interprocess
+state polling, so changes may take a moment to reach an open preview.
 Disabling detailed logging clears the current manager history and shared
 snapshots but retains exported files in Documents. Clearing the log folder also
 clears the current manager history; active apps may recreate shared snapshots.
@@ -70,6 +92,50 @@ including per-message accounting. A saturated socket can still lose messages
 before the queue fills; such losses and queue overflow are reported. The
 legacy D-Bus transport also has independent queue and rate limits. Core log
 formatting can truncate messages before they reach the channel.
+
+For Google Maps (`com.google.android.apps.maps`), the runtime attempts to
+instrument both its Java Cronet fallback URL requests and Android's system
+OkHttp `HttpURLConnection`. With detailed logging enabled, `maps-net:`
+records identify a request or connection within one process and engine. The
+Java Cronet path records HTTP status, redirects, outcome, coarse error category
+and bytes read; a zero status means unavailable, bytes read may be less than
+the complete response, and redirects are not included in the count.
+The system HTTP path records the connection and the first final HTTP status or
+coarse error; it does not measure response size or request completion.
+System HTTP events can include other Maps traffic, and a single request can
+appear in both paths: their identifiers are independent.
+
+For the first 16 system HTTP failures with an IOException directly caused by
+an otherwise unclassified checked exception, `checked_group` groups exception
+classes by process-local numbers (up to eight classes), without logging names;
+additional classes are `overflow`.
+`checked_scope` is a coarse package category, and `provider_frame` reports only
+whether one of a few fixed ProviderInstaller class names occurs in the first
+48 frames of that exception. `not_seen` does not exclude obfuscated or
+truncated frames. `gms_provider` reports whether `GmsCore_OpenSSL` is registered
+at that moment, not whether it is active or whether provider installation
+caused the failure. `checked_sample=limit_reached` marks unsampled failures.
+`cause_origin` is the first recognized subsystem frame in the deepest sampled
+cause, not necessarily where the exception originated.
+
+These records do not contain URLs, headers, bodies, credentials or coordinates.
+`ready` indicates the expected hooks were installed; `unavailable` includes the
+fixed name of the failed stage, and `instrumentation_error` indicates
+incomplete capture. Each collector tracks at most 2,048 active objects and
+emits at most 10,000 events per process; `capacity_exceeded` and
+`event_limit_reached` indicate incomplete capture. A system HTTP connection is
+tracked until disconnect or garbage collection; a client keeping many
+connections open can fill the system HTTP collector.
+Native Cronet, gRPC bidirectional streams, other engines and requests in other
+processes are not covered. Hook installation and actual coverage depend on the
+app and runtime versions and have not been verified on Aurora.
+
+To collect them, enable logging in the manager, start Maps, reproduce the
+problem, then choose Log > Save to file. The report in Documents includes
+available standalone snapshots. Inspect the entire report before sharing:
+other existing log entries can still contain sensitive information. Pausing
+or disabling capture affects the manager's report as described above, not
+system output; exported files remain in Documents until deleted separately.
 
 Native EGL/GLES rendering is always built into the Aurora runtime, including
 Aurora IDE builds. New runtime features do not require experimental build or
@@ -178,7 +244,12 @@ Preview orientation and size changes are coalesced in one event-loop turn.
 The runtime receives the final viewport and display rotation together, including
 embedded workers, instead of relaying intermediate width/height or rotation-only
 configurations during a page rotation. This avoids redundant Android relayouts;
-the app still needs to render a frame for the new configuration.
+the app still needs to render a frame for the new configuration. Standalone
+Android orientation requests now constrain the standalone window too. Each
+generated standalone RPM contains the runtime executable present at build time;
+updating the manager alone does not establish that an already installed package
+uses the updated executable. Rebuild and reinstall that RPM to test the current
+runtime.
 
 Aurora Store keeps its own window while its Android process restarts. The
 supervisor recognizes the ProcessPhoenix default-launcher restart used by
@@ -297,10 +368,24 @@ data. The manager declares the WebView's `Internet`, `UserDirs` and
 package. The manager links against the system WebView using `aurorawebview`
 pkg-config metadata, retaining its system CEF search path. The dynamic loader
 loads CEF when the manager process starts so it can allocate static thread-local
-storage. Preview, import and builder actions again launch the manager binary;
+storage. The manager initializes the system WebView with the original command
+line before creating Qt's application; CEF subprocesses enter this same early
+initialization rather than launching another manager UI. The report button only
+opens the page and does not initialize CEF again. Preview, import and builder actions again launch the manager binary;
 they load CEF at startup but do not initialize WebView. The CEF-free
 `/usr/share/ru.androidcompatibilitylayer.appmanager/ru.androidcompatibilitylayer.appmanager.runtime`
 is a non-executable payload copied into new standalone RPMs.
+
+Bundle inspection detects Java bytecode in the base and accepted split APKs,
+including feature splits whose base has no DEX. Native ABI checks still apply.
+This fixes rejection of that bundle layout, but does not establish that a
+particular Chrome release installs or runs: its original complete bundle and
+device execution are still required for that conclusion.
+Focused regressions: build and run
+`android_compatibility_layer_report_webview_startup_test` with the SDK, and run
+`python3 core/tests/apk-split-code/test.py` on a Linux x86_64 host with GCC and
+zlib development files. Add `--manager /path/to/built/manager` to exercise
+the real store bundle importer with split-only code and rejection cases.
 
 The manager holds bounded activity and detailed histories in RAM and periodically
 atomically saves them in its private application files directory. They are
@@ -377,7 +462,7 @@ with `readback_filter` to see how often a readback was skipped.
 draw used the CPU path; `filter_draw_errors` records GLES errors after the
 filtered draw was submitted. Shared-texture presentation does not read pixels
 back; `readback_present` applies to the CPU pixel-presentation callback.
-The experimental GPU Canvas applies all declared Android color-filter blend
+The GPU Canvas applies all declared Android color-filter blend
 modes (`CLEAR` through `LIGHTEN`) with paint `SRC_OVER` directly to a GPU
 source texture for shape and external-bitmap draws. For the outer paint blend,
 `DST` is a no-op; `SRC_OVER`, `DST_OVER`, `DST_OUT`, `SRC_ATOP`, `XOR`, `PLUS`
@@ -387,22 +472,29 @@ preserves source coverage (`CLEAR`, `DST`, `SRC_IN`, `DST_IN`, `DST_OUT`,
 modes and GLES setup failures retain the CPU fallback. `canvas_copies_gpu`
 counts Canvas copies that sampled a GPU snapshot instead of reading the source
 bitmap back. Integer-aligned 1:1 copies support paint opacity and supported color
-filters and blend modes. Standalone GLES 3 also supports nearest-neighbor
-scaled copies between different canvases at integer-aligned source and
+filters and blend modes. Standalone GLES 2 and 3 also support nearest-neighbor
+scaled copies at integer-aligned source and
 destination coordinates when no destination pixel center lands on a source
 pixel boundary, including independently scaled axes and destinations cropped
 at target bounds. With `FILTER_BITMAP`, scaled copies use bilinear filtering
 on a GPU snapshot cropped to the source rectangle, preventing samples outside
-it. Both copy paths require a source used by the current GLES context only and
+it. Copies can use a source written by another shared context. Both copy paths
 support integer rectangular clips, including closed rectangular paths and up to
 eight rectangular difference clips. Ambiguous nearest-neighbor sampling,
-nonrectangular or fractional path clips, unsupported paint combinations, other
-contexts, and reversed destination coordinates keep the existing CPU fallback.
-Text shaping, measurement and
-glyph-outline generation remain CPU-side through Qt, while the GPU Canvas
-renders the resulting outlines. Android core self-draws still settle the source
-first; the GPU host can avoid an additional readback for eligible direct
-self-draws, including overlapping copies and GLES 3 scaling.
+nonrectangular or fractional path clips, unsupported paint combinations,
+unsupported context combinations, reversed destination coordinates, and shader
+setup failures (including unavailable fragment high precision) keep the existing
+CPU fallback.
+For Bitmap-aware GPU hosts, a Bitmap's texture persists across Canvas
+operations. Flush orders GPU work without necessarily updating CPU pixels;
+CPU pixel access, encoding and operations that need a CPU image materialize
+the current pixels. CPU writes invalidate the GPU copy before its next use.
+GLES 3 shared-context writes use sync fences for cross-context ordering;
+contexts without sync-object support retain the blocking completion fallback.
+Core self-draws do not force a readback: eligible draws, including overlapping
+copies and standalone GLES 2/3 scaling, use a GPU snapshot; unsupported cases materialize
+the CPU image as needed. Text shaping, measurement and glyph-outline generation
+remain CPU-side through Qt, while the GPU Canvas renders the resulting outlines.
 Embedded previews use CPU Canvas from startup if the GPU channel or EGL
 DMA-BUF export is unavailable. They do not use GPU readback as the startup
 fallback: readback still needs a current EGL context on the drawing thread.

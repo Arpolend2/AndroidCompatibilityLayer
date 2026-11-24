@@ -30,6 +30,10 @@ class TestPlayer : public QObject {
     Q_PROPERTY(QString status READ status CONSTANT)
     Q_PROPERTY(int backGestureEdgeDp READ backGestureEdgeDp CONSTANT)
     Q_PROPERTY(bool closeOnBackGesture MEMBER closeOnBackGesture CONSTANT)
+    Q_PROPERTY(int orientationMask READ orientationMask WRITE setOrientationMask NOTIFY orientationMaskChanged)
+    Q_PROPERTY(bool frameCaptureEnabled READ frameCaptureEnabled WRITE setFrameCaptureEnabled NOTIFY frameCaptureEnabledChanged)
+    Q_PROPERTY(bool frameCapturePending READ frameCapturePending NOTIFY frameCaptureStatusChanged)
+    Q_PROPERTY(QString frameCaptureStatus READ frameCaptureStatus NOTIFY frameCaptureStatusChanged)
 public:
     bool showStatus() const { return false; }
     QString status() const { return QString(); }
@@ -40,13 +44,36 @@ public:
     Q_INVOKABLE void endGestureFrameWait() {}
     Q_INVOKABLE void close() { ++closes; }
     Q_INVOKABLE void closeToManager() { ++closes; }
+    Q_INVOKABLE void captureFramePair() {}
+    bool frameCaptureEnabled() const { return m_frameCaptureEnabled; }
+    bool frameCapturePending() const { return false; }
+    QString frameCaptureStatus() const { return QString(); }
+    void setFrameCaptureEnabled(bool enabled)
+    {
+        if (m_frameCaptureEnabled == enabled) return;
+        m_frameCaptureEnabled = enabled;
+        emit frameCaptureEnabledChanged();
+    }
     void frame(bool fresh) { newFrame = fresh; emit frameChanged(); }
     int backs = 0;
     int closes = 0;
     bool newFrame = false;
     bool closeOnBackGesture = false;
+    int orientationMask() const { return m_orientationMask; }
+    void setOrientationMask(int mask)
+    {
+        if (m_orientationMask == mask) return;
+        m_orientationMask = mask;
+        emit orientationMaskChanged();
+    }
 signals:
     void frameChanged();
+    void orientationMaskChanged();
+    void frameCaptureEnabledChanged();
+    void frameCaptureStatusChanged();
+private:
+    int m_orientationMask = -1;
+    bool m_frameCaptureEnabled = false;
 };
 
 class TestPicker : public QObject {
@@ -75,15 +102,17 @@ int main(int argc, char **argv)
     QGuiApplication app(argc, argv);
     const bool diagnosticTest = argc == 3 && QByteArray(argv[2]) == "--diagnostic";
     const bool orientationTest = argc == 3 && QByteArray(argv[2]) == "--orientation";
+    const bool orientationPolicyTest = argc == 3 && QByteArray(argv[2]) == "--orientation-policy";
+    const bool frameCaptureTest = argc == 3 && QByteArray(argv[2]) == "--frame-capture";
     if (argc != 2 && !(argc == 3 && QByteArray(argv[2]) == "--microg") &&
-        !diagnosticTest && !orientationTest) {
+        !diagnosticTest && !orientationTest && !orientationPolicyTest && !frameCaptureTest) {
         std::fprintf(stderr, "Expected the absolute path to Preview.qml\n");
         return 1;
     }
 
     qmlRegisterType<TestSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
     TestPlayer player;
-    player.closeOnBackGesture = argc == 3 && !diagnosticTest && !orientationTest;
+    player.closeOnBackGesture = argc == 3 && !diagnosticTest && !orientationTest && !orientationPolicyTest && !frameCaptureTest;
     TestPicker picker;
     TestDiagnostics diagnostics;
     QQuickView view;
@@ -98,6 +127,34 @@ int main(int argc, char **argv)
         return 1;
     }
     if (view.rootObject()->findChild<QObject *>(QStringLiteral("backGestureHint"))) return 1;
+    if (frameCaptureTest) {
+        QTimer::singleShot(700, [&]() {
+            QObject *button = view.rootObject()->findChild<QObject *>(QStringLiteral("captureDiagnosticFrames"));
+            if (!button || button->property("visible").toBool()) {
+                std::fprintf(stderr, "frame capture visible with logging disabled\n");
+                app.exit(1);
+                return;
+            }
+            player.setFrameCaptureEnabled(true);
+            QCoreApplication::processEvents();
+            if (!button->property("visible").toBool()) {
+                std::fprintf(stderr, "frame capture hidden with logging enabled\n");
+                app.exit(1);
+                return;
+            }
+            view.resize(960, 540);
+            QCoreApplication::processEvents();
+            if (!button->property("visible").toBool()) {
+                std::fprintf(stderr, "frame capture hidden in landscape\n");
+                app.exit(1);
+                return;
+            }
+            player.setFrameCaptureEnabled(false);
+            QCoreApplication::processEvents();
+            app.exit(button->property("visible").toBool() ? 1 : 0);
+        });
+        return app.exec();
+    }
     if (diagnosticTest) {
         QTimer::singleShot(800, [&]() {
             QObject *error = view.rootObject()->findChild<QObject *>(QStringLiteral("standaloneDiagnosticError"));
@@ -139,6 +196,38 @@ int main(int argc, char **argv)
                 if (surface->pageOrientation != expected[i]) {
                     std::fprintf(stderr, "page orientation mapping failed for %s: %d\n",
                                  names[i], surface->pageOrientation);
+                    failed = true;
+                }
+            }
+            app.exit(failed ? 1 : 0);
+        });
+        return app.exec();
+    }
+    if (orientationPolicyTest) {
+        QTimer::singleShot(500, [&]() {
+            struct PolicyCase {
+                int mask;
+                const char *expression;
+            };
+            const PolicyCase cases[] = {
+                { -1, "defaultAllowedOrientations" },
+                { int(Qt::PortraitOrientation), "Orientation.Portrait" },
+                { int(Qt::LandscapeOrientation), "Orientation.Landscape" },
+                { int(Qt::InvertedPortraitOrientation), "Orientation.PortraitInverted" },
+                { int(Qt::InvertedLandscapeOrientation), "Orientation.LandscapeInverted" },
+                { int(Qt::LandscapeOrientation | Qt::InvertedLandscapeOrientation),
+                  "Orientation.Landscape | Orientation.LandscapeInverted" },
+                { int(Qt::PortraitOrientation | Qt::LandscapeOrientation |
+                      Qt::InvertedPortraitOrientation | Qt::InvertedLandscapeOrientation),
+                  "Orientation.All" }
+            };
+            for (const PolicyCase &policy : cases) {
+                player.setOrientationMask(policy.mask);
+                QCoreApplication::processEvents();
+                const int expected = action(policy.expression).toInt();
+                if (view.rootObject()->property("allowedOrientations").toInt() != expected ||
+                    action("pageStack.currentPage.allowedOrientations").toInt() != expected) {
+                    std::fprintf(stderr, "orientation policy mapping failed for mask %d\n", policy.mask);
                     failed = true;
                 }
             }

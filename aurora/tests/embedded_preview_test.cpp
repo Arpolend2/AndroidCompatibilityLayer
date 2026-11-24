@@ -8,6 +8,7 @@
 #include "../picker_host.h"
 #include "../preview_keyboard.h"
 #include "../preview_text.h"
+#include "../error_log.h"
 #include "../sensor_host.h"
 #include "../../core/src/apk/mg_apk.h"
 extern "C" {
@@ -30,6 +31,30 @@ extern "C" {
 
 static megler_run_config config;
 static void output(const char *text) { std::printf("%s\n", text); std::fflush(stdout); }
+
+static bool testFrameCaptureRequiresLogging()
+{
+    PreviewPlayer player(QStringLiteral("."), QStringLiteral("."));
+    QString error;
+    if (!ErrorLog::setDetailedEnabled(false, &error)) return false;
+    player.captureFramePair();
+    if (player.frameCapturePending() || player.frameCaptureEnabled() ||
+        player.frameCaptureStatus().isEmpty()) return false;
+    if (!ErrorLog::setDetailedEnabled(true, &error)) return false;
+    QEventLoop loop;
+    QTimer::singleShot(650, &loop, &QEventLoop::quit);
+    loop.exec();
+    if (!player.frameCaptureEnabled()) return false;
+    if (!ErrorLog::setDetailedPaused(true)) return false;
+    player.captureFramePair();
+    if (player.frameCaptureEnabled() || player.frameCapturePending()) return false;
+    if (!ErrorLog::setDetailedPaused(false)) return false;
+    player.captureFramePair();
+    if (!player.frameCaptureEnabled()) return false;
+    if (!ErrorLog::setDetailedEnabled(false, &error)) return false;
+    player.captureFramePair();
+    return !player.frameCaptureEnabled() && !player.frameCapturePending();
+}
 
 static bool testViewportUpdates()
 {
@@ -165,6 +190,7 @@ extern "C" const megler_gfx_host *mg_gfx_standin()
 }
 
 extern "C" bool mg_egl_set_native_display(void *) { return true; }
+extern "C" bool mg_java_gfx_retains_thread_context(void) { return false; }
 
 static bool drawTestFrame(uint32_t color)
 {
@@ -293,6 +319,8 @@ int main(int argc, char **argv)
     QGuiApplication app(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("EmbeddedPreviewTest"));
     QCoreApplication::setApplicationName(QStringLiteral("EmbeddedPreviewTest"));
+    if (argc == 2 && QByteArray(argv[1]) == "--frame-capture-test")
+        return testFrameCaptureRequiresLogging() ? 0 : 1;
     if (argc == 2 && QByteArray(argv[1]) == "--shared-frames-test") {
         if (!testSharedFrames()) {
             std::fprintf(stderr, "Shared CPU preview frame transport failed.\n");

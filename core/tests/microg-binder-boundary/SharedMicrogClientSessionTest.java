@@ -5,6 +5,8 @@ import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.ServiceInfo;
 import android.os.Binder;
 import android.os.IBinder;
 import android.os.Looper;
@@ -41,6 +43,7 @@ public final class SharedMicrogClientSessionTest {
         boolean failUnbind;
         boolean refuseBind;
         boolean disconnectDuringBind;
+        volatile ServiceInfo resolved = publicService();
         final IBinder service = new Binder() {
             @Override protected boolean onTransact(int code, Parcel request, Parcel reply, int flags) {
                 if (code != 42) return false;
@@ -52,8 +55,18 @@ public final class SharedMicrogClientSessionTest {
 
         ServiceContext() { super(null); }
 
+        private static ServiceInfo publicService() {
+            ServiceInfo info = new ServiceInfo();
+            info.packageName = PACKAGE;
+            info.name = "fixture.Service";
+            info.exported = true;
+            info.enabled = true;
+            return info;
+        }
+
         @Override public boolean bindService(Intent intent, ServiceConnection connection, int flags) {
-            check(PACKAGE.equals(intent.getPackage()) && flags == Context.BIND_AUTO_CREATE,
+            check(PACKAGE.equals(intent.getPackage()) && intent.getComponent() != null &&
+                  "fixture.Service".equals(intent.getComponent().getClassName()) && flags == Context.BIND_AUTO_CREATE,
                   "server receives explicit GMS intent");
             binds++;
             entered.countDown();
@@ -81,7 +94,24 @@ public final class SharedMicrogClientSessionTest {
 
     private static final class Transport implements AutoCloseable {
         final ServiceContext context = new ServiceContext();
-        final SharedMicrogServiceRouter serverRouter = new SharedMicrogServiceRouter(context);
+        final SharedMicrogAccounts.Server accountServer = new SharedMicrogAccounts.Server(
+            new SharedMicrogAccounts.Engine() {
+                @Override public android.accounts.Account[] accounts() {
+                    return new android.accounts.Account[] {
+                        new android.accounts.Account("fixture.google", SharedMicrogAccounts.GOOGLE)
+                    };
+                }
+                @Override public AutoCloseable start(int operation, android.accounts.Account account,
+                        String tokenType, String[] features, android.os.Bundle options,
+                        android.accounts.AccountAuthenticatorResponse response) {
+                    return () -> { };
+                }
+            }, new SharedMicrogAccounts.Foreground() {
+                @Override public boolean launch(long channelId, android.content.Intent intent) { return false; }
+                @Override public void dismiss(long channelId) { }
+            }, 1, "fixture.client", 11001, 50001);
+        final SharedMicrogServiceRouter serverRouter =
+            new SharedMicrogServiceRouter(context, intent -> context.resolved, accountServer);
         final Socket client;
         final Socket server;
         final BinderBridge serverBridge;
@@ -138,6 +168,24 @@ public final class SharedMicrogClientSessionTest {
     private static void bindAndTeardown() throws Exception {
         try (Transport transport = new Transport()) {
             transport.open();
+            java.lang.reflect.Field clientUid = SharedMicrogIdentity.class.getDeclaredField("clientUid");
+            clientUid.setAccessible(true);
+            clientUid.setInt(null, 11001);
+            android.accounts.Account[] accounts = SharedMicrogAccounts.currentClient().accounts();
+            check(accounts.length == 1 && "fixture.google".equals(accounts[0].name),
+                "account API is exposed through the manager-authorized root channel");
+            android.accounts.AccountManager manager = new android.accounts.AccountManager(null);
+            android.accounts.Account[] managerAccounts = manager.getAccountsByType(SharedMicrogAccounts.GOOGLE);
+            check(managerAccounts.length == 1 && accounts[0].equals(managerAccounts[0]),
+                "AccountManager lists worker-owned Google accounts");
+            boolean secretRejected = false;
+            try { manager.getPassword(managerAccounts[0]); }
+            catch (UnsupportedOperationException expected) { secretRejected = true; }
+            check(secretRejected, "AccountManager does not read worker credentials locally");
+            check(!manager.hasAccountAccess(managerAccounts[0], "fixture.client", null) &&
+                    manager.getAccountVisibility(managerAccounts[0], "fixture.client") ==
+                        android.accounts.AccountManager.VISIBILITY_UNDEFINED,
+                "account presence does not imply per-client visibility or access");
             boolean unsupported = false;
             try {
                 Services.bind(null, intent().addCategory("unsupported.category"),
@@ -164,6 +212,7 @@ public final class SharedMicrogClientSessionTest {
                   "router unbind precedes transport shutdown");
             transport.session.close();
             check(transport.context.unbinds == 2, "close is idempotent");
+            clientUid.setInt(null, -1);
         }
     }
 
@@ -214,6 +263,37 @@ public final class SharedMicrogClientSessionTest {
                   "connection can be reused after refused binds");
             Services.unbind(connection);
             check(transport.context.unbinds == 2, "subsequent successful bind is released");
+        }
+    }
+
+    private static void rejectNonPublicServices() throws Exception {
+        try (Transport transport = new Transport()) {
+            transport.open();
+            AtomicReference<IBinder> service = new AtomicReference<>();
+            ServiceConnection connection = connection(service, new CountDownLatch(1));
+            ServiceInfo info = ServiceContext.publicService();
+            transport.context.resolved = null;
+            check(!Services.bind(null, intent(), connection), "unknown service rejected");
+            transport.context.resolved = info;
+            info.exported = false;
+            check(!Services.bind(null, intent(), connection), "non-exported service rejected");
+            info.exported = true;
+            info.enabled = false;
+            check(!Services.bind(null, intent(), connection), "disabled service rejected");
+            info.enabled = true;
+            info.permission = "fixture.permission";
+            check(!Services.bind(null, intent(), connection), "permission-protected service rejected");
+            info.permission = null;
+            info.packageName = "fixture.other";
+            check(!Services.bind(null, intent(), connection), "foreign service rejected");
+            info.packageName = PACKAGE;
+            check(!Services.bind(null, intent().setClassName(PACKAGE, "fixture.Other"), connection),
+                  "mismatched explicit service rejected");
+            check(transport.context.binds == 0 && service.get() == null,
+                  "rejected requests never reach service");
+            check(Services.bind(null, intent(), connection) && service.get() != null,
+                  "public service remains bindable");
+            Services.unbind(connection);
         }
     }
 
@@ -312,6 +392,10 @@ public final class SharedMicrogClientSessionTest {
     }
 
     public static void main(String[] args) throws Exception {
+        Field self = ApplicationInfo.class.getDeclaredField("sSelf");
+        self.setAccessible(true);
+        Object oldSelf = self.get(null);
+        self.set(null, new ApplicationInfo());
         Field mainLooper = Looper.class.getDeclaredField("sMain");
         mainLooper.setAccessible(true);
         Object oldMain = mainLooper.get(null);
@@ -322,6 +406,7 @@ public final class SharedMicrogClientSessionTest {
         try {
             bindAndTeardown();
             refusedAndDisconnectedBindings();
+            rejectNonPublicServices();
             startupFailures(mainLooper);
             replacementAndDisconnect();
             pendingBindAndClose();
@@ -331,6 +416,7 @@ public final class SharedMicrogClientSessionTest {
         } finally {
             Services.setSharedMicrogClientRouter(null);
             mainLooper.set(null, oldMain);
+            self.set(null, oldSelf);
         }
     }
 }

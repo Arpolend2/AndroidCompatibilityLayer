@@ -126,6 +126,9 @@
     public static native boolean notification(int operation, String tag, int id, String title, String body);
     public static native boolean notificationDetailed(String tag, int id, String title, String body,
                                                       int flags, int max, int progress, boolean indeterminate);
+    public static native boolean notificationClassified(String tag, int id, String title, String body,
+                                                        int flags, int max, int progress, boolean indeterminate,
+                                                        int importance, boolean silent);
     /** The phone's picker of files (kind 0) or its camera, for a photo (1) or a video (2) (megler_system_host.pick, megler.Pickers):
      *  request `id`, the MIME types each followed by '\n', several or one (at most `max`, 0 none), the request's folder as the
      *  app sees it, where the shell puts what was picked or taken, a video's limit and quality (-1 none said), and where the

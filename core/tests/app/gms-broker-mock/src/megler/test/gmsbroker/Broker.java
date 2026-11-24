@@ -8,6 +8,8 @@ import android.os.Parcel;
 import android.os.RemoteException;
 
 public class Broker extends Service {
+    public static class NoFilter extends Broker { }
+    public static class Inherited extends Broker { }
     private static final String BROKER = "com.google.android.gms.common.internal.IGmsServiceBroker";
     private static final String CALLBACK = "com.google.android.gms.common.internal.IGmsCallbacks";
     private static final class Counts { int binds, unbinds, rebinds; }

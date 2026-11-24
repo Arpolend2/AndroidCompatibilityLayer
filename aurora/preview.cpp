@@ -5,7 +5,9 @@
 
 #include <QCoreApplication>
 #include <QAtomicInt>
+#include <QDateTime>
 #include <QDebug>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QMouseEvent>
@@ -16,6 +18,8 @@
 #include <QQuickWindow>
 #include <QScreen>
 #include <QGuiApplication>
+#include <QMetaObject>
+#include <QStandardPaths>
 #include "preview_orientation.h"
 #include <QTimer>
 #include <QWheelEvent>
@@ -25,6 +29,7 @@
 
 #include "preview_text.h"
 #include "preview_frame.h"
+#include "preview_frame_export.h"
 #include "preview_keyboard.h"
 #include "audio_output.h"
 #include "audio_mp3_codec.h"
@@ -62,6 +67,7 @@ struct StartupChannelGuard {
     {
         starting = false;
         if (!running) {
+            megler_set_camera_storage_alias(nullptr, false);
             mg_java_close_shared_microg_client();
             channel.reset();
         }
@@ -83,6 +89,12 @@ PreviewPlayer::PreviewPlayer(const QString &root, const QString &data, const QSt
       m_splitsUtf8(QFile::encodeName(QFileInfo(apk).dir().filePath(QStringLiteral("splits")))),
       m_status(tr("Starting Android app..."))
 {
+    QString frameExportCleanupError;
+    if (!PreviewFrameExport::cleanupExpiredPairs(
+            QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+            QDateTime::currentDateTimeUtc(), &frameExportCleanupError))
+        qWarning().noquote() << "Could not remove expired diagnostic frame exports:"
+                             << frameExportCleanupError;
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
     m_gpuState = std::make_shared<PreviewGpuState>();
 #endif
@@ -90,6 +102,10 @@ PreviewPlayer::PreviewPlayer(const QString &root, const QString &data, const QSt
     if (!m_gpuCanvas.setMetricsEnabled([]() { return ErrorLog::detailedCaptureEnabled(); }))
         qWarning("Could not configure GPU diagnostics.");
 #endif
+    updateFrameCaptureEnabled();
+    QTimer *captureLogStateTimer = new QTimer(this);
+    connect(captureLogStateTimer, &QTimer::timeout, this, &PreviewPlayer::updateFrameCaptureEnabled);
+    captureLogStateTimer->start(500);
 }
 
 void PreviewPlayer::enableStoreWorkerTeardownTrace()
@@ -125,6 +141,77 @@ void PreviewPlayer::setStatus(const QString &status)
 {
     m_status = status;
     emit statusChanged();
+}
+
+void PreviewPlayer::setFrameCaptureStatus(const QString &status)
+{
+    if (m_frameCaptureStatus == status) return;
+    m_frameCaptureStatus = status;
+    emit frameCaptureStatusChanged();
+}
+
+void PreviewPlayer::updateFrameCaptureEnabled()
+{
+    const bool enabled = ErrorLog::detailedCaptureEnabled();
+    if (m_frameCaptureEnabled != enabled) {
+        m_frameCaptureEnabled = enabled;
+        emit frameCaptureEnabledChanged();
+    }
+#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
+    if (!enabled && m_frameCapturePending) {
+        m_gpuState->cancelFramePairCapture(m_frameCaptureSequence, QStringLiteral("Detailed logging was stopped."));
+        finishFrameCapture();
+        if (m_frameCapturePending) {
+            m_frameCapturePending = false;
+            setFrameCaptureStatus(tr("Enable logging to capture diagnostic frames."));
+        }
+    }
+#endif
+}
+
+void PreviewPlayer::captureFramePair()
+{
+    updateFrameCaptureEnabled();
+    if (!m_frameCaptureEnabled) {
+        setFrameCaptureStatus(tr("Enable logging to capture diagnostic frames."));
+        return;
+    }
+    if (m_frameCapturePending) {
+        setFrameCaptureStatus(tr("A frame-pair capture is already waiting for a GL frame."));
+        return;
+    }
+    if (!m_running || m_closing) {
+        setFrameCaptureStatus(tr("Start the Android preview before capturing a frame pair."));
+        return;
+    }
+#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
+    if (m_cpuPresentationOnly) {
+        setFrameCaptureStatus(tr("The CPU-only preview path cannot provide a pre-transfer GL frame."));
+        return;
+    }
+    ++m_frameCaptureSequence;
+    if (!m_frameCaptureSequence) ++m_frameCaptureSequence;
+    if (!m_gpuState->requestFramePairCapture(m_frameCaptureSequence)) {
+        setFrameCaptureStatus(tr("A previous frame-pair capture is still completing."));
+        return;
+    }
+    const quint64 sequence = m_frameCaptureSequence;
+    m_frameCapturePending = true;
+    setFrameCaptureStatus(tr("Waiting for the next GL frame to capture."));
+    QTimer::singleShot(5000, this, [this, sequence]() {
+        finishFrameCapture();
+        if (!m_frameCapturePending || m_frameCaptureSequence != sequence) return;
+        m_gpuState->cancelFramePairCapture(
+            sequence, QStringLiteral("No native EGL GL frame arrived before the capture timed out."));
+        finishFrameCapture();
+        if (!m_frameCapturePending || m_frameCaptureSequence != sequence) return;
+        m_frameCapturePending = false;
+        setFrameCaptureStatus(
+            tr("No native EGL GL frame arrived. This rendering path may use CPU or DMA-BUF frames instead."));
+    });
+#else
+    setFrameCaptureStatus(tr("This build does not enable the native EGL/GPU preview path."));
+#endif
 }
 
 void PreviewPlayer::start()
@@ -168,6 +255,50 @@ void PreviewPlayer::start()
                       (m_theme.isEmpty() && m_systemDark);
     megler_set_theme(m_systemAccent.isValid() ? m_systemAccent.rgba() : 0, dark);
     megler_run_config run = {};
+    mg_apk_info cameraInfo = {};
+    if (!mg_apk_read_info(m_apkUtf8.constData(), &cameraInfo)) {
+        setStatus(tr("Could not inspect the Android app's camera storage permissions."));
+        ErrorLog::record(QStringLiteral("Android"), m_status, true);
+        return;
+    }
+    if (cameraInfo.target_sdk < 0 || cameraInfo.min_sdk < 0) {
+        mg_apk_info_free(&cameraInfo);
+        setStatus(tr("Invalid Android camera storage metadata."));
+        ErrorLog::record(QStringLiteral("Android"), m_status, true);
+        return;
+    }
+    bool requestsCamera = false, requestsStorageWrite = false;
+    for (int i = 0; i < cameraInfo.npermissions; ++i) {
+        if (cameraInfo.permission_max_sdk[i] != 0 && cameraInfo.permission_max_sdk[i] < 34) continue;
+        const QByteArray permission(cameraInfo.permissions[i]);
+        requestsCamera = requestsCamera || permission == "android.permission.CAMERA";
+        requestsStorageWrite = requestsStorageWrite || permission == "android.permission.WRITE_EXTERNAL_STORAGE";
+    }
+    const QString cameraPackage = QString::fromUtf8(cameraInfo.package);
+    const int cameraTargetSdk = cameraInfo.target_sdk > 0 ? cameraInfo.target_sdk :
+                                cameraInfo.min_sdk > 0 ? cameraInfo.min_sdk : 1;
+    const bool modernMediaStore = cameraTargetSdk >= 29;
+    mg_apk_info_free(&cameraInfo);
+    const bool cameraDestination = requestsCamera && !m_deniedPermissions.contains(QStringLiteral("camera"));
+    const bool ordinaryStorage = !m_deniedPermissions.contains(QStringLiteral("storage")) &&
+                                 !m_deniedPermissions.contains(QStringLiteral("read_media_visual")) &&
+                                 !m_deniedPermissions.contains(QStringLiteral("read_media_aural"));
+    if (cameraDestination) {
+        if (!ordinaryStorage) m_storage = AuroraStorageHost(QStringList());
+        const bool cameraWrite = modernMediaStore ||
+                                 (requestsStorageWrite && !m_deniedPermissions.contains(QStringLiteral("storage")));
+        QString storageError;
+        if (!m_storage.configureCameraPictures(cameraPackage, cameraWrite, &storageError)) {
+            setStatus(tr("Could not prepare camera picture storage: %1").arg(storageError));
+            ErrorLog::record(QStringLiteral("Android"), m_status, true);
+            return;
+        }
+    }
+    if (!megler_set_camera_storage_alias(cameraPackage.toUtf8().constData(), cameraDestination)) {
+        setStatus(tr("Could not configure the camera directory while Android is running."));
+        ErrorLog::record(QStringLiteral("Android"), m_status, true);
+        return;
+    }
     GoogleServicesRuntime googleServices(QString::fromUtf8(m_rootUtf8));
     QString googleError;
     if (m_sharedMicrogEnabled) {
@@ -282,9 +413,7 @@ void PreviewPlayer::start()
     if (!m_deniedPermissions.contains(QStringLiteral("camera"))) run.camera = auroraCameraHost();
     run.sensors = auroraSensorHost();
     if (!m_deniedPermissions.contains(QStringLiteral("nearby_devices"))) run.bluetooth = auroraBluetoothHost();
-    if (!m_deniedPermissions.contains(QStringLiteral("storage")) &&
-        !m_deniedPermissions.contains(QStringLiteral("read_media_visual")) &&
-        !m_deniedPermissions.contains(QStringLiteral("read_media_aural"))) run.storage = m_storage.host();
+    if (ordinaryStorage || cameraDestination) run.storage = m_storage.host();
     if (!m_deniedPermissions.contains(QStringLiteral("location"))) run.location = auroraLocationHost();
     if (!m_deniedPermissions.contains(QStringLiteral("location"))) {
         if (m_location.isEmpty()) {
@@ -317,6 +446,10 @@ void PreviewPlayer::start()
         m_keyboard->start();
         run.keyboard = m_keyboard->host();
     } else if (m_hasRemoteKeyboard) run.keyboard = m_remoteKeyboard;
+    if (!m_cpuPresentationOnly) {
+        run.display.user = this;
+        run.display.orientation = orientationRequested;
+    }
     run.window.user = this;
     run.window.present_pixels = presentPixels;
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
@@ -564,6 +697,7 @@ int MEGLER_CB PreviewPlayer::presentEglWindow(void *user, void *display, void *s
 {
     PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
     const int result = self->m_gpuState->submit(display, surface, width, height, self);
+    self->queueFrameCaptureResult();
     if (result != 1) {
         static QAtomicInt warned = Q_BASIC_ATOMIC_INITIALIZER(0);
         if (result == 0 && warned.testAndSetOrdered(0, 1)) {
@@ -598,9 +732,61 @@ int MEGLER_CB PreviewPlayer::presentEglWindow(void *user, void *display, void *s
 int MEGLER_CB PreviewPlayer::presentEglLayer(void *user, int layer, void *display, void *surface, int width, int height)
 {
     PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
-    return self->m_gpuState->submit(display, surface, width, height, self, layer);
+    const int result = self->m_gpuState->submit(display, surface, width, height, self, layer);
+    self->queueFrameCaptureResult();
+    return result;
 }
 
+void PreviewPlayer::queueFrameCaptureResult()
+{
+    if (!m_gpuState->framePairCaptureReady() ||
+        !m_frameCaptureResultQueued.testAndSetOrdered(0, 1))
+        return;
+    if (!QMetaObject::invokeMethod(this, "finishFrameCapture", Qt::QueuedConnection)) {
+        m_frameCaptureResultQueued.storeRelease(0);
+        qWarning("Could not schedule the diagnostic frame-pair export");
+    }
+}
+#endif
+
+void PreviewPlayer::finishFrameCapture()
+{
+    m_frameCaptureResultQueued.storeRelease(0);
+#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
+    PreviewGpuFrameCapture capture;
+    if (!m_gpuState->takeFramePairCapture(&capture)) return;
+    if (!m_frameCapturePending || capture.sequence != m_frameCaptureSequence) return;
+    m_frameCapturePending = false;
+    if (!ErrorLog::detailedCaptureEnabled()) {
+        setFrameCaptureStatus(tr("Enable logging to capture diagnostic frames."));
+        return;
+    }
+    if (!capture.failure.isEmpty()) {
+        setFrameCaptureStatus(tr("Frame-pair capture unavailable: %1").arg(capture.failure));
+        return;
+    }
+    if (capture.beforeTransfer.isNull() || capture.composedAfter.isNull()) {
+        setFrameCaptureStatus(tr("Frame-pair capture unavailable: one of the image stages is empty."));
+        return;
+    }
+    const QDateTime capturedAt = capture.capturedAt.isValid()
+        ? capture.capturedAt : QDateTime::currentDateTimeUtc();
+    QString savedDirectory;
+    QString error;
+    if (!PreviewFrameExport::savePair(
+            QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+            capture.sequence, capturedAt, capture.beforeTransfer, capture.composedAfter,
+            QDateTime::currentDateTimeUtc(), &savedDirectory, &error)) {
+        setFrameCaptureStatus(tr("Frame pair could not be saved: %1").arg(error));
+        return;
+    }
+    setFrameCaptureStatus(
+        tr("Saved to Documents/AndroidCompatibilityLayer-Frames/%1 (kept for up to 7 days).")
+            .arg(QFileInfo(savedDirectory).fileName()));
+#endif
+}
+
+#ifdef MG_EXPERIMENTAL_GPU_COMPOSITION
 bool MEGLER_CB PreviewPlayer::presentEglViews(void *user, const void *pixels, int width, int height, int stride)
 {
     PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
@@ -797,6 +983,97 @@ PreviewSurface::~PreviewSurface()
     cancelWheelGesture();
 }
 
+void PreviewPlayer::setScreenOrientations(int natural, int actual)
+{
+    if (m_naturalOrientation == natural && m_actualOrientation == actual) return;
+    m_naturalOrientation = natural;
+    m_actualOrientation = actual;
+    updateOrientationMask();
+}
+
+void MEGLER_CB PreviewPlayer::orientationRequested(void *user, int requested)
+{
+    PreviewPlayer *self = static_cast<PreviewPlayer *>(user);
+    if (!QMetaObject::invokeMethod(self, "setRequestedOrientation", Qt::QueuedConnection,
+                                   Q_ARG(int, requested)))
+        qWarning() << "Unable to queue Android orientation request" << requested;
+}
+
+void PreviewPlayer::setRequestedOrientation(int requested)
+{
+    if (requested < MEGLER_ORIENTATION_UNSPECIFIED || requested > MEGLER_ORIENTATION_LOCKED) {
+        qWarning() << "Unsupported Android orientation request:" << requested;
+        return;
+    }
+    if (requested == MEGLER_ORIENTATION_BEHIND) return;
+    m_requestedOrientation = requested;
+    updateOrientationMask();
+}
+
+void PreviewPlayer::updateOrientationMask()
+{
+    const int portrait = int(Qt::PortraitOrientation);
+    const int landscape = int(Qt::LandscapeOrientation);
+    const int portraitInverted = int(Qt::InvertedPortraitOrientation);
+    const int landscapeInverted = int(Qt::InvertedLandscapeOrientation);
+    const int all = portrait | landscape | portraitInverted | landscapeInverted;
+    int next = -1;
+    switch (m_requestedOrientation) {
+    case MEGLER_ORIENTATION_UNSPECIFIED:
+    case MEGLER_ORIENTATION_USER:
+    case MEGLER_ORIENTATION_FULL_USER:
+        break;
+    case MEGLER_ORIENTATION_LANDSCAPE:
+        next = landscape;
+        break;
+    case MEGLER_ORIENTATION_PORTRAIT:
+        next = portrait;
+        break;
+    case MEGLER_ORIENTATION_SENSOR:
+    case MEGLER_ORIENTATION_FULL_SENSOR:
+        next = all;
+        break;
+    case MEGLER_ORIENTATION_NOSENSOR:
+        if (m_naturalOrientation == portrait || m_naturalOrientation == landscape ||
+            m_naturalOrientation == portraitInverted || m_naturalOrientation == landscapeInverted)
+            next = m_naturalOrientation;
+        else {
+            qWarning() << "Cannot apply NOSENSOR orientation without a known native direction";
+            return;
+        }
+        break;
+    case MEGLER_ORIENTATION_SENSOR_LANDSCAPE:
+    case MEGLER_ORIENTATION_USER_LANDSCAPE:
+        next = landscape | landscapeInverted;
+        break;
+    case MEGLER_ORIENTATION_SENSOR_PORTRAIT:
+    case MEGLER_ORIENTATION_USER_PORTRAIT:
+        next = portrait | portraitInverted;
+        break;
+    case MEGLER_ORIENTATION_REVERSE_LANDSCAPE:
+        next = landscapeInverted;
+        break;
+    case MEGLER_ORIENTATION_REVERSE_PORTRAIT:
+        next = portraitInverted;
+        break;
+    case MEGLER_ORIENTATION_LOCKED:
+        if (m_actualOrientation == portrait || m_actualOrientation == landscape ||
+            m_actualOrientation == portraitInverted || m_actualOrientation == landscapeInverted)
+            next = m_actualOrientation;
+        else {
+            qWarning() << "Cannot apply LOCKED orientation without a known current direction";
+            return;
+        }
+        break;
+    default:
+        qWarning() << "Unsupported Android orientation request:" << m_requestedOrientation;
+        return;
+    }
+    if (m_orientationMask == next) return;
+    m_orientationMask = next;
+    emit orientationMaskChanged();
+}
+
 void PreviewSurface::setPlayer(QObject *object)
 {
     PreviewPlayer *player = qobject_cast<PreviewPlayer *>(object);
@@ -889,7 +1166,14 @@ void PreviewSurface::updateViewport()
 #endif
     const qreal ratio = window() ? window()->devicePixelRatio() : 1;
     setTextureSize(previewViewport(width(), height(), ratio, m_player ? m_player->renderCap() : 0).pixels);
-    if (m_player) m_player->setViewport(width(), height(), ratio, displayRotation());
+    if (m_player) {
+        QScreen *screen = window() ? window()->screen() : nullptr;
+        const Qt::ScreenOrientation native = screen ? screen->nativeOrientation() : Qt::PrimaryOrientation;
+        const Qt::ScreenOrientation effectiveNative =
+            previewNativeOrientation(native, QGuiApplication::platformName().startsWith(QLatin1String("wayland")));
+        m_player->setScreenOrientations(int(effectiveNative), m_pageOrientation);
+        m_player->setViewport(width(), height(), ratio, displayRotation());
+    }
 }
 
 #ifdef MG_EXPERIMENTAL_GPU_COMPOSITION

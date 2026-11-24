@@ -104,13 +104,20 @@ public final class Accounts {
     private static void signOutIfDataCleared(File f) {
         File mark = new File(f.getParentFile(), GOOGLE_SIGNED_OUT);
         if (!mark.exists()) return;
+        ArrayList<Entry> before = new ArrayList<>(sEntries);
         int n = 0;
         for (Iterator<Entry> i = sEntries.iterator(); i.hasNext(); ) {
             if (!"com.google".equals(i.next().type)) continue;
             i.remove();
             n++;
         }
-        if (n > 0 && !write()) return;
+        if (n > 0 && !write()) {
+            sEntries.clear();
+            sEntries.addAll(before);
+            sTime = -1;
+            sLength = -1;
+            return;
+        }
         mark.delete();
         android.util.Log.i("Megler", "accounts: Google Play services' data was cleared: " + n + " Google account(s) signed out with it");
     }
@@ -122,9 +129,10 @@ public final class Accounts {
         }
     }
     /** Writes the accounts out, and says they changed. */
-    private static void save() {
-        write();
+    private static boolean save() {
+        if (!write()) return false;
         changed();
+        return true;
     }
     /** Writes the accounts out: false when their file could not be written. */
     private static boolean write() {
@@ -179,25 +187,39 @@ public final class Accounts {
         e.password = password;
         if (userData != null) for (String k : userData.keySet()) e.data.put(k, userData.getString(k));
         sEntries.add(e);
-        save();
+        if (!save()) {
+            sEntries.remove(e);
+            return false;
+        }
         android.util.Log.i("Megler", "accounts: added " + a.type + " account");
         return true;
     }
     public static synchronized boolean remove(Account a) {
         Entry e = find(a);
         if (e == null) return false;
-        sEntries.remove(e);
-        save();
+        int index = sEntries.indexOf(e);
+        sEntries.remove(index);
+        if (!save()) {
+            sEntries.add(index, e);
+            return false;
+        }
         android.util.Log.i("Megler", "accounts: removed " + a.type + " account");
         return true;
     }
     public static synchronized Account rename(Account a, String newName) {
         Entry e = find(a);
         if (e == null || newName == null || find(new Account(newName, a.type)) != null) return null;
+        String oldName = e.name, oldPreviousName = e.previousName;
+        LinkedHashMap<String, String> oldTokens = new LinkedHashMap<>(e.tokens);
         e.previousName = e.name;
         e.name = newName;
         e.tokens.clear();
-        save();
+        if (!save()) {
+            e.name = oldName;
+            e.previousName = oldPreviousName;
+            e.tokens.putAll(oldTokens);
+            return null;
+        }
         return new Account(newName, a.type);
     }
     public static synchronized String previousName(Account a) { Entry e = find(a); return e == null ? null : e.previousName; }
@@ -205,34 +227,61 @@ public final class Accounts {
     public static synchronized void setPassword(Account a, String password) {
         Entry e = find(a);
         if (e == null) return;
+        String oldPassword = e.password;
+        LinkedHashMap<String, String> oldTokens = new LinkedHashMap<>(e.tokens);
         e.password = password;
         e.tokens.clear();
-        save();
+        if (!save()) {
+            e.password = oldPassword;
+            e.tokens.putAll(oldTokens);
+            throw new IllegalStateException("Cannot persist account password");
+        }
     }
     public static synchronized String userData(Account a, String key) { Entry e = find(a); return e == null ? null : e.data.get(key); }
     public static synchronized void setUserData(Account a, String key, String value) {
         Entry e = find(a);
         if (e == null || key == null) return;
+        boolean present = e.data.containsKey(key);
+        String oldValue = e.data.get(key);
         if (value == null) e.data.remove(key); else e.data.put(key, value);
-        save();
+        if (!save()) {
+            if (present) e.data.put(key, oldValue); else e.data.remove(key);
+            throw new IllegalStateException("Cannot persist account user data");
+        }
     }
     public static synchronized String token(Account a, String type) { Entry e = find(a); return e == null ? null : e.tokens.get(type); }
     public static synchronized void setToken(Account a, String type, String token) {
         Entry e = find(a);
         if (e == null || type == null) return;
+        boolean present = e.tokens.containsKey(type);
+        String oldValue = e.tokens.get(type);
         if (token == null) e.tokens.remove(type); else e.tokens.put(type, token);
-        save();
+        if (!save()) {
+            if (present) e.tokens.put(type, oldValue); else e.tokens.remove(type);
+            throw new IllegalStateException("Cannot persist account token");
+        }
     }
     /** Forgets a token wherever accounts of the type keep it. */
     public static synchronized void invalidateToken(String accountType, String token) {
         if (token == null) return;
         refresh();
         boolean any = false;
+        LinkedHashMap<Entry, LinkedHashMap<String, String>> previous = new LinkedHashMap<>();
         for (Entry e : sEntries) {
             if (accountType != null && !accountType.equals(e.type)) continue;
-            any |= e.tokens.values().removeIf(token::equals);
+            if (e.tokens.containsValue(token)) {
+                previous.put(e, new LinkedHashMap<>(e.tokens));
+                e.tokens.values().removeIf(token::equals);
+                any = true;
+            }
         }
-        if (any) save();
+        if (any && !save()) {
+            for (Map.Entry<Entry, LinkedHashMap<String, String>> old : previous.entrySet()) {
+                old.getKey().tokens.clear();
+                old.getKey().tokens.putAll(old.getValue());
+            }
+            throw new IllegalStateException("Cannot persist account token invalidation");
+        }
     }
 
     // ---- who hears that they changed

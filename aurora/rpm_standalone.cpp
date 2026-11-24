@@ -8,6 +8,7 @@
 #include "shared_runtime.h"
 #include "permission_settings.h"
 #include "standalone_app_mapping.h"
+#include "../core/include/megler.h"
 
 #include <QBuffer>
 #include <QCryptographicHash>
@@ -276,6 +277,45 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
         if (group.value(QStringLiteral("allowed")).toBool())
             allowedGroups.insert(group.value(QStringLiteral("group")).toString());
     }
+    bool cameraOwnPictures = false;
+    if (allowedGroups.contains(QStringLiteral("camera")) && !allowedGroups.contains(QStringLiteral("storage"))) {
+        const QByteArray apkBytes = apk.toUtf8();
+        const QFileInfo splitsInfo(QFileInfo(apk).dir().filePath(QStringLiteral("splits")));
+        if (splitsInfo.isSymLink()) {
+            *problem = QCoreApplication::translate("RpmStandalone", "Could not inspect camera picture-storage permissions.");
+            return false;
+        }
+        const QByteArray splitBytes = splitsInfo.filePath().toUtf8();
+        char *raw = splitsInfo.isDir() ? megler_apk_report_splits(apkBytes.constData(), splitBytes.constData())
+                                      : megler_apk_report(apkBytes.constData());
+        if (!raw) {
+            *problem = QCoreApplication::translate("RpmStandalone", "Could not inspect camera picture-storage permissions.");
+            return false;
+        }
+        QJsonParseError parseError;
+        const QJsonDocument report = QJsonDocument::fromJson(QByteArray(raw), &parseError);
+        megler_free(raw);
+        const QJsonObject cameraInfo = report.object();
+        const QJsonValue targetSdk = cameraInfo.value(QStringLiteral("targetSdk"));
+        if (parseError.error != QJsonParseError::NoError || !report.isObject() ||
+            !cameraInfo.value(QStringLiteral("ok")).toBool() ||
+            cameraInfo.value(QStringLiteral("package")).toString() != package ||
+            !targetSdk.isDouble() || targetSdk.toInt(-1) < 0 ||
+            targetSdk.toDouble() != targetSdk.toInt(-1)) {
+            *problem = QCoreApplication::translate("RpmStandalone", "Invalid camera picture-storage metadata.");
+            return false;
+        }
+        int effectiveSdk = targetSdk.toInt();
+        if (effectiveSdk == 0) {
+            const QJsonValue minSdk = cameraInfo.value(QStringLiteral("minSdk"));
+            if (!minSdk.isDouble() || minSdk.toInt(-1) < 0 || minSdk.toDouble() != minSdk.toInt(-1)) {
+                *problem = QCoreApplication::translate("RpmStandalone", "Invalid camera picture-storage metadata.");
+                return false;
+            }
+            effectiveSdk = minSdk.toInt() > 0 ? minSdk.toInt() : 1;
+        }
+        cameraOwnPictures = effectiveSdk >= 29;
+    }
     QString random = QUuid::createUuid().toString();
     random.remove(QLatin1Char('{'));
     random.remove(QLatin1Char('}'));
@@ -370,6 +410,8 @@ bool RpmStandalone::createUnsigned(const QString &package, const QString &label,
             if (requests("READ_MEDIA_VIDEO") || requests("READ_MEDIA_VISUAL_USER_SELECTED"))
                 osPermissions << QStringLiteral("Videos");
         }
+        if (cameraOwnPictures && !osPermissions.contains(QStringLiteral("Pictures")))
+            osPermissions << QStringLiteral("Pictures");
         if (allowedGroups.contains(QStringLiteral("read_media_aural"))) osPermissions << QStringLiteral("Music");
     }
     const QString desktop = QStringLiteral(

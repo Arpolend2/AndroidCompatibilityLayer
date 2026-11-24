@@ -7,8 +7,11 @@ import java.util.Locale;
 public class TextUtils {
     public static final int CAP_MODE_CHARACTERS = InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS, CAP_MODE_WORDS = InputType.TYPE_TEXT_FLAG_CAP_WORDS,
         CAP_MODE_SENTENCES = InputType.TYPE_TEXT_FLAG_CAP_SENTENCES, SAFE_STRING_FLAG_TRIM = 1, SAFE_STRING_FLAG_SINGLE_LINE = 2, SAFE_STRING_FLAG_FIRST_LINE = 4;
-    public static final Parcelable_ CHAR_SEQUENCE_CREATOR = null;
-    public interface Parcelable_ {}
+    // Parcel currently keeps CharSequences in its in-process object table, not Android's wire format.
+    public static final android.os.Parcelable.Creator<CharSequence> CHAR_SEQUENCE_CREATOR = new android.os.Parcelable.Creator<CharSequence>() {
+        public CharSequence createFromParcel(android.os.Parcel p) { return p.readCharSequence(); }
+        public CharSequence[] newArray(int size) { return new CharSequence[size]; }
+    };
     public enum TruncateAt { START, MIDDLE, END, MARQUEE, END_SMALL }
     public interface EllipsizeCallback { void ellipsized(int start, int end); }
     public interface StringSplitter extends Iterable<String> { void setString(String s); }

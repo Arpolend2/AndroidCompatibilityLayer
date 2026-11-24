@@ -810,11 +810,21 @@ typedef struct surface {
     void *native;                      /* the window's own surface (mg_nwindow_ops.egl_create); NULL for one of EGL's */
     int current;                       /* a window's own: the threads it is current on, as draw and as read, each counted */
     bool doomed;                       /* eglDestroySurface came while it was current: it ends once the last thread lets it go */
+    i64 presentation_time;
+    bool has_presentation_time;
 } surface;
 static surface g_surfaces[16];
 static mg_lock g_surfaces_lock = MG_LOCK_INIT;
 /* The windows' own surfaces current on this thread, as the app named them (eglMakeCurrent's draw and read). */
 static MG_THREAD_LOCAL surface *t_draw, *t_read;
+static MG_THREAD_LOCAL i64 t_presentation_time;
+static MG_THREAD_LOCAL bool t_has_presentation_time;
+
+bool mg_egl_surface_presentation_time(i64 *timestamp)
+{
+    if (t_has_presentation_time && timestamp) *timestamp = t_presentation_time;
+    return t_has_presentation_time;
+}
 
 static surface *surface_of(EGLSurface s)
 {
@@ -2516,7 +2526,13 @@ static EGLBoolean window_swap(EGLDisplay d, surface *w)
         return 0;
     }
     before = window_real(w, NULL, NULL);
+    mg_lock_acquire(&g_surfaces_lock);
+    t_has_presentation_time = w->has_presentation_time;
+    t_presentation_time = w->presentation_time;
+    w->has_presentation_time = false;
+    mg_lock_release(&g_surfaces_lock);
     shown = w->window->ops->egl_swap(w->native);
+    t_has_presentation_time = false;
     after = window_real(w, &w->width, &w->height);
     if (after != before) {
         fn_make_current make = A(fn_make_current, "eglMakeCurrent");
@@ -2573,6 +2589,24 @@ static EGLBoolean g_eglSwapBuffers(EGLDisplay d, EGLSurface handle)
 
 static EGLBoolean g_eglSwapInterval(EGLDisplay d, EGLint interval) { (void)d; (void)interval; return 1; }
 
+static EGLBoolean g_eglPresentationTimeANDROID(EGLDisplay d, EGLSurface handle, i64 timestamp)
+{
+    typedef EGLBoolean (*fn_presentation)(EGLDisplay, EGLSurface, i64);
+    surface *w = window_surface(handle);
+    fn_presentation real;
+    if (w) {
+        mg_lock_acquire(&g_surfaces_lock);
+        w->presentation_time = timestamp;
+        w->has_presentation_time = true;
+        mg_lock_release(&g_surfaces_lock);
+        return 1;
+    }
+    real = A(fn_presentation, "eglPresentationTimeANDROID");
+    if (real) return real(d, handle, timestamp);
+    g_error = EGL_BAD_SURFACE;
+    return 0;
+}
+
 static void *g_eglGetProcAddress(const char *name) { return mg_egl_resolve(name); }
 
 /* --------------------------------------------------------- hardware buffers
@@ -2623,16 +2657,18 @@ static const char *layer_extensions(const char *angle)
 {
     static const char fences[] = " EGL_KHR_fence_sync EGL_KHR_wait_sync EGL_ANDROID_native_fence_sync";
     static const char buffers[] = " EGL_ANDROID_get_native_client_buffer EGL_ANDROID_image_native_buffer";
+    static const char presentation[] = " EGL_ANDROID_presentation_time";
     const char *out;
     bool images;
     if (!angle) return angle;
     images = has_ext(angle, "EGL_KHR_image_base") && has_ext(angle, "EGL_KHR_gl_texture_2D_image");
     mg_lock_acquire(&g_ext_lock);
     if (g_ext_from != angle || !g_ext) {
-        char *ext = (char *)mg_alloc(strlen(angle) + sizeof(fences) + sizeof(buffers));
+        char *ext = (char *)mg_alloc(strlen(angle) + sizeof(fences) + sizeof(buffers) + sizeof(presentation));
         strcpy(ext, angle);
         if (!native_egl() && !has_ext(angle, "EGL_KHR_fence_sync")) strcat(ext, fences);
         if (images) strcat(ext, buffers);
+        if (!native_egl() && !has_ext(angle, "EGL_ANDROID_presentation_time")) strcat(ext, presentation);
         /* (One made before may still be read by whoever asked for it then: it is kept.) */
         g_ext = ext;
         g_ext_from = angle;
@@ -3254,6 +3290,7 @@ static const mg_sym g_egl_overrides[] = {
     MG_WRAP("eglDestroyContext", g_eglDestroyContext),
     MG_WRAP("eglQuerySurface", g_eglQuerySurface),
     MG_WRAP("eglSwapBuffers", g_eglSwapBuffers),
+    MG_WRAP("eglPresentationTimeANDROID", g_eglPresentationTimeANDROID),
     MG_WRAP("eglMakeCurrent", g_eglMakeCurrent),
     MG_WRAP("eglGetCurrentSurface", g_eglGetCurrentSurface),
     MG_WRAP("eglSurfaceAttrib", g_eglSurfaceAttrib),
@@ -3625,6 +3662,155 @@ bool mg_egl_external_upload(u32 external, u32 *helper, void **image, int *helper
     bool ok;
     turn_begin();
     ok = external_upload(external, helper, image, helper_w, helper_h, rgba, w, h);
+    turn_end();
+    return ok;
+}
+
+bool mg_egl_surface_current(void **display, void **context)
+{
+    typedef void *(*fn_current)(void);
+    fn_current get_display = A(fn_current, "eglGetCurrentDisplay");
+    fn_current get_context = A(fn_current, "eglGetCurrentContext");
+    void *d, *c;
+    turn_begin();
+    d = get_display ? get_display() : NULL;
+    c = get_context ? get_context() : NULL;
+    turn_end();
+    if (display) *display = d;
+    if (context) *context = c;
+    return d && c;
+}
+
+bool mg_egl_surface_bind(u32 texture, bool require_unused)
+{
+    typedef void (*fn_bind)(u32, u32);
+    typedef u8 (*fn_is_texture)(u32);
+    typedef u32 (*fn_error)(void);
+    fn_bind bind = A(fn_bind, "glBindTexture");
+    fn_is_texture is_texture = A(fn_is_texture, "glIsTexture");
+    fn_error error = A(fn_error, "glGetError");
+    bool ok;
+    if (!texture || !bind || !error || (require_unused && !is_texture)) return false;
+    turn_begin();
+    ok = !require_unused || !is_texture(texture);
+    if (ok) {
+        bind(0x8D65, texture);         /* GL_TEXTURE_EXTERNAL_OES */
+        ok = error() == 0;
+    }
+    turn_end();
+    return ok;
+}
+
+bool mg_egl_surface_delete(u32 texture)
+{
+    typedef void (*fn_delete)(i32, const u32 *);
+    typedef u32 (*fn_error)(void);
+    fn_delete del = A(fn_delete, "glDeleteTextures");
+    fn_error error = A(fn_error, "glGetError");
+    bool ok;
+    if (!texture || !del || !error) return false;
+    turn_begin();
+    del(1, &texture);
+    ok = error() == 0;
+    turn_end();
+    return ok;
+}
+
+bool mg_egl_surface_upload(u32 texture, const u8 *rgba, int width, int height)
+{
+    enum {
+        TEXTURE_2D = 0x0DE1, TEXTURE_EXTERNAL = 0x8D65, BINDING_2D = 0x8069,
+        UNPACK_ALIGNMENT = 0x0CF5, UNPACK_ROW_LENGTH = 0x0CF2, UNPACK_SKIP_ROWS = 0x0CF3,
+        UNPACK_SKIP_PIXELS = 0x0CF4, UNPACK_BUFFER = 0x88EC, UNPACK_BUFFER_BINDING = 0x88EF,
+        VERSION = 0x1F02, EXTENSIONS = 0x1F03, RGBA = 0x1908, UNSIGNED_BYTE = 0x1401,
+        MIN_FILTER = 0x2801, MAG_FILTER = 0x2800, WRAP_S = 0x2802, WRAP_T = 0x2803,
+        LINEAR = 0x2601, CLAMP = 0x812F, GL_TEXTURE_2D_KHR = 0x30B1,
+        IMAGE_PRESERVED_KHR = 0x30D2, NONE = 0x3038
+    };
+    typedef void (*fn_get)(u32, i32 *);
+    typedef const u8 *(*fn_string)(u32);
+    typedef void (*fn_gen)(i32, u32 *);
+    typedef void (*fn_delete)(i32, const u32 *);
+    typedef void (*fn_bind)(u32, u32);
+    typedef void (*fn_param)(u32, u32, i32);
+    typedef void (*fn_store)(u32, i32);
+    typedef void (*fn_teximage)(u32, i32, i32, i32, i32, i32, u32, u32, const void *);
+    typedef void *(*fn_current)(void);
+    typedef void *(*fn_create)(void *, void *, u32, void *, const EGLint *);
+    typedef EGLBoolean (*fn_destroy)(void *, void *);
+    typedef void (*fn_target)(u32, void *);
+    typedef u32 (*fn_error)(void);
+    fn_get get = A(fn_get, "glGetIntegerv");
+    fn_string string = A(fn_string, "glGetString");
+    fn_gen gen = A(fn_gen, "glGenTextures");
+    fn_delete del = A(fn_delete, "glDeleteTextures");
+    fn_bind bind = A(fn_bind, "glBindTexture"), bind_buffer = A(fn_bind, "glBindBuffer");
+    fn_param param = A(fn_param, "glTexParameteri");
+    fn_store store = A(fn_store, "glPixelStorei");
+    fn_teximage teximage = A(fn_teximage, "glTexImage2D");
+    fn_current get_display = A(fn_current, "eglGetCurrentDisplay"), get_context = A(fn_current, "eglGetCurrentContext");
+    fn_create create = A(fn_create, "eglCreateImageKHR");
+    fn_destroy destroy = A(fn_destroy, "eglDestroyImageKHR");
+    fn_target target = A(fn_target, "glEGLImageTargetTexture2DOES");
+    fn_error error = A(fn_error, "glGetError");
+    static const EGLint attrs[] = { IMAGE_PRESERVED_KHR, 1, NONE };
+    i32 old_2d = 0, alignment = 4, buffer = 0, row = 0, skip_rows = 0, skip_pixels = 0;
+    const char *version, *extensions;
+    void *display, *context, *image = NULL;
+    u32 helper = 0, gl_error;
+    bool es3, unpack_rows, ok = false;
+    if (!texture || !rgba || width <= 0 || height <= 0 || !get || !string || !gen || !del || !bind || !param || !store || !teximage ||
+        !get_display || !get_context || !create || !destroy || !target || !error) return false;
+    turn_begin();
+    display = get_display();
+    context = get_context();
+    version = (const char *)string(VERSION);
+    extensions = (const char *)string(EXTENSIONS);
+    if (!display || !context || !version) goto done;
+    es3 = strstr(version, "OpenGL ES 3.") != NULL;
+    unpack_rows = es3 || (extensions && strstr(extensions, "GL_EXT_unpack_subimage"));
+    get(BINDING_2D, &old_2d);
+    get(UNPACK_ALIGNMENT, &alignment);
+    if (es3 && bind_buffer) {
+        get(UNPACK_BUFFER_BINDING, &buffer);
+        if (buffer) bind_buffer(UNPACK_BUFFER, 0);
+    }
+    if (unpack_rows) {
+        get(UNPACK_ROW_LENGTH, &row);
+        get(UNPACK_SKIP_ROWS, &skip_rows);
+        get(UNPACK_SKIP_PIXELS, &skip_pixels);
+        store(UNPACK_ROW_LENGTH, 0);
+        store(UNPACK_SKIP_ROWS, 0);
+        store(UNPACK_SKIP_PIXELS, 0);
+    }
+    store(UNPACK_ALIGNMENT, 1);
+    gen(1, &helper);
+    if (!helper) goto restore;
+    bind(TEXTURE_2D, helper);
+    param(TEXTURE_2D, MIN_FILTER, LINEAR);
+    param(TEXTURE_2D, MAG_FILTER, LINEAR);
+    param(TEXTURE_2D, WRAP_S, CLAMP);
+    param(TEXTURE_2D, WRAP_T, CLAMP);
+    teximage(TEXTURE_2D, 0, RGBA, width, height, 0, RGBA, UNSIGNED_BYTE, rgba);
+    if (error()) goto restore;
+    image = create(display, context, GL_TEXTURE_2D_KHR, (void *)(mg_addr)helper, attrs);
+    if (!image) goto restore;
+    bind(TEXTURE_EXTERNAL, texture);
+    target(TEXTURE_EXTERNAL, image);
+    gl_error = error();
+    ok = gl_error == 0;
+restore:
+    if (image && !destroy(display, image)) ok = false;
+    bind(TEXTURE_2D, (u32)old_2d);
+    if (helper) del(1, &helper);
+    store(UNPACK_ALIGNMENT, alignment);
+    if (unpack_rows) {
+        store(UNPACK_ROW_LENGTH, row);
+        store(UNPACK_SKIP_ROWS, skip_rows);
+        store(UNPACK_SKIP_PIXELS, skip_pixels);
+    }
+    if (es3 && buffer && bind_buffer) bind_buffer(UNPACK_BUFFER, (u32)buffer);
+done:
     turn_end();
     return ok;
 }

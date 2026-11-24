@@ -1,6 +1,7 @@
 package megler;
 
 import android.content.Context;
+import android.content.Intent;
 import android.os.ParcelFileDescriptor;
 import android.system.ErrnoException;
 import android.system.Os;
@@ -57,7 +58,29 @@ final class SharedMicrogConnections implements AutoCloseable {
         try {
             SharedMicrogIdentity.add(id, packageName, uid);
             registered = true;
-            router = new SharedMicrogServiceRouter(context);
+            SharedMicrogAccounts.Server accounts = new SharedMicrogAccounts.Server(
+                new SharedMicrogAccountEngine(context), new SharedMicrogAccounts.Foreground() {
+                    @Override public boolean launch(long channelId, Intent intent) {
+                        if (intent == null || intent.getComponent() == null ||
+                                !"com.google.android.gms".equals(intent.getComponent().getPackageName()) ||
+                                Manifest.activity(intent.getComponent().getClassName()) == null ||
+                                AppRunner.application() == null || !SharedMicrogWorker.showUi(channelId))
+                            return false;
+                        try {
+                            AppRunner.startActivity(AppRunner.application(),
+                                new Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), -1, null);
+                            return true;
+                        } catch (RuntimeException e) {
+                            SharedMicrogWorker.dismissUi(channelId);
+                            return false;
+                        }
+                    }
+
+                    @Override public void dismiss(long channelId) {
+                        SharedMicrogWorker.dismissUi(channelId);
+                    }
+                }, id, packageName, uid, pid);
+            router = new SharedMicrogServiceRouter(context, accounts);
             bridge = new BinderBridge(new FileInputStream(descriptor.getFileDescriptor()),
                 new FileOutputStream(descriptor.getFileDescriptor()), router.root(), () -> {
                     try { Os.shutdown(descriptor.getFileDescriptor(), SHUT_RDWR); }

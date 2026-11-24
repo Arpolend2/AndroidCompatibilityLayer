@@ -29,6 +29,10 @@ public slots:
         record.insert(QStringLiteral("previewSummary"), hints.value(QStringLiteral("x-nemo-preview-summary")).toString());
         record.insert(QStringLiteral("previewBody"), hints.value(QStringLiteral("x-nemo-preview-body")).toString());
         record.insert(QStringLiteral("suppressSound"), hints.value(QStringLiteral("suppress-sound")).toBool());
+        record.insert(QStringLiteral("originPackage"), hints.value(QStringLiteral("x-nemo-origin-package")).toString());
+        record.insert(QStringLiteral("hasUrgency"), hints.contains(QStringLiteral("urgency")));
+        record.insert(QStringLiteral("urgency"), hints.value(QStringLiteral("urgency")).toInt());
+        record.insert(QStringLiteral("urgencyIsByte"), hints.value(QStringLiteral("urgency")).userType() == QMetaType::UChar);
         record.insert(QStringLiteral("hasProgress"), hints.contains(QStringLiteral("x-nemo-progress")));
         record.insert(QStringLiteral("progress"), hints.value(QStringLiteral("x-nemo-progress")).toDouble());
         record.insert(QStringLiteral("timeout"), timeout);
@@ -107,7 +111,8 @@ int main(int argc, char **argv)
     if (!require(record(service).value("replaces").toInt() == 41, "replacement id")) return 1;
     const auto detailed = [&](int id, int flags, int max, int progress, bool indeterminate) {
         return callbacks.send_detailed(callbacks.user, pkg, nullptr, id, "Download", "Downloading",
-                                       flags, max, progress, indeterminate);
+                                       flags, max, progress, indeterminate,
+                                       MEGLER_NOTIFICATION_IMPORTANCE_HIGH, false);
     };
     if (!require(detailed(10, 8, 100, 25, false), "progress post")) return 1;
     QJsonObject progress = record(service);
@@ -166,6 +171,54 @@ int main(int argc, char **argv)
     if (!require(startService(service), "service restart")) return 1;
     if (!require(send(MEGLER_NOTIFICATION_POST, pkg, nullptr, 7, "", ""), "post after restart")) return 1;
     if (!require(record(service).value("replaces").toInt(-1) == 0, "stale id discarded")) return 1;
+    const auto classified = [&](int id, int flags, int importance, bool silent, int max = 0, int value = 0) {
+        return callbacks.send_detailed(callbacks.user, pkg, nullptr, id, "Download", "Downloading",
+                                       flags, max, value, false, importance, silent);
+    };
+    if (!require(classified(20, 2, MEGLER_NOTIFICATION_IMPORTANCE_MIN, true),
+                 "initial quiet ongoing notification")) return 1;
+    QJsonObject policy = record(service);
+    if (!require(policy.value("replaces").toInt(-1) == 0 &&
+                 policy.value("previewSpecified").toBool() &&
+                 policy.value("previewSummary").toString().isEmpty() &&
+                 policy.value("previewBody").toString().isEmpty() &&
+                 policy.value("suppressSound").toBool() &&
+                 policy.value("originPackage").toString() == QLatin1String(pkg) &&
+                 policy.value("hasUrgency").toBool() && policy.value("urgencyIsByte").toBool() &&
+                 policy.value("urgency").toInt(-1) == 0 &&
+                 policy.value("timeout").toInt(-1) == 0 && !policy.value("hasProgress").toBool(),
+                 "initial ongoing minimum importance is quiet without progress")) return 1;
+    const int quietId = 42;
+    if (!require(classified(20, 2, MEGLER_NOTIFICATION_IMPORTANCE_LOW, false, 100, 25),
+                 "quiet progress update")) return 1;
+    policy = record(service);
+    if (!require(policy.value("replaces").toInt() == quietId && policy.value("hasProgress").toBool() &&
+                 policy.value("previewSpecified").toBool() && policy.value("suppressSound").toBool() &&
+                 policy.value("urgency").toInt(-1) == 0,
+                 "low importance remains quiet on progress")) return 1;
+    if (!require(classified(21, 0, MEGLER_NOTIFICATION_IMPORTANCE_DEFAULT, false), "default post")) return 1;
+    policy = record(service);
+    if (!require(policy.value("previewSpecified").toBool() && !policy.value("suppressSound").toBool() &&
+                 policy.value("urgency").toInt(-1) == 1 && policy.value("timeout").toInt() == -1,
+                 "default importance retains sound without preview")) return 1;
+    if (!require(classified(22, 0, MEGLER_NOTIFICATION_IMPORTANCE_HIGH, false), "high post")) return 1;
+    policy = record(service);
+    if (!require(!policy.value("previewSpecified").toBool() && !policy.value("suppressSound").toBool() &&
+                 policy.value("urgency").toInt(-1) == 1,
+                 "high importance permits preview")) return 1;
+    if (!require(classified(23, 0, MEGLER_NOTIFICATION_IMPORTANCE_HIGH, true), "silent high post")) return 1;
+    policy = record(service);
+    if (!require(!policy.value("previewSpecified").toBool() && policy.value("suppressSound").toBool(),
+                 "silent channel may still show preview")) return 1;
+    if (!require(classified(24, 0, MEGLER_NOTIFICATION_IMPORTANCE_MAX, false), "max post")) return 1;
+    policy = record(service);
+    if (!require(!policy.value("previewSpecified").toBool() && !policy.value("suppressSound").toBool() &&
+                 policy.value("urgency").toInt(-1) == 1, "max importance permits preview")) return 1;
+    if (!require(classified(20, 0, MEGLER_NOTIFICATION_IMPORTANCE_HIGH, false),
+                 "ongoing completion")) return 1;
+    policy = record(service);
+    if (!require(policy.value("replaces").toInt() == quietId && policy.value("timeout").toInt() == -1,
+                 "completion clears ongoing timeout")) return 1;
     service.terminate();
     if (!require(service.waitForFinished(5000), "final service stop")) return 1;
     return 0;

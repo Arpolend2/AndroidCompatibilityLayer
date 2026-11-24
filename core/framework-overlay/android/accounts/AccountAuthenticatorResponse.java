@@ -16,13 +16,25 @@ public class AccountAuthenticatorResponse implements Parcelable {
     public AccountAuthenticatorResponse(Parcel parcel) { mAccountAuthenticatorResponse = IAccountAuthenticatorResponse.Stub.asInterface(parcel.readStrongBinder()); }
 
     public void onResult(Bundle result) {
-        try { if (mAccountAuthenticatorResponse != null) mAccountAuthenticatorResponse.onResult(result); } catch (RemoteException e) { }
+        try {
+            if (mAccountAuthenticatorResponse != null) mAccountAuthenticatorResponse.onResult(result);
+        } catch (RemoteException e) {
+            System.err.println("Account authenticator result delivery failed");
+            try {
+                mAccountAuthenticatorResponse.onError(AccountManager.ERROR_CODE_INVALID_RESPONSE,
+                    "Authenticator result could not be delivered");
+            } catch (RemoteException failure) {
+                System.err.println("Account authenticator error delivery failed");
+            }
+        }
     }
     public void onRequestContinued() {
-        try { if (mAccountAuthenticatorResponse != null) mAccountAuthenticatorResponse.onRequestContinued(); } catch (RemoteException e) { }
+        try { if (mAccountAuthenticatorResponse != null) mAccountAuthenticatorResponse.onRequestContinued(); }
+        catch (RemoteException e) { System.err.println("Account authenticator continuation delivery failed"); }
     }
     public void onError(int errorCode, String errorMessage) {
-        try { if (mAccountAuthenticatorResponse != null) mAccountAuthenticatorResponse.onError(errorCode, errorMessage); } catch (RemoteException e) { }
+        try { if (mAccountAuthenticatorResponse != null) mAccountAuthenticatorResponse.onError(errorCode, errorMessage); }
+        catch (RemoteException e) { System.err.println("Account authenticator error delivery failed"); }
     }
     public int describeContents() { return 0; }
     public void writeToParcel(Parcel dest, int flags) { dest.writeStrongBinder(mAccountAuthenticatorResponse == null ? null : mAccountAuthenticatorResponse.asBinder()); }

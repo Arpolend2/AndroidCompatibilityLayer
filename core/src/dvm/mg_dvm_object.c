@@ -704,6 +704,141 @@ mg_jobj *mg_dvm_const_string(mg_dvm_dex *d, u32 idx)
     return s;
 }
 
+typedef struct {
+    mg_dvm_class *seen[128];
+    int count;
+    bool exact, other, incomplete;
+    int other_scope;
+} array_store_interface_scan;
+
+static bool array_store_scan_remember(array_store_interface_scan *scan, mg_dvm_class *c)
+{
+    int i;
+    for (i = 0; i < scan->count; i++)
+        if (scan->seen[i] == c) return false;
+    if (scan->count == (int)MG_COUNT(scan->seen)) {
+        scan->incomplete = true;
+        return false;
+    }
+    scan->seen[scan->count++] = c;
+    return true;
+}
+
+static void array_store_scan_interface(array_store_interface_scan *scan, mg_dvm_class *iface, mg_dvm_class *component)
+{
+    int i;
+    if (!iface || !array_store_scan_remember(scan, iface)) return;
+    if (iface == component) scan->exact = true;
+    else if (iface->name && strcmp(iface->name, component->name) == 0) {
+        if (!scan->other) scan->other_scope = iface->scope;
+        scan->other = true;
+    }
+    for (i = 0; i < iface->nifaces; i++) array_store_scan_interface(scan, iface->ifaces[i], component);
+}
+
+bool mg_dvm_array_store_diagnostic_format(mg_dvm_class *actual, mg_dvm_class *component, char *buf, size_t n)
+{
+    array_store_interface_scan scan;
+    mg_dvm_class *k;
+    int depth, written;
+    const char *identity;
+    char interface_identity[80];
+    if (!buf || !n) return false;
+    buf[0] = 0;
+    if (!actual || !component || !component->name || strcmp(component->name, "android/text/ParcelableSpan") != 0) return false;
+
+    memset(&scan, 0, sizeof(scan));
+    for (k = actual, depth = 0; k && depth < (int)MG_COUNT(scan.seen); k = k->super, depth++) {
+        if (!array_store_scan_remember(&scan, k)) {
+            scan.incomplete = true;
+            break;
+        }
+        for (int i = 0; i < k->nifaces; i++) array_store_scan_interface(&scan, k->ifaces[i], component);
+        if (scan.incomplete) break;
+    }
+    if (k) scan.incomplete = true;
+
+    if (scan.incomplete) identity = "unknown";
+    else if (scan.exact && scan.other) {
+        snprintf(interface_identity, sizeof(interface_identity), "exact+other-identity(loader-scope=%d)", scan.other_scope);
+        identity = interface_identity;
+    } else if (scan.exact) identity = "exact";
+    else if (scan.other) {
+        snprintf(interface_identity, sizeof(interface_identity), "other-identity(loader-scope=%d)", scan.other_scope);
+        identity = interface_identity;
+    } else identity = "none";
+
+    written = snprintf(buf, n, "ArrayStoreException type diagnostic: actual=%s(loader-scope=%d), component=%s(loader-scope=%d), assignable=%s, matching-interface=%s",
+                       actual->name ? actual->name : "?", actual->scope, component->name, component->scope,
+                       mg_dvm_assignable(actual, component) ? "true" : "false", identity);
+    return written >= 0;
+}
+
+static void array_store_name(char *out, size_t n, const char *name)
+{
+    size_t i = 0;
+    if (!n) return;
+    if (!name) name = "?";
+    while (*name && i + 2 < n) {
+        unsigned char c = (unsigned char)*name++;
+        out[i++] = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                    c == '_' || c == '$' || c == '/' || c == '<' || c == '>') ? (char)c : '?';
+    }
+    if (*name) out[i++] = '~';
+    out[i] = 0;
+}
+
+void mg_dvm_array_store_stack_format(const mg_dvm_frame *frame, u32 first_pc, char *buf, size_t n)
+{
+    size_t used = 0;
+    unsigned count = 0;
+    if (!buf || !n) return;
+    buf[0] = 0;
+    while (frame && count < 8) {
+        char cls[64], method[32];
+        const mg_dvm_method *m = frame->m;
+        int written;
+        array_store_name(cls, sizeof(cls), m && m->cls ? m->cls->name : NULL);
+        array_store_name(method, sizeof(method), m ? m->name : NULL);
+        if (m && (m->flags & DVM_ACC_NATIVE))
+            written = snprintf(buf + used, n - used, "%s%s.%s(native)", count ? " < " : "", cls, method);
+        else
+            written = snprintf(buf + used, n - used, "%s%s.%s(pc=%u)", count ? " < " : "", cls, method,
+                               (unsigned)(count ? frame->pc : first_pc));
+        if (written < 0 || (size_t)written >= n - used) return;
+        used += (size_t)written;
+        frame = frame->prev;
+        count++;
+    }
+    if (frame) snprintf(buf + used, n - used, " < ...");
+}
+
+bool mg_dvm_array_store_stack_claim(volatile i32 *reports)
+{
+    i32 count;
+    do {
+        count = mg_atomic_add(reports, 0);
+        if (count >= 4) return false;
+    } while (mg_atomic_cas(reports, count, count + 1) != count);
+    return true;
+}
+
+void mg_dvm_array_store_diagnostic(mg_jobj *value, mg_dvm_class *component, const mg_dvm_frame *frame, u32 pc)
+{
+    static volatile i32 stack_reports;
+    char detail[512], stack[960];
+    if (!value || !value->dvm) return;
+    if (!mg_dvm_array_store_diagnostic_format(mg_dvm_class_of(value), component, detail, sizeof(detail))) return;
+    mg_warn("%s", detail);
+    if (!mg_dvm_array_store_stack_claim(&stack_reports)) return;
+    if (!frame) {
+        frame = mg_dvm_self()->top;
+        if (frame) pc = frame->pc;
+    }
+    mg_dvm_array_store_stack_format(frame, pc, stack, sizeof(stack));
+    mg_warn("ArrayStoreException call site (innermost first): %s", stack[0] ? stack : "(no Java frames)");
+}
+
 bool mg_dvm_arraycopy(mg_jobj *src, i32 sp, mg_jobj *dst, i32 dp, i32 n)
 {
     i32 i;
@@ -727,6 +862,7 @@ bool mg_dvm_arraycopy(mg_jobj *src, i32 sp, mg_jobj *dst, i32 dp, i32 n)
         for (i = 0; i < n; i++) {
             mg_jobj *o = src->u.oarr.v[sp + i];
             if (o && !mg_dvm_is_instance(o, mg_dvm_class_of(dst)->component)) {
+                mg_dvm_array_store_diagnostic(o, mg_dvm_class_of(dst)->component, NULL, 0);
                 return mg_dvm_throw("java/lang/ArrayStoreException", "%s cannot be stored in an array of type %s", mg_dvm_class_of(o)->name, mg_dvm_class_of(dst)->name);
             }
             dst->u.oarr.v[dp + i] = o;

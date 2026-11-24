@@ -1985,6 +1985,7 @@ int mg_dvm_jit_op(mg_dvm_thread *t, mg_dvm_frame *f, u32 pc)
             return 1;
         }
         if (v && !mg_dvm_is_instance(v, mg_dvm_class_of(a)->component)) {
+            mg_dvm_array_store_diagnostic(v, mg_dvm_class_of(a)->component, f, pc);
             mg_dvm_throw("java/lang/ArrayStoreException", "%s cannot be stored in an array of type %s", mg_dvm_class_of(v)->name, mg_dvm_class_of(a)->name);
             return 1;
         }

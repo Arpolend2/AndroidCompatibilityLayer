@@ -589,6 +589,10 @@ mg_dvm_method *mg_dvm_find_virtual(mg_dvm_class *receiver, const char *name, con
 mg_dvm_field *mg_dvm_find_field(mg_dvm_class *c, const char *name, bool is_static);
 mg_dvm_field *mg_dvm_find_field_typed(mg_dvm_class *c, const char *name, const char *type, bool is_static);
 bool mg_dvm_assignable(mg_dvm_class *sub, mg_dvm_class *sup);
+bool mg_dvm_array_store_diagnostic_format(mg_dvm_class *actual, mg_dvm_class *component, char *buf, size_t n);
+void mg_dvm_array_store_stack_format(const mg_dvm_frame *frame, u32 first_pc, char *buf, size_t n);
+bool mg_dvm_array_store_stack_claim(volatile i32 *reports);
+void mg_dvm_array_store_diagnostic(mg_jobj *value, mg_dvm_class *component, const mg_dvm_frame *frame, u32 pc);
 /* The method a call of `m` on `self` runs when it is not a call of exactly `m`: what invoke-virtual and invoke-interface find. */
 mg_dvm_method *mg_dvm_virtual_target(mg_dvm_method *m, mg_jobj *self);
 /*

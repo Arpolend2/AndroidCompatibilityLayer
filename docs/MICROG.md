@@ -140,7 +140,115 @@ answered it before, and its database never had microG's Android ID.
 
 ## Accounts
 
-`android.accounts.AccountManager` keeps accounts in
+The shared worker now exposes a per-client Binder account endpoint on the
+manager-authorized channel. It supports listing Google account names, add
+account, get auth token and feature checks. The worker binds microG's
+authenticator itself; its authenticator Binder and account database are never
+sent to the client. A request can receive only the account name/type, the
+boolean feature result, or the real token returned by the authenticator for
+that request. Passwords and user data are not included. The endpoint bounds
+requests, sanitizes results, rejects unsupported options, times out and
+cancels pending work, and closes requests with the client channel. A two-JVM
+test covers the endpoint and its integration into the manager-authorized
+channel; it uses synthetic fixture data, not a Google account or token.
+
+In shared-client mode, `AccountManager` routes Google operations on that
+endpoint to the worker. Direct credential access and explicit account writes
+are rejected, and unsupported Google authenticator operations fail rather than
+fall back to a local authenticator. Other account types retain the legacy
+in-process behavior for supported operations, but shared-client account lists
+contain only worker Google accounts. Account listeners refresh that same
+restricted list on a background thread while registered, polling every two
+seconds and refreshing after an add; failed refreshes are logged and do not
+become empty-list updates.
+Outside shared-client mode the older `accounts.json`
+implementation remains; it is still a shared file and must not be mounted as a
+way to provide worker credentials. The separate microG settings preview and
+worker use separate storage roots, so signing in through settings does not
+populate the worker's account list; there is no automatic credential migration.
+Failed account-file writes do not publish or report the attempted change.
+
+Authenticator Intents are launched only inside the microG worker and only for
+an explicit `com.google.android.gms` activity present in its manifest. The
+manager-owned sign-in page receives rendered frames over a separate bounded
+worker channel; touch, Back and soft-keyboard input return only to the active
+worker channel. Frame writes retry socket backpressure and report failure if a
+complete frame cannot be sent within one second, rather than silently dropping
+the remainder. The worker retries immediately when the socket becomes writable;
+if a whole packet still cannot fit, it pauses before polling again. The manager
+handles a bounded batch of frame packets per event-loop dispatch so input can
+proceed during sustained frame traffic. Only a fully empty first frame is
+suppressed, so it cannot
+replace the waiting screen with a false black frame; later empty or
+transparent frames are still published to avoid retaining stale page contents.
+The worker logs fixed account outcome markers (`VALIDATED`, `ERROR`, `CANCELED`,
+`TIMEOUT`, `CHANNEL_CLOSED`) and whether the callback was submitted, without
+account names, tokens or credentials. `VALIDATED` means the authenticator's
+response passed the worker checks; callback submission does not prove that the
+client received or used the result. Worker output must be collected separately
+if it is not included in the manager log.
+The worker supplies the same CPU drawing, text and image host as the preview.
+It initializes Qt with the windowless `minimal:enable_fonts` platform and
+checks for a loadable platform plugin and usable font glyphs before starting.
+An unavailable plugin or font backend causes an explicit worker startup failure.
+The manager sends the active surface's capped pixel dimensions, density and
+display rotation to the worker, which applies them through `megler_set_surface`.
+Both peers must support the resize control message. Touch is held back during a
+viewport transition until a frame of the requested dimensions arrives. Keyboard
+overlap remains a separate height notification, rather than a second resize.
+Frames carry no viewport generation, so a same-sized frame cannot by itself
+prove that a rotation or density change has finished rendering.
+Its keyboard is separate from the preview keyboard, and the
+requesting app receives neither the sign-in Intent nor UI credentials. The
+worker response is returned only after the authenticator completes, and only
+its validated account fields and actual token are forwarded. No token is
+fabricated or written to logs.
+
+In the dedicated shared microG worker, resuming
+`org.microg.gms.auth.login.LoginActivity` advances the microG pre-connect
+screen exactly once. This starts the LoginActivity WebView path directly,
+instead of leaving the worker on the pre-connect screen with no navigation.
+The ordinary settings and in-app microG flows keep their normal consent
+screen.
+
+The host-side boundary fixture now exercises a private screen launch, a later
+authenticator result, result sanitization and rejection of an unapproved
+activity. The native worker control test exercises the UI/keyboard event
+packets and active-channel input gating, including rejecting input after the
+screen closes. These tests do not run Android's real sign-in Activity or verify
+the rendered/input path on a device. End-to-end Google sign-in and token
+issuance remain unconfirmed until tested on the target device.
+
+Caller package, UID and PID are passed by the manager to the worker and
+overwritten into authenticator options; they are not cryptographically
+authenticated application identity. The user accepted the risk of application
+impersonation without APK signature or request-origin verification. The
+channel confines a response to its requesting connection, but this does not
+establish that the requester is the named application. Any account visibility
+or token authorization depends on microG's authenticator flow; this has not
+been verified on a device.
+
+`AbstractAccountAuthenticator.Transport` also accepts Android's one-way
+authenticator transactions and delivers their result or error through the
+response. A two-JVM fixture covers selected requests and a response that
+cannot be serialized. `IAccountAuthenticatorResponse` carries one-way results,
+continuations and errors across Binder; tests use synthetic data.
+The Binder wire format also supports an Intent with a restricted set of fields
+and Bundle values, including `Account` and `AccountAuthenticatorResponse`.
+Selector, clip data, source bounds and unsupported extras are rejected rather
+than discarded. A two-JVM fixture round-trips an Intent and its live response
+callback and checks malformed data and disconnects. Both peers must support
+this wire extension.
+
+The trusted foreground sign-in screen is not connected yet. The worker is
+headless and currently refuses an authenticator Intent instead of forwarding
+it into the requesting app. Thus add-account or token requests that require UI
+fail explicitly; there is no password entry in a third-party app and no
+successful UI/token flow claimed. The host needs a manager-owned foreground
+surface and a worker-to-surface request/result channel. Device testing is required for actual
+Google sign-in, user consent, cancellation, and real token delivery.
+
+Outside shared-client mode, `android.accounts.AccountManager` keeps accounts in
 `/data/megler-services/accounts/accounts.json` (`megler.Accounts`), one file for
 all apps, read again when another process wrote it. Requests that need an
 account type's authenticator bind its service -- microG's `GoogleLoginService`
@@ -154,7 +262,8 @@ no activity and starts the intent it gets with `startActivityForResult`) gets
 the result the sign-in sets as it finishes (`RESULT_OK`): `megler.AppResults`
 passes it through `/data/megler-services/results/`, and microG's app brings the
 caller to the front again. There is no account chooser, no visibility, and no
-session API.
+session API. This is the legacy, non-shared-worker path; it does not prove that
+the new worker endpoint can show or complete an authenticator screen.
 
 A content provider's caller (`ContentProvider.getCallingPackage`) is the app:
 every caller is in the app's one process, whose uid and pid are the app's, and
@@ -2046,8 +2155,13 @@ components rather than selecting pre-bound services, and releases a connection's
 bindings when closed. Its synchronous protocol currently carries only an action
 and component: data, types, categories and extras are not implemented. Caller
 identity is an optional connection property, not part of this protocol. The
-router reports an unavailable service as a failed bind rather than a transport
-exception; actual transport and protocol failures remain errors. The client
+router refuses services that do not resolve to an enabled, exported GMS
+component without a service permission, including an inherited application
+permission. A service with no explicit `exported` is exported when it has an
+intent filter. This is not a complete Android permission model: dynamic
+component state is not established by this check. An unavailable or refused
+service is returned as a failed bind rather than a transport exception; actual
+transport and protocol failures remain errors. The client
 releases the server's binding record even when no service was returned. This
 router also handles production shared-service binds.
 The fixture checks process exits and disconnect, without network or account

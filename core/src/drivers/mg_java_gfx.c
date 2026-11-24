@@ -155,6 +155,7 @@ struct gcanvas {
     gcanvas *next;
     bool dirty;                        /* drawn through since its last flush */
     bool stale;                        /* the memory was written behind its back */
+    bool cpu_stale;                    /* its bitmap memory changed and must be uploaded before partial drawing */
     gstate *st;                        /* st[depth] is the current one */
     i32 depth, cap;
     float sent[6];                     /* the matrix the shell has */
@@ -169,6 +170,34 @@ typedef struct gface {
 } gface;
 
 static megler_gfx_host G;
+/* Offscreen hosts are destroyed after app exit while guest threads may still run. */
+static mg_lock g_host_lock = MG_LOCK_INIT;
+static mg_cond g_host_idle = MG_COND_INIT;
+static bool g_host_closing;
+static u32 g_host_active;
+static MG_THREAD_LOCAL bool t_retains_host_context;
+
+bool mg_java_gfx_retains_thread_context(void) { return t_retains_host_context; }
+
+static bool host_enter(void)
+{
+    bool entered;
+    if (!G.release_thread) return true;
+    mg_lock_acquire(&g_host_lock);
+    entered = !g_host_closing;
+    if (entered) g_host_active++;
+    mg_lock_release(&g_host_lock);
+    if (!entered) mg_note_once("gfx: a host callback arrived after graphics shutdown");
+    return entered;
+}
+
+static void host_leave(void)
+{
+    if (!G.release_thread) return;
+    mg_lock_acquire(&g_host_lock);
+    if (--g_host_active == 0) mg_cond_broadcast(&g_host_idle);
+    mg_lock_release(&g_host_lock);
+}
 /*
  * The time spent in the shell's drawing, summed for each thread: GFX(statement) runs a statement that calls G and adds what
  * it took, by the clock. Two readings of the clock a call; the Java driver's frame meter reads the main thread's sum
@@ -178,7 +207,10 @@ static MG_THREAD_LOCAL u64 t_host_ns;
 #define GFX(statement)                                    \
     do {                                                  \
         u64 gfx_started_ = mg_time_monotonic_ns();        \
-        statement;                                        \
+        if (host_enter()) {                               \
+            statement;                                    \
+            host_leave();                                 \
+        }                                                 \
         t_host_ns += mg_time_monotonic_ns() - gfx_started_; \
     } while (0)
 static struct {
@@ -427,8 +459,8 @@ static gbitmap *bm_of(i64 h)
 
 static u32 *bm_row(const gbitmap *b, i32 y) { return (u32 *)(void *)(b->px + (size_t)y * (size_t)b->stride); }
 
-/* Before the pixels are read: what was drawn through the bitmap's canvases goes into the memory. */
-static void bm_settle(gbitmap *b)
+/* Submit pending drawing without making the bitmap's CPU memory current. */
+static void bm_flush(gbitmap *b)
 {
     gcanvas *v;
     mg_lock_acquire(&g_lock);
@@ -441,14 +473,43 @@ static void bm_settle(gbitmap *b)
     mg_lock_release(&g_lock);
 }
 
+/* Before CPU pixels are read: materialize the GPU image, or use legacy flush semantics. */
+static bool bm_settle(gbitmap *b)
+{
+    gcanvas *v;
+    bool ok = true;
+    mg_lock_acquire(&g_lock);
+    bm_wait_presented(b);
+    for (v = b->canvases; v; v = v->next) {
+        if (!v->dirty) continue;
+        if (v->host && G.flush) GFX(G.flush(G.user, v->host));
+    }
+    if (G.bitmap_readback) {
+        ok = false;
+        GFX(ok = G.bitmap_readback(G.user, b->id, b->px, b->w, b->h, b->stride));
+        if (!ok) {
+            mg_note_once("gfx: the shell could not read back bitmap pixels; the CPU copy remains stale");
+        }
+    }
+    if (ok || !G.bitmap_readback)
+        for (v = b->canvases; v; v = v->next)
+            if (v->dirty) v->dirty = false;
+    mg_lock_release(&g_lock);
+    return ok;
+}
+
 /* After the pixels were written by anything but a canvas: the canvases are told before they next draw, and a kept copy is no good. */
 static void bm_changed(gbitmap *b)
 {
     gcanvas *v;
     mg_lock_acquire(&g_lock);
     b->version++;
-    for (v = b->canvases; v; v = v->next) v->stale = true;
+    for (v = b->canvases; v; v = v->next) {
+        v->stale = true;
+        v->cpu_stale = true;
+    }
     mg_lock_release(&g_lock);
+    if (G.bitmap_changed) GFX(G.bitmap_changed(G.user, b->id));
 }
 
 /* The memory itself goes: nothing refers to the bitmap any more, neither the Java nor a display list. */
@@ -1673,6 +1734,7 @@ static bool cv_whole(gcanvas *v) { return v->depth == 0 && !v->st[0].clipped && 
 static void cv_changes(gcanvas *v, bool replaces)
 {
     gcanvas *o;
+    const bool shared_gpu_bitmap = G.canvas_new_bitmap != NULL;
     mg_lock_acquire(&g_lock);
     bm_wait_presented(v->bm);
     for (o = v->bm->canvases; o; o = o->next) {
@@ -1685,8 +1747,11 @@ static void cv_changes(gcanvas *v, bool replaces)
         o->stale = true;
     }
     if (v->stale) {
-        if (G.touched && !replaces) GFX(G.touched(G.user, v->host));
+        if (G.touched && !replaces && (!shared_gpu_bitmap || v->cpu_stale))
+            GFX(G.touched(G.user, v->host));
         v->stale = false;
+        if (shared_gpu_bitmap)
+            for (o = v->bm->canvases; o; o = o->next) o->cpu_stale = false;
     }
     v->dirty = true;
     v->bm->version++;
@@ -1818,7 +1883,7 @@ N(G_bmErase)
         GFX(G.draw_color(G.user, through->host, (u32)c->args[1].i, MEGLER_GFX_BLEND_SRC));
         return;
     }
-    bm_settle(b);
+    if (!bm_settle(b)) return;
     if (!v) {
         memset(b->px, 0, (size_t)b->stride * (size_t)b->h);
     } else {
@@ -1841,7 +1906,7 @@ N(G_bmEraseMemory)
     u32 v = premultiplied((u32)c->args[1].i), *row;
     i32 x, y;
     if (!b) return;
-    bm_settle(b);
+    if (!bm_settle(b)) return;
     if (!v) {
         memset(b->px, 0, (size_t)b->stride * (size_t)b->h);
     } else {
@@ -1858,7 +1923,7 @@ N(G_bmGetPixel)
     gbitmap *b = bm_of(c->args[0].j);
     i32 x = c->args[1].i, y = c->args[2].i;
     if (!b || x < 0 || y < 0 || x >= b->w || y >= b->h) return;
-    bm_settle(b);
+    if (!bm_settle(b)) return;
     c->ret.i = (i32)unpremultiplied(bm_row(b, y)[x]);
 }
 
@@ -1867,7 +1932,7 @@ N(G_bmSetPixel)
     gbitmap *b = bm_of(c->args[0].j);
     i32 x = c->args[1].i, y = c->args[2].i;
     if (!b || x < 0 || y < 0 || x >= b->w || y >= b->h) return;
-    bm_settle(b);
+    if (!bm_settle(b)) return;
     bm_row(b, y)[x] = premultiplied((u32)c->args[3].i);
     bm_changed(b);
 }
@@ -1892,7 +1957,7 @@ N(G_bmPixels)
         mg_dvm_throw("java/lang/ArrayIndexOutOfBoundsException", "pixels");
         return;
     }
-    bm_settle(b);
+    if (!bm_settle(b)) return;
     for (r = 0; r < h; r++) {
         u32 *row = bm_row(b, (i32)(y + r)) + (size_t)x;
         i32 *at = px + (size_t)(off + r * stride);
@@ -1917,7 +1982,7 @@ N(G_bmRaw)
     gbitmap *b = bm_of(c->args[0].j);
     u8 *at = (u8 *)pointer(c->args[1].j);
     if (!b || !at) return;
-    bm_settle(b);
+    if (!bm_settle(b)) return;
     if (c->args[2].z) {
         swap_red_blue(b->px, at, (size_t)b->w * (size_t)b->h);
         bm_changed(b);
@@ -1933,7 +1998,7 @@ N(G_bmOpaque)
     gbitmap *b = bm_of(c->args[0].j);
     i32 x, y;
     if (!b) return;
-    bm_settle(b);
+    if (!bm_settle(b)) return;
     for (y = 0; y < b->h; y++) {
         u32 *row = bm_row(b, y);
         for (x = 0; x < b->w; x++) row[x] |= 0xFF000000u;
@@ -1946,7 +2011,7 @@ N(G_bmAddress)
 {
     gbitmap *b = bm_of(c->args[0].j);
     if (!b) return;
-    bm_settle(b);
+    if (!bm_settle(b)) return;
     c->ret.j = handle(b->px);
 }
 
@@ -2043,7 +2108,7 @@ N(G_bmCompress)
     bool encoded = false;
     if (!b || !HAS(image_encode)) return;
     memset(&out, 0, sizeof(out));
-    bm_settle(b);
+    if (!bm_settle(b)) return;
     if (quality < 0) quality = 0;
     if (quality > 100) quality = 100;
     GFX(encoded = G.image_encode(G.user, b->px, b->w, b->h, b->stride, c->args[1].i == 0 ? MEGLER_GFX_JPEG : MEGLER_GFX_PNG, quality, bytes_write, &out));
@@ -2062,9 +2127,12 @@ static void bm_copy_drawn(gbitmap *s, i32 x, i32 y, i32 w, i32 h, const float *m
     megler_gfx_paint p;
     gpaint def;
     float src[4], dst[4];
-    void *cv;
-    if (!HAS(canvas_new) || !HAS(draw_bitmap)) return;
-    GFX(cv = G.canvas_new(G.user, d->px, d->w, d->h, d->stride));
+    void *cv = NULL;
+    if ((!G.canvas_new && !G.canvas_new_bitmap) || !HAS(draw_bitmap)) return;
+    if (G.canvas_new_bitmap)
+        GFX(cv = G.canvas_new_bitmap(G.user, d->px, d->w, d->h, d->stride, d->id));
+    else
+        GFX(cv = G.canvas_new(G.user, d->px, d->w, d->h, d->stride));
     if (!cv) return;
     paint_of(NULL, &def);
     p = def.p;
@@ -2081,6 +2149,45 @@ static void bm_copy_drawn(gbitmap *s, i32 x, i32 y, i32 w, i32 h, const float *m
     GFX(G.draw_bitmap(G.user, cv, &image, src, dst, &p));
     if (G.flush) GFX(G.flush(G.user, cv));
     if (G.canvas_free) GFX(G.canvas_free(G.user, cv));
+}
+
+static bool bm_copy_gpu(gbitmap *s, i32 x, i32 y, i32 w, i32 h, gbitmap *d, bool filter)
+{
+    megler_gfx_paint paint;
+    float src[4], dst[4];
+    void *source = NULL, *target = NULL;
+    bool copied = false;
+    if (!G.canvas_new_bitmap || !G.canvas_free || !G.draw_canvas) return false;
+    bm_flush(s);
+    GFX(source = G.canvas_new_bitmap(G.user, s->px, s->w, s->h, s->stride, s->id));
+    if (!source) return false;
+    GFX(target = G.canvas_new_bitmap(G.user, d->px, d->w, d->h, d->stride, d->id));
+    if (!target) {
+        if (G.canvas_free) GFX(G.canvas_free(G.user, source));
+        return false;
+    }
+    memset(&paint, 0, sizeof(paint));
+    paint.color = 0xffffffffu;
+    paint.flags = filter ? MEGLER_GFX_FILTER_BITMAP : 0;
+    paint.blend = MEGLER_GFX_BLEND_SRC;
+    paint.filter_mode = -1;
+    src[0] = (float)x;
+    src[1] = (float)y;
+    src[2] = (float)(x + w);
+    src[3] = (float)(y + h);
+    dst[0] = dst[1] = 0;
+    dst[2] = (float)d->w;
+    dst[3] = (float)d->h;
+    GFX(copied = G.draw_canvas(G.user, target, source, src, dst, &paint));
+    if (copied) {
+        if (G.flush) GFX(G.flush(G.user, target));
+        d->version++;
+    }
+    if (G.canvas_free) {
+        GFX(G.canvas_free(G.user, source));
+        GFX(G.canvas_free(G.user, target));
+    }
+    return copied;
 }
 
 /*
@@ -2102,10 +2209,17 @@ N(G_bmCopy)
     i32 r, nw, nh;
     bool filter = c->args[6].z != 0;
     if (!s || x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > s->w || y + h > s->h) return;
-    bm_settle(s);
     if (!m) {
         d = bm_new(w, h);
         if (!d) return;
+        if (bm_copy_gpu(s, (i32)x, (i32)y, (i32)w, (i32)h, d, false)) {
+            c->ret.j = handle(d);
+            return;
+        }
+        if (!bm_settle(s)) {
+            bm_free(d);
+            return;
+        }
         for (r = 0; r < (i32)h; r++) memcpy(bm_row(d, r), bm_row(s, (i32)(y + r)) + (size_t)x, (size_t)w * 4);
         c->ret.j = handle(d);
         return;
@@ -2116,11 +2230,23 @@ N(G_bmCopy)
     d = bm_new(nw > 0 ? nw : 1, nh > 0 ? nh : 1);
     if (!d) return;
     if (m[1] == 0 && m[3] == 0 && m[0] != 0 && m[4] != 0 && isfinite(m[0]) && isfinite(m[4])) {
+        if (m[0] > 0 && m[4] > 0 && bm_copy_gpu(s, (i32)x, (i32)y, (i32)w, (i32)h, d, filter)) {
+            c->ret.j = handle(d);
+            return;
+        }
+        if (!bm_settle(s)) {
+            bm_free(d);
+            return;
+        }
         if (!bm_scale(s, (i32)x, (i32)y, (i32)w, (i32)h, d, m[0] < 0, m[4] < 0, filter)) {
             bm_free(d);
             return;
         }
     } else {
+        if (!bm_settle(s)) {
+            bm_free(d);
+            return;
+        }
         memcpy(moved, m, sizeof(moved));
         moved[2] -= box[0];
         moved[5] -= box[1];
@@ -2152,10 +2278,19 @@ static gcanvas *cv_make(gbitmap *b)
 {
     gcanvas *v = cv_alloc(b->w, b->h);
     v->bm = b;
-    /* What other canvases have drawn is in the memory before the shell reads it as this one's picture. */
-    bm_settle(b);
+    /* A persistent GPU host attaches to the existing bitmap texture; legacy
+       hosts still need the CPU image before a second canvas is made. */
+    if (G.canvas_new_bitmap) bm_flush(b);
+    else if (!bm_settle(b)) {
+        free(v->st);
+        free(v);
+        return NULL;
+    }
     /* Without the shell's half the canvas still counts saves and keeps its matrix and clip, so that the Java's bookkeeping holds; it draws nothing. */
-    if (HAS(canvas_new)) GFX(v->host = G.canvas_new(G.user, b->px, b->w, b->h, b->stride));
+    if (G.canvas_new_bitmap)
+        GFX(v->host = G.canvas_new_bitmap(G.user, b->px, b->w, b->h, b->stride, b->id));
+    else if (HAS(canvas_new))
+        GFX(v->host = G.canvas_new(G.user, b->px, b->w, b->h, b->stride));
     mg_lock_acquire(&g_lock);
     v->next = b->canvases;
     b->canvases = v;
@@ -2736,6 +2871,7 @@ static void draw_bitmap(gcanvas *v, gbitmap *b, float *src, float *dst, const gp
     if (G.draw_canvas && canvas_copy && v->bm != b) {
         bool drawn = false;
         if (!(ready = cv_draw(v, false))) return;
+        if (G.canvas_new_bitmap) bm_flush(b);
         mg_lock_acquire(&g_lock);
         gcanvas *source = b->canvases;
         if (source && !source->next && source->host && !source->stale)
@@ -2743,8 +2879,12 @@ static void draw_bitmap(gcanvas *v, gbitmap *b, float *src, float *dst, const gp
         mg_lock_release(&g_lock);
         if (drawn) return;
     }
-    /* What is drawn from must otherwise be in memory, including self-copies. */
-    bm_settle(b);
+    /* A persistent GPU host resolves the bitmap by ID; legacy hosts need CPU pixels. */
+    if (G.canvas_new_bitmap) {
+        if (v->bm != b) bm_flush(b);
+    } else if (!bm_settle(b)) {
+        return;
+    }
     if (!ready && !cv_draw(v, false)) return;
     image_of(b, &image);
     GFX(G.draw_bitmap(G.user, v->host, &image, src, dst, &p->p));
@@ -4261,7 +4401,7 @@ N(G_txMeasure)
  */
 N(G_txMetrics)
 {
-    float *out = (float *)elements(c->args[2].l, 'F', 5), m[5] = { 0, 0, 0, 0, 0 }, spacing;
+    float *out = (float *)elements(c->args[2].l, 'F', 5), m[5] = { 0, 0, 0, 0, 0 }, spacing = 0;
     gpaint p;
     int i;
     paint_of(c->args[0].l, &p);
@@ -4300,7 +4440,7 @@ N(G_txBounds)
  */
 N(G_txBreak)
 {
-    i32 count, fit;
+    i32 count, fit = 0;
     const u16 *text = text_of(c->args[0].l, c->args[1].i, c->args[2].i, &count);
     float max_width = c->args[3].f;
     gpaint p;
@@ -4455,7 +4595,7 @@ N(G_tfDerive)
 N(G_tfFromData)
 {
     const u8 *data = (const u8 *)elements(c->args[0].l, 'B', 1);
-    void *host;
+    void *host = NULL;
     if (!data || !HAS(typeface_from_data)) return;
     GFX(host = G.typeface_from_data(G.user, data, length_of(c->args[0].l)));
     if (host) c->ret.j = handle(tf_new(host, 400, false));
@@ -4519,7 +4659,7 @@ static i64 shader_handle(void *host) { return handle(sh_new(host)); }
 N(G_shLinear)
 {
     gstops s;
-    void *made;
+    void *made = NULL;
     if (!HAS(shader_linear)) return;
     stops_of(c->args[4].l, c->args[5].l, &s);
     GFX(made = G.shader_linear(G.user, c->args[0].f, c->args[1].f, c->args[2].f, c->args[3].f, s.colors, s.positions, s.count, tile_number(c->args[6].i)));
@@ -4531,7 +4671,7 @@ N(G_shLinear)
 N(G_shRadial)
 {
     gstops s;
-    void *made;
+    void *made = NULL;
     if (!HAS(shader_radial)) return;
     stops_of(c->args[3].l, c->args[4].l, &s);
     GFX(made = G.shader_radial(G.user, c->args[0].f, c->args[1].f, c->args[2].f, s.colors, s.positions, s.count, tile_number(c->args[5].i)));
@@ -4543,7 +4683,7 @@ N(G_shRadial)
 N(G_shSweep)
 {
     gstops s;
-    void *made;
+    void *made = NULL;
     if (!HAS(shader_sweep)) return;
     stops_of(c->args[2].l, c->args[3].l, &s);
     GFX(made = G.shader_sweep(G.user, c->args[0].f, c->args[1].f, s.colors, s.positions, s.count));
@@ -4556,9 +4696,9 @@ N(G_shBitmap)
 {
     gbitmap *b = bm_of(c->args[0].j);
     megler_gfx_image image;
-    void *made;
+    void *made = NULL;
     if (!b || !HAS(shader_bitmap)) return;
-    bm_settle(b);
+    if (!bm_settle(b)) return;
     image_of(b, &image);
     GFX(made = G.shader_bitmap(G.user, &image, tile_number(c->args[1].i)));
     c->ret.j = shader_handle(made);
@@ -4668,8 +4808,10 @@ N(G_bmDiffer)
         c->ret.i = -1;
         return;
     }
-    bm_settle(a);
-    bm_settle(b);
+    if (!bm_settle(a) || !bm_settle(b)) {
+        c->ret.i = -1;
+        return;
+    }
     if (box) {
         memcpy(skip, box, sizeof(skip));
         box[0] = box[1] = box[2] = box[3] = 0;
@@ -4757,7 +4899,10 @@ static void present_bitmap(gbitmap *b)
         }
         mg_lock_release(&g_lock);
         if (host) {
-            shown = g_present.canvas_fn(g_present.canvas_user, host, b->w, b->h);
+            if (host_enter()) {
+                shown = g_present.canvas_fn(g_present.canvas_user, host, b->w, b->h);
+                host_leave();
+            }
             mg_lock_acquire(&g_lock);
             if (--b->presenting == 0) mg_cond_broadcast(&g_presented);
             mg_lock_release(&g_lock);
@@ -4766,8 +4911,8 @@ static void present_bitmap(gbitmap *b)
         if (shown) {
             /* (A look at what was shown, for a diagnosis, when one is asked for: the memory brought up to date for it.) */
             if (g_present.probe && g_present.probe_due && g_present.probe_due()) {
-                bm_settle(b);
-                g_present.probe(b->px, b->w, b->h, b->stride);
+                if (bm_settle(b))
+                    g_present.probe(b->px, b->w, b->h, b->stride);
             }
             return;
         }
@@ -4778,8 +4923,11 @@ static void present_bitmap(gbitmap *b)
         said++;
         mg_info("gfx: the window's picture went through memory, %ux%u: %s", (unsigned)b->w, (unsigned)b->h, why);
     }
-    bm_settle(b);
-    g_present.fn(g_present.user, b->px, b->w, b->h, b->stride);
+    if (!bm_settle(b)) return;
+    if (host_enter()) {
+        g_present.fn(g_present.user, b->px, b->w, b->h, b->stride);
+        host_leave();
+    }
 }
 
 /*
@@ -4819,6 +4967,7 @@ static void frame_show(gcanvas *v, gbitmap *b, gdlist *l, const i32 part[4], u32
 static MG_HOSTCB void rt_main(void *arg)
 {
     (void)arg;
+    t_retains_host_context = true;
     mg_lock_acquire(&g_rt_lock);
     for (;;) {
         gcanvas *v;
@@ -4897,6 +5046,10 @@ void mg_java_gfx_frames_finish(void)
 {
     rt_wait();
     if (!G.release_thread) return;
+    mg_lock_acquire(&g_host_lock);
+    g_host_closing = true;
+    while (g_host_active) mg_cond_wait(&g_host_idle, &g_host_lock);
+    mg_lock_release(&g_host_lock);
     mg_lock_acquire(&g_rt_lock);
     if (R.started == 1) {
         R.release = true;
@@ -5053,8 +5206,12 @@ const mg_jhle *mg_java_gfx_natives(void) { return k_gfx; }
 
 void mg_java_gfx_set_host(const megler_gfx_host *host)
 {
+    t_retains_host_context = true;
+    mg_lock_acquire(&g_host_lock);
     if (host) G = *host;
     else memset(&G, 0, sizeof(G));
+    g_host_closing = false;
+    mg_lock_release(&g_host_lock);
 }
 
 u64 mg_java_gfx_host_ns(void) { return t_host_ns; }
@@ -5107,7 +5264,7 @@ bool mg_java_gfx_bitmap_info(i64 bm, mg_java_gfx_bitmap *out)
 {
     gbitmap *b = bm_of(bm);
     if (!b) return false;
-    bm_settle(b);
+    if (!bm_settle(b)) return false;
     info_of(b, out);
     return true;
 }
@@ -5123,7 +5280,7 @@ bool mg_java_gfx_lock_rgba(i64 bm, mg_java_gfx_bitmap *out)
     gbitmap *b = bm_of(bm);
     bool first;
     if (!b) return false;
-    bm_settle(b);
+    if (!bm_settle(b)) return false;
     mg_lock_acquire(&g_lock);
     first = b->rgba_locks++ == 0;
     mg_lock_release(&g_lock);

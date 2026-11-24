@@ -42,6 +42,30 @@ if ($FrameworkClasses) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & (Join-Path $Jdk 'bin\java.exe') -cp "$Output;$FrameworkClasses;$AndroidJar" BinderBundleBridgeTest
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & (Join-Path $Jdk 'bin\javac.exe') -encoding UTF-8 -cp "$Output;$FrameworkClasses;$AndroidJar" -d $Output `
+        (Join-Path $root 'core\framework-overlay\android\accounts\IAccountAuthenticatorResponse.java') `
+        (Join-Path $root 'core\framework-overlay\android\accounts\AccountAuthenticatorResponse.java') `
+        (Join-Path $PSScriptRoot 'AccountAuthenticatorResponseBridgeTest.java')
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & (Join-Path $Jdk 'bin\java.exe') -cp "$Output;$FrameworkClasses;$AndroidJar" AccountAuthenticatorResponseBridgeTest
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & (Join-Path $Jdk 'bin\javac.exe') -encoding UTF-8 -cp "$Output;$FrameworkClasses;$AndroidJar" -d $Output `
+        (Join-Path $root 'core\framework-overlay\android\accounts\AbstractAccountAuthenticator.java') `
+        (Join-Path $PSScriptRoot 'AccountAuthenticatorTransportTest.java')
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & (Join-Path $Jdk 'bin\java.exe') -cp "$Output;$FrameworkClasses;$AndroidJar" AccountAuthenticatorTransportTest
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & (Join-Path $Jdk 'bin\javac.exe') -encoding UTF-8 -cp "$Output;$FrameworkClasses;$AndroidJar" -d $Output `
+        (Join-Path $PSScriptRoot 'AccountAuthenticatorIntentBridgeTest.java')
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & (Join-Path $Jdk 'bin\java.exe') -cp "$Output;$FrameworkClasses;$AndroidJar" AccountAuthenticatorIntentBridgeTest
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & (Join-Path $Jdk 'bin\javac.exe') -encoding UTF-8 -cp "$Output;$FrameworkClasses;$AndroidJar" -d $Output `
+        (Join-Path $root 'core\framework-overlay\megler\SharedMicrogAccounts.java') `
+        (Join-Path $PSScriptRoot 'SharedMicrogAccountsTest.java')
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & (Join-Path $Jdk 'bin\java.exe') -cp "$Output;$FrameworkClasses;$AndroidJar" megler.SharedMicrogAccountsTest
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $identityOutput = Join-Path $Output 'identity'
     New-Item -ItemType Directory -Force $identityOutput | Out-Null
     & (Join-Path $Jdk 'bin\javac.exe') -encoding UTF-8 -cp "$FrameworkClasses;$AndroidJar" -d $identityOutput `

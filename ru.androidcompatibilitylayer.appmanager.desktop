@@ -20,4 +20,4 @@ Intents=OpenURI;Start
 [X-Task MicrogWatchdog]
 Type=periodic
 Exec=/usr/bin/ru.androidcompatibilitylayer.appmanager --microg-watchdog
-Permissions=Internet;UserDirs;DeviceInfo;Camera;Sensors;Audio;Bluetooth;Location
+Permissions=Internet;UserDirs;DeviceInfo;Sensors;Bluetooth;Location

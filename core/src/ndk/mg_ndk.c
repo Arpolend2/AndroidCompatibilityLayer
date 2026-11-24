@@ -43,6 +43,8 @@ bool mg_nwindow_valid(const mg_nwindow *w) { return w && (!w->ops || !w->ops->va
 static int g_nw_width(mg_nwindow *w) { int a, b; if (!w) return -1; if (!mg_nwindow_valid(w)) return NW_GONE; mg_nwindow_buffer_size(w, &a, &b); return a; }
 static int g_nw_height(mg_nwindow *w) { int a, b; if (!w) return -1; if (!mg_nwindow_valid(w)) return NW_GONE; mg_nwindow_buffer_size(w, &a, &b); return b; }
 static int g_nw_format(mg_nwindow *w) { return !w ? -1 : !mg_nwindow_valid(w) ? NW_GONE : w->format; }
+/* No producer here assigns a dataspace to window buffers. */
+static int g_nw_dataspace(mg_nwindow *w) { return mg_nwindow_valid(w) ? 0 /* ADATASPACE_UNKNOWN */ : -22 /* EINVAL */; }
 
 static int g_nw_set_geometry(mg_nwindow *w, int width, int height, int format)
 {
@@ -81,6 +83,14 @@ typedef struct looper_fd {
     void *data;
 } looper_fd;
 
+typedef struct choreo_callback {
+    mg_addr callback;
+    void *data;
+    u64 frame;
+    bool wide;
+    struct choreo_callback *next;
+} choreo_callback;
+
 typedef struct mg_looper {
     volatile i32 refs;
     int wake_fd;
@@ -89,6 +99,7 @@ typedef struct mg_looper {
     int nfds, cap;
     looper_fd pending[32];
     int npending;
+    choreo_callback *frames;
 } mg_looper;
 
 static MG_THREAD_LOCAL mg_looper *t_looper;
@@ -119,6 +130,93 @@ static void g_looper_wake(mg_looper *l)
 {
     u64 one = 1;
     if (l) mg_fd_write(l->wake_fd, &one, 8);
+}
+
+/* The Java choreographer is likewise paced at 60 Hz. This is a timer-based
+ * approximation, not a notification from the display compositor. */
+#define CHOREO_FRAME_NS 16666667ull
+
+static mg_looper *g_choreo_instance(void)
+{
+    mg_looper *l = g_looper_for_thread();
+    if (!l) mg_note_once("AChoreographer_getInstance: no looper on this thread");
+    return l;
+}
+
+static void choreo_post(mg_looper *l, mg_addr callback, void *data, u64 delay_ms, bool wide)
+{
+    choreo_callback *entry, **p;
+    u64 now, due;
+    if (!l || !callback) {
+        mg_warn("AChoreographer: cannot post without a choreographer and callback");
+        return;
+    }
+    entry = (choreo_callback *)mg_alloc(sizeof(*entry));
+    now = mg_time_monotonic_ns();
+    if (delay_ms > (UINT64_MAX - now - CHOREO_FRAME_NS) / 1000000ull)
+        delay_ms = (UINT64_MAX - now - CHOREO_FRAME_NS) / 1000000ull;
+    due = now + delay_ms * 1000000ull;
+    entry->frame = due + CHOREO_FRAME_NS - due % CHOREO_FRAME_NS;
+    entry->callback = callback;
+    entry->data = data;
+    entry->wide = wide;
+    mg_lock_acquire(&l->lock);
+    for (p = &l->frames; *p && (*p)->frame <= entry->frame; p = &(*p)->next) { }
+    entry->next = *p;
+    *p = entry;
+    mg_lock_release(&l->lock);
+    g_looper_wake(l);
+}
+
+static void g_choreo_post(mg_looper *l, mg_addr callback, void *data) { choreo_post(l, callback, data, 0, false); }
+static void g_choreo_post64(mg_looper *l, mg_addr callback, void *data) { choreo_post(l, callback, data, 0, true); }
+static void g_choreo_post_delayed(mg_looper *l, mg_addr callback, void *data, glong delay)
+{
+    choreo_post(l, callback, data, delay > 0 ? (u64)delay : 0, false);
+}
+static void g_choreo_post_delayed64(mg_looper *l, mg_addr callback, void *data, u32 delay)
+{
+    choreo_post(l, callback, data, delay, true);
+}
+
+/* Detach the entire ready batch before calling guest code: a callback can
+ * post another one without running it in this frame. */
+static bool choreo_dispatch(mg_looper *l, u64 now)
+{
+    choreo_callback *ready, *last, *entry;
+    u64 frame;
+    mg_lock_acquire(&l->lock);
+    ready = l->frames;
+    if (!ready || ready->frame > now) {
+        mg_lock_release(&l->lock);
+        return false;
+    }
+    last = ready;
+    while (last->next && last->next->frame <= now) last = last->next;
+    l->frames = last->next;
+    last->next = NULL;
+    mg_lock_release(&l->lock);
+    frame = now - now % CHOREO_FRAME_NS;
+    while (ready) {
+        entry = ready;
+        ready = ready->next;
+        if (entry->wide) MG_GFN(void (*)(i64, void *), entry->callback)((i64)frame, entry->data);
+        else MG_GFN(void (*)(glong, void *), entry->callback)((glong)frame, entry->data);
+        free(entry);
+    }
+    return true;
+}
+
+static int choreo_timeout(mg_looper *l, int timeout_ms)
+{
+    u64 now = mg_time_monotonic_ns(), due = 0, ms;
+    mg_lock_acquire(&l->lock);
+    if (l->frames) due = l->frames->frame;
+    mg_lock_release(&l->lock);
+    if (!due) return timeout_ms;
+    ms = due <= now ? 0 : (due - now + 999999ull) / 1000000ull;
+    if (ms > 2147483647ull) ms = 2147483647ull;
+    return timeout_ms < 0 || ms < (u64)timeout_ms ? (int)ms : timeout_ms;
 }
 
 static int g_looper_remove_fd(mg_looper *l, int fd)
@@ -189,9 +287,12 @@ static int looper_poll_once(mg_looper *l, int timeout_ms, int *out_fd, int *out_
             /* ALOOPER_EVENT_INPUT 1, OUTPUT 2 -> POLLIN 1, POLLOUT 4 */
             pfds[i + 1].events = (i16)(((snapshot[i].events & 1) ? MG_POLLIN : 0) | ((snapshot[i].events & 2) ? MG_POLLOUT : 0));
         }
-        hits = mg_fd_poll(pfds, n + 1, timeout_ms);
+        hits = mg_fd_poll(pfds, n + 1, choreo_timeout(l, timeout_ms));
         if (hits < 0) return POLL_ERROR;
-        if (hits == 0) return POLL_TIMEOUT;
+        if (hits == 0) {
+            if (choreo_dispatch(l, mg_time_monotonic_ns())) return POLL_CALLBACK;
+            return POLL_TIMEOUT;
+        }
         if (pfds[0].revents) {
             u64 drain;
             mg_fd_read(l->wake_fd, &drain, 8);
@@ -905,8 +1006,12 @@ const mg_sym mg_tab_ndk[] = {
     N("ASurfaceTransactionStats_getPreviousReleaseFenceFd", g_stats_release_fence),
     N("ANativeWindow_acquire", mg_nwindow_acquire), N("ANativeWindow_release", mg_nwindow_release),
     N("ANativeWindow_getWidth", g_nw_width), N("ANativeWindow_getHeight", g_nw_height), N("ANativeWindow_getFormat", g_nw_format),
+    N("ANativeWindow_getBuffersDataSpace", g_nw_dataspace),
     N("ANativeWindow_setBuffersGeometry", g_nw_set_geometry), N("ANativeWindow_lock", g_nw_lock),
     N("ANativeWindow_unlockAndPost", g_nw_unlock), N("ANativeWindow_setBuffersTransform", g_nw_ok), N("ANativeWindow_setFrameRate", g_nw_ok),
+    N("AChoreographer_getInstance", g_choreo_instance), N("AChoreographer_postFrameCallback", g_choreo_post),
+    N("AChoreographer_postFrameCallback64", g_choreo_post64), N("AChoreographer_postFrameCallbackDelayed", g_choreo_post_delayed),
+    N("AChoreographer_postFrameCallbackDelayed64", g_choreo_post_delayed64),
     N("ALooper_forThread", g_looper_for_thread), N("ALooper_prepare", g_looper_prepare), N("ALooper_acquire", g_looper_acquire),
     N("ALooper_release", g_looper_release), N("ALooper_pollOnce", g_looper_poll_once), N("ALooper_pollAll", g_looper_poll_all),
     N("ALooper_wake", g_looper_wake), N("ALooper_addFd", g_looper_add_fd), N("ALooper_removeFd", g_looper_remove_fd),

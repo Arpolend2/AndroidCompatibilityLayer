@@ -44,6 +44,7 @@
 #include "error_log.h"
 #include "external_apk_receiver.h"
 #include "manager_lifecycle.h"
+#include "microg_watchdog_schedule.h"
 #include "single_instance_lock.h"
 #include "library_app_index.h"
 #include "sensor_host.h"
@@ -686,7 +687,7 @@ struct StoreWorkerTeardownMarker {
 };
 }
 
-int runApplication(int argc, char *argv[], void (*initReportWebView)())
+int runApplication(int argc, char *argv[], bool reportWebViewAvailable)
 {
     const QByteArray mode = argc > 1 ? QByteArray(argv[1]) : QByteArray();
     if (mode == "--unpack-bundle" || mode == "--unpack-store-bundle" || mode == "--unpack-store-xapk") {
@@ -1155,6 +1156,8 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
 
     qmlRegisterType<SideMouseButtons>("AndroidCompatibilityLayer.Navigation", 1, 0, "SideMouseButtons");
     qmlRegisterType<PreviewSurface>("AndroidCompatibilityLayer.Preview", 1, 0, "PreviewSurface");
+    qmlRegisterType<SharedMicrogAuthSurface>("AndroidCompatibilityLayer.MicroG", 1, 0,
+                                             "SharedMicrogAuthSurface");
     app->setQuitOnLastWindowClosed(false);
     QPointer<ManagerLifecycle> activeLifecycle;
     QScopedPointer<Probe> probe;
@@ -1169,7 +1172,7 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
         if (probe) return;
         probe.reset(new Probe(Aurora::Application::organizationPathTo(SharedRuntime::location()).toLocalFile(),
                               nullptr, &diagnosticLog));
-        probe->setReportWebViewInitializer(initReportWebView);
+        probe->setReportWebViewAvailable(reportWebViewAvailable);
         QObject::connect(probe.data(), &Probe::runtimeSettingsChanged, probe.data(), [&]() {
             if (activeLifecycle) {
                 activeLifecycle->refreshSharedMicrogProvider();
@@ -1200,11 +1203,16 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
         view.reset(Aurora::Application::createView());
         PreviewKeyboard *keyboard = new PreviewKeyboard(view->contentItem());
         embeddedPreview->setRemoteKeyboard(keyboard);
+        if (activeLifecycle) {
+            PreviewKeyboard *authKeyboard = new PreviewKeyboard(view->contentItem());
+            activeLifecycle->setAuthenticationKeyboard(authKeyboard);
+        }
         QObject::connect(embeddedPreview.data(), &EmbeddedPreview::channelError,
                          [](const QString &error) { qWarning().noquote() << "Embedded preview:" << error; });
         probe->setConfirmationWindow(view.data());
         view->rootContext()->setContextProperty(QStringLiteral("probe"), probe.data());
         view->rootContext()->setContextProperty(QStringLiteral("microgPreview"), embeddedPreview.data());
+        view->rootContext()->setContextProperty(QStringLiteral("sharedMicrogAuth"), activeLifecycle.data());
         view->setSource(Aurora::Application::pathTo(QStringLiteral("qml/AndroidCompatibilityLayer.qml")));
         if (view->status() == QQuickView::Error) {
             qWarning("Cannot load the manager window.");
@@ -1230,8 +1238,24 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
     QString configuredIdentityDirectory;
     bool sharedMicrogConfigured = false;
     RuntimeManager::Task microgWatchdog(QStringLiteral("MicrogWatchdog"));
-    bool watchdogSettingKnown = false;
-    bool watchdogEnabled = false;
+    MicrogWatchdogSchedule watchdogSchedule(
+        [&microgWatchdog](bool enabled, const MicrogWatchdogSchedule::Completion &complete) {
+            if (enabled) {
+                microgWatchdog.withInterval(900).withMaximumRunningTime(60).withAutostart(true);
+                microgWatchdog.start([complete](const RuntimeManager::Error &error) {
+                    if (error.isError())
+                        qWarning("Cannot schedule the microG watchdog: %s", qPrintable(error.message()));
+                    complete(!error.isError());
+                });
+            } else {
+                microgWatchdog.stop(RuntimeManager::Task::StopFlag::Disable,
+                                    [complete](const RuntimeManager::Error &error) {
+                    if (error.isError())
+                        qWarning("Cannot disable the microG watchdog: %s", qPrintable(error.message()));
+                    complete(!error.isError());
+                });
+            }
+        });
     configureSharedMicrog = [&]() {
         QSettings settings;
         const QString provider = settings.value(QStringLiteral("googleServices/provider"),
@@ -1241,24 +1265,8 @@ int runApplication(int argc, char *argv[], void (*initReportWebView)())
             return;
         }
         const bool useMicrog = provider == QLatin1String("microg");
-        if ((!backgroundManager || (view && view->isVisible())) &&
-            (!watchdogSettingKnown || watchdogEnabled != useMicrog)) {
-            watchdogSettingKnown = true;
-            watchdogEnabled = useMicrog;
-            if (useMicrog) {
-                microgWatchdog.withInterval(900).withMaximumRunningTime(60).withAutostart(true);
-                microgWatchdog.start([](const RuntimeManager::Error &error) {
-                    if (error.isError())
-                        qWarning("Cannot schedule the microG watchdog: %s", qPrintable(error.message()));
-                });
-            } else {
-                microgWatchdog.stop(RuntimeManager::Task::StopFlag::Disable,
-                                    [](const RuntimeManager::Error &error) {
-                    if (error.isError())
-                        qWarning("Cannot disable the microG watchdog: %s", qPrintable(error.message()));
-                });
-            }
-        }
+        if (!backgroundManager || (view && view->isVisible()))
+            watchdogSchedule.setEnabled(useMicrog);
         if (!useMicrog) {
             if (sharedMicrogConfigured) {
                 lifecycle.disableSharedMicrogWorker();

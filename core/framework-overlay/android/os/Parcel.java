@@ -334,10 +334,38 @@ public final class Parcel {
                 Object item = bundle.get(key);
                 if (item != null && !(item instanceof String) && !(item instanceof Integer) &&
                         !(item instanceof Long) && !(item instanceof Boolean) &&
-                        !(item instanceof byte[]) && !(item instanceof IBinder) && !(item instanceof Bundle))
+                        !(item instanceof byte[]) && !(item instanceof IBinder) && !(item instanceof Bundle) &&
+                        !(item instanceof android.content.Intent) &&
+                        item.getClass() != android.accounts.Account.class &&
+                        item.getClass() != android.accounts.AccountAuthenticatorResponse.class)
                     throw new IllegalArgumentException("Unsupported Binder Bundle value");
                 writeWireValue(out, item, exporter, depth + 1, count);
             }
+        } else if (value instanceof android.content.Intent) {
+            android.content.Intent intent = (android.content.Intent) value;
+            if (intent.getSelector() != null || intent.getClipData() != null || intent.getSourceBounds() != null)
+                throw new IllegalArgumentException("Unsupported Binder Intent fields");
+            out.writeByte(10);
+            android.content.ComponentName component = intent.getComponent();
+            writeWireValue(out, intent.getAction(), exporter, depth + 1, count);
+            writeWireValue(out, intent.getDataString(), exporter, depth + 1, count);
+            writeWireValue(out, intent.getType(), exporter, depth + 1, count);
+            writeWireValue(out, intent.getPackage(), exporter, depth + 1, count);
+            writeWireValue(out, component == null ? null : component.getPackageName(), exporter, depth + 1, count);
+            writeWireValue(out, component == null ? null : component.getClassName(), exporter, depth + 1, count);
+            writeWireValue(out, intent.getIdentifier(), exporter, depth + 1, count);
+            out.writeInt(intent.getFlags());
+            java.util.Set<String> categories = intent.getCategories();
+            int size = categories == null ? 0 : categories.size();
+            if (size > BINDER_WIRE_MAX_OBJECTS - count[0])
+                throw new IllegalArgumentException("Binder Intent category limit exceeded");
+            out.writeInt(size);
+            for (String category : categories == null ? java.util.Collections.<String>emptySet() : categories) {
+                if (category == null) throw new IllegalArgumentException("Invalid Binder Intent category");
+                ++count[0];
+                writeWireString(out, category);
+            }
+            writeWireValue(out, intent.getExtras(), exporter, depth + 1, count);
         } else if (value instanceof Parcelable[]) {
             Parcelable[] values = (Parcelable[]) value;
             if (values.length > BINDER_WIRE_MAX_OBJECTS - count[0])
@@ -408,8 +436,10 @@ public final class Parcel {
             }
             return bundle;
         case 8:
-            if (inBundle) throw new IllegalArgumentException("Parcelable inside Binder Bundle is unsupported");
             String name = readWireString(in);
+            if (inBundle && !name.equals("android.accounts.Account") &&
+                    !name.equals("android.accounts.AccountAuthenticatorResponse"))
+                throw new IllegalArgumentException("Parcelable inside Binder Bundle is unsupported");
             int nestedSize = in.readInt();
             if (name.isEmpty() || nestedSize < 12 || nestedSize > in.available())
                 throw new IllegalArgumentException("Invalid Binder Parcelable");
@@ -432,8 +462,52 @@ public final class Parcel {
                 if (!validateOnly) array[i] = item;
             }
             return validateOnly ? null : new WireParcelableArray(array);
+        case 10:
+            String action = readWireNullableString(in, importer, validateOnly, depth, count);
+            String dataString = readWireNullableString(in, importer, validateOnly, depth, count);
+            String type = readWireNullableString(in, importer, validateOnly, depth, count);
+            String pkg = readWireNullableString(in, importer, validateOnly, depth, count);
+            String componentPackage = readWireNullableString(in, importer, validateOnly, depth, count);
+            String componentClass = readWireNullableString(in, importer, validateOnly, depth, count);
+            String identifier = readWireNullableString(in, importer, validateOnly, depth, count);
+            if ((componentPackage == null) != (componentClass == null))
+                throw new IllegalArgumentException("Invalid Binder Intent component");
+            int flags = in.readInt();
+            int categories = in.readInt();
+            if (categories < 0 || categories > BINDER_WIRE_MAX_OBJECTS - count[0])
+                throw new IllegalArgumentException("Invalid Binder Intent categories");
+            java.util.HashSet<String> seen = new java.util.HashSet<>();
+            for (int i = 0; i < categories; i++) {
+                ++count[0];
+                if (!seen.add(readWireString(in))) throw new IllegalArgumentException("Duplicate Binder Intent category");
+            }
+            in.mark(1);
+            int extrasTag = in.readUnsignedByte();
+            in.reset();
+            if (extrasTag != 0 && extrasTag != 7) throw new IllegalArgumentException("Invalid Binder Intent extras");
+            Object extras = readWireValue(in, importer, validateOnly, depth + 1, count, false);
+            if (validateOnly) return null;
+            android.content.Intent intent = new android.content.Intent(action);
+            intent.setDataAndType(dataString == null ? null : android.net.Uri.parse(dataString), type);
+            intent.setPackage(pkg);
+            if (componentPackage != null)
+                intent.setComponent(new android.content.ComponentName(componentPackage, componentClass));
+            intent.setIdentifier(identifier);
+            intent.setFlags(flags);
+            for (String category : seen) intent.addCategory(category);
+            if (extras != null) intent.replaceExtras((Bundle) extras);
+            return intent;
         default: throw new IllegalArgumentException("Unsupported Binder object type");
         }
+    }
+
+    private static String readWireNullableString(java.io.DataInputStream in, MeglerBinderImporter importer,
+            boolean validateOnly, int depth, int[] count) throws java.io.IOException {
+        in.mark(1);
+        int tag = in.readUnsignedByte();
+        in.reset();
+        if (tag != 0 && tag != 2) throw new IllegalArgumentException("Invalid Binder Intent string");
+        return (String) readWireValue(in, importer, validateOnly, depth + 1, count, false);
     }
 
     private static void putWireBundleValue(Bundle bundle, String key, Object value) {
@@ -444,6 +518,16 @@ public final class Parcel {
         else if (value instanceof byte[]) bundle.putByteArray(key, (byte[]) value);
         else if (value instanceof IBinder) bundle.putBinder(key, (IBinder) value);
         else if (value instanceof Bundle) bundle.putBundle(key, (Bundle) value);
+        else if (value instanceof android.content.Intent) bundle.putParcelable(key, (android.content.Intent) value);
+        else if (value instanceof WireParcelable) {
+            WireParcelable item = (WireParcelable) value;
+            if (item.name.equals("android.accounts.Account"))
+                bundle.putParcelable(key, (android.accounts.Account) adapt(item, android.accounts.Account.CREATOR));
+            else if (item.name.equals("android.accounts.AccountAuthenticatorResponse"))
+                bundle.putParcelable(key, (android.accounts.AccountAuthenticatorResponse)
+                    adapt(item, android.accounts.AccountAuthenticatorResponse.CREATOR));
+            else throw new IllegalArgumentException("Unsupported Binder Bundle Parcelable");
+        }
         else throw new IllegalArgumentException("Unsupported Binder Bundle value");
     }
 
@@ -545,6 +629,13 @@ public final class Parcel {
         case 9:
             int count = in.readInt();
             for (int i = 0; i < count; i++) replaceWireValueHandles(in, wire, handles);
+            return;
+        case 10:
+            for (int i = 0; i < 7; i++) replaceWireValueHandles(in, wire, handles);
+            skipWire(in, 4);
+            int categories = in.readInt();
+            for (int i = 0; i < categories; i++) skipWire(in, in.readInt());
+            replaceWireValueHandles(in, wire, handles);
             return;
         default: throw new java.io.IOException("Invalid encoded Binder object");
         }

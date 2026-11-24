@@ -1818,6 +1818,7 @@ static MG_HOSTCB void reference_main(void *arg)
     (void)arg;
     mg_dvm_self();
     mg_dvm_thread_attach("HeapTaskDaemon", NULL, true);
+    mg_info("gc: reference thread tid=%u", (unsigned)mg_thread_self_id());
     for (;;) {
         mg_jobj *list, *o = NULL;
         mg_lock_acquire(&g_final_lock);

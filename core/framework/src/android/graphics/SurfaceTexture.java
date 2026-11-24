@@ -3,7 +3,7 @@ package android.graphics;
 /**
  * A stream of frames from a producer (a Surface made on it: MediaCodec's video, lockCanvas drawing, an EGL window surface) to a
  * consumer. Megler keeps the frames in software: a back buffer the producer draws, and the front one the consumer (a TextureView)
- * shows. GL consumers (updateTexImage into an external texture) get no pixels yet.
+ * shows. GL consumers latch the latest software frame into an external texture.
  */
 public class SurfaceTexture {
     public interface OnFrameAvailableListener { void onFrameAvailable(SurfaceTexture t); }
@@ -15,13 +15,15 @@ public class SurfaceTexture {
     private Bitmap mFront, mBack;
     private Canvas mFrontCanvas, mBackCanvas;
     private boolean mLocked, mReleased;
-    private long mTimestamp;
+    private volatile long mTimestamp, mPostedAt;
+    private long mLatchedTimestamp, mConsumer, mConsumerDisplay, mConsumerContext;
+    private boolean mAttached, mHasLatched;
     private OnFrameAvailableListener mListener;
     private android.os.Handler mHandler;
     /** The TextureView showing this texture, told when a frame arrives. */
     public android.view.View meglerView;
     public SurfaceTexture(int texName) { this(texName, false); }
-    public SurfaceTexture(int texName, boolean singleBufferMode) { mTex = texName; }
+    public SurfaceTexture(int texName, boolean singleBufferMode) { mTex = texName; mAttached = true; }
     public SurfaceTexture(boolean singleBufferMode) { mTex = 0; }
     public void setOnFrameAvailableListener(OnFrameAvailableListener l) { setOnFrameAvailableListener(l, null); }
     public void setOnFrameAvailableListener(OnFrameAvailableListener l, android.os.Handler h) {
@@ -50,7 +52,8 @@ public class SurfaceTexture {
             return mBackCanvas;
         }
     }
-    public void meglerPost(Canvas c) {
+    public void meglerPost(Canvas c) { meglerPost(c, System.nanoTime()); }
+    public void meglerPost(Canvas c, long timestamp) {
         synchronized (mLock) {
             if (!mLocked) return;
             if (mReleased) {
@@ -70,7 +73,7 @@ public class SurfaceTexture {
                 mBackCanvas = null;
                 mBack = null;
             }
-            mLocked = false; mTimestamp = System.nanoTime();
+            mLocked = false; mTimestamp = timestamp; mPostedAt = System.nanoTime();
             mLock.notifyAll();
         }
         android.view.View v = meglerView;
@@ -81,7 +84,8 @@ public class SurfaceTexture {
     public boolean meglerValid() { return !mReleased; }
     private Bitmap mStage;
     /** A native producer's frame (core/src/drivers/mg_java_ndk.c's TextureView windows, ANativeWindow_lock): w x h RGBA at addr, bottom row first when flip. */
-    public void meglerPostRgba(long addr, int w, int h, boolean flip) {
+    public void meglerPostRgba(long addr, int w, int h, boolean flip) { meglerPostRgba(addr, w, h, flip, System.nanoTime()); }
+    public void meglerPostRgba(long addr, int w, int h, boolean flip, long timestamp) {
         if (mStage == null || mStage.getWidth() != w || mStage.getHeight() != h) mStage = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
         // A TextureView is opaque unless set otherwise, and Android then shows the producer's colours whatever their alpha: a
         // decoder's RGBA with alpha 0 would be a transparent picture here.
@@ -95,22 +99,52 @@ public class SurfaceTexture {
             c.drawColor(0, PorterDuff.Mode.CLEAR);
             c.drawBitmap(mStage, null, new Rect(0, 0, c.getWidth(), c.getHeight()), null);
             c.restore();
-        } finally { meglerPost(c); }
+        } finally { meglerPost(c, timestamp); }
     }
     /** The latest frame (null before the first). */
     public Bitmap meglerFront() { synchronized (mLock) { return mFront; } }
-    public void updateTexImage() { if (mReleased) throw new IllegalStateException("updateTexImage on a released SurfaceTexture"); }
+    private native int meglerUpdateTexImage();
+    private native int meglerAttachToGLContext(int tex);
+    private native int meglerDetachFromGLContext();
+    private native void meglerFreeConsumer();
+    public void updateTexImage() {
+        synchronized (mLock) {
+            if (mReleased || !mAttached || meglerUpdateTexImage() != 0)
+                throw new IllegalStateException("cannot update SurfaceTexture on this GL context");
+        }
+    }
     public void releaseTexImage() {}
-    public void detachFromGLContext() { mTex = 0; }
-    public void attachToGLContext(int tex) { mTex = tex; }
-    public void getTransformMatrix(float[] m) { android.opengl.Matrix.setIdentityM(m, 0); }
-    public long getTimestamp() { return mTimestamp; }
+    public void detachFromGLContext() {
+        synchronized (mLock) {
+            if (mReleased || !mAttached || meglerDetachFromGLContext() != 0)
+                throw new IllegalStateException("cannot detach SurfaceTexture from this GL context");
+            mAttached = false;
+            mTex = 0;
+        }
+    }
+    public void attachToGLContext(int tex) {
+        synchronized (mLock) {
+            if (mReleased || mAttached || meglerAttachToGLContext(tex) != 0)
+                throw new IllegalStateException("cannot attach SurfaceTexture to this GL context");
+            mTex = tex;
+            mAttached = true;
+        }
+    }
+    public void getTransformMatrix(float[] m) {
+        if (m == null || m.length != 16) throw new IllegalArgumentException("matrix must contain 16 elements");
+        synchronized (mLock) {
+            android.opengl.Matrix.setIdentityM(m, 0);
+            if (mHasLatched) { m[5] = -1; m[13] = 1; }
+        }
+    }
+    public long getTimestamp() { synchronized (mLock) { return mLatchedTimestamp; } }
     public int getDataSpace() { return 0; }
     public boolean isSingleBuffered() { return false; }
     public void release() {
         synchronized (mLock) {
             if (mReleased) return;
             mReleased = true;
+            meglerFreeConsumer();
             // A producer may still be drawing into the locked canvas. Retire
             // it when posted, rather than freeing its native state underneath it.
             if (!mLocked) releaseCanvases();
@@ -127,4 +161,5 @@ public class SurfaceTexture {
         mFrontCanvas = mBackCanvas = null;
     }
     public boolean isReleased() { return mReleased; }
+    @Override protected void finalize() throws Throwable { try { release(); } finally { super.finalize(); } }
 }

@@ -74,5 +74,36 @@ public final class NotificationBridgeTest {
         progress.setProgress(0, 0, false);
         manager.notify(9, progress.build());
         check(Native.calls == 7 && Native.max == 0 && !Native.indeterminate, "progress cleared");
+
+        Manifest.targetSdk = 28;
+        manager.channel = new NotificationChannel("downloads", "Downloads", NotificationManager.IMPORTANCE_MIN);
+        manager.channel.setSound(null, null);
+        Notification.Builder download = new Notification.Builder(null, "downloads")
+                .setContentTitle("Downloading").setOngoing(true);
+        manager.notify(10, download.build());
+        check(Native.calls == 8 && Native.importance == NotificationManager.IMPORTANCE_MIN &&
+              Native.silent && (Native.flags & Notification.FLAG_ONGOING_EVENT) != 0,
+              "quiet ongoing channel without progress");
+        manager.channel = new NotificationChannel("alerts", "Alerts", NotificationManager.IMPORTANCE_HIGH);
+        manager.notify(10, download.setOngoing(false).build());
+        check(Native.calls == 9 && Native.importance == NotificationManager.IMPORTANCE_HIGH &&
+              !Native.silent && (Native.flags & Notification.FLAG_ONGOING_EVENT) == 0,
+              "channel importance and sound override");
+        manager.channel = null;
+        Manifest.targetSdk = 25;
+        Notification legacy = new Notification.Builder(null)
+                .setPriority(Notification.PRIORITY_HIGH).setDefaults(Notification.DEFAULT_SOUND).build();
+        manager.notify(11, legacy);
+        check(Native.calls == 10 && Native.importance == NotificationManager.IMPORTANCE_HIGH &&
+              !Native.silent, "legacy high priority and default sound");
+        legacy = new Notification.Builder(null).setPriority(Notification.PRIORITY_MIN).build();
+        manager.notify(11, legacy);
+        check(Native.calls == 11 && Native.importance == NotificationManager.IMPORTANCE_MIN &&
+              Native.silent, "legacy silent minimum priority");
+        Native.classifiedUnavailable = true;
+        manager.notify(12, legacy);
+        manager.notify(12, legacy);
+        check(Native.calls == 13 && Native.legacyCalls == 2 && Native.warnings == 1,
+              "older runtime falls back with one warning");
     }
 }

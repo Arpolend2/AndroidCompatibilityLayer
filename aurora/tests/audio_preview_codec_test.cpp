@@ -14,11 +14,20 @@
 #include "../../core/src/apk/mg_apk.h"
 
 #include <QGuiApplication>
+#include <QDBusUnixFileDescriptor>
+#include <QDir>
+#include <QFile>
 #include <QMouseEvent>
+#include <QThread>
 #include <QTemporaryDir>
 
 #include <cstdio>
+#include <cstring>
+#include <thread>
 #include <vector>
+#ifdef Q_OS_UNIX
+#include <unistd.h>
+#endif
 
 static bool codecConfigured;
 static std::vector<int> keys;
@@ -33,6 +42,14 @@ static int surfaceCalls;
 static int surfaceRotation;
 static int surfaceWidth;
 static int surfaceHeight;
+static bool cameraDirectoryAlias;
+static QByteArray cameraAliasPackage;
+static bool cameraStorageRequested;
+static bool cameraMetadataValid = true;
+static int cameraTargetSdk = 28;
+static int cameraMinSdk;
+static int cameraWriteMaxSdk;
+static int runCalls;
 
 class TestSurface : public PreviewSurface
 {
@@ -46,13 +63,45 @@ extern "C" bool megler_init(const megler_config *config)
     if (config->log) config->log(0, "core integration test", config->log_user);
     return true;
 }
-extern "C" bool mg_apk_read_info(const char *, mg_apk_info *) { return false; }
+extern "C" bool mg_apk_read_info(const char *, mg_apk_info *info)
+{
+    if (!cameraMetadataValid) return false;
+    std::memset(info, 0, sizeof(*info));
+    std::strcpy(info->package, "org.example.app");
+    info->target_sdk = cameraTargetSdk;
+    info->min_sdk = cameraMinSdk;
+    if (cameraStorageRequested) {
+        info->npermissions = 2;
+        std::strcpy(info->permissions[0], "android.permission.CAMERA");
+        std::strcpy(info->permissions[1], "android.permission.WRITE_EXTERNAL_STORAGE");
+        info->permission_max_sdk[1] = cameraWriteMaxSdk;
+    }
+    return true;
+}
+extern "C" void mg_apk_info_free(mg_apk_info *) {}
+extern "C" bool megler_set_camera_storage_alias(const char *package, bool enabled)
+{
+    cameraDirectoryAlias = enabled;
+    cameraAliasPackage = enabled && package ? QByteArray(package) : QByteArray();
+    return true;
+}
 extern "C" bool mg_apk_gms_name(const char *) { return false; }
 extern "C" bool mg_apk_is_microg(const char *) { return false; }
+extern "C" bool mg_java_set_shared_microg_client(int, int, int, const char *) { return false; }
+extern "C" void mg_java_close_shared_microg_client() {}
+extern "C" bool megler_apk_describe_activities(const char *, const char *, const char *) { return false; }
+extern "C" bool megler_background_work_active() { return false; }
+extern "C" void megler_set_paused(bool) {}
+int takeSharedMicrogStream(QDBusUnixFileDescriptor *, QString *error)
+{
+    if (error) *error = QStringLiteral("Shared microG is not available in this test");
+    return -1;
+}
 extern "C" void megler_set_locale(const char *locale) { localeSet = locale; }
 extern "C" void megler_set_theme(uint32_t accent, bool dark) { themeAccent = accent; themeDark = dark; }
 extern "C" bool megler_run(const megler_run_config *config)
 {
+    ++runCalls;
     runConfig = *config;
     const megler_codec_host &codec = config->codec;
     codecConfigured = codec.supports && codec.open && codec.push && codec.pull_sound &&
@@ -90,6 +139,7 @@ QString InstallRequestHost::appsDir() const { return {}; }
 megler_keyboard_host PreviewKeyboard::host() { return {}; }
 void PreviewKeyboard::start() {}
 void PreviewKeyboard::stop() {}
+void PreviewKeyboard::hideKeyboard() {}
 bool PreviewKeyboard::back() { return false; }
 void PreviewKeyboard::setSurface(QQuickItem *, const QSize &) {}
 
@@ -100,6 +150,13 @@ int main(int argc, char **argv)
     QCoreApplication::setApplicationName(QStringLiteral("PreviewRuntime"));
     QTemporaryDir directory;
     if (!directory.isValid()) return 1;
+    qputenv("HOME", directory.path().toUtf8());
+    qputenv("XDG_CONFIG_HOME", (directory.path() + QStringLiteral("/config")).toUtf8());
+    if (!QDir().mkpath(directory.path() + QStringLiteral("/config"))) return 1;
+    QFile userDirs(directory.path() + QStringLiteral("/config/user-dirs.dirs"));
+    if (!userDirs.open(QIODevice::WriteOnly)) return 1;
+    userDirs.write("XDG_PICTURES_DIR=\"" + directory.path().toUtf8() + "/Pictures\"\n");
+    userDirs.close();
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, directory.path());
     if (!RuntimeSettings::save(QStringLiteral("runtime/renderCap"), 960) ||
@@ -143,6 +200,15 @@ int main(int argc, char **argv)
         app.processEvents();
         if (finished != 0 || !preview.status().contains(QStringLiteral("ended"))) return 1;
     }
+    {
+        PreviewPlayer worker(QStringLiteral("."), QStringLiteral("."));
+        worker.setCpuPresentationOnly(true);
+        worker.start();
+        if (runConfig.display.orientation || runConfig.display.user) {
+            std::fprintf(stderr, "CPU-only embedded worker must not register a window orientation callback\n");
+            return 1;
+        }
+    }
     PreviewPlayer player(QStringLiteral("."), QStringLiteral("."));
     const Qt::ScreenOrientation directions[] = { Qt::PortraitOrientation, Qt::LandscapeOrientation,
         Qt::InvertedPortraitOrientation, Qt::InvertedLandscapeOrientation };
@@ -170,6 +236,51 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "Runtime settings were not passed to Megler\n");
         return 1;
     }
+    if (!runConfig.display.orientation || runConfig.display.user != &player) {
+        std::fprintf(stderr, "Android orientation callback was not installed\n");
+        return 1;
+    }
+    bool orientationOnGuiThread = false;
+    QObject::connect(&player, &PreviewPlayer::orientationMaskChanged, [&]() {
+        orientationOnGuiThread = QThread::currentThread() == app.thread();
+    });
+    std::thread orientationThread([&]() {
+        runConfig.display.orientation(runConfig.display.user, MEGLER_ORIENTATION_LANDSCAPE);
+    });
+    orientationThread.join();
+    if (player.orientationMask() != -1) return 1;
+    app.processEvents();
+    if (player.orientationMask() != int(Qt::LandscapeOrientation) || !orientationOnGuiThread) return 1;
+    const int allOrientations = int(Qt::PortraitOrientation | Qt::LandscapeOrientation |
+                                    Qt::InvertedPortraitOrientation | Qt::InvertedLandscapeOrientation);
+    const int portraitOrientations = int(Qt::PortraitOrientation | Qt::InvertedPortraitOrientation);
+    const int landscapeOrientations = int(Qt::LandscapeOrientation | Qt::InvertedLandscapeOrientation);
+    const auto requestOrientation = [&](int requested, int expected) {
+        runConfig.display.orientation(runConfig.display.user, requested);
+        app.processEvents();
+        return player.orientationMask() == expected;
+    };
+    const struct { int requested; int expected; } orientationCases[] = {
+        { MEGLER_ORIENTATION_PORTRAIT, int(Qt::PortraitOrientation) },
+        { MEGLER_ORIENTATION_REVERSE_PORTRAIT, int(Qt::InvertedPortraitOrientation) },
+        { MEGLER_ORIENTATION_REVERSE_LANDSCAPE, int(Qt::InvertedLandscapeOrientation) },
+        { MEGLER_ORIENTATION_SENSOR, allOrientations },
+        { MEGLER_ORIENTATION_FULL_SENSOR, allOrientations },
+        { MEGLER_ORIENTATION_SENSOR_LANDSCAPE, landscapeOrientations },
+        { MEGLER_ORIENTATION_USER_LANDSCAPE, landscapeOrientations },
+        { MEGLER_ORIENTATION_SENSOR_PORTRAIT, portraitOrientations },
+        { MEGLER_ORIENTATION_USER_PORTRAIT, portraitOrientations },
+        { MEGLER_ORIENTATION_USER, -1 },
+        { MEGLER_ORIENTATION_FULL_USER, -1 },
+        { MEGLER_ORIENTATION_UNSPECIFIED, -1 }
+    };
+    for (const auto &orientation : orientationCases)
+        if (!requestOrientation(orientation.requested, orientation.expected)) return 1;
+    player.setScreenOrientations(int(Qt::LandscapeOrientation), int(Qt::InvertedPortraitOrientation));
+    if (!requestOrientation(MEGLER_ORIENTATION_NOSENSOR, int(Qt::LandscapeOrientation)) ||
+        !requestOrientation(MEGLER_ORIENTATION_LOCKED, int(Qt::InvertedPortraitOrientation)) ||
+        !requestOrientation(MEGLER_ORIENTATION_BEHIND, int(Qt::InvertedPortraitOrientation)) ||
+        !requestOrientation(99, int(Qt::InvertedPortraitOrientation))) return 1;
     const int previousSurfaceCalls = surfaceCalls;
     player.setDisplayRotation(3);
     if (surfaceCalls != previousSurfaceCalls + 1 || surfaceWidth != 443 ||
@@ -285,6 +396,102 @@ int main(int argc, char **argv)
     runConfig.on_exit(runConfig.user, 0, "");
     app.processEvents();
     if (!finished) return 1;
+    cameraStorageRequested = true;
+    {
+        PreviewPlayer camera(QStringLiteral("."), directory.path());
+        camera.start();
+        if (!cameraDirectoryAlias || cameraAliasPackage != "org.example.app" ||
+            runConfig.storage.link_count != 1 ||
+            std::strcmp(runConfig.storage.links[0].name, "Pictures") ||
+            !runConfig.storage.links[0].writable) return 1;
+    }
+    {
+        PreviewPlayer denied(QStringLiteral("."), directory.path());
+        denied.setDeniedPermissions(QStringList() << QStringLiteral("storage"));
+        denied.start();
+        int error = -1;
+        if (!cameraDirectoryAlias || runConfig.storage.link_count != 1 ||
+            runConfig.storage.links[0].writable ||
+            runConfig.storage.open(runConfig.storage.user, 0, "new.jpg",
+                                   MEGLER_STORAGE_WRITE | MEGLER_STORAGE_CREATE,
+                                   MEGLER_STORAGE_FILE, &error) ||
+            error != MEGLER_STORAGE_DENIED) return 1;
+    }
+    {
+        PreviewPlayer denied(QStringLiteral("."), directory.path());
+        denied.setDeniedPermissions(QStringList() << QStringLiteral("camera"));
+        denied.start();
+        if (cameraDirectoryAlias || runConfig.storage.link_count) return 1;
+    }
+    cameraWriteMaxSdk = 28;
+    {
+        PreviewPlayer expired(QStringLiteral("."), directory.path());
+        expired.start();
+        if (!cameraDirectoryAlias || runConfig.storage.link_count != 1 ||
+            runConfig.storage.links[0].writable) return 1;
+    }
+    cameraTargetSdk = 0;
+    cameraMinSdk = 34;
+    QSettings().setValue(QStringLiteral("storage/sharedFolders"), QStringList() << QStringLiteral("Pictures"));
+    QFile foreign(directory.path() + QStringLiteral("/Pictures/foreign.txt"));
+    if (!foreign.open(QIODevice::WriteOnly) || foreign.write("foreign fixture") != 15) return 1;
+    foreign.close();
+    {
+        PreviewPlayer modern(QStringLiteral("."), directory.path());
+        modern.setDeniedPermissions(QStringList() << QStringLiteral("storage")
+                                                 << QStringLiteral("read_media_visual"));
+        modern.start();
+        int error = -1;
+        if (!cameraDirectoryAlias || runConfig.storage.link_count != 1 ||
+            !runConfig.storage.links[0].writable ||
+            runConfig.storage.open(runConfig.storage.user, 0, "foreign.txt",
+                                   MEGLER_STORAGE_READ, MEGLER_STORAGE_FILE, &error)) return 1;
+        void *own = runConfig.storage.open(runConfig.storage.user, 0, "own.jpg",
+                                          MEGLER_STORAGE_WRITE | MEGLER_STORAGE_CREATE,
+                                          MEGLER_STORAGE_FILE, &error);
+        if (!own || !QFile::exists(directory.path() +
+                QStringLiteral("/Pictures/AndroidCompatibilityLayer/org.example.app/own.jpg"))) return 1;
+#ifdef Q_OS_UNIX
+        ::close(static_cast<int>(reinterpret_cast<intptr_t>(own) - 1));
+#endif
+    }
+    cameraTargetSdk = 28;
+    cameraWriteMaxSdk = 0;
+    {
+        PreviewPlayer selected(QStringLiteral("."), directory.path());
+        selected.start();
+        int error = -1;
+        void *existing = runConfig.storage.open(runConfig.storage.user, 0, "foreign.txt",
+                                                MEGLER_STORAGE_READ, MEGLER_STORAGE_FILE, &error);
+        if (!cameraDirectoryAlias || !existing) return 1;
+#ifdef Q_OS_UNIX
+        ::close(static_cast<int>(reinterpret_cast<intptr_t>(existing) - 1));
+#endif
+    }
+    QSettings().setValue(QStringLiteral("storage/sharedFolders"), QStringList());
+    cameraStorageRequested = false;
+    {
+        PreviewPlayer ordinary(QStringLiteral("."), directory.path());
+        ordinary.start();
+        if (cameraDirectoryAlias || runConfig.storage.link_count) return 1;
+    }
+    cameraMetadataValid = false;
+    {
+        const int before = runCalls;
+        PreviewPlayer unknown(QStringLiteral("."), directory.path());
+        unknown.start();
+        if (runCalls != before || cameraDirectoryAlias ||
+            !unknown.status().contains(QStringLiteral("camera storage"))) return 1;
+    }
+    cameraMetadataValid = true;
+    cameraTargetSdk = -1;
+    {
+        const int before = runCalls;
+        PreviewPlayer invalid(QStringLiteral("."), directory.path());
+        invalid.start();
+        if (runCalls != before || cameraDirectoryAlias ||
+            !invalid.status().contains(QStringLiteral("camera storage"))) return 1;
+    }
     std::puts("Preview MP3 configuration and Back passed");
     return 0;
 }

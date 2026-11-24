@@ -11,4 +11,5 @@ for source in core/third_party/zlib/*.c; do
     gcc $CFLAGS -c "$source" -o "$WORK_DIR/objects/$(basename "$source").o"
 done
 gcc $CFLAGS -DMEGLER_SHARED_MICROG_WORKER_STANDALONE -c aurora/shared_microg_worker.c -o "$WORK_DIR/objects/worker.o"
+gcc $CFLAGS -c core/tests/mg_gfx_standin.c -o "$WORK_DIR/objects/gfx-standin.o"
 gcc -Wl,--gc-sections -o "$WORK_DIR/megler-shared-microg-worker" "$WORK_DIR"/objects/*.o -lm -lpthread -ldl

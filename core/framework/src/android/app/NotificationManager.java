@@ -30,11 +30,29 @@ import java.util.Objects;
  */
 public class NotificationManager {
     private final boolean mOwnPackage;
+    private static volatile boolean sClassifiedNotificationUnavailable;
+    private static final Object sNotificationLock = new Object();
+    private static final java.util.HashMap<Integer, Integer> sForegroundIds = new java.util.HashMap<>();
+    private static final java.util.HashSet<NotificationKey> sPosted = new java.util.HashSet<>();
+    private static final class NotificationKey {
+        final String tag;
+        final int id;
+        NotificationKey(String tag, int id) { this.tag = tag; this.id = id; }
+        @Override public boolean equals(Object other) {
+            if (!(other instanceof NotificationKey)) return false;
+            NotificationKey key = (NotificationKey) other;
+            return id == key.id && Objects.equals(tag, key.tag);
+        }
+        @Override public int hashCode() { return 31 * id + Objects.hashCode(tag); }
+    }
     public static final int IMPORTANCE_UNSPECIFIED = -1000, IMPORTANCE_NONE = 0, IMPORTANCE_MIN = 1, IMPORTANCE_LOW = 2, IMPORTANCE_DEFAULT = 3, IMPORTANCE_HIGH = 4, IMPORTANCE_MAX = 5,
         INTERRUPTION_FILTER_ALL = 1, INTERRUPTION_FILTER_PRIORITY = 2, INTERRUPTION_FILTER_NONE = 3, INTERRUPTION_FILTER_ALARMS = 4, INTERRUPTION_FILTER_UNKNOWN = 0;
     public static final String ACTION_NOTIFICATION_POLICY_ACCESS_GRANTED_CHANGED = "android.app.action.NOTIFICATION_POLICY_ACCESS_GRANTED_CHANGED", ACTION_APP_BLOCK_STATE_CHANGED = "android.app.action.APP_BLOCK_STATE_CHANGED";
     public void notify(int id, Notification n) { notify(null, id, n); }
     public void notify(String tag, int id, Notification n) {
+        synchronized (sNotificationLock) { notifyLocked(tag, id, n); }
+    }
+    private void notifyLocked(String tag, int id, Notification n) {
         if (n == null) throw new IllegalArgumentException("notification is null");
         if (!areNotificationsEnabled()) return;
         megler.Manifest.read();
@@ -50,20 +68,86 @@ public class NotificationManager {
         int max = n.extras == null ? 0 : n.extras.getInt(Notification.EXTRA_PROGRESS_MAX);
         int progress = n.extras == null ? 0 : n.extras.getInt(Notification.EXTRA_PROGRESS);
         boolean indeterminate = n.extras != null && n.extras.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE);
-        if (!megler.Native.notificationDetailed(tag, id, title == null ? "" : title.toString(),
-                text == null ? "" : text.toString(), n.flags, max, progress, indeterminate))
+        int importance = channel != null ? channel.getImportance()
+                : Math.max(Notification.PRIORITY_MIN, Math.min(Notification.PRIORITY_MAX, n.priority)) + IMPORTANCE_DEFAULT;
+        if (importance == IMPORTANCE_UNSPECIFIED) importance = IMPORTANCE_DEFAULT;
+        boolean silent = channel != null ? channel.getSound() == null
+                : n.sound == null && (n.defaults & Notification.DEFAULT_SOUND) == 0;
+        int flags = n.flags;
+        if (tag == null && sForegroundIds.containsKey(id))
+            flags |= Notification.FLAG_FOREGROUND_SERVICE | Notification.FLAG_ONGOING_EVENT;
+        String titleText = title == null ? "" : title.toString();
+        String bodyText = text == null ? "" : text.toString();
+        boolean delivered;
+        if (sClassifiedNotificationUnavailable) {
+            delivered = megler.Native.notificationDetailed(tag, id, titleText, bodyText,
+                    flags, max, progress, indeterminate);
+        } else {
+            try {
+                delivered = megler.Native.notificationClassified(tag, id, titleText, bodyText,
+                        flags, max, progress, indeterminate, importance, silent);
+            } catch (UnsatisfiedLinkError e) {
+                sClassifiedNotificationUnavailable = true;
+                android.util.Log.w("Megler", "notification classification is unavailable in this runtime");
+                delivered = megler.Native.notificationDetailed(tag, id, titleText, bodyText,
+                        flags, max, progress, indeterminate);
+            }
+        }
+        if (delivered) sPosted.add(new NotificationKey(tag, id));
+        else
             android.util.Log.w("Megler", "notification delivery failed");
     }
     public void cancel(int id) { cancel(null, id); }
     public void cancel(String tag, int id) {
         if (!mOwnPackage) return;
-        if (!megler.Native.notification(2, tag, id, null, null))
-            android.util.Log.w("Megler", "notification cancellation failed");
+        synchronized (sNotificationLock) {
+            if (tag == null && sForegroundIds.containsKey(id)) return;
+            cancelLocked(tag, id);
+        }
+    }
+    private void cancelLocked(String tag, int id) {
+        if (megler.Native.notification(2, tag, id, null, null))
+            sPosted.remove(new NotificationKey(tag, id));
+        else android.util.Log.w("Megler", "notification cancellation failed");
     }
     public void cancelAll() {
         if (!mOwnPackage) return;
-        if (!megler.Native.notification(3, null, 0, null, null))
-            android.util.Log.w("Megler", "notification cancellation failed");
+        synchronized (sNotificationLock) {
+            if (sForegroundIds.isEmpty()) {
+                if (megler.Native.notification(3, null, 0, null, null)) sPosted.clear();
+                else android.util.Log.w("Megler", "notification cancellation failed");
+                return;
+            }
+            for (NotificationKey key : new ArrayList<>(sPosted))
+                if (key.tag != null || !sForegroundIds.containsKey(key.id)) cancelLocked(key.tag, key.id);
+        }
+    }
+    void meglerStartForeground(int oldId, boolean oldActive, int id, Notification n) {
+        synchronized (sNotificationLock) {
+            if (!mOwnPackage) {
+                notify(id, n);
+                return;
+            }
+            notify(id, n);
+            if (!oldActive || oldId != id) {
+                if (oldActive) releaseForeground(oldId);
+                sForegroundIds.put(id, sForegroundIds.getOrDefault(id, 0) + 1);
+                if (oldId != 0 && oldId != id && !sForegroundIds.containsKey(oldId)) cancel(oldId);
+            }
+        }
+    }
+    void meglerStopForeground(int id, boolean active, boolean remove) {
+        synchronized (sNotificationLock) {
+            if (!mOwnPackage) return;
+            if (active) releaseForeground(id);
+            if (remove && !sForegroundIds.containsKey(id)) cancel(id);
+        }
+    }
+    private static void releaseForeground(int id) {
+        Integer count = sForegroundIds.get(id);
+        if (count == null) throw new IllegalStateException("foreground notification not registered");
+        if (count == 1) sForegroundIds.remove(id);
+        else sForegroundIds.put(id, count - 1);
     }
 
     public void createNotificationChannel(NotificationChannel channel) { createNotificationChannels(java.util.Arrays.asList(channel)); }

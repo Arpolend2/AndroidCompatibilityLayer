@@ -1262,7 +1262,7 @@ N(Native_notification)
         c->args[4].l ? text_of(c->args[4].l) : NULL);
 }
 
-N(Native_notificationDetailed)
+static void notification_detailed(mg_jcall *c, bool classified)
 {
     const megler_notification_host *host = &J.config->notifications;
     const char *tag = c->args[0].l ? text_of(c->args[0].l) : NULL;
@@ -1270,12 +1270,16 @@ N(Native_notificationDetailed)
     const char *body = c->args[3].l ? text_of(c->args[3].l) : NULL;
     if (host->send_detailed)
         c->ret.z = host->send_detailed(host->user, J.package, tag, c->args[1].i, title, body,
-                                       c->args[4].i, c->args[5].i, c->args[6].i, c->args[7].i != 0);
+                                       c->args[4].i, c->args[5].i, c->args[6].i, c->args[7].i != 0,
+                                       classified ? c->args[8].i : -1,
+                                       classified && c->args[9].i != 0);
     else
         c->ret.z = host->send && host->send(host->user, MEGLER_NOTIFICATION_POST, J.package,
                                              tag, c->args[1].i, title, body);
 }
 
+N(Native_notificationDetailed) { notification_detailed(c, false); }
+N(Native_notificationClassified) { notification_detailed(c, true); }
 /* What a file's name says of it in the log: its extension alone (".jpg"), never the name the user gave it. */
 static const char *extension_of(const char *name)
 {
@@ -1630,6 +1634,7 @@ static const mg_jhle k_native[] = {
     { "megler/Native", "permission", NULL, Native_permission },
     { "megler/Native", "notification", NULL, Native_notification },
     { "megler/Native", "notificationDetailed", NULL, Native_notificationDetailed },
+    { "megler/Native", "notificationClassified", NULL, Native_notificationClassified },
     { "megler/Native", "pick", NULL, Native_pick },
     { "megler/Native", "pickAnswer", NULL, Native_pickAnswer },
     { "megler/Native", "appsList", NULL, Native_appsList },
@@ -2752,6 +2757,7 @@ static MG_HOSTCB void main_thread(void *arg)
         mg_java_camera_set_host(&J.config->camera);
         mg_dvm_register(mg_java_camera_natives());
         mg_dvm_register(mg_java_shared_microg_client_natives());
+        mg_dvm_register(mg_java_surface_texture_natives());
         mg_java_location_set_host(&J.config->location);
         mg_dvm_register(mg_java_location_natives());
         mg_dvm_register(mg_java_sensors_natives());

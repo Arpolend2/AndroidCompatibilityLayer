@@ -1,10 +1,19 @@
 #include "manager_lifecycle.h"
 #include "standalone_diagnostic_registry.h"
+#include "preview_keyboard.h"
+#include "preview_orientation.h"
+#include "preview_viewport.h"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QGuiApplication>
+#include <QQuickItem>
+#include <QQuickWindow>
+#include <QScreen>
 #include <QDBusConnectionInterface>
 #include <QDBusMessage>
 #include <QDBusReply>
@@ -106,12 +115,218 @@ ManagerLifecycle::ManagerLifecycle(const std::function<bool()> &showGui, QObject
     });
     connect(&m_worker, &SharedMicrogSupervisor::channelDisconnected,
             &m_provider, &SharedMicrogProviderObject::releaseChannelById);
+    connect(&m_worker, &SharedMicrogSupervisor::authenticationUiChanged, this,
+            [this](quint64 channelId, bool active) {
+        if (active) {
+            if (m_authUiChannel && m_authUiChannel != channelId) {
+                m_worker.sendBack(channelId);
+                return;
+            }
+            if (!this->showGui()) {
+                m_worker.sendBack(channelId);
+                return;
+            }
+            m_authUiChannel = channelId;
+            m_authFrame = QImage();
+            m_pendingAuthFrame = QImage();
+            m_authViewport = QSize();
+            m_authDensity = 0;
+            m_authFrameCurrent = false;
+            m_authViewportPending = false;
+            m_authAwaitingViewportFrame = false;
+            emit authenticationFrameChanged();
+            emit authenticationUiChanged();
+            return;
+        }
+        closeAuthenticationUi(channelId);
+    });
+    connect(&m_worker, &SharedMicrogSupervisor::authenticationFrameChanged, this,
+            [this](quint64 channelId, const QImage &frame) {
+        acceptAuthenticationFrame(channelId, frame);
+    });
+    connect(&m_worker, &SharedMicrogSupervisor::authenticationKeyboardRequested, this,
+            [this](quint64 channelId, int kind, int flags, int enter) {
+        if (m_authUiChannel == channelId && m_authKeyboard)
+            m_authKeyboard->showKeyboard(kind, flags, enter);
+    });
+    connect(&m_worker, &SharedMicrogSupervisor::authenticationKeyboardHidden, this,
+            [this](quint64 channelId) {
+        if (m_authUiChannel == channelId && m_authKeyboard)
+            m_authKeyboard->hideKeyboard();
+    });
+    connect(&m_worker, &SharedMicrogSupervisor::workerDied, this, [this]() {
+        closeAuthenticationUi(m_authUiChannel);
+    });
+    connect(&m_worker, &SharedMicrogSupervisor::channelDisconnected, this,
+            [this](quint64 channelId) { closeAuthenticationUi(channelId); });
+}
+
+void ManagerLifecycle::acceptAuthenticationFrame(quint64 channelId, const QImage &frame)
+{
+    if (m_authUiChannel != channelId) return;
+    if (m_authViewportPending) {
+        m_pendingAuthFrame = frame;
+        return;
+    }
+    if (!m_authViewport.isEmpty() && frame.size() != m_authViewport) return;
+    const bool firstFrame = m_authFrame.isNull() && !frame.isNull();
+    m_authFrame = frame;
+    m_authFrameCurrent = !frame.isNull();
+    m_authAwaitingViewportFrame = false;
+    if (firstFrame) {
+        quint64 nonzero = 0;
+        for (int row = 0; row < frame.height(); ++row) {
+            const unsigned char *pixels = frame.constScanLine(row);
+            for (int i = 0; i < frame.width() * 4; ++i)
+                if (pixels[i]) ++nonzero;
+        }
+        qInfo("Shared microG UI frame ready: channel=%llu, size=%dx%d, nonzero_bytes=%llu",
+              static_cast<unsigned long long>(channelId),
+              frame.width(), frame.height(), static_cast<unsigned long long>(nonzero));
+    }
+    if (m_authKeyboard && m_authSurface)
+        m_authKeyboard->setSurface(m_authSurface, frame.size());
+    emit authenticationFrameChanged();
 }
 
 ManagerLifecycle::~ManagerLifecycle()
 {
+    if (m_authKeyboard) m_authKeyboard->stop();
     m_provider.revokeAllChannels();
     m_worker.stop();
+}
+
+void ManagerLifecycle::closeAuthenticationUi(quint64 channelId)
+{
+    if (!channelId || m_authUiChannel != channelId) return;
+    m_authUiChannel = 0;
+    m_authFrame = QImage();
+    m_pendingAuthFrame = QImage();
+    m_authViewport = QSize();
+    m_authDensity = 0;
+    m_authFrameCurrent = false;
+    m_authViewportPending = false;
+    m_authAwaitingViewportFrame = false;
+    if (m_authKeyboard) m_authKeyboard->hideKeyboard();
+    if (m_authKeyboard && m_authSurface)
+        m_authKeyboard->setSurface(nullptr, QSize());
+    m_authSurface.clear();
+    emit authenticationFrameChanged();
+    emit authenticationUiChanged();
+}
+
+void ManagerLifecycle::setAuthenticationKeyboard(PreviewKeyboard *keyboard)
+{
+    if (m_authKeyboard == keyboard) return;
+    if (m_authKeyboard) {
+        disconnect(m_authKeyboard, nullptr, this, nullptr);
+        m_authKeyboard->stop();
+    }
+    m_authKeyboard = keyboard;
+    if (!keyboard) return;
+    keyboard->setRemote(true);
+    keyboard->start();
+    connect(keyboard, &PreviewKeyboard::textCommitted, this,
+            [this](const QString &text) { sendAuthenticationText(text); });
+    connect(keyboard, &PreviewKeyboard::textKey, this,
+            [this](int key) { sendAuthenticationTextKey(key); });
+    connect(keyboard, &PreviewKeyboard::keyboardClosed, this,
+            [this]() { sendAuthenticationKeyboardClosed(); });
+    connect(keyboard, &PreviewKeyboard::keyboardHeight, this,
+            [this](int height) { sendAuthenticationKeyboardHeight(height); });
+}
+
+bool ManagerLifecycle::authenticationTouch(int phase, int x, int y)
+{
+    return m_authUiChannel && m_authFrameCurrent &&
+           m_worker.sendTouch(m_authUiChannel, phase, 0, x, y);
+}
+
+void ManagerLifecycle::authenticationBack()
+{
+    if (!m_authUiChannel) return;
+    if (m_authKeyboard && m_authKeyboard->back()) return;
+    m_worker.sendBack(m_authUiChannel);
+}
+
+void ManagerLifecycle::cancelAuthentication()
+{
+    if (m_authUiChannel) m_worker.sendBack(m_authUiChannel);
+}
+
+void ManagerLifecycle::setAuthenticationSurface(QObject *surface, int pixelWidth, int pixelHeight)
+{
+    QQuickItem *item = qobject_cast<QQuickItem *>(surface);
+    m_authSurface = item;
+    if (m_authKeyboard)
+        m_authKeyboard->setSurface(item, m_authFrame.isNull()
+                                   ? QSize(qMax(0, pixelWidth), qMax(0, pixelHeight))
+                                   : m_authFrame.size());
+}
+
+void ManagerLifecycle::setAuthenticationViewport(const QSize &pixels, int density, int rotation)
+{
+    if (!m_authUiChannel || pixels.isEmpty()) return;
+    if (m_authViewport == pixels && m_authDensity == density && m_authRotation == rotation) {
+        m_authViewportPending = false;
+        const QImage pending = m_pendingAuthFrame;
+        m_pendingAuthFrame = QImage();
+        if (!m_authAwaitingViewportFrame && !pending.isNull() && pending.size() == pixels) {
+            acceptAuthenticationFrame(m_authUiChannel, pending);
+            return;
+        }
+        m_authFrameCurrent = !m_authAwaitingViewportFrame && !m_authFrame.isNull() &&
+                             m_authFrame.size() == pixels;
+        return;
+    }
+    const bool reuseInitial = !m_authDensity && !m_pendingAuthFrame.isNull() &&
+                              m_pendingAuthFrame.size() == pixels;
+    const bool mustWait = m_authFrame.isNull() || m_authFrame.size() != pixels ||
+                          (m_authDensity && (m_authDensity != density || m_authRotation != rotation));
+    if (mustWait) {
+        m_authFrameCurrent = false;
+        m_authAwaitingViewportFrame = true;
+    }
+    if (!m_worker.sendUiResize(m_authUiChannel, pixels.width(), pixels.height(), density, rotation)) {
+        m_authFrameCurrent = false;
+        qWarning("Shared microG UI viewport update failed.");
+        return;
+    }
+    m_authViewport = pixels;
+    m_authDensity = density;
+    m_authRotation = rotation;
+    m_authViewportPending = false;
+    const QImage pending = m_pendingAuthFrame;
+    m_pendingAuthFrame = QImage();
+    if (reuseInitial) acceptAuthenticationFrame(m_authUiChannel, pending);
+}
+
+void ManagerLifecycle::invalidateAuthenticationViewport()
+{
+    if (!m_authUiChannel) return;
+    m_authViewportPending = true;
+    m_authFrameCurrent = false;
+}
+
+bool ManagerLifecycle::sendAuthenticationText(const QString &text)
+{
+    if (!m_authUiChannel) return false;
+    return m_worker.sendText(m_authUiChannel, text.toUtf8());
+}
+
+bool ManagerLifecycle::sendAuthenticationTextKey(int key)
+{
+    return m_authUiChannel && m_worker.sendTextKey(m_authUiChannel, key);
+}
+
+void ManagerLifecycle::sendAuthenticationKeyboardClosed()
+{
+    if (m_authUiChannel) m_worker.sendKeyboardClosed(m_authUiChannel);
+}
+
+void ManagerLifecycle::sendAuthenticationKeyboardHeight(int height)
+{
+    if (m_authUiChannel) m_worker.sendKeyboardHeight(m_authUiChannel, height);
 }
 
 bool ManagerLifecycle::configureSharedMicrogWorker(const QString &program,
@@ -454,6 +669,7 @@ bool ManagerLifecycle::start(bool background, QString *error)
         qWarning("Shared microG provider service is unavailable: manager D-Bus name not owned.");
         return true;
     }
+
     QString providerError;
     if (!m_provider.start(&providerError)) {
         if (background) {
@@ -465,6 +681,137 @@ bool ManagerLifecycle::start(bool background, QString *error)
     m_background = background;
     if (background && !m_keepAlive) m_idle.start();
     return true;
+}
+
+SharedMicrogAuthSurface::SharedMicrogAuthSurface(QQuickItem *parent)
+    : QQuickPaintedItem(parent)
+{
+    setAcceptedMouseButtons(Qt::LeftButton);
+    setFlag(ItemHasContents, true);
+    m_viewportTimer.setSingleShot(true);
+    connect(&m_viewportTimer, &QTimer::timeout, this, &SharedMicrogAuthSurface::updateViewport);
+    connect(this, &QQuickItem::windowChanged, this, [this](QQuickWindow *window) {
+        disconnect(m_screenConnection);
+        if (window)
+            m_screenConnection = connect(window, &QQuickWindow::screenChanged,
+                                         this, [this](QScreen *) { scheduleViewport(); });
+        scheduleViewport();
+    });
+}
+
+void SharedMicrogAuthSurface::setHost(QObject *host)
+{
+    ManagerLifecycle *lifecycle = qobject_cast<ManagerLifecycle *>(host);
+    if (m_host == lifecycle) return;
+    if (m_host) disconnect(m_host, nullptr, this, nullptr);
+    m_host = lifecycle;
+    if (m_host) {
+        connect(m_host, &ManagerLifecycle::authenticationFrameChanged, this,
+                [this]() { update(); });
+        connect(m_host, &ManagerLifecycle::authenticationUiChanged, this,
+                [this]() { update(); scheduleViewport(); });
+    }
+    update();
+    scheduleViewport();
+    emit hostChanged();
+}
+
+void SharedMicrogAuthSurface::setPageOrientation(int orientation)
+{
+    if (m_pageOrientation == orientation) return;
+    m_pageOrientation = orientation;
+    scheduleViewport();
+}
+
+void SharedMicrogAuthSurface::geometryChanged(const QRectF &geometry, const QRectF &oldGeometry)
+{
+    QQuickPaintedItem::geometryChanged(geometry, oldGeometry);
+    if (geometry.size() != oldGeometry.size()) scheduleViewport();
+}
+
+void SharedMicrogAuthSurface::scheduleViewport()
+{
+    if (m_pressed && m_host) {
+        m_host->authenticationTouch(2, m_lastGuestX, m_lastGuestY);
+        m_pressed = false;
+    }
+    if (m_host && window() && width() > 0 && height() > 0)
+        m_host->invalidateAuthenticationViewport();
+    m_viewportTimer.start(0);
+}
+
+void SharedMicrogAuthSurface::updateViewport()
+{
+    if (!m_host || !window() || width() <= 0 || height() <= 0) return;
+    const PreviewViewport viewport = previewViewport(width(), height(), window()->devicePixelRatio(), 2048);
+    QScreen *screen = window()->screen();
+    if (screen) {
+        const Qt::ScreenOrientation native = previewNativeOrientation(
+            screen->nativeOrientation(), QGuiApplication::platformName().startsWith(QLatin1String("wayland")));
+        const int rotation = previewDisplayRotation(native, static_cast<Qt::ScreenOrientation>(m_pageOrientation));
+        if (rotation >= 0) m_rotation = rotation;
+    }
+    m_host->setAuthenticationViewport(viewport.pixels, viewport.density, m_rotation);
+}
+
+void SharedMicrogAuthSurface::paint(QPainter *painter)
+{
+    painter->fillRect(boundingRect(), Qt::black);
+    if (!m_host) return;
+    const QImage frame = m_host->authenticationFrame();
+    if (frame.isNull()) return;
+    painter->drawImage(imageTarget(frame), frame);
+}
+
+QRectF SharedMicrogAuthSurface::imageTarget(const QImage &frame) const
+{
+    if (frame.isNull() || width() <= 0 || height() <= 0) return QRectF();
+    const QSizeF scaled = QSizeF(frame.size()).scaled(QSizeF(width(), height()), Qt::KeepAspectRatio);
+    return QRectF((width() - scaled.width()) / 2, (height() - scaled.height()) / 2,
+                  scaled.width(), scaled.height());
+}
+
+bool SharedMicrogAuthSurface::sendTouch(int phase, const QPointF &point)
+{
+    if (!m_host) return false;
+    const QImage frame = m_host->authenticationFrame();
+    if (frame.isNull()) return false;
+    const QRectF target = imageTarget(frame);
+    if (target.isEmpty() || (phase == 0 && !target.contains(point))) return false;
+    const int x = qBound(0, qRound((point.x() - target.left()) * frame.width() / target.width()),
+                         frame.width() - 1);
+    const int y = qBound(0, qRound((point.y() - target.top()) * frame.height() / target.height()),
+                         frame.height() - 1);
+    if (!m_host->authenticationTouch(phase, x, y)) return false;
+    m_lastGuestX = x;
+    m_lastGuestY = y;
+    return true;
+}
+
+void SharedMicrogAuthSurface::mousePressEvent(QMouseEvent *event)
+{
+    m_lastTouch = event->localPos();
+    m_pressed = event->button() == Qt::LeftButton && sendTouch(0, m_lastTouch);
+    event->setAccepted(m_pressed);
+}
+
+void SharedMicrogAuthSurface::mouseMoveEvent(QMouseEvent *event)
+{
+    m_lastTouch = event->localPos();
+    event->setAccepted(m_pressed && sendTouch(1, m_lastTouch));
+}
+
+void SharedMicrogAuthSurface::mouseReleaseEvent(QMouseEvent *event)
+{
+    if (m_pressed) sendTouch(2, event->localPos());
+    m_pressed = false;
+    event->accept();
+}
+
+void SharedMicrogAuthSurface::mouseUngrabEvent()
+{
+    if (m_pressed) sendTouch(2, m_lastTouch);
+    m_pressed = false;
 }
 
 QStringList ManagerLifecycle::launchFileArguments(const QStringList &arguments)

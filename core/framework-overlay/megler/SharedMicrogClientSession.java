@@ -12,11 +12,13 @@ import java.util.concurrent.Executor;
 public final class SharedMicrogClientSession implements AutoCloseable {
     private final BinderBridge bridge;
     private final SharedMicrogClientRouter router;
+    private final SharedMicrogAccounts.Channel accounts;
     private boolean closed;
 
-    private SharedMicrogClientSession(BinderBridge bridge, SharedMicrogClientRouter router) {
+    private SharedMicrogClientSession(BinderBridge bridge, SharedMicrogClientRouter router, SharedMicrogAccounts.Channel accounts) {
         this.bridge = bridge;
         this.router = router;
+        this.accounts = accounts;
     }
 
     /**
@@ -32,16 +34,19 @@ public final class SharedMicrogClientSession implements AutoCloseable {
                                           Closeable shutdownTransport, Executor callbacks) {
         BinderBridge bridge = null;
         SharedMicrogClientRouter router = null;
+        SharedMicrogAccounts.Channel accounts = null;
         try {
             if (shutdownTransport == null)
                 throw new IllegalArgumentException("A transport shutdown operation is required.");
             bridge = new BinderBridge(input, output, null, shutdownTransport);
             router = callbacks == null ? new SharedMicrogClientRouter(bridge.remoteRoot()) :
                 new SharedMicrogClientRouter(bridge.remoteRoot(), callbacks);
-            SharedMicrogClientSession session = new SharedMicrogClientSession(bridge, router);
+            accounts = SharedMicrogAccounts.install(bridge.remoteRoot());
+            SharedMicrogClientSession session = new SharedMicrogClientSession(bridge, router, accounts);
             Services.installSharedMicrogClientRouter(router);
             return session;
         } catch (RuntimeException | Error failure) {
+            if (accounts != null) SharedMicrogAccounts.clear(accounts);
             if (router != null) {
                 try { router.close(); }
                 catch (RuntimeException closeError) { failure.addSuppressed(closeError); }
@@ -79,7 +84,7 @@ public final class SharedMicrogClientSession implements AutoCloseable {
             closed = true;
         }
         Services.clearSharedMicrogClientRouter(router);
-        try { router.close(); }
+        try { SharedMicrogAccounts.clear(accounts); router.close(); }
         finally { closeBridge(bridge); }
     }
 }

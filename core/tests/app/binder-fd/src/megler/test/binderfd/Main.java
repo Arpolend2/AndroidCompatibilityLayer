@@ -339,12 +339,22 @@ public class Main extends Activity {
             request.writeInt(42);
             request.writeString("megler.test.nonexistent.BIND");
             request.writeString(null);
-            rejected = false;
-            try { router.transact(SharedMicrogServiceRouter.BIND, request, reply, 0); }
-            catch (RemoteException expected) { rejected = true; }
-            if (!rejected) throw new AssertionError("unknown service bound");
+            if (!router.transact(SharedMicrogServiceRouter.BIND, request, reply, 0))
+                throw new AssertionError("unknown service request failed");
+            reply.readException();
+            if (reply.readString() != null || reply.readStrongBinder() != null)
+                throw new AssertionError("unknown service bound");
+            request.recycle(); reply.recycle();
+            request = Parcel.obtain(); reply = Parcel.obtain();
+            request.writeInt(42);
+            if (!router.transact(SharedMicrogServiceRouter.UNBIND, request, reply, 0))
+                throw new AssertionError("unknown service cleanup failed");
+            reply.readException();
             if (boundService(root, 0) == null) throw new AssertionError("rebind failed");
             if (!isTestReal()) {
+                checkServiceRefused(router, 43, "megler.test.gmsbroker.HIDDEN", null);
+                checkServiceRefused(router, 44, null, "megler.test.gmsbroker.Broker$NoFilter");
+                checkServiceRefused(router, 45, "megler.test.gmsbroker.PROTECTED", null);
                 request.recycle(); reply.recycle();
                 request = Parcel.obtain(); reply = Parcel.obtain();
                 request.writeInt(2);
@@ -363,6 +373,26 @@ public class Main extends Activity {
                 reply.readException();
             }
             Log.i("BinderGuestTest", "PASS dynamic binding lifecycle");
+        } finally { request.recycle(); reply.recycle(); }
+    }
+
+    private static void checkServiceRefused(IBinder router, int id, String action, String component) throws Exception {
+        Parcel request = Parcel.obtain(), reply = Parcel.obtain();
+        try {
+            request.writeInt(id);
+            request.writeString(action);
+            request.writeString(component);
+            if (!router.transact(SharedMicrogServiceRouter.BIND, request, reply, 0))
+                throw new AssertionError("service request failed");
+            reply.readException();
+            if (reply.readString() != null || reply.readStrongBinder() != null)
+                throw new AssertionError("restricted service bound");
+            request.recycle(); reply.recycle();
+            request = Parcel.obtain(); reply = Parcel.obtain();
+            request.writeInt(id);
+            if (!router.transact(SharedMicrogServiceRouter.UNBIND, request, reply, 0))
+                throw new AssertionError("service cleanup failed");
+            reply.readException();
         } finally { request.recycle(); reply.recycle(); }
     }
 

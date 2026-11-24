@@ -30,6 +30,12 @@ typedef enum {
 AuroraEglFrameResult aurora_egl_frame_capture(EGLDisplay display, EGLSurface surface,
                                                int width, int height, int opaque, AuroraEglFrame *frame,
                                                char *failure, size_t failure_size);
+/* As above, optionally read the source pixels as bottom-up RGBA before transport changes alpha. */
+AuroraEglFrameResult aurora_egl_frame_capture_with_readback(EGLDisplay display, EGLSurface surface,
+                                                             int width, int height, int opaque,
+                                                             AuroraEglFrame *frame, void *rgba,
+                                                             size_t rgba_size, char *failure,
+                                                             size_t failure_size);
 /* Called with a consumer GLES context current on the frame's display.
    The caller owns the returned texture in that context. */
 GLuint aurora_egl_frame_import(const AuroraEglFrame *frame);

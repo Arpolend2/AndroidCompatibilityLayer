@@ -14,6 +14,7 @@ public final class Manifest {
         public String taskAffinity;
         public int theme, label, icon, screenOrientation = -1, configChanges, launchMode, windowSoftInputMode, uiOptions, initOrder;
         public boolean exported, enabled = true, grantUriPermissions;
+        private boolean exportedDeclared;
         public Bundle metaData;
         public final ArrayList<Filter> filters = new ArrayList<>();
     }
@@ -47,6 +48,7 @@ public final class Manifest {
             XmlBlock.Parser p = new XmlBlock(d, "AndroidManifest.xml").newParser();
             Component cur = null; Filter filter = null;
             boolean inApp = false;          /* components are only those under <application> (<queries> names packages, intents and providers too) */
+            String appPermission = null;
             int t;
             TypedValue v = new TypedValue();
             while ((t = p.next()) != XmlPullParser.END_DOCUMENT) {
@@ -86,6 +88,7 @@ public final class Manifest {
                 case "uses-library": libraries.add(p.getAttributeValue(NS, "name")); break;
                 case "application":
                     inApp = true;
+                    appPermission = p.getAttributeValue(NS, "permission");
                     applicationClass = full(p.getAttributeValue(NS, "name"));
                     appTheme = p.getAttributeResourceValue(NS, "theme", 0);
                     appLabel = p.getAttributeResourceValue(NS, "label", 0);
@@ -117,12 +120,14 @@ public final class Manifest {
                     cur.launchMode = p.getAttributeIntValue(NS, "launchMode", 0);
                     cur.initOrder = p.getAttributeIntValue(NS, "initOrder", 0);
                     cur.windowSoftInputMode = p.getAttributeIntValue(NS, "windowSoftInputMode", 0);
+                    cur.exportedDeclared = p.indexOf(NS, "exported") >= 0;
                     cur.exported = p.getAttributeBooleanValue(NS, "exported", false);
                     cur.enabled = p.getAttributeBooleanValue(NS, "enabled", true);
                     cur.authorities = p.getAttributeValue(NS, "authorities");
                     cur.grantUriPermissions = p.getAttributeBooleanValue(NS, "grantUriPermissions", false);
                     cur.process = p.getAttributeValue(NS, "process");
-                    cur.permission = p.getAttributeValue(NS, "permission");
+                    cur.permission = "service".equals(tag) && p.indexOf(NS, "permission") < 0
+                        ? appPermission : p.getAttributeValue(NS, "permission");
                     cur.readPermission = p.getAttributeValue(NS, "readPermission");
                     cur.writePermission = p.getAttributeValue(NS, "writePermission");
                     if (cur.parentActivity == null) cur.parentActivity = full(p.getAttributeValue(NS, "parentActivityName"));
@@ -132,7 +137,10 @@ public final class Manifest {
                     else activities.add(cur);
                     break;
                 }
-                case "intent-filter": if (cur != null) { filter = new Filter(); cur.filters.add(filter); } break;
+                case "intent-filter": if (cur != null) {
+                    filter = new Filter(); cur.filters.add(filter);
+                    if ("service".equals(cur.kind) && !cur.exportedDeclared) cur.exported = true;
+                } break;
                 case "action": if (filter != null) filter.actions.add(p.getAttributeValue(NS, "name")); break;
                 case "category": if (filter != null) filter.categories.add(p.getAttributeValue(NS, "name")); break;
                 case "data":

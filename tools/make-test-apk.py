@@ -112,4 +112,5 @@ def main():
             z.writestr(zipfile.ZipInfo('assets/' + name), text, zipfile.ZIP_DEFLATED)
 
 
-main()
+if __name__ == "__main__":
+    main()

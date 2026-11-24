@@ -4,6 +4,7 @@
 #include "store_worker_teardown.h"
 
 #include <QElapsedTimer>
+#include <QByteArray>
 #include <QMetaObject>
 #include <QMutexLocker>
 #include <QOpenGLContext>
@@ -17,6 +18,8 @@
 
 namespace {
 const int LayerCount = 8;
+const int MaximumCaptureDimension = 4096;
+const qint64 MaximumCaptureBytes = 32 * 1024 * 1024;
 
 struct GpuRoot : QSGNode {
     QSGSimpleRectNode *background = new QSGSimpleRectNode;
@@ -82,6 +85,55 @@ void addTexture(QSGNode *parent, QSGTexture *texture, const QRectF &rect, bool f
     if (flip) node->setTextureCoordinatesTransform(QSGSimpleTextureNode::MirrorVertically);
     parent->appendChildNode(node);
 }
+
+QImage readComposedFrame(QQuickWindow *window, QString *failure)
+{
+    QOpenGLContext *context = QOpenGLContext::currentContext();
+    if (!window || !context || !context->isOpenGLES()) {
+        if (failure) *failure = QStringLiteral("Qt did not provide a current GLES context after composition");
+        return QImage();
+    }
+    QSize size = window->renderTargetSize();
+    if (size.isEmpty())
+        size = window->size() * window->devicePixelRatio();
+    if (size.width() <= 0 || size.height() <= 0 ||
+        size.width() > MaximumCaptureDimension || size.height() > MaximumCaptureDimension) {
+        if (failure) *failure = QStringLiteral("composed frame is empty or exceeds the diagnostic size limit");
+        return QImage();
+    }
+    const qint64 bytes = static_cast<qint64>(size.width()) * size.height() * 4;
+    if (bytes <= 0 || bytes > MaximumCaptureBytes) {
+        if (failure) *failure = QStringLiteral("composed frame is empty or exceeds the diagnostic size limit");
+        return QImage();
+    }
+
+    QByteArray rgba(static_cast<int>(bytes), char(0));
+    QOpenGLFunctions *gl = context->functions();
+    GLint previousFramebuffer = 0;
+    GLint previousPackAlignment = 4;
+    gl->glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+    gl->glGetIntegerv(GL_PACK_ALIGNMENT, &previousPackAlignment);
+    gl->glBindFramebuffer(GL_FRAMEBUFFER, window->renderTargetId());
+    if (previousPackAlignment != 4)
+        gl->glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    gl->glReadPixels(0, 0, size.width(), size.height(), GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    const GLenum error = gl->glGetError();
+    gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
+    if (previousPackAlignment != 4)
+        gl->glPixelStorei(GL_PACK_ALIGNMENT, previousPackAlignment);
+    if (error != GL_NO_ERROR) {
+        if (failure)
+            *failure = QStringLiteral("composed-frame glReadPixels failed (OpenGL error 0x%1)")
+                           .arg(static_cast<unsigned int>(error), 4, 16, QLatin1Char('0'));
+        return QImage();
+    }
+    const QImage bottomUp(reinterpret_cast<const uchar *>(rgba.constData()), size.width(), size.height(),
+                          size.width() * 4, QImage::Format_RGBA8888);
+    QImage result = bottomUp.mirrored(false, true).copy();
+    if (result.isNull() && failure)
+        *failure = QStringLiteral("could not allocate the composed-frame image");
+    return result;
+}
 }
 
 PreviewGpuState::~PreviewGpuState()
@@ -97,6 +149,74 @@ QString PreviewGpuState::lastFailure() const
 {
     QMutexLocker lock(&mutex);
     return failureReason;
+}
+
+bool PreviewGpuState::requestFramePairCapture(quint64 sequence)
+{
+    if (!sequence) return false;
+    QMutexLocker lock(&mutex);
+    if (frameCaptureRequested || frameCaptureActive || frameCaptureCompleted)
+        return false;
+    frameCaptureSequence = sequence;
+    frameCaptureAt = QDateTime();
+    frameCaptureBefore = QImage();
+    frameCaptureAfter = QImage();
+    frameCaptureFailure.clear();
+    frameCaptureRequested = true;
+    return true;
+}
+
+bool PreviewGpuState::framePairCaptureReady() const
+{
+    QMutexLocker lock(&mutex);
+    return frameCaptureCompleted;
+}
+
+bool PreviewGpuState::takeFramePairCapture(PreviewGpuFrameCapture *capture)
+{
+    if (!capture) return false;
+    QMutexLocker lock(&mutex);
+    if (!frameCaptureCompleted) return false;
+    capture->sequence = frameCaptureSequence;
+    capture->capturedAt = frameCaptureAt;
+    capture->beforeTransfer = frameCaptureBefore;
+    capture->composedAfter = frameCaptureAfter;
+    capture->failure = frameCaptureFailure;
+    frameCaptureRequested = false;
+    frameCaptureActive = false;
+    frameCaptureAwaitingRender = false;
+    frameCaptureCompleted = false;
+    frameCaptureSequence = 0;
+    frameCaptureAt = QDateTime();
+    frameCaptureBefore = QImage();
+    frameCaptureAfter = QImage();
+    frameCaptureFailure.clear();
+    return true;
+}
+
+void PreviewGpuState::cancelFramePairCapture(quint64 sequence, const QString &reason)
+{
+    QMutexLocker lock(&mutex);
+    if (sequence == 0 || frameCaptureSequence != sequence) return;
+    if (frameCaptureRequested && !frameCaptureActive) {
+        frameCaptureRequested = false;
+        frameCaptureCompleted = false;
+        frameCaptureSequence = 0;
+        frameCaptureAt = QDateTime();
+        frameCaptureBefore = QImage();
+        frameCaptureAfter = QImage();
+        frameCaptureFailure.clear();
+        return;
+    }
+    if (frameCaptureCompleted) return;
+    frameCaptureRequested = false;
+    frameCaptureActive = false;
+    frameCaptureAwaitingRender = false;
+    frameCaptureCompleted = true;
+    frameCaptureFailure = reason;
+    frameCaptureBefore = QImage();
+    frameCaptureAfter = QImage();
+    finished.wakeAll();
 }
 
 bool PreviewGpuState::submitDmaBuf(AuroraDmaBufFrame &&incoming, QObject *notifier,
@@ -221,6 +341,7 @@ bool PreviewGpuState::releaseCanvasTexture(uint32_t texture, QObject *notifier)
 int PreviewGpuState::submit(EGLDisplay display, EGLSurface surface, int width, int height, QObject *notifier, int layer)
 {
     quint64 currentGeneration, layerGeneration = 0;
+    bool captureThisFrame = false;
     if (layer < -1 || layer >= LayerCount) {
         QMutexLocker lock(&mutex);
         failureReason = QStringLiteral("invalid GPU layer index");
@@ -248,24 +369,70 @@ int PreviewGpuState::submit(EGLDisplay display, EGLSurface surface, int width, i
         busy = true;
         currentGeneration = generation;
         if (layer >= 0) layerGeneration = layers[layer].generation;
+        captureThisFrame = frameCaptureRequested;
+        if (captureThisFrame) {
+            frameCaptureRequested = false;
+            frameCaptureActive = true;
+            frameCaptureAwaitingRender = false;
+            frameCaptureCompleted = false;
+            frameCaptureAt = QDateTime::currentDateTimeUtc();
+            frameCaptureBefore = QImage();
+            frameCaptureAfter = QImage();
+            frameCaptureFailure.clear();
+        }
     }
     AuroraEglFrame captured = {}, capturedOpaque = {};
-    char captureFailure[160] = {};
-    AuroraEglFrameResult result = aurora_egl_frame_capture(display, surface, width, height, layer < 0, &captured,
-                                                           captureFailure, sizeof(captureFailure));
+    char transferFailure[160] = {};
+    char readbackFailure[160] = {};
+    QByteArray rgba;
+    QImage capturedBefore;
+    QString captureError;
+    AuroraEglFrameResult result;
+    const bool captureDimensionsValid = width > 0 && height > 0 &&
+        width <= MaximumCaptureDimension && height <= MaximumCaptureDimension &&
+        static_cast<qint64>(width) * height * 4 <= MaximumCaptureBytes;
+    if (captureThisFrame && captureDimensionsValid) {
+        rgba.resize(width * height * 4);
+        result = aurora_egl_frame_capture_with_readback(display, surface, width, height, layer < 0,
+                                                        &captured, rgba.data(), static_cast<size_t>(rgba.size()),
+                                                        readbackFailure, sizeof(readbackFailure));
+        if (result == AURORA_EGL_FRAME_READY) {
+            const QImage bottomUp(reinterpret_cast<const uchar *>(rgba.constData()), width, height, width * 4,
+                                  QImage::Format_RGBA8888);
+            capturedBefore = bottomUp.mirrored(false, true).copy();
+            if (capturedBefore.isNull())
+                captureError = QStringLiteral("could not allocate the pre-transfer GL frame");
+        } else {
+            captureError = QString::fromLatin1(readbackFailure[0] ? readbackFailure : "source GL readback failed");
+            if (result != AURORA_EGL_FRAME_CONTEXT_LOST)
+                result = aurora_egl_frame_capture(display, surface, width, height, layer < 0, &captured,
+                                                  transferFailure, sizeof(transferFailure));
+        }
+    } else {
+        if (captureThisFrame)
+            captureError = QStringLiteral("GL frame is empty or exceeds the diagnostic size limit");
+        result = aurora_egl_frame_capture(display, surface, width, height, layer < 0, &captured,
+                                          transferFailure, sizeof(transferFailure));
+    }
     if (result == AURORA_EGL_FRAME_READY && layer >= 0)
         result = aurora_egl_frame_capture(display, surface, width, height, 1, &capturedOpaque,
-                                          captureFailure, sizeof(captureFailure));
+                                          transferFailure, sizeof(transferFailure));
     if (result != AURORA_EGL_FRAME_READY) {
         aurora_egl_frame_release(&captured);
         aurora_egl_frame_release(&capturedOpaque);
         QMutexLocker lock(&mutex);
         busy = false;
-        failureReason = captureFailure[0]
-            ? QString::fromLatin1(captureFailure)
+        failureReason = transferFailure[0]
+            ? QString::fromLatin1(transferFailure)
             : result == AURORA_EGL_FRAME_CONTEXT_LOST
                 ? QStringLiteral("system EGL context was lost while capturing a frame")
                 : QStringLiteral("native EGL frame capture was rejected");
+        if (captureThisFrame) {
+            frameCaptureActive = false;
+            frameCaptureAwaitingRender = false;
+            frameCaptureCompleted = true;
+            frameCaptureFailure = captureError.isEmpty() ? failureReason : captureError;
+        }
         finished.wakeAll();
         return result == AURORA_EGL_FRAME_CONTEXT_LOST ? -1 : 0;
     }
@@ -276,6 +443,12 @@ int PreviewGpuState::submit(EGLDisplay display, EGLSurface surface, int width, i
         aurora_egl_frame_release(&capturedOpaque);
         busy = false;
         failureReason = QStringLiteral("GPU frame became stale before Qt consumed it");
+        if (captureThisFrame) {
+            frameCaptureActive = false;
+            frameCaptureAwaitingRender = false;
+            frameCaptureCompleted = true;
+            frameCaptureFailure = QStringLiteral("GL frame became stale before Qt consumed it");
+        }
         finished.wakeAll();
         return 0;
     }
@@ -294,11 +467,24 @@ int PreviewGpuState::submit(EGLDisplay display, EGLSurface surface, int width, i
     pendingLayerGeneration = layerGeneration;
     pending = true;
     done = accepted = false;
+    if (captureThisFrame) {
+        frameCaptureBefore = capturedBefore;
+        frameCaptureFailure = captureError;
+        if (!captureError.isEmpty()) {
+            frameCaptureActive = false;
+            frameCaptureCompleted = true;
+        }
+    }
     if (!QMetaObject::invokeMethod(notifier, "requestGpuFrame", Qt::QueuedConnection)) {
         aurora_egl_frame_release(&frame);
         aurora_egl_frame_release(&opaqueFrame);
         failureReason = QStringLiteral("could not schedule a Qt scene graph update");
         pending = busy = false;
+        if (captureThisFrame && !frameCaptureCompleted) {
+            frameCaptureActive = false;
+            frameCaptureCompleted = true;
+            frameCaptureFailure = failureReason;
+        }
         finished.wakeAll();
         return 0;
     }
@@ -314,11 +500,32 @@ int PreviewGpuState::submit(EGLDisplay display, EGLSurface surface, int width, i
         aurora_egl_frame_release(&opaqueFrame);
         failureReason = QStringLiteral("Qt scene graph did not consume the GPU frame before timeout");
         pending = active = busy = false;
+        if (captureThisFrame && !frameCaptureCompleted) {
+            frameCaptureActive = false;
+            frameCaptureAwaitingRender = false;
+            frameCaptureCompleted = true;
+            frameCaptureFailure = failureReason;
+        }
         finished.wakeAll();
         return 0;
     }
     if (!accepted && failureReason.isEmpty())
         failureReason = QStringLiteral("Qt scene graph rejected the GPU frame");
+    if (captureThisFrame && !frameCaptureCompleted) {
+        QElapsedTimer captureTimer;
+        captureTimer.start();
+        while (!frameCaptureCompleted) {
+            const qint64 elapsed = captureTimer.elapsed();
+            if (elapsed >= 1000) break;
+            finished.wait(&mutex, static_cast<unsigned long>(1000 - elapsed));
+        }
+        if (!frameCaptureCompleted) {
+            frameCaptureActive = false;
+            frameCaptureAwaitingRender = false;
+            frameCaptureCompleted = true;
+            frameCaptureFailure = QStringLiteral("Qt did not finish the composed-frame readback before timeout");
+        }
+    }
     busy = false;
     finished.wakeAll();
     return accepted ? 1 : 0;
@@ -407,6 +614,15 @@ void PreviewGpuState::clearLocked()
         dmaBufCompletion = {};
         if (completion) completion(id, false);
     }
+    if (frameCaptureRequested || frameCaptureActive || frameCaptureAwaitingRender) {
+        frameCaptureRequested = false;
+        frameCaptureActive = false;
+        frameCaptureAwaitingRender = false;
+        frameCaptureCompleted = true;
+        frameCaptureBefore = QImage();
+        frameCaptureAfter = QImage();
+        frameCaptureFailure = QStringLiteral("GPU frame capture was interrupted by a preview reset");
+    }
     finished.wakeAll();
 }
 
@@ -428,11 +644,23 @@ PreviewGpuItem::PreviewGpuItem(const std::shared_ptr<PreviewGpuState> &state, QQ
     setAcceptedMouseButtons(Qt::NoButton);
     auto watchWindow = [this](QQuickWindow *window) {
         disconnect(m_invalidation);
+        disconnect(m_afterRendering);
         m_state->invalidate();
         if (window) {
             std::shared_ptr<PreviewGpuState> state = m_state;
             m_invalidation = connect(window, &QQuickWindow::sceneGraphInvalidated, this,
                                      [state]() { state->invalidate(); }, Qt::DirectConnection);
+            m_afterRendering = connect(window, &QQuickWindow::afterRendering, this, [state, window]() {
+                QMutexLocker lock(&state->mutex);
+                if (!state->frameCaptureAwaitingRender) return;
+                state->frameCaptureAwaitingRender = false;
+                QString failure;
+                state->frameCaptureAfter = readComposedFrame(window, &failure);
+                state->frameCaptureFailure = failure;
+                state->frameCaptureActive = false;
+                state->frameCaptureCompleted = true;
+                state->finished.wakeAll();
+            }, Qt::DirectConnection);
         }
     };
     connect(this, &QQuickItem::windowChanged, this, watchWindow);
@@ -444,6 +672,14 @@ PreviewGpuItem::~PreviewGpuItem() { m_state->invalidate(); }
 QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
 {
     QMutexLocker lock(&m_state->mutex);
+    auto failCapture = [this](const QString &reason) {
+        if (!m_state->frameCaptureActive) return;
+        m_state->frameCaptureActive = false;
+        m_state->frameCaptureAwaitingRender = false;
+        m_state->frameCaptureCompleted = true;
+        m_state->frameCaptureFailure = reason;
+        m_state->finished.wakeAll();
+    };
     QOpenGLContext *context = QOpenGLContext::currentContext();
     m_state->consumerContext = context && context->isOpenGLES() ? context : nullptr;
     m_state->consumerDisplay = context && context->isOpenGLES() ? eglGetCurrentDisplay() : EGL_NO_DISPLAY;
@@ -487,6 +723,10 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
             delete first;
             delete second;
         }
+        if (!current)
+            failCapture(QStringLiteral("GL layer changed before the captured frame could be composed"));
+        else if (!ok)
+            failCapture(m_state->failureReason);
         aurora_egl_frame_release(&m_state->frame);
         aurora_egl_frame_release(&m_state->opaqueFrame);
         m_state->accepted = ok;
@@ -606,6 +846,7 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
         m_state->canvasNodeTexture = 0;
     }
     if (!m_state->active) {
+        failCapture(QStringLiteral("Qt scene graph did not produce a composed frame"));
         delete root;
         return nullptr;
     }
@@ -621,6 +862,7 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
         if (!views) {
             m_state->failureReason = QStringLiteral("Qt could not upload the Java view overlay texture");
             m_state->active = false;
+            failCapture(m_state->failureReason);
             delete root;
             return nullptr;
         }
@@ -666,6 +908,8 @@ QSGNode *PreviewGpuItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *
             }
         }
     }
+    if (m_state->frameCaptureActive)
+        m_state->frameCaptureAwaitingRender = true;
     return root;
 }
 

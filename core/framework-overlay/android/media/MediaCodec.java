@@ -312,9 +312,12 @@ public final class MediaCodec {
     public MediaFormat getOutputFormat() { synchronized (mLock) { if (mState == ST_UNINITIALIZED) throw new IllegalStateException(); return new MediaFormat(mOutputFormat); } }
     public MediaFormat getOutputFormat(int i) { return getOutputFormat(); }
     public MediaFormat getInputFormat() { synchronized (mLock) { if (mState == ST_UNINITIALIZED) throw new IllegalStateException(); return new MediaFormat(mInputFormat); } }
-    public void releaseOutputBuffer(int index, boolean render) { release(index, render, 0); }
-    public void releaseOutputBuffer(int index, long renderTimestampNs) { release(index, true, renderTimestampNs); }
-    private void release(int index, boolean render, long whenNs) {
+    public void releaseOutputBuffer(int index, boolean render) { release(index, render, 0, false); }
+    public void releaseOutputBuffer(int index, long renderTimestampNs) { release(index, true, renderTimestampNs, true); }
+    static long surfaceTextureTimestampNs(long presentationTimeUs, boolean hasWhen, long renderTimestampNs) {
+        return hasWhen ? renderTimestampNs : presentationTimeUs * 1000L;
+    }
+    private void release(int index, boolean render, long whenNs, boolean hasWhen) {
         Out o;
         synchronized (mLock) {
             if (mState != ST_RUNNING) throw new IllegalStateException("releaseOutputBuffer when not executing");
@@ -324,7 +327,7 @@ public final class MediaCodec {
         if (o.frame != 0) {
             if (TRACE && !render) mSkipped++;
             long t0 = TRACE ? System.nanoTime() : 0;
-            try { if (render) draw(o); } finally { megler.MediaCodecNative.freeFrame(o.frame); }
+            try { if (render) draw(o, surfaceTextureTimestampNs(o.pts, hasWhen, whenNs)); } finally { megler.MediaCodecNative.freeFrame(o.frame); }
             if (TRACE && render) mDrawNs += System.nanoTime() - t0;
         }
         handBack();
@@ -332,12 +335,12 @@ public final class MediaCodec {
     private static final boolean TRACE = System.getenv("TL_MEDIA_TRACE") != null;
     private int mDrawn, mSkipped;
     private long mDrawNs;
-    private void draw(Out o) {
+    private void draw(Out o, long timestampNs) {
         Surface s = mSurface;
         if (TRACE && mDrawn++ % 30 == 0) android.util.Log.d("MediaCodec", mName + ": frame " + mDrawn + " at " + o.pts + " (" + mSkipped + " skipped, " + (mDrawn > 1 ? mDrawNs / 1000000 / (mDrawn - 1) : 0) + " ms a draw) " + mOutW + "x" + mOutH + " to " + (s != null ? s.meglerView : null));
         if (s == null || !s.isValid() || mOutW <= 0 || mOutH <= 0) return;
         if (s.meglerTexture != null) {
-            if (drawSurfaceTexture(o, s.meglerTexture)) rendered(o);
+            if (drawSurfaceTexture(o, s.meglerTexture, timestampNs)) rendered(o);
             return;
         }
         // A SurfaceView's surface: a picture decoded on the graphics processor stays there, as a TextureView's does, the view
@@ -373,7 +376,7 @@ public final class MediaCodec {
      * size first, it was scaled to the view on the graphics processor, read back whole, posted, and sent up again: at 1440x2560
      * 15 MB each way a frame, which left TikTok Lite's videos at four pictures a second.
      */
-    private boolean drawSurfaceTexture(Out o, android.graphics.SurfaceTexture t) {
+    private boolean drawSurfaceTexture(Out o, android.graphics.SurfaceTexture t, long timestampNs) {
         // A picture decoded on the graphics processor stays there: the texture's newest frame, which its TextureView draws
         // from there (as an OpenGL ES frame), nothing read back into a bitmap and sent up again.
         // Where the shell lays the video under the views, it has shown the window already: the view is not drawn again.
@@ -384,7 +387,7 @@ public final class MediaCodec {
         if (b == null || b.getWidth() != mOutW || b.getHeight() != mOutH) mTextureFrames[i] = b = Bitmap.createBitmap(mOutW, mOutH, Bitmap.Config.ARGB_8888);
         if (!megler.MediaCodecNative.renderFrame(o.frame, b)) return false;
         mTextureNext = (i + 1) % mTextureFrames.length;
-        return t.meglerPostBitmap(b);
+        return t.meglerPostBitmap(b, timestampNs);
     }
     private void rendered(Out o) {
         OnFrameRenderedListener l = mRendered;

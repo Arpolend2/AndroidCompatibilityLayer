@@ -1930,6 +1930,7 @@ static void j_SetObjectArrayElement(JNIEnvP e, mg_jobj *a, i32 i, mg_jobj *v)
         return;
     }
     if (a->dvm && v && (!v->dvm || !mg_dvm_is_instance(v, mg_dvm_class_of(a)->component))) {
+        mg_dvm_array_store_diagnostic(v, mg_dvm_class_of(a)->component, NULL, 0);
         mg_dvm_throw("java/lang/ArrayStoreException", "%s cannot be stored in an array of type %s", mg_jni_class_name(v), mg_jni_class_name(a));
         return;
     }

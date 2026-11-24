@@ -1,4 +1,5 @@
 #include "../shared_folders.h"
+#include "../../core/src/bionic/mg_camera_storage_path.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -40,6 +41,12 @@ int main(int argc, char **argv)
     QCoreApplication::setApplicationName(QStringLiteral("SharedFolders"));
     QTemporaryDir temporary;
     check(temporary.isValid(), "temporary root");
+    qputenv("HOME", temporary.path().toUtf8());
+    qputenv("XDG_CONFIG_HOME", (temporary.path() + QStringLiteral("/config")).toUtf8());
+    check(QDir().mkpath(temporary.path() + QStringLiteral("/config")), "create isolated user configuration");
+    const QString pictures = temporary.path() + QStringLiteral("/Pictures");
+    writeFile(temporary.path() + QStringLiteral("/config/user-dirs.dirs"),
+              "XDG_PICTURES_DIR=\"" + pictures.toUtf8() + "\"\n");
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, temporary.path());
     const QString root = temporary.path() + QStringLiteral("/Documents");
@@ -111,6 +118,90 @@ int main(int argc, char **argv)
         QStringLiteral("Documents"), temporary.path() + QStringLiteral("/missing")});
     AuroraStorageHost missingStorage(missingFolders);
     check(missingStorage.host().link_count == 0, "missing folder is excluded");
+
+    AuroraStorageHost camera{QStringList()};
+    QString cameraError;
+    check(camera.configureCameraPictures(QStringLiteral("org.example.camera"), true, &cameraError) &&
+          cameraError.isEmpty(), "prepare package-scoped Pictures");
+    const megler_storage_host cameraHost = camera.host();
+    check(cameraHost.link_count == 1 && std::strcmp(cameraHost.links[0].name, "Pictures") == 0,
+          "publish one canonical Pictures link, not duplicate DCIM");
+    check(cameraHost.make_folder(cameraHost.user, 0, "DCIM", &error) &&
+          cameraHost.make_folder(cameraHost.user, 0, "DCIM/OpenCamera", &error), "create camera destination");
+    handle = cameraHost.open(cameraHost.user, 0, "DCIM/OpenCamera/synthetic.jpg",
+                             MEGLER_STORAGE_WRITE | MEGLER_STORAGE_CREATE | MEGLER_STORAGE_EXCLUSIVE,
+                             MEGLER_STORAGE_FILE, &error);
+    check(handle && error == MEGLER_STORAGE_OK, "save camera fixture directly in native Pictures");
+    check(::write(descriptor(handle), "synthetic", 9) == 9, "write camera fixture");
+    ::close(descriptor(handle));
+    const QString cameraRoot = pictures + QStringLiteral("/AndroidCompatibilityLayer/org.example.camera");
+    QFile saved(cameraRoot + QStringLiteral("/DCIM/OpenCamera/synthetic.jpg"));
+    check(saved.open(QIODevice::ReadOnly) && saved.readAll() == "synthetic",
+          "camera file exists in package-scoped native Pictures");
+    handle = cameraHost.open(cameraHost.user, 0, "../org.example.other/private.jpg",
+                             MEGLER_STORAGE_READ, MEGLER_STORAGE_FILE, &error);
+    check(!handle && error == MEGLER_STORAGE_INVALID, "camera mount cannot traverse to another package");
+    const QByteArray cameraEscape = QFile::encodeName(cameraRoot + QStringLiteral("/escape"));
+    check(::symlink(outsidePath.constData(), cameraEscape.constData()) == 0, "create camera escape fixture");
+    handle = cameraHost.open(cameraHost.user, 0, "escape/secret.txt", MEGLER_STORAGE_READ,
+                             MEGLER_STORAGE_FILE, &error);
+    check(!handle && error == MEGLER_STORAGE_DENIED, "camera mount rejects symlink escape");
+
+    AuroraStorageHost denied{QStringList()};
+    check(denied.configureCameraPictures(QStringLiteral("org.example.camera"), false, &cameraError),
+          "prepare explicit permission-denied mount");
+    const megler_storage_host deniedHost = denied.host();
+    check(deniedHost.link_count == 1 && !deniedHost.links[0].writable, "denial keeps mount instead of private fallback");
+    handle = deniedHost.open(deniedHost.user, 0, "DCIM/new.jpg",
+                             MEGLER_STORAGE_WRITE | MEGLER_STORAGE_CREATE,
+                             MEGLER_STORAGE_FILE, &error);
+    check(!handle && error == MEGLER_STORAGE_DENIED, "camera write reports permission denial");
+    check(!deniedHost.make_folder(deniedHost.user, 0, "DCIM", &error) &&
+          error == MEGLER_STORAGE_DENIED, "camera mkdir reports permission denial");
+    check(!camera.configureCameraPictures(QStringLiteral("../outside"), true, &cameraError) &&
+          !cameraError.isEmpty(), "reject untrusted package path");
+
+    const QByteArray badScope = QFile::encodeName(pictures + QStringLiteral("/AndroidCompatibilityLayer/org.example.bad"));
+    check(::symlink(outsidePath.constData(), badScope.constData()) == 0, "create redirected package fixture");
+    AuroraStorageHost redirected{QStringList()};
+    check(!redirected.configureCameraPictures(QStringLiteral("org.example.bad"), true, &cameraError) &&
+          !cameraError.isEmpty(), "refuse redirected package root explicitly");
+
+    QVector<AuroraStorageHost::Folder> explicitPictures;
+    explicitPictures.append(AuroraStorageHost::Folder{QStringLiteral("Pictures"), pictures});
+    AuroraStorageHost selected(explicitPictures);
+    check(selected.configureCameraPictures(QStringLiteral("org.example.camera"), true, &cameraError),
+          "keep explicitly selected Pictures");
+    const megler_storage_host selectedHost = selected.host();
+    handle = selectedHost.open(selectedHost.user, 0, "AndroidCompatibilityLayer/org.example.camera/DCIM/OpenCamera/synthetic.jpg",
+                               MEGLER_STORAGE_READ, MEGLER_STORAGE_FILE, &error);
+    check(handle && selectedHost.link_count == 1, "selected Pictures keeps its original root and one link");
+    ::close(descriptor(handle));
+    check(selected.configureCameraPictures(QStringLiteral("org.example.camera"), false, &cameraError),
+          "deny camera writes without discarding selected Pictures reads");
+    const megler_storage_host readOnlyHost = selected.host();
+    handle = readOnlyHost.open(readOnlyHost.user, 0, "AndroidCompatibilityLayer/org.example.camera/DCIM/OpenCamera/synthetic.jpg",
+                               MEGLER_STORAGE_READ, MEGLER_STORAGE_FILE, &error);
+    check(handle && !readOnlyHost.links[0].writable, "explicit Pictures remains readable without write permission");
+    ::close(descriptor(handle));
+    handle = readOnlyHost.open(readOnlyHost.user, 0, "new.jpg", MEGLER_STORAGE_WRITE | MEGLER_STORAGE_CREATE,
+                               MEGLER_STORAGE_FILE, &error);
+    check(!handle && error == MEGLER_STORAGE_DENIED, "read-only host rejects writes itself");
+    check(!readOnlyHost.make_folder(readOnlyHost.user, 0, "new", &error) &&
+          error == MEGLER_STORAGE_DENIED, "read-only host rejects mkdir");
+    check(!readOnlyHost.remove(readOnlyHost.user, 0, "AndroidCompatibilityLayer", true, &error) &&
+          error == MEGLER_STORAGE_DENIED, "read-only host rejects removal");
+    check(!readOnlyHost.rename(readOnlyHost.user, 0, "AndroidCompatibilityLayer", 0, "moved", &error) &&
+          error == MEGLER_STORAGE_DENIED, "read-only host rejects rename");
+
+    check(std::strcmp(mg_camera_storage_suffix("/storage/emulated/0/DCIM/OpenCamera/photo.jpg"),
+                      "/OpenCamera/photo.jpg") == 0 &&
+          std::strcmp(mg_camera_storage_suffix("/storage/emulated/0/Pictures/DCIM/OpenCamera/photo.jpg"),
+                      "/OpenCamera/photo.jpg") == 0, "DCIM aliases share a canonical suffix");
+    check(!mg_camera_storage_suffix("/storage/emulated/0/DCIM-other/photo.jpg") &&
+          !mg_camera_storage_suffix("/storage/emulated/0/Pictures-other/DCIM/photo.jpg") &&
+          !mg_camera_storage_suffix("/storage/emulated/10/DCIM/photo.jpg"),
+          "camera alias respects path component and user boundaries");
 
     std::puts("Aurora shared folders OK");
     return 0;

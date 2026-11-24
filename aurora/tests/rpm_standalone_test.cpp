@@ -18,13 +18,18 @@
 #include <unistd.h>
 #endif
 
-static QByteArray apkReport = R"({"ok":true,"package":"org.example.app","permissions":["android.permission.INTERNET","android.permission.CAMERA","android.permission.ACCESS_FINE_LOCATION","android.permission.BLUETOOTH_CONNECT"],"permissionMaxSdk":[0,0,0,0]})";
+static QByteArray apkReport = R"({"ok":true,"package":"org.example.app","targetSdk":28,"permissions":["android.permission.INTERNET","android.permission.CAMERA","android.permission.ACCESS_FINE_LOCATION","android.permission.BLUETOOTH_CONNECT"],"permissionMaxSdk":[0,0,0,0]})";
+static int splitReportCalls;
 extern "C" char *megler_apk_report(const char *) {
     char *result = static_cast<char *>(std::malloc(size_t(apkReport.size()) + 1));
     if (result) std::memcpy(result, apkReport.constData(), size_t(apkReport.size()) + 1);
     return result;
 }
-extern "C" char *megler_apk_report_splits(const char *path, const char *) { return megler_apk_report(path); }
+extern "C" char *megler_apk_report_splits(const char *path, const char *) {
+    ++splitReportCalls;
+    char *result = megler_apk_report(path);
+    return result;
+}
 extern "C" bool megler_apk_icon(const char *, uint8_t **, size_t *) { return false; }
 extern "C" bool megler_apk_icon_splits(const char *, const char *, uint8_t **, size_t *) { return false; }
 extern "C" void megler_free(void *ptr) { std::free(ptr); }
@@ -209,13 +214,45 @@ int main(int argc, char **argv)
         !contents.contains("\"deniedPermissions\":[\"camera\",\"location\"]") ||
         !contents.contains("Permissions=Internet;Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;Bluetooth\n")) return 1;
     const QString first = output;
-    apkReport = R"({"ok":true,"package":"org.example.app","permissions":["android.permission.CAMERA","android.permission.ACCESS_FINE_LOCATION","android.permission.RECORD_AUDIO","android.permission.BODY_SENSORS","android.permission.READ_MEDIA_IMAGES","android.permission.READ_MEDIA_AUDIO","android.permission.CALL_PHONE","android.permission.INTERNET"],"permissionMaxSdk":[0,0,0,0,0,0,0,28]})";
+    apkReport = R"({"ok":true,"package":"org.example.app","targetSdk":34,"permissions":["android.permission.CAMERA","android.permission.ACCESS_FINE_LOCATION","android.permission.RECORD_AUDIO","android.permission.BODY_SENSORS","android.permission.READ_MEDIA_IMAGES","android.permission.READ_MEDIA_AUDIO","android.permission.CALL_PHONE","android.permission.INTERNET"],"permissionMaxSdk":[0,0,0,0,0,0,0,28]})";
     if (!PermissionSettings::save(appDir, QStringList(), &error) ||
         !RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;
     QFile selectedRpm(output);
     if (!selectedRpm.open(QIODevice::ReadOnly) ||
         !selectedRpm.readAll().contains("Permissions=Audio;ru.androidcompatibilitylayer.appmanager.log@ru.androidcompatibilitylayer.appmanager;ru.androidcompatibilitylayer.appmanager@ru.androidcompatibilitylayer.appmanager;Camera;Location;Microphone;Call;Sensors;Pictures;Music\n")) return 1;
+    apkReport = R"({"ok":true,"package":"org.example.app","targetSdk":34,"permissions":["android.permission.CAMERA"],"permissionMaxSdk":[0]})";
+    if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+            store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;
+    QFile cameraRpm(output);
+    if (!cameraRpm.open(QIODevice::ReadOnly) ||
+        !cameraRpm.readAll().contains(";Camera;Pictures\n")) return 1;
+    const QString singleStore = root.filePath(QStringLiteral("single-store"));
+    const QString singleApp = QDir(singleStore).filePath(QStringLiteral("org.example.app"));
+    const int previousSplitReportCalls = splitReportCalls;
+    if (!QDir().mkpath(singleApp) || !write(singleApp + QStringLiteral("/base.apk"), "single-camera-fixture") ||
+        !RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+            singleStore, runtimeLink, qmlLink, binary, out, &output, &error) ||
+        splitReportCalls != previousSplitReportCalls) return 1;
+    if (!PermissionSettings::save(appDir, QStringList() << QStringLiteral("camera"), &error) ||
+        !RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+            store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;
+    QFile deniedCameraRpm(output);
+    if (!deniedCameraRpm.open(QIODevice::ReadOnly) ||
+        deniedCameraRpm.readAll().contains(";Pictures\n")) return 1;
+    if (!PermissionSettings::save(appDir, QStringList(), &error)) return 1;
+    apkReport = R"({"ok":true,"package":"org.example.app","permissions":["android.permission.CAMERA"],"permissionMaxSdk":[0]})";
+    if (RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+            store, runtimeLink, qmlLink, binary, out, &output, &error) || error.isEmpty()) return 1;
+    apkReport = R"({"ok":true,"package":"org.example.app","targetSdk":34.5,"permissions":["android.permission.CAMERA"],"permissionMaxSdk":[0]})";
+    if (RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+            store, runtimeLink, qmlLink, binary, out, &output, &error) || error.isEmpty()) return 1;
+    apkReport = R"({"ok":true,"package":"org.example.app","targetSdk":0,"minSdk":34,"permissions":["android.permission.CAMERA"],"permissionMaxSdk":[0]})";
+    if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
+            store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;
+    QFile implicitTargetRpm(output);
+    if (!implicitTargetRpm.open(QIODevice::ReadOnly) ||
+        !implicitTargetRpm.readAll().contains(";Camera;Pictures\n")) return 1;
     apkReport = R"({"ok":true,"package":"org.example.app","permissions":[],"permissionMaxSdk":[]})";
     if (!RpmStandalone::createUnsigned(QStringLiteral("org.example.app"), QStringLiteral("Example"), icon,
             store, runtimeLink, qmlLink, binary, out, &output, &error)) return 1;

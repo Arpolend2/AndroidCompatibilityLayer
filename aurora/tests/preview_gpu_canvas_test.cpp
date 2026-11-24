@@ -20,7 +20,10 @@
 #include <QThread>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 
 namespace {
 std::atomic<int> metricReports{0};
@@ -320,12 +323,16 @@ int main(int argc, char **argv)
     QOpenGLContext shareContext;
     QSurfaceFormat format = QSurfaceFormat::defaultFormat();
     format.setRenderableType(QSurfaceFormat::OpenGLES);
+    format.setVersion(2, 0);
     shareSurface.setFormat(format);
     shareSurface.create();
-    shareContext.setFormat(shareSurface.format());
+    shareContext.setFormat(format);
     if (!shareSurface.isValid() || !shareContext.create() || !shareContext.isOpenGLES() ||
         !shareContext.makeCurrent(&shareSurface)) {
-        std::fprintf(stderr, "SKIP: this Qt platform plugin cannot create an offscreen OpenGL ES context\n");
+        std::fprintf(stderr, "SKIP: offscreen OpenGL setup failed (surface=%d context=%d gles=%d current=%d version=%d.%d)\n",
+                     shareSurface.isValid(), shareContext.isValid(), shareContext.isOpenGLES(),
+                     QOpenGLContext::currentContext() == &shareContext, shareContext.format().majorVersion(),
+                     shareContext.format().minorVersion());
         return 77;
     }
 
@@ -641,7 +648,7 @@ int main(int argc, char **argv)
         copyPaint.blend = MEGLER_GFX_BLEND_SRC_OVER;
         copyPaint.filter_mode = -1;
         copyPaint.flags = 0;
-        const bool hasBlit = shareContext.format().majorVersion() >= 3;
+        const bool hasGpuScaling = shareContext.isOpenGLES();
         host.save(host.user, filteredGpuCanvas);
         cpuHost->save(cpuHost->user, filteredCpuCanvas);
         host.set_matrix(host.user, filteredGpuCanvas, translated);
@@ -717,12 +724,12 @@ int main(int argc, char **argv)
             cpuHost->draw_bitmap(cpuHost->user, filteredCpuCanvas, &sourceImage, region,
                                  scaled, &copyPaint);
         flushForComparison();
-        const bool smoothedCopyMatches = smoothedCopy == hasBlit &&
+        const bool smoothedCopyMatches = smoothedCopy == hasGpuScaling &&
             pixelsMatch(filteredGpuPixels, filteredCpuPixels, 2) &&
             copyGpuPixels.count(char(0)) == copyGpuPixels.size();
         if (!smoothedCopyMatches)
             std::fprintf(stderr, "Canvas bilinear copy: accepted=%d expected=%d max difference=%d\n",
-                         int(smoothedCopy), int(hasBlit),
+                         int(smoothedCopy), int(hasGpuScaling),
                          pixelsMaxDifference(filteredGpuPixels, filteredCpuPixels));
         expandedCopiesMatch = smoothedCopyMatches && expandedCopiesMatch;
         copyPaint.flags = 0;
@@ -736,18 +743,18 @@ int main(int argc, char **argv)
         sourceImage.height = 12;
         sourceImage.stride = 16 * 4;
         sourceImage.pixels = copyCpuPixels.constData();
-        if (hasBlit)
+        if (hasGpuScaling)
             cpuHost->draw_bitmap(cpuHost->user, filteredCpuCanvas, &sourceImage, region, scaled, &copyPaint);
         host.restore(host.user, filteredGpuCanvas);
         cpuHost->restore(cpuHost->user, filteredCpuCanvas);
         host.set_matrix(host.user, filteredGpuCanvas, identityForFilter);
         cpuHost->set_matrix(cpuHost->user, filteredCpuCanvas, identityForFilter);
         flushForComparison();
-        scaledCopyMatches = copiedScaled == hasBlit &&
+        scaledCopyMatches = copiedScaled == hasGpuScaling &&
                             copyGpuPixels.count(char(0)) == copyGpuPixels.size() &&
                             pixelsMatch(filteredGpuPixels, filteredCpuPixels, 0);
-        std::fprintf(stderr, "2x copy: %s (GLES3=%d accepted=%d max pixel difference=%d)\n",
-                     scaledCopyMatches ? "PASS" : "FAIL", int(hasBlit), int(copiedScaled),
+        std::fprintf(stderr, "2x copy: %s (GPU scaling=%d accepted=%d max pixel difference=%d)\n",
+                     scaledCopyMatches ? "PASS" : "FAIL", int(hasGpuScaling), int(copiedScaled),
                      pixelsMaxDifference(filteredGpuPixels, filteredCpuPixels));
 
         struct CopyCase { int xScale, yScale, alpha, filter, blend, layerAlpha; };
@@ -774,7 +781,7 @@ int main(int argc, char **argv)
             copyPaint.filter_mode = test.filter;
             copyPaint.blend = test.blend;
             const bool copied = host.draw_canvas(host.user, filteredGpuCanvas, copyGpu, region, destination, &copyPaint);
-            const bool expectedCopy = (test.xScale == 1 && test.yScale == 1) || hasBlit;
+            const bool expectedCopy = (test.xScale == 1 && test.yScale == 1) || hasGpuScaling;
             if (copied) {
                 ++expectedGpuCopies;
                 cpuHost->draw_bitmap(cpuHost->user, filteredCpuCanvas, &sourceImage, region, destination, &copyPaint);
@@ -875,17 +882,17 @@ int main(int argc, char **argv)
             const QByteArray nearestPixels(reinterpret_cast<const char *>(qtNearest.constBits()), filterStride * filterHeight);
             if (copied && !pixelsMatch(qtPixels, nearestPixels, 2))
                 sawInterpolation = true;
-            const bool matches = copied == hasBlit && noReadback &&
+            const bool matches = copied == hasGpuScaling && noReadback &&
                 pixelsMatch(filteredGpuPixels, filteredCpuPixels, 2) &&
                 pixelsMatch(filteredGpuPixels, qtPixels, 3);
             if (!matches)
                 std::fprintf(stderr, "Canvas bilinear %gx%g: accepted=%d expected=%d CPU diff=%d Qt diff=%d\n",
-                             target.width(), target.height(), int(copied), int(hasBlit),
+                             target.width(), target.height(), int(copied), int(hasGpuScaling),
                              pixelsMaxDifference(filteredGpuPixels, filteredCpuPixels),
                              pixelsMaxDifference(filteredGpuPixels, qtPixels));
             expandedCopiesMatch = matches && expandedCopiesMatch;
         }
-        expandedCopiesMatch = (sawInterpolation || !hasBlit) && expandedCopiesMatch;
+        expandedCopiesMatch = (sawInterpolation || !hasGpuScaling) && expandedCopiesMatch;
         host.draw_color(host.user, filteredGpuCanvas, translucentBackground, MEGLER_GFX_BLEND_SRC);
         cpuHost->draw_color(cpuHost->user, filteredCpuCanvas, translucentBackground, MEGLER_GFX_BLEND_SRC);
         host.save(host.user, filteredGpuCanvas);
@@ -909,11 +916,11 @@ int main(int argc, char **argv)
         host.restore(host.user, filteredGpuCanvas);
         cpuHost->restore(cpuHost->user, filteredCpuCanvas);
         flushForComparison();
-        const bool filteredSmoothMatches = filteredSmoothCopy == hasBlit && noReadback &&
+        const bool filteredSmoothMatches = filteredSmoothCopy == hasGpuScaling && noReadback &&
             pixelsMatch(filteredGpuPixels, filteredCpuPixels, 2);
         if (!filteredSmoothMatches)
             std::fprintf(stderr, "Canvas bilinear filtered blend: accepted=%d expected=%d max difference=%d\n",
-                         int(filteredSmoothCopy), int(hasBlit),
+                         int(filteredSmoothCopy), int(hasGpuScaling),
                          pixelsMaxDifference(filteredGpuPixels, filteredCpuPixels));
         expandedCopiesMatch = filteredSmoothMatches && expandedCopiesMatch;
         copyPaint.flags = 0;
@@ -937,7 +944,7 @@ int main(int argc, char **argv)
                 copyPaint.filter_color = 0x80e04020u;
                 const bool copied = host.draw_canvas(host.user, filteredGpuCanvas, copyGpu,
                                                      reducedRegion, destination, &copyPaint);
-                const bool expectedCopy = destination[2] == 20 || hasBlit;
+                const bool expectedCopy = destination[2] == 20 || hasGpuScaling;
                 if (copied) {
                     ++expectedGpuCopies;
                     cpuHost->draw_bitmap(cpuHost->user, filteredCpuCanvas, &sourceImage,
@@ -991,11 +998,11 @@ int main(int argc, char **argv)
         host.restore(host.user, filteredGpuCanvas);
         cpuHost->restore(cpuHost->user, filteredCpuCanvas);
         flushForComparison();
-        const bool rectPathsMatch = copiedRectPaths == hasBlit && pathStayedGpu &&
+        const bool rectPathsMatch = copiedRectPaths == hasGpuScaling && pathStayedGpu &&
             pixelsMatch(filteredGpuPixels, filteredCpuPixels, 2);
         if (!rectPathsMatch)
             std::fprintf(stderr, "Canvas rectangle path clips: accepted=%d expected=%d max difference=%d\n",
-                         int(copiedRectPaths), int(hasBlit),
+                         int(copiedRectPaths), int(hasGpuScaling),
                          pixelsMaxDifference(filteredGpuPixels, filteredCpuPixels));
         expandedCopiesMatch = rectPathsMatch && expandedCopiesMatch;
         const float fractionalRectPath[] = {
@@ -1073,12 +1080,12 @@ int main(int argc, char **argv)
             host.restore(host.user, filteredGpuCanvas);
             cpuHost->restore(cpuHost->user, filteredCpuCanvas);
             flushForComparison();
-            const bool matches = copied == hasBlit &&
+            const bool matches = copied == hasGpuScaling &&
                 pixelsMatch(filteredGpuPixels, filteredCpuPixels, 2) &&
                 copyGpuPixels.count(char(0)) == copyGpuPixels.size();
             if (!matches)
                 std::fprintf(stderr, "Canvas reduction 15x9 to %dx%d: accepted=%d expected=%d max difference=%d\n",
-                             size[0], size[1], int(copied), int(hasBlit),
+                             size[0], size[1], int(copied), int(hasGpuScaling),
                              pixelsMaxDifference(filteredGpuPixels, filteredCpuPixels));
             expandedCopiesMatch = matches && expandedCopiesMatch;
         }
@@ -1104,7 +1111,7 @@ int main(int argc, char **argv)
                                      destination, &copyPaint);
             }
             flushForComparison();
-            const bool matches = copied == (!scaled || hasBlit) &&
+            const bool matches = copied == (!scaled || hasGpuScaling) &&
                                  pixelsMatch(filteredGpuPixels, filteredCpuPixels, 2);
             if (!matches)
                 std::fprintf(stderr, "Canvas cropped copy: accepted=%d max difference=%d\n",
@@ -1154,7 +1161,7 @@ int main(int argc, char **argv)
         const float selfSource[] = {1, 2, 9, 8};
         const float selfDestinations[][4] = {{3, 3, 11, 9}, {0, 0, 16, 12}, {2, 1, 14, 10}};
         for (int i = 0; i < 3; ++i) {
-            if (i && !hasBlit)
+            if (i && !hasGpuScaling)
                 continue;
             if (i == 2) {
                 host.clip_rect(host.user, copyGpu, 6, 3, 9, 6, MEGLER_GFX_CLIP_DIFFERENCE);
@@ -1325,6 +1332,304 @@ int main(int argc, char **argv)
     }
     gl->glDeleteTextures(1, &nextSnapshot);
 
+    const uint32_t persistentBitmapId = 0x7ffffff0u;
+    const int persistentReleasesBefore = presented.releases;
+    QByteArray persistentPixels(stride * height, char(0));
+    void *persistentCanvasA = host.canvas_new_bitmap(host.user, persistentPixels.data(), width, height,
+                                                      stride, persistentBitmapId);
+    if (persistentCanvasA) {
+        for (int i = 0; i < persistentPixels.size(); i += 4) {
+            persistentPixels[i] = char(0x20);
+            persistentPixels[i + 1] = char(0x40);
+            persistentPixels[i + 2] = char(0x80);
+            persistentPixels[i + 3] = char(0xff);
+        }
+        host.bitmap_changed(host.user, persistentBitmapId);
+    }
+    void *persistentCanvasB = persistentCanvasA
+        ? host.canvas_new_bitmap(host.user, persistentPixels.data(), width, height, stride, persistentBitmapId)
+        : nullptr;
+    const bool persistentPresentationA = persistentCanvasA &&
+        host.present(host.user, persistentCanvasA, 0, 0, width, height);
+    const uint32_t persistentTexture = presented.texture;
+    const bool persistentPresentationB = persistentCanvasB &&
+        host.present(host.user, persistentCanvasB, 0, 0, width, height);
+    const bool persistentTextureReused = persistentPresentationA && persistentPresentationB &&
+        persistentTexture != 0 && presented.texture == persistentTexture;
+    const bool persistentUploadMatches = shareContext.makeCurrent(&shareSurface) &&
+        texturePixel(gl, persistentTexture, 0x80, 0x40, 0x20, 0xff);
+    if (persistentCanvasB)
+        host.draw_color(host.user, persistentCanvasB, 0xffff0000u, MEGLER_GFX_BLEND_SRC);
+    if (persistentCanvasB)
+        host.flush(host.user, persistentCanvasB);
+    const bool persistentFlushAvoidsReadback = persistentCanvasB &&
+        isBgra(persistentPixels, width, 32, 32, 0x20, 0x40, 0x80, 0xff);
+    QByteArray redReference(stride * height, char(0));
+    for (int i = 0; i < redReference.size(); i += 4) {
+        redReference[i + 2] = char(0xff);
+        redReference[i + 3] = char(0xff);
+    }
+    QByteArray textureCopyPixels(stride * height, char(0));
+    QByteArray cpuCopyPixels(stride * height, char(0));
+    void *textureCopyCanvas = host.canvas_new(host.user, textureCopyPixels.data(), width, height, stride);
+    void *cpuCopyCanvas = cpuHost->canvas_new(cpuHost->user, cpuCopyPixels.data(), width, height, stride);
+    megler_gfx_image persistentImage = {};
+    persistentImage.pixels = persistentPixels.data();
+    persistentImage.width = width;
+    persistentImage.height = height;
+    persistentImage.stride = stride;
+    persistentImage.id = persistentBitmapId;
+    persistentImage.version = 2;
+    megler_gfx_image redReferenceImage = persistentImage;
+    redReferenceImage.pixels = redReference.data();
+    megler_gfx_paint bitmapPaint = paint;
+    bitmapPaint.color = 0x80ffffffu;
+    bitmapPaint.blend = MEGLER_GFX_BLEND_SRC_OVER;
+    bitmapPaint.filter_mode = -1;
+    const float fullSource[] = {0, 0, static_cast<float>(width), static_cast<float>(height)};
+    const float fullDestination[] = {0, 0, static_cast<float>(width), static_cast<float>(height)};
+    const bool copyCanvasesReady = textureCopyCanvas && cpuCopyCanvas;
+    if (copyCanvasesReady) {
+        host.clip_rect(host.user, textureCopyCanvas, 8, 8, 56, 56, MEGLER_GFX_CLIP_INTERSECT);
+        cpuHost->clip_rect(cpuHost->user, cpuCopyCanvas, 8, 8, 56, 56, MEGLER_GFX_CLIP_INTERSECT);
+        host.draw_bitmap(host.user, textureCopyCanvas, &persistentImage, fullSource, fullDestination, &bitmapPaint);
+        cpuHost->draw_bitmap(cpuHost->user, cpuCopyCanvas, &redReferenceImage, fullSource, fullDestination, &bitmapPaint);
+        host.flush(host.user, textureCopyCanvas);
+    }
+    const bool textureCopyAvoidsReadback = persistentCanvasB &&
+        isBgra(persistentPixels, width, 32, 32, 0x20, 0x40, 0x80, 0xff);
+    const bool textureBitmapDrawMatches = copyCanvasesReady &&
+        pixelsMatch(textureCopyPixels, cpuCopyPixels, 2) &&
+        isBgra(textureCopyPixels, width, 32, 32, 0, 0, 0x80, 0x80) &&
+        isBgra(textureCopyPixels, width, 4, 4, 0, 0, 0, 0);
+    const bool persistentReadbackWorks = persistentCanvasB &&
+        host.bitmap_readback(host.user, persistentBitmapId, persistentPixels.data(), width, height, stride) &&
+        isBgra(persistentPixels, width, 32, 32, 0, 0, 0xff, 0xff);
+
+    GLint maxTextureSize = 0;
+    if (shareContext.makeCurrent(&shareSurface))
+        gl->glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+    const int fallbackWidth = maxTextureSize > 0 && maxTextureSize < 1048576 ? maxTextureSize + 1 : 0;
+    QByteArray fallbackPixels(fallbackWidth * 4, char(0));
+    QByteArray fallbackReference(fallbackWidth * 4, char(0));
+    QByteArray sourceReference(stride * height, char(0));
+    void *fallbackCanvas = fallbackWidth
+        ? host.canvas_new(host.user, fallbackPixels.data(), fallbackWidth, 1, fallbackWidth * 4) : nullptr;
+    void *fallbackCpuCanvas = fallbackWidth
+        ? cpuHost->canvas_new(cpuHost->user, fallbackReference.data(), fallbackWidth, 1, fallbackWidth * 4) : nullptr;
+    void *referenceSourceCanvas = cpuHost->canvas_new(cpuHost->user, sourceReference.data(), width, height, stride);
+    bool fallbackSourceStale = false;
+    bool fallbackSourceMatches = false;
+    if (persistentCanvasB && fallbackCanvas && fallbackCpuCanvas && referenceSourceCanvas) {
+        host.draw_color(host.user, persistentCanvasB, 0xff0000ffu, MEGLER_GFX_BLEND_SRC);
+        host.flush(host.user, persistentCanvasB);
+        fallbackSourceStale = isBgra(persistentPixels, width, 0, 0, 0, 0, 0xff, 0xff);
+        cpuHost->draw_color(cpuHost->user, referenceSourceCanvas, 0xff0000ffu, MEGLER_GFX_BLEND_SRC);
+        host.draw_color(host.user, fallbackCanvas, 0xff00ff00u, MEGLER_GFX_BLEND_SRC);
+        cpuHost->draw_color(cpuHost->user, fallbackCpuCanvas, 0xff00ff00u, MEGLER_GFX_BLEND_SRC);
+        host.clip_rect(host.user, fallbackCanvas, 1, 0, 3, 1, MEGLER_GFX_CLIP_INTERSECT);
+        cpuHost->clip_rect(cpuHost->user, fallbackCpuCanvas, 1, 0, 3, 1, MEGLER_GFX_CLIP_INTERSECT);
+        const float row[] = {0, 0, 4, 1};
+        megler_gfx_image referenceImage = persistentImage;
+        referenceImage.pixels = sourceReference.data();
+        host.draw_bitmap(host.user, fallbackCanvas, &persistentImage, row, row, &bitmapPaint);
+        cpuHost->draw_bitmap(cpuHost->user, fallbackCpuCanvas, &referenceImage, row, row, &bitmapPaint);
+        fallbackSourceMatches = pixelsMatch(fallbackPixels, fallbackReference, 2);
+    }
+    if (fallbackCanvas)
+        host.canvas_free(host.user, fallbackCanvas);
+    if (fallbackCpuCanvas)
+        cpuHost->canvas_free(cpuHost->user, fallbackCpuCanvas);
+    if (referenceSourceCanvas)
+        cpuHost->canvas_free(cpuHost->user, referenceSourceCanvas);
+    if (textureCopyCanvas)
+        host.canvas_free(host.user, textureCopyCanvas);
+    if (cpuCopyCanvas)
+        cpuHost->canvas_free(cpuHost->user, cpuCopyCanvas);
+    if (persistentCanvasB)
+        host.canvas_free(host.user, persistentCanvasB);
+    if (persistentCanvasA)
+        host.canvas_free(host.user, persistentCanvasA);
+    const bool persistentTextureRetained = presented.releases == persistentReleasesBefore + 1;
+    host.bitmap_gone(host.user, persistentBitmapId);
+    const bool persistentTextureReleased = presented.releases == persistentReleasesBefore + 2;
+    if (!expect(persistentTextureReused && persistentUploadMatches,
+                "multiple canvases reuse one persistent GPU bitmap and upload CPU changes") ||
+        !expect(persistentFlushAvoidsReadback && persistentReadbackWorks,
+                "GPU flush only orders work; explicit bitmap readback materializes CPU pixels") ||
+        !expect(textureCopyAvoidsReadback && textureBitmapDrawMatches,
+                "Bitmap drawing samples the persistent GPU texture without source readback, matching alpha and clipping") ||
+        !expect(fallbackSourceStale && fallbackSourceMatches,
+                "CPU fallback materializes a GPU bitmap source before alpha-blended clipped drawing") ||
+        !expect(persistentTextureRetained && persistentTextureReleased,
+                "persistent bitmap texture is released only after all canvases and the bitmap are gone")) {
+        shareContext.doneCurrent();
+        return 1;
+    }
+
+    {
+        std::mutex bitmapMutex;
+        std::condition_variable bitmapChanged;
+        bool writeReady = false, workerCanvasCreated = false;
+        std::thread worker([&]() {
+            void *workerCanvas = host.canvas_new_bitmap(host.user, persistentPixels.data(), width, height,
+                                                        stride, persistentBitmapId);
+            if (workerCanvas) {
+                host.draw_color(host.user, workerCanvas, 0xff00ff00u, MEGLER_GFX_BLEND_SRC);
+                host.canvas_free(host.user, workerCanvas);
+            }
+            if (host.release_thread)
+                host.release_thread(host.user);
+            std::lock_guard<std::mutex> lock(bitmapMutex);
+            workerCanvasCreated = workerCanvas != nullptr;
+            writeReady = true;
+            bitmapChanged.notify_one();
+        });
+        {
+            std::unique_lock<std::mutex> lock(bitmapMutex);
+            bitmapChanged.wait(lock, [&]() { return writeReady; });
+        }
+        const bool sharedContextReadback = workerCanvasCreated &&
+            host.bitmap_readback(host.user, persistentBitmapId, persistentPixels.data(), width, height, stride) &&
+            isBgra(persistentPixels, width, 32, 32, 0, 255, 0, 255);
+        worker.join();
+        host.bitmap_gone(host.user, persistentBitmapId);
+        if (!expect(sharedContextReadback,
+                    "shared-context GPU bitmap writes are visible to CPU readback"))
+            return 1;
+    }
+
+    {
+        const uint32_t sourceId = 0x7ffffff1u;
+        const int width = 320, height = 480, stride = width * 4;
+        QByteArray sourcePixels(stride * height, char(0));
+        QByteArray sourceReference(stride * height, char(0));
+        QByteArray targetPixels(stride * height, char(0));
+        QByteArray targetReference(stride * height, char(0));
+        void *source = nullptr;
+        std::thread writer([&]() {
+            source = host.canvas_new_bitmap(host.user, sourcePixels.data(), width, height, stride, sourceId);
+            if (source)
+                host.draw_color(host.user, source, 0x80402010u, MEGLER_GFX_BLEND_SRC);
+            if (host.release_thread)
+                host.release_thread(host.user);
+        });
+        writer.join();
+        void *target = host.canvas_new(host.user, targetPixels.data(), width, height, stride);
+        void *cpuSource = cpuHost->canvas_new(cpuHost->user, sourceReference.data(), width, height, stride);
+        void *cpuTarget = cpuHost->canvas_new(cpuHost->user, targetReference.data(), width, height, stride);
+        bool copied = false, noSourceReadback = false, matches = false;
+        bool scaledCopied = false, scaledMatches = false;
+        bool sampleStateRestored = false;
+        bool benchMatches = true;
+        qint64 gpuCopyUs = 0, cpuFallbackUs = 0;
+        if (source && target && cpuSource && cpuTarget) {
+            cpuHost->draw_color(cpuHost->user, cpuSource, 0x80402010u, MEGLER_GFX_BLEND_SRC);
+            host.draw_color(host.user, target, 0xff204080u, MEGLER_GFX_BLEND_SRC);
+            cpuHost->draw_color(cpuHost->user, cpuTarget, 0xff204080u, MEGLER_GFX_BLEND_SRC);
+            host.clip_rect(host.user, target, 8, 8, width - 8, height - 8, MEGLER_GFX_CLIP_INTERSECT);
+            cpuHost->clip_rect(cpuHost->user, cpuTarget, 8, 8, width - 8, height - 8, MEGLER_GFX_CLIP_INTERSECT);
+            megler_gfx_paint copyPaint = paint;
+            copyPaint.color = 0x80ffffffu;
+            copyPaint.blend = MEGLER_GFX_BLEND_SRC_OVER;
+            copyPaint.filter_mode = -1;
+            const float region[] = {0, 0, float(width), float(height)};
+            QOpenGLContext *currentContext = QOpenGLContext::currentContext();
+            QOpenGLFunctions *gl = currentContext ? currentContext->functions() : nullptr;
+            if (gl) {
+                gl->glSampleCoverage(0.0f, GL_FALSE);
+                gl->glEnable(GL_SAMPLE_COVERAGE);
+                gl->glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+            }
+            copied = host.draw_canvas(host.user, target, source, region, region, &copyPaint);
+            if (gl) {
+                sampleStateRestored = gl->glIsEnabled(GL_SAMPLE_COVERAGE) &&
+                                      gl->glIsEnabled(GL_SAMPLE_ALPHA_TO_COVERAGE);
+                gl->glDisable(GL_SAMPLE_COVERAGE);
+                gl->glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+                gl->glSampleCoverage(1.0f, GL_FALSE);
+            }
+            noSourceReadback = sourcePixels.count(char(0)) == sourcePixels.size();
+            if (copied) {
+                megler_gfx_image sourceImage = {};
+                sourceImage.pixels = sourceReference.data();
+                sourceImage.width = width;
+                sourceImage.height = height;
+                sourceImage.stride = stride;
+                cpuHost->draw_bitmap(cpuHost->user, cpuTarget, &sourceImage, region, region, &copyPaint);
+            }
+            host.flush(host.user, target);
+            matches = pixelsMatch(targetPixels, targetReference, 2);
+            host.draw_color(host.user, target, 0xff204080u, MEGLER_GFX_BLEND_SRC);
+            cpuHost->draw_color(cpuHost->user, cpuTarget, 0xff204080u, MEGLER_GFX_BLEND_SRC);
+            const float halfRegion[] = {0, 0, float(width / 2), float(height / 2)};
+            scaledCopied = host.draw_canvas(host.user, target, source, halfRegion, region, &copyPaint);
+            if (scaledCopied) {
+                megler_gfx_image sourceImage = {};
+                sourceImage.pixels = sourceReference.data();
+                sourceImage.width = width;
+                sourceImage.height = height;
+                sourceImage.stride = stride;
+                cpuHost->draw_bitmap(cpuHost->user, cpuTarget, &sourceImage, halfRegion, region, &copyPaint);
+            }
+            host.flush(host.user, target);
+            scaledMatches = pixelsMatch(targetPixels, targetReference, 2);
+
+            if (copied) {
+                QByteArray fallbackPixels(stride * height, char(0));
+                void *fallbackTarget = host.canvas_new(host.user, fallbackPixels.data(), width, height, stride);
+                bool benchmarkOk = fallbackTarget != nullptr;
+                const int repetitions = 32;
+                const auto runCopies = [&](void *destination, bool gpu) {
+                    QElapsedTimer timer;
+                    timer.start();
+                    for (int i = 0; i < repetitions && benchmarkOk; ++i) {
+                        host.draw_color(host.user, source, (i & 1) ? 0x80402010u : 0x80204010u,
+                                        MEGLER_GFX_BLEND_SRC);
+                        if (gpu) {
+                            benchmarkOk = host.draw_canvas(host.user, destination, source, region, region, &copyPaint);
+                        } else {
+                            benchmarkOk = host.bitmap_readback(host.user, sourceId, sourcePixels.data(),
+                                                               width, height, stride);
+                            megler_gfx_image sourceImage = {};
+                            sourceImage.pixels = sourcePixels.data();
+                            sourceImage.width = width;
+                            sourceImage.height = height;
+                            sourceImage.stride = stride;
+                            if (benchmarkOk)
+                                host.draw_bitmap(host.user, destination, &sourceImage, region, region, &copyPaint);
+                        }
+                    }
+                    host.flush(host.user, destination);
+                    return timer.nsecsElapsed() / 1000;
+                };
+                if (benchmarkOk) {
+                    host.draw_color(host.user, target, 0xff204080u, MEGLER_GFX_BLEND_SRC);
+                    host.draw_color(host.user, fallbackTarget, 0xff204080u, MEGLER_GFX_BLEND_SRC);
+                    host.clip_rect(host.user, fallbackTarget, 8, 8, width - 8, height - 8, MEGLER_GFX_CLIP_INTERSECT);
+                    gpuCopyUs = runCopies(target, true);
+                    cpuFallbackUs = runCopies(fallbackTarget, false);
+                    benchMatches = benchmarkOk && pixelsMatch(targetPixels, fallbackPixels, 2);
+                }
+                if (fallbackTarget)
+                    host.canvas_free(host.user, fallbackTarget);
+            }
+        }
+        if (source) host.canvas_free(host.user, source);
+        if (target) host.canvas_free(host.user, target);
+        if (cpuSource) cpuHost->canvas_free(cpuHost->user, cpuSource);
+        if (cpuTarget) cpuHost->canvas_free(cpuHost->user, cpuTarget);
+        host.bitmap_gone(host.user, sourceId);
+        if (!expect(copied && noSourceReadback && matches && benchMatches && sampleStateRestored,
+                    "cross-context canvas copy stays on GPU and preserves alpha, clipping and blend") ||
+            !expect(scaledCopied && scaledMatches,
+                    "cross-context scaled canvas copy preserves alpha, clipping and blend"))
+            return 1;
+        if (copied)
+            std::printf("Cross-context copy benchmark (32 copies, 320x480): GPU=%lld us, forced CPU readback=%lld us\n",
+                        static_cast<long long>(gpuCopyUs), static_cast<long long>(cpuFallbackUs));
+    }
+
     QByteArray gpuPixels(benchStride * benchHeight, char(0));
     void *gpuBenchCanvas = host.canvas_new(host.user, gpuPixels.data(), benchWidth, benchHeight, benchStride);
     if (!expect(gpuBenchCanvas != nullptr, "GPU benchmark canvas allocation")) {
@@ -1395,6 +1700,86 @@ int main(int argc, char **argv)
     }
 
     {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool ready = false, finish = false, created = false, unbound = false;
+        const int contextsBefore = shareContext.shareGroup()->shares().size();
+        int contextsAfter = -1;
+        std::thread worker([&]() {
+            QByteArray pixels(stride * height, char(0));
+            void *canvas = embeddedHost.canvas_new(embeddedHost.user, pixels.data(), width, height, stride);
+            if (canvas) {
+                embeddedHost.draw_color(embeddedHost.user, canvas, 0xffff0000u, MEGLER_GFX_BLEND_SRC);
+                embeddedHost.flush(embeddedHost.user, canvas);
+            }
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                created = canvas != nullptr;
+                unbound = !QOpenGLContext::currentContext();
+                ready = true;
+                changed.notify_one();
+                changed.wait(lock, [&]() { return finish; });
+            }
+            if (canvas) embeddedHost.canvas_free(embeddedHost.user, canvas);
+            embeddedHost.release_thread(embeddedHost.user);
+        });
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            changed.wait(lock, [&]() { return ready; });
+            contextsAfter = shareContext.shareGroup()->shares().size();
+            finish = true;
+        }
+        changed.notify_one();
+        worker.join();
+        if (!expect(created && unbound && contextsAfter == contextsBefore,
+                    "idle worker releases its offscreen context"))
+            return 1;
+    }
+
+    {
+        std::unique_ptr<PreviewGpuCanvasHost> retiring(new PreviewGpuCanvasHost);
+        PresentedPixels retiringFrames;
+        if (!expect(retiring->prepareCpuPresentation(&shareContext, presentPixels, &retiringFrames),
+                    "prepare worker surface for teardown"))
+            return 1;
+        megler_gfx_host retiringHost = *mg_gfx_standin();
+        retiring->install(&retiringHost);
+        QByteArray mainPixels(stride * height, char(0));
+        void *mainCanvas = retiringHost.canvas_new(retiringHost.user, mainPixels.data(), width, height, stride);
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool ready = false, finish = false, workerOk = false;
+        std::thread worker([&]() {
+            QByteArray pixels(stride * height, char(0));
+            void *canvas = retiringHost.canvas_new(retiringHost.user, pixels.data(), width, height, stride);
+            if (canvas) {
+                retiringHost.draw_color(retiringHost.user, canvas, 0xffff0000u, MEGLER_GFX_BLEND_SRC);
+                retiringHost.flush(retiringHost.user, canvas);
+                retiringHost.canvas_free(retiringHost.user, canvas);
+            }
+            std::unique_lock<std::mutex> lock(mutex);
+            workerOk = canvas && !QOpenGLContext::currentContext();
+            ready = true;
+            changed.notify_one();
+            changed.wait(lock, [&]() { return finish; });
+        });
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            changed.wait(lock, [&]() { return ready; });
+        }
+        if (mainCanvas) retiringHost.canvas_free(retiringHost.user, mainCanvas);
+        retiring.reset();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            finish = true;
+        }
+        changed.notify_one();
+        worker.join();
+        if (!expect(mainCanvas && workerOk, "destroy the offscreen surface while its idle worker remains alive"))
+            return 1;
+    }
+
+    {
         PreviewGpuCanvasHost remoteGpu;
         PresentedTexture remote;
         megler_gfx_host remoteHost = *mg_gfx_standin();
@@ -1404,14 +1789,13 @@ int main(int argc, char **argv)
         remoteGpu.install(&remoteHost);
         QByteArray remotePixels(stride * height, char(0));
         void *canvas = remoteHost.canvas_new(remoteHost.user, remotePixels.data(), width, height, stride);
-        const bool current = QOpenGLContext::currentContext() &&
-                             QOpenGLContext::currentContext() != &shareContext;
+        const bool unboundAfterCall = !QOpenGLContext::currentContext();
         const bool canRelease = remoteHost.release_thread != nullptr;
         if (canRelease) remoteHost.release_thread(remoteHost.user);
         const bool unbound = !QOpenGLContext::currentContext();
         if (canvas) remoteHost.canvas_free(remoteHost.user, canvas);
-        if (!expect(canvas && current && canRelease && unbound,
-                    "remote worker shutdown releases the context on its owning thread"))
+        if (!expect(canvas && unboundAfterCall && canRelease && unbound,
+                    "remote worker leaves the offscreen surface unbound and releases its context"))
             return 1;
     }
 

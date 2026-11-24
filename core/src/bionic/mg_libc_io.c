@@ -19,6 +19,8 @@
 #include "../elf/mg_elf.h"
 #include "../mg_core.h"
 #include "mg_fd.h"
+#include "mg_camera_storage_path.h"
+#include "../../include/megler.h"
 
 /* --------------------------------------------------------------- the paths
  *
@@ -66,6 +68,23 @@ static char g_internal[256] = "/data/data/com.example.app";
 static char g_external[64] = EXTERNAL;
 static char g_cwd[512] = "/";
 static char *g_space_dir;              /* a host folder on the volume everything is kept on: what statfs asks about */
+static bool g_camera_alias_pending, g_camera_alias_enabled, g_camera_alias_blocked;
+static char g_camera_alias_package[sizeof(g_package)];
+
+bool megler_set_camera_storage_alias(const char *package, bool enabled)
+{
+    if (megler_running()) {
+        mg_warn("storage: camera directory alias cannot change while an app runs");
+        return false;
+    }
+    if (enabled && (!package || !package[0] || strlen(package) >= sizeof(g_camera_alias_package))) {
+        mg_warn("storage: camera directory alias requires a valid expected package");
+        return false;
+    }
+    mg_strlcpy(g_camera_alias_package, enabled ? package : "", sizeof(g_camera_alias_package));
+    g_camera_alias_pending = enabled;
+    return true;
+}
 
 static const struct {
     const char *path;
@@ -277,6 +296,13 @@ void mg_fs_configure(const char *package, const char *internal_dir, const char *
     static const char *const own[] = { "data", "obb" };
     char *p, *h;
     size_t i;
+    g_camera_alias_enabled = g_camera_alias_pending;
+    g_camera_alias_blocked = g_camera_alias_enabled && strcmp(g_camera_alias_package, package) != 0;
+    if (g_camera_alias_blocked)
+        mg_warn("storage: camera package changed from %s to %s; Pictures access is refused",
+                g_camera_alias_package, package);
+    g_camera_alias_pending = false;
+    g_camera_alias_package[0] = 0;
     mg_strlcpy(g_package, package, sizeof(g_package));
     snprintf(g_internal, sizeof(g_internal), "/data/data/%s", package);
     mg_path_mkdirs(internal_dir);
@@ -337,6 +363,15 @@ void mg_fs_shared_storage(const char *shared_dir, const mg_fs_link *links, int c
         mount_put(p, h, MOUNT_LINK | (links[k].read_only ? MOUNT_READ_ONLY : 0));
         free(p);
         free(h);
+    }
+    if (g_camera_alias_enabled) {
+        bool pictures = false;
+        for (k = 0; k < count; ++k)
+            pictures = pictures || (strlen(links[k].name) == 8 && ascii_same(links[k].name, "Pictures", 8, true));
+        if (!pictures || g_camera_alias_blocked) {
+            if (!pictures) mg_warn("storage: camera Pictures link is missing; access is refused");
+            mount_put(EXTERNAL "/Pictures", MG_FOREIGN_PREFIX "-1", MOUNT_LINK | MOUNT_READ_ONLY);
+        }
     }
 }
 
@@ -478,7 +513,16 @@ static char *normalize(const char *path)
     if (!n) out[n++] = '/';
     out[n] = 0;
     free(full);
-    return without_alias(proc_self(out));
+    out = without_alias(proc_self(out));
+    if (g_camera_alias_enabled) {
+        const char *suffix = mg_camera_storage_suffix(out);
+        if (suffix) {
+            char *camera = mg_sprintf(EXTERNAL "/Pictures/DCIM%s", suffix);
+            free(out);
+            return camera;
+        }
+    }
+    return out;
 }
 
 static const mount *mount_longest(const char *g)

@@ -2,12 +2,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.google.android.gms"
     android:versionCode="1" android:versionName="test">
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="28" />
-    <application android:label="Synthetic service">
-        <service android:name="megler.test.gmsbroker.Broker" android:exported="true">
+    <application android:label="Synthetic service" android:permission="megler.test.INHERITED">
+        <service android:name="megler.test.gmsbroker.Broker" android:permission="">
             <intent-filter><action android:name="megler.test.gmsbroker.BIND" /></intent-filter>
         </service>
-        <service android:name="megler.test.gmsbroker.Hidden" android:exported="false">
+        <service android:name="megler.test.gmsbroker.Hidden" android:exported="false" android:permission="">
             <intent-filter><action android:name="megler.test.gmsbroker.HIDDEN" /></intent-filter>
+        </service>
+        <service android:name="megler.test.gmsbroker.Broker$NoFilter" android:permission="" />
+        <service android:name="megler.test.gmsbroker.Broker$Inherited">
+            <intent-filter><action android:name="megler.test.gmsbroker.PROTECTED" /></intent-filter>
         </service>
     </application>
 </manifest>

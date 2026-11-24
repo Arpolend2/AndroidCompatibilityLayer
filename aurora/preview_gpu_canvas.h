@@ -36,6 +36,7 @@ public:
     bool prepareRemotePresentation(QOpenGLContext *shareContext, Present present, Release release, void *presentUser);
     bool prepareCpuPresentation(QOpenGLContext *shareContext, PresentPixels present, void *presentUser);
     void install(megler_gfx_host *host);
+    void releaseThreadContext();
     bool drawTextPath(void *canvas, const float *path, int count, int fill, const megler_gfx_paint *paint, void *shader);
     bool drawTextFallbackPath(void *canvas, const float *path, int count, int fill, const megler_gfx_paint *paint, void *shader);
     bool drawTextBitmap(void *canvas, const megler_gfx_image *image, const float *src, const float *dst,
@@ -43,15 +44,20 @@ public:
 
 private:
     struct Canvas;
+    struct Bitmap;
     struct Shader;
     bool prepareTexturePresentation(QOpenGLContext *shareContext, Present present, Release release,
                                     void *presentUser, bool offscreenWorker);
     static void MEGLER_CB releaseThread(void *user);
     static void *MEGLER_CB canvasNew(void *user, void *pixels, int width, int height, int stride);
+    static void *MEGLER_CB canvasNewBitmap(void *user, void *pixels, int width, int height, int stride, uint32_t id);
     static void MEGLER_CB canvasFree(void *user, void *canvas);
     static void MEGLER_CB canvasDiscard(void *user, void *canvas);
     static void MEGLER_CB flush(void *user, void *canvas);
     static void MEGLER_CB touched(void *user, void *canvas);
+    static bool MEGLER_CB bitmapReadback(void *user, uint32_t id, void *pixels, int width, int height, int stride);
+    static void MEGLER_CB bitmapChanged(void *user, uint32_t id);
+    static void MEGLER_CB bitmapGone(void *user, uint32_t id);
     static void MEGLER_CB save(void *user, void *canvas);
     static void MEGLER_CB saveLayer(void *user, void *canvas, const float *bounds, int alpha, int blend);
     static void MEGLER_CB saveLayerBlur(void *user, void *canvas, const float *bounds, int alpha, float radiusX, float radiusY, bool clamp);
@@ -81,11 +87,16 @@ private:
 
     Canvas *findCanvas(void *canvas) const;
     bool ensureCurrent(const char *origin);
+    bool ensureBitmapCurrent(Canvas *canvas);
+    bool waitForBitmap(Bitmap *bitmap, bool forceWait = false);
+    bool ensureCpuMirrorCurrent(Bitmap *bitmap);
     bool prepareContext(QOpenGLContext *shareContext);
     bool ensureFramebuffer(Canvas *canvas, const char *origin);
     bool ensureFilterFramebuffer(Canvas *canvas);
     bool readback(Canvas *canvas, PreviewGpuReadbackReason reason);
     bool upload(Canvas *canvas);
+    void finishGpuWrite(Canvas *canvas);
+    void markCpuWrite(Bitmap *bitmap);
     void removeFramebuffer(Canvas *canvas);
     bool drawFiltered(Canvas *canvas, const megler_gfx_paint *paint,
                       const QRectF &deviceBounds, const std::function<void(QPainter &)> &drawSource,
@@ -110,6 +121,7 @@ private:
     void *m_presentUser;
     mutable QMutex m_mutex;
     QHash<void *, Canvas *> m_canvases;
+    QHash<uint32_t, Bitmap *> m_bitmaps;
     quint64 m_nextCanvasId;
     std::shared_ptr<PreviewGpuMetrics> m_metrics;
 };

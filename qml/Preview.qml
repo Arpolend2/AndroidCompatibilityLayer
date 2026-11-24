@@ -4,9 +4,19 @@ import AndroidCompatibilityLayer.Preview 1.0
 import "PreviewNavigation.js" as Navigation
 
 ApplicationWindow {
+    id: root
     readonly property bool systemDark: Theme.colorScheme === Theme.LightOnDark
     readonly property color systemAccent: Theme.highlightColor
-    allowedOrientations: defaultAllowedOrientations
+    function previewOrientations(mask) {
+        if (mask < 0) return defaultAllowedOrientations
+        var allowed = 0
+        if (mask & Qt.PortraitOrientation) allowed |= Orientation.Portrait
+        if (mask & Qt.LandscapeOrientation) allowed |= Orientation.Landscape
+        if (mask & Qt.InvertedPortraitOrientation) allowed |= Orientation.PortraitInverted
+        if (mask & Qt.InvertedLandscapeOrientation) allowed |= Orientation.LandscapeInverted
+        return allowed
+    }
+    allowedOrientations: previewOrientations(preview.orientationMask)
     AndroidFilePicker { host: pickerHost; stack: pickerStack }
 
     Item {
@@ -78,8 +88,9 @@ ApplicationWindow {
         id: previewPage
         Page {
             id: guestPage
-            allowedOrientations: Orientation.All
+            allowedOrientations: root.previewOrientations(preview.orientationMask)
             property string diagnosticFileError: ""
+            property bool hidingCaptureControls: false
             onStatusChanged: navigationTimer.restart()
             PreviewSurface {
                 anchors.fill: parent
@@ -118,6 +129,39 @@ ApplicationWindow {
                     width: parent.width - 2 * x
                     wrapMode: Text.Wrap
                     text: qsTr("Diagnostic file could not be saved: %1").arg(guestPage.diagnosticFileError)
+                }
+            }
+            Connections {
+                target: preview
+                onFrameCaptureStatusChanged: {
+                    if (!preview.frameCapturePending)
+                        guestPage.hidingCaptureControls = false
+                }
+            }
+            Column {
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.bottom: parent.bottom
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                spacing: Theme.paddingSmall
+                visible: preview.frameCaptureEnabled && !guestPage.hidingCaptureControls
+                Button {
+                    objectName: "captureDiagnosticFrames"
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: preview.frameCapturePending ? qsTr("Capturing diagnostic frames...") : qsTr("Save diagnostic frames")
+                    enabled: !preview.frameCapturePending
+                    onClicked: {
+                        guestPage.hidingCaptureControls = true
+                        preview.captureFramePair()
+                        if (!preview.frameCapturePending)
+                            guestPage.hidingCaptureControls = false
+                    }
+                }
+                Label {
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.Wrap
+                    visible: preview.frameCaptureStatus.length > 0
+                    text: preview.frameCaptureStatus
                 }
             }
             Timer {

@@ -852,10 +852,10 @@ typedef struct megler_storage_host {
  *   canvas_free   done with. Every save has been restored and the canvas has
  *                 been flushed by then. The memory itself is the layer's, and
  *                 is not touched after this returns.
- *   flush         when this returns, the memory holds everything drawn through
- *                 the canvas so far: the layer, the app or another canvas is
- *                 about to read it. Only called when something was drawn since
- *                 the last flush.
+ *   flush         drawing through the canvas so far is submitted and ordered
+ *                 before later drawing to the same bitmap. Only called when
+ *                 something was drawn since the last flush. Hosts without
+ *                 bitmap_readback also make the memory current here.
  *   touched       the memory was written by someone else (the layer itself,
  *                 the app's native code, another canvas) since the last flush:
  *                 take it as the picture again before drawing more. Called
@@ -1437,6 +1437,15 @@ typedef struct megler_gfx_host {
     /* Release thread-local drawing resources on the Java main and (if used)
        frame-rendering threads, after the last frame and before normal exit notification. */
     void (MEGLER_CB *release_thread)(void *user);
+    /* Optional persistent GPU bitmap lifecycle. canvas_new_bitmap receives
+       the bitmap ID so separate canvases can share its GPU image. */
+    void *(MEGLER_CB *canvas_new_bitmap)(void *user, void *pixels, int width, int height, int stride, uint32_t id);
+    /* Bring a bitmap's GPU image into its canonical BGRA memory before a CPU
+       read. True also when the host has no GPU image for this ID. */
+    bool (MEGLER_CB *bitmap_readback)(void *user, uint32_t id, void *pixels, int width, int height, int stride);
+    /* The canonical memory was changed by the CPU and must replace any cached
+       GPU image before it is used again. */
+    void (MEGLER_CB *bitmap_changed)(void *user, uint32_t id);
 } megler_gfx_host;
 
 /*
@@ -1679,13 +1688,18 @@ typedef struct megler_system_host {
 } megler_system_host;
 
 enum { MEGLER_NOTIFICATION_POST = 1, MEGLER_NOTIFICATION_CANCEL = 2, MEGLER_NOTIFICATION_CANCEL_ALL = 3 };
+enum {
+    MEGLER_NOTIFICATION_IMPORTANCE_MIN = 1, MEGLER_NOTIFICATION_IMPORTANCE_LOW = 2,
+    MEGLER_NOTIFICATION_IMPORTANCE_DEFAULT = 3, MEGLER_NOTIFICATION_IMPORTANCE_HIGH = 4,
+    MEGLER_NOTIFICATION_IMPORTANCE_MAX = 5
+};
 typedef struct megler_notification_host {
     void *user;
     bool (MEGLER_CB *send)(void *user, int operation, const char *package,
                            const char *tag, int id, const char *title, const char *body);
     bool (MEGLER_CB *send_detailed)(void *user, const char *package, const char *tag, int id,
                                     const char *title, const char *body, int flags, int max,
-                                    int progress, bool indeterminate);
+                                    int progress, bool indeterminate, int importance, bool silent);
 } megler_notification_host;
 
 /*
@@ -2195,6 +2209,15 @@ MEGLER_API bool megler_run_headless(const megler_run_config *config);
  * it before reading what it stores.
  */
 MEGLER_API bool megler_running(void);
+/*
+ * Before the next app starts, make its DCIM directory an alias of Pictures/DCIM.
+ * When enabled, package must match the APK whose storage the shell configured; a different package is denied Pictures access.
+ * The shell must provide a Pictures storage link, including a denied link when access is refused.
+ * Consumed by the next filesystem configuration only; other runs keep their ordinary directories.
+ * A NULL package is allowed when disabling. False while an app runs or the enabled package is invalid.
+ * No files are moved and the storage host's permissions are unchanged.
+ */
+MEGLER_API bool megler_set_camera_storage_alias(const char *package, bool enabled);
 MEGLER_API const char *megler_last_error(void);
 /*
  * Where another thread of the process stands, in one line: its pc and lr, and the ways back into a module or into Android
