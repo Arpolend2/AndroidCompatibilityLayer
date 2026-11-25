@@ -44,17 +44,25 @@ Aurora Store, настройки microG и самостоятельный RuStor
 
 ## Использованные проекты
 
-Предварительный список; состав и лицензии компонентов runtime ещё требуют проверки перед публикацией.
+### Основа и зависимости
+
+Ниже перечислены выявленные компоненты; состав конкретного Android runtime также зависит от SDK-образа, поэтому список не исчерпывает его лицензионные уведомления.
 
 - [Megler](https://github.com/Computershik73/megler-w10m) — основа проекта; автор — Илья Высоцкий.
 - [Husk](https://github.com/Leviidev/Husk) — основа части Java framework; см. [уведомление](core/framework/NOTICE).
 - [Android Open Source Project](https://source.android.com/) — компоненты Android runtime, включая libcore, Conscrypt, BoringSSL, ICU и Expat.
 - Android runtime также содержит компоненты [OpenJDK](https://openjdk.org/), [Apache Harmony](https://harmony.apache.org/), [Apache Xalan](https://xalan.apache.org/), [Apache HttpComponents](https://hc.apache.org/), [Bouncy Castle](https://www.bouncycastle.org/), [OkHttp](https://github.com/square/okhttp) и [Netty](https://netty.io/).
+- [FFmpeg](https://ffmpeg.org/) 8 — приватные библиотеки декодирования из форка [ffmpeg_aurora](https://gitflic.ru/project/timosh/ffmpeg_aurora), commit `b545fc0781c5312f867f8e548c0e24970e800a95`, LGPL 2.1+; к форку применяется патч droidmedia copy-back. Подробности, включая SHA-256 исходного архива, — в [документации интеграции](aurora/codec_audio_integration.md).
+- [Rockchip MPP](https://github.com/rockchip-linux/mpp) — необязательная аппаратная декодировка на устройствах с совместимой системной библиотекой; библиотека загружается динамически и не поставляется с проектом.
 - [zlib](https://zlib.net/) и [SQLite](https://sqlite.org/) — сжатие и база данных.
 - [stb_vorbis](https://github.com/nothings/stb) и [minimp3](https://github.com/lieff/minimp3) — декодирование аудио; лицензия minimp3 находится [в репозитории](aurora/audio_minimp3_LICENSE.txt).
-- [Qt](https://www.qt.io/) — интерфейс и системные мосты Авроры.
+- [Qt](https://www.qt.io/) и [Aurora SDK](https://developer.auroraos.ru/) — интерфейс и интеграция с системными API; [OpenSSL](https://www.openssl.org/) используется для криптографических операций. EGL/GLES и WebView предоставляются системной средой.
 - Корневые сертификаты основаны на хранилище [Mozilla](https://www.mozilla.org/) в виде набора [curl](https://curl.se/ca/cacert.pem); подробности — в `core/cacerts/README.md`.
 
-Aurora Store и microG — отдельные проекты, которые можно установить через настройки менеджера; они не являются частью исходного кода порта. Runtime также использует файлы из образа эмулятора Android SDK. Условия их распространения и необходимые уведомления ещё проверяются; список ссылок не заменяет лицензионные уведомления.
+### Благодарности
+
+- [Никита Тимошников (@TimoshN)](https://github.com/TimoshN) — начальные варианты ARM-сборки и GPU/gralloc-передачи кадров для Авроры из [PR #1](https://github.com/Arpolend2/AndroidCompatibilityLayer/pull/1). Эти части были адаптированы и переработаны в порте; PR остаётся открытым.
+
+Aurora Store и microG — отдельные проекты, которые можно установить через настройки менеджера; они не являются частью исходного кода порта. Android runtime также использует файлы из образа эмулятора Android SDK; происхождение и необходимые уведомления для этого набора требуют отдельной проверки. Ссылки в этом разделе не заменяют лицензионные уведомления.
 
 Инструкции по сборке и подробные ограничения: [aurora/README.md](aurora/README.md). Оригинальный README Megler сохранён в [README.upstream.md](README.upstream.md).
