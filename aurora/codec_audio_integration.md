@@ -13,6 +13,10 @@ The distributed `droidmedia-copy.patch` fixes bounds checks, chroma layout,
 copy-back callback shutdown and asynchronous EOS handling in the fork. System FFmpeg
 libraries are not replaced.
 
+The RPM excludes only the private `libav*-acl.so` capabilities from generated
+dependency metadata: these libraries are packaged together and loaded by path.
+System-library dependencies are still generated normally.
+
 The bridge loads the private libraries from
 `Aurora::Application::organizationPathTo("appmanager/ffmpeg8")` and checks
 versions and required symbols. If unavailable, it tries FFmpeg 7 **when its

@@ -8,6 +8,8 @@ Source0:    %{name}-%{version}.tar.bz2
 
 %global __provides_exclude_from ^%{_datadir}/(%{name}/fixtures|common/ru.androidcompatibilitylayer/appmanager/android-runtime)/.*$
 %global __requires_exclude_from ^%{_datadir}/common/ru.androidcompatibilitylayer/appmanager/android-runtime/.*$
+%global __provides_exclude ^libav(codec|format|util)-acl[.]so[.]
+%global __requires_exclude ^libav(codec|format|util)-acl[.]so[.]
 
 Requires:       sailfishsilica-qt5 >= 0.10.9
 Requires:       qt5-plugin-imageformat-jpeg
