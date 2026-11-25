@@ -57,7 +57,6 @@ Item {
         appName: qsTr("Android App Manager")
         appIcon: "ru.androidcompatibilitylayer.appmanager"
         isTransient: true
-        suppressSound: true
     }
     Notification {
         id: notification
@@ -65,7 +64,6 @@ Item {
         appName: qsTr("Android App Manager")
         appIcon: "ru.androidcompatibilitylayer.appmanager"
         progress: Notification.ProgressIndeterminate
-        suppressSound: true
         expireTimeout: 16 * 60 * 1000
         onReplacesIdChanged: {
             if (root.awaitingId && replacesId !== 0) {
